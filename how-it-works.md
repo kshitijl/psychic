@@ -433,6 +433,13 @@ Must enable at startup and disable on cleanup. Also disable/enable when launchin
 
 This creates a hierarchy of engagement levels for later analysis.
 
+**Scroll event deduplication:**
+- Track scrolled files in `HashSet<(String, String)>` - key is `(query, full_path)`
+- Only log scroll once per session for each unique (query, file) combination
+- Prevents spam: user might scroll up/down many times on same file
+- Check `scrolled_files.contains(&key)` before logging
+- Per-session deduplication (not global) - resets each time app starts
+
 ### Why Mouse Scroll for Preview?
 
 Original behavior: mouse scroll moved selection up/down in results list.

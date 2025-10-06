@@ -18,6 +18,7 @@ use ratatui::{
     Terminal,
 };
 use std::{
+    collections::HashSet,
     env,
     io::{self, stdout},
     path::PathBuf,
@@ -33,6 +34,7 @@ struct App {
     selected_index: usize,
     preview_scroll: u16,
     preview_cache: Option<(String, Text<'static>)>, // (file_path, rendered_text)
+    scrolled_files: HashSet<(String, String)>, // (query, full_path) - track what we've logged scroll for
     root: PathBuf,
     session_id: String,
     db: Database,
@@ -57,6 +59,7 @@ impl App {
             selected_index: 0,
             preview_scroll: 0,
             preview_cache: None,
+            scrolled_files: HashSet::new(),
             root,
             session_id,
             db: Database::new()?,
@@ -340,37 +343,49 @@ fn run_app(
                         MouseEventKind::ScrollDown => {
                             app.preview_scroll = app.preview_scroll.saturating_add(3);
 
-                            // Log scroll event
+                            // Log scroll event (deduplicated by query + full_path)
                             if !app.filtered_files.is_empty() {
                                 let selected_file = &app.filtered_files[app.selected_index];
                                 let full_path = app.root.join(selected_file);
-                                let (mtime, atime) = get_file_times(&full_path);
-                                let _ = app.db.log_scroll(
-                                    &app.query,
-                                    selected_file,
-                                    &full_path.to_string_lossy(),
-                                    mtime,
-                                    atime,
-                                    &app.session_id,
-                                );
+                                let full_path_str = full_path.to_string_lossy().to_string();
+                                let key = (app.query.clone(), full_path_str.clone());
+
+                                if !app.scrolled_files.contains(&key) {
+                                    let (mtime, atime) = get_file_times(&full_path);
+                                    let _ = app.db.log_scroll(
+                                        &app.query,
+                                        selected_file,
+                                        &full_path_str,
+                                        mtime,
+                                        atime,
+                                        &app.session_id,
+                                    );
+                                    app.scrolled_files.insert(key);
+                                }
                             }
                         }
                         MouseEventKind::ScrollUp => {
                             app.preview_scroll = app.preview_scroll.saturating_sub(3);
 
-                            // Log scroll event
+                            // Log scroll event (deduplicated by query + full_path)
                             if !app.filtered_files.is_empty() {
                                 let selected_file = &app.filtered_files[app.selected_index];
                                 let full_path = app.root.join(selected_file);
-                                let (mtime, atime) = get_file_times(&full_path);
-                                let _ = app.db.log_scroll(
-                                    &app.query,
-                                    selected_file,
-                                    &full_path.to_string_lossy(),
-                                    mtime,
-                                    atime,
-                                    &app.session_id,
-                                );
+                                let full_path_str = full_path.to_string_lossy().to_string();
+                                let key = (app.query.clone(), full_path_str.clone());
+
+                                if !app.scrolled_files.contains(&key) {
+                                    let (mtime, atime) = get_file_times(&full_path);
+                                    let _ = app.db.log_scroll(
+                                        &app.query,
+                                        selected_file,
+                                        &full_path_str,
+                                        mtime,
+                                        atime,
+                                        &app.session_id,
+                                    );
+                                    app.scrolled_files.insert(key);
+                                }
                             }
                         }
                         _ => {}
