@@ -9,6 +9,7 @@ pub fn gather_context() -> ContextData {
         dns: get_dns(),
         shell_history: get_shell_history(),
         running_processes: get_running_processes(),
+        timezone: get_timezone(),
     }
 }
 
@@ -97,4 +98,29 @@ fn get_running_processes() -> String {
         Ok(out) => String::from_utf8_lossy(&out.stdout).trim().to_string(),
         Err(_) => String::from("unknown"),
     }
+}
+
+fn get_timezone() -> String {
+    // Try TZ environment variable first
+    if let Ok(tz) = std::env::var("TZ") {
+        if !tz.is_empty() {
+            return tz;
+        }
+    }
+
+    // Try reading /etc/localtime symlink on Unix systems
+    if let Ok(link) = std::fs::read_link("/etc/localtime") {
+        if let Some(tz_path) = link.to_str() {
+            // Extract timezone from path like /usr/share/zoneinfo/America/Los_Angeles
+            if let Some(tz) = tz_path.strip_prefix("/usr/share/zoneinfo/") {
+                return tz.to_string();
+            }
+            if let Some(tz) = tz_path.strip_prefix("/var/db/timezone/zoneinfo/") {
+                return tz.to_string();
+            }
+        }
+    }
+
+    // Fallback to UTC
+    String::from("UTC")
 }

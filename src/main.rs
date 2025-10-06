@@ -1,5 +1,6 @@
 mod context;
 mod db;
+mod features;
 mod walker;
 
 use anyhow::Result;
@@ -8,7 +9,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
 };
-use db::Database;
+use db::{Database, EventData, FileMetadata};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
@@ -37,6 +38,7 @@ struct App {
     scrolled_files: HashSet<(String, String)>, // (query, full_path) - track what we've logged scroll for
     root: PathBuf,
     session_id: String,
+    current_subsession_id: u64,
     db: Database,
     last_impression_log: Instant,
 }
@@ -62,6 +64,7 @@ impl App {
             scrolled_files: HashSet::new(),
             root,
             session_id,
+            current_subsession_id: 1,
             db: Database::new()?,
             last_impression_log: Instant::now(),
         })
@@ -101,25 +104,27 @@ impl App {
         }
 
         // Log top 10 visible files with metadata
-        let top_10: Vec<(String, String, Option<i64>, Option<i64>)> = self
+        let top_10: Vec<FileMetadata> = self
             .filtered_files
             .iter()
             .take(10)
             .map(|relative| {
                 let full_path = self.root.join(relative);
-                let (mtime, atime) = get_file_times(&full_path);
+                let (mtime, atime, file_size) = get_file_metadata(&full_path);
                 (
                     relative.clone(),
                     full_path.to_string_lossy().to_string(),
                     mtime,
                     atime,
+                    file_size,
                 )
             })
             .collect();
 
         if !top_10.is_empty() {
-            self.db.log_impressions(&self.query, &top_10, &self.session_id)?;
+            self.db.log_impressions(&self.query, &top_10, self.current_subsession_id, &self.session_id)?;
             self.last_impression_log = Instant::now();
+            self.current_subsession_id += 1;
         }
 
         Ok(())
@@ -140,7 +145,7 @@ impl App {
     }
 }
 
-fn get_file_times(path: &PathBuf) -> (Option<i64>, Option<i64>) {
+fn get_file_metadata(path: &PathBuf) -> (Option<i64>, Option<i64>, Option<i64>) {
     if let Ok(metadata) = std::fs::metadata(path) {
         let mtime = metadata
             .modified()
@@ -154,9 +159,11 @@ fn get_file_times(path: &PathBuf) -> (Option<i64>, Option<i64>) {
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs() as i64);
 
-        (mtime, atime)
+        let file_size = Some(metadata.len() as i64);
+
+        (mtime, atime, file_size)
     } else {
-        (None, None)
+        (None, None, None)
     }
 }
 
@@ -351,15 +358,18 @@ fn run_app(
                                 let key = (app.query.clone(), full_path_str.clone());
 
                                 if !app.scrolled_files.contains(&key) {
-                                    let (mtime, atime) = get_file_times(&full_path);
-                                    let _ = app.db.log_scroll(
-                                        &app.query,
-                                        selected_file,
-                                        &full_path_str,
+                                    let (mtime, atime, file_size) = get_file_metadata(&full_path);
+                                    let _ = app.db.log_scroll(EventData {
+                                        query: &app.query,
+                                        file_path: selected_file,
+                                        full_path: &full_path_str,
                                         mtime,
                                         atime,
-                                        &app.session_id,
-                                    );
+                                        file_size,
+                                        subsession_id: app.current_subsession_id,
+                                        action: "scroll",
+                                        session_id: &app.session_id,
+                                    });
                                     app.scrolled_files.insert(key);
                                 }
                             }
@@ -375,15 +385,18 @@ fn run_app(
                                 let key = (app.query.clone(), full_path_str.clone());
 
                                 if !app.scrolled_files.contains(&key) {
-                                    let (mtime, atime) = get_file_times(&full_path);
-                                    let _ = app.db.log_scroll(
-                                        &app.query,
-                                        selected_file,
-                                        &full_path_str,
+                                    let (mtime, atime, file_size) = get_file_metadata(&full_path);
+                                    let _ = app.db.log_scroll(EventData {
+                                        query: &app.query,
+                                        file_path: selected_file,
+                                        full_path: &full_path_str,
                                         mtime,
                                         atime,
-                                        &app.session_id,
-                                    );
+                                        file_size,
+                                        subsession_id: app.current_subsession_id,
+                                        action: "scroll",
+                                        session_id: &app.session_id,
+                                    });
                                     app.scrolled_files.insert(key);
                                 }
                             }
@@ -419,17 +432,20 @@ fn run_app(
                             if !app.filtered_files.is_empty() {
                                 let selected_file = &app.filtered_files[app.selected_index];
                                 let full_path = app.root.join(selected_file);
-                                let (mtime, atime) = get_file_times(&full_path);
+                                let (mtime, atime, file_size) = get_file_metadata(&full_path);
 
                                 // Log the click
-                                app.db.log_click(
-                                    &app.query,
-                                    selected_file,
-                                    &full_path.to_string_lossy(),
+                                app.db.log_click(EventData {
+                                    query: &app.query,
+                                    file_path: selected_file,
+                                    full_path: &full_path.to_string_lossy(),
                                     mtime,
                                     atime,
-                                    &app.session_id,
-                                )?;
+                                    file_size,
+                                    subsession_id: app.current_subsession_id,
+                                    action: "click",
+                                    session_id: &app.session_id,
+                                })?;
 
                                 // Suspend TUI and launch editor
                                 disable_raw_mode()?;

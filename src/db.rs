@@ -2,6 +2,9 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 use std::path::PathBuf;
 
+// Type alias for file metadata tuples
+pub type FileMetadata = (String, String, Option<i64>, Option<i64>, Option<i64>); // (relative, full, mtime, atime, file_size)
+
 #[derive(Debug, Clone)]
 pub struct ContextData {
     pub cwd: String,
@@ -10,6 +13,7 @@ pub struct ContextData {
     pub dns: String,
     pub shell_history: String,
     pub running_processes: String,
+    pub timezone: String,
 }
 
 pub struct EventData<'a> {
@@ -18,6 +22,8 @@ pub struct EventData<'a> {
     pub full_path: &'a str,
     pub mtime: Option<i64>,
     pub atime: Option<i64>,
+    pub file_size: Option<i64>,
+    pub subsession_id: u64,
     pub action: &'a str,
     pub session_id: &'a str,
 }
@@ -48,6 +54,8 @@ impl Database {
                 full_path TEXT NOT NULL,
                 mtime INTEGER,
                 atime INTEGER,
+                file_size INTEGER,
+                subsession_id INTEGER,
                 action TEXT NOT NULL,
                 session_id TEXT NOT NULL
             )",
@@ -63,6 +71,7 @@ impl Database {
                 dns TEXT NOT NULL,
                 shell_history TEXT NOT NULL,
                 running_processes TEXT NOT NULL,
+                timezone TEXT NOT NULL,
                 created_at INTEGER NOT NULL
             )",
             [],
@@ -85,8 +94,8 @@ impl Database {
         let timestamp = jiff::Timestamp::now().as_second();
 
         self.conn.execute(
-            "INSERT INTO sessions (session_id, cwd, gateway, subnet, dns, shell_history, running_processes, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO sessions (session_id, cwd, gateway, subnet, dns, shell_history, running_processes, timezone, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 session_id,
                 &context.cwd,
@@ -95,6 +104,7 @@ impl Database {
                 &context.dns,
                 &context.shell_history,
                 &context.running_processes,
+                &context.timezone,
                 timestamp
             ],
         )?;
@@ -106,8 +116,8 @@ impl Database {
         let timestamp = jiff::Timestamp::now().as_second();
 
         self.conn.execute(
-            "INSERT INTO events (timestamp, query, file_path, full_path, mtime, atime, action, session_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO events (timestamp, query, file_path, full_path, mtime, atime, file_size, subsession_id, action, session_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 timestamp,
                 event.query,
@@ -115,6 +125,8 @@ impl Database {
                 event.full_path,
                 event.mtime,
                 event.atime,
+                event.file_size,
+                event.subsession_id,
                 event.action,
                 event.session_id
             ],
@@ -126,16 +138,19 @@ impl Database {
     pub fn log_impressions(
         &self,
         query: &str,
-        file_paths: &[(String, String, Option<i64>, Option<i64>)], // (relative, full, mtime, atime)
+        file_paths: &[FileMetadata],
+        subsession_id: u64,
         session_id: &str,
     ) -> Result<()> {
-        for (file_path, full_path, mtime, atime) in file_paths {
+        for (file_path, full_path, mtime, atime, file_size) in file_paths {
             self.log_event(EventData {
                 query,
                 file_path,
                 full_path,
                 mtime: *mtime,
                 atime: *atime,
+                file_size: *file_size,
+                subsession_id,
                 action: "impression",
                 session_id,
             })?;
@@ -144,43 +159,11 @@ impl Database {
         Ok(())
     }
 
-    pub fn log_click(
-        &self,
-        query: &str,
-        file_path: &str,
-        full_path: &str,
-        mtime: Option<i64>,
-        atime: Option<i64>,
-        session_id: &str,
-    ) -> Result<()> {
-        self.log_event(EventData {
-            query,
-            file_path,
-            full_path,
-            mtime,
-            atime,
-            action: "click",
-            session_id,
-        })
+    pub fn log_click(&self, event: EventData) -> Result<()> {
+        self.log_event(event)
     }
 
-    pub fn log_scroll(
-        &self,
-        query: &str,
-        file_path: &str,
-        full_path: &str,
-        mtime: Option<i64>,
-        atime: Option<i64>,
-        session_id: &str,
-    ) -> Result<()> {
-        self.log_event(EventData {
-            query,
-            file_path,
-            full_path,
-            mtime,
-            atime,
-            action: "scroll",
-            session_id,
-        })
+    pub fn log_scroll(&self, event: EventData) -> Result<()> {
+        self.log_event(event)
     }
 }
