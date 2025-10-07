@@ -2,10 +2,12 @@ Read how-it-works.md to understand the basics. It should reflect the current sta
 
 After adding a fair amount of new code to implement a feature or fix a bug:
 * run `cargo build --release`
-* run `cargo rest`
+* run `cargo test`
 * also `cargo clippy`.
 * add new tests for the feature just added, if possible
 * update how-it-works.md so that it reflects both current state and has a log of things done. You don't need to do this for every little change, but when you consider a piece of work "done".
+
+When running the binary, always use `cargo run --release -- <args>` instead of running the binary directly. This prevents running an outdated binary.
 
 Try to write features as functions in such a way that as much as possible of the functionality can be tested using `cargo test`. So, try to keep functions and functionality free of IO.
 

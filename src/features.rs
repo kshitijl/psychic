@@ -1,10 +1,15 @@
 use anyhow::{Context, Result};
 use csv::Writer;
-use jiff::{Timestamp, Span};
 use rusqlite::Connection;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+
+// Import the feature definitions module
+use crate::feature_defs::{FeatureInputs, FEATURE_REGISTRY, csv_columns};
+
+// Re-export types that other modules need
+pub use crate::feature_defs::{ClickEvent, Session};
 
 // Data structures for holding event and session data in memory
 
@@ -20,24 +25,11 @@ struct Event {
     action: String,
 }
 
-#[derive(Debug, Clone)]
-struct Session {
-    session_id: String,
-    timezone: String,
-    cwd: String,
-}
-
 // Output format enum
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum OutputFormat {
     Csv,
     Json,
-}
-
-// Helper structs for accumulator
-#[derive(Debug, Clone)]
-struct ClickEvent {
-    timestamp: i64,
 }
 
 // Accumulator for fold-based processing
@@ -239,98 +231,34 @@ fn compute_features_from_accumulator(
 ) -> Result<HashMap<String, String>> {
     let mut features = HashMap::new();
 
-    // Label starts as 0, will be updated to 1 if click/scroll happens later
+    // Metadata columns
     features.insert("label".to_string(), "0".to_string());
-
-    // Subsession ID (for grouping in LambdaRank)
     features.insert("subsession_id".to_string(), impression.subsession_id.to_string());
-
-    // Session ID (for potential session-level features)
     features.insert("session_id".to_string(), impression.session_id.clone());
-
-    // Query
     features.insert("query".to_string(), impression.query.clone());
-
-    // File path
     features.insert("file_path".to_string(), impression.file_path.clone());
 
-    // filename_starts_with_query
-    let filename = Path::new(&impression.file_path)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
-    features.insert(
-        "filename_starts_with_query".to_string(),
-        if !impression.query.is_empty()
-            && filename
-                .to_lowercase()
-                .starts_with(&impression.query.to_lowercase())
-        {
-            "1"
-        } else {
-            "0"
-        }
-        .to_string(),
-    );
+    // Create FeatureInputs from Event + Accumulator
+    let session = sessions.get(&impression.session_id);
+    let cwd = session
+        .map(|s| Path::new(&s.cwd))
+        .unwrap_or_else(|| Path::new("/"));
 
-    // clicks_last_30_days - only count clicks BEFORE this impression
-    if let Some(session) = sessions.get(&impression.session_id) {
-        let now_ts = Timestamp::from_second(impression.timestamp)?;
-        let session_tz =
-            jiff::tz::TimeZone::get(&session.timezone).unwrap_or(jiff::tz::TimeZone::system());
-        let now_zoned = now_ts.to_zoned(session_tz);
-        let thirty_days_ago = now_zoned.checked_sub(Span::new().days(30))?.timestamp();
+    let inputs = FeatureInputs {
+        query: &impression.query,
+        file_path: &impression.file_path,
+        full_path: Path::new(&impression.full_path),
+        mtime: impression.mtime,
+        cwd,
+        clicks_by_file: &acc.clicks_by_file,
+        current_timestamp: impression.timestamp,
+        session,
+    };
 
-        let clicks_last_30_days = acc
-            .clicks_by_file
-            .get(&impression.full_path)
-            .map(|clicks| {
-                clicks
-                    .iter()
-                    .filter(|c| {
-                        c.timestamp >= thirty_days_ago.as_second()
-                            && c.timestamp <= impression.timestamp // Only past clicks!
-                    })
-                    .count()
-            })
-            .unwrap_or(0);
-
-        features.insert(
-            "clicks_last_30_days".to_string(),
-            clicks_last_30_days.to_string(),
-        );
-    } else {
-        features.insert("clicks_last_30_days".to_string(), "0".to_string());
-    }
-
-    // modified_today
-    if let Some(mtime) = impression.mtime {
-        let seconds_since_mod = impression.timestamp - mtime;
-        let hours = seconds_since_mod / 3600;
-        features.insert(
-            "modified_today".to_string(),
-            if hours < 24 { "1" } else { "0" }.to_string(),
-        );
-    } else {
-        features.insert("modified_today".to_string(), "0".to_string());
-    }
-
-    // is_under_cwd - check if file is under the session's cwd
-    if let Some(session) = sessions.get(&impression.session_id) {
-        let full_path_normalized = Path::new(&impression.full_path)
-            .canonicalize()
-            .unwrap_or_else(|_| Path::new(&impression.full_path).to_path_buf());
-        let cwd_normalized = Path::new(&session.cwd)
-            .canonicalize()
-            .unwrap_or_else(|_| Path::new(&session.cwd).to_path_buf());
-
-        let is_under_cwd = full_path_normalized.starts_with(&cwd_normalized);
-        features.insert(
-            "is_under_cwd".to_string(),
-            if is_under_cwd { "1" } else { "0" }.to_string(),
-        );
-    } else {
-        features.insert("is_under_cwd".to_string(), "0".to_string());
+    // Compute all features using the registry
+    for feature in FEATURE_REGISTRY.iter() {
+        let value = feature.compute(&inputs)?;
+        features.insert(feature.name().to_string(), value.to_string());
     }
 
     Ok(features)
@@ -351,18 +279,7 @@ fn write_features_to_json(
 // CSV writing
 
 fn write_csv_header(wtr: &mut Writer<std::fs::File>) -> Result<()> {
-    wtr.write_record([
-        "label",
-        "group_id",
-        "subsession_id",
-        "session_id",
-        "query",
-        "file_path",
-        "filename_starts_with_query",
-        "clicks_last_30_days",
-        "modified_today",
-        "is_under_cwd",
-    ])?;
+    wtr.write_record(csv_columns())?;
     Ok(())
 }
 
@@ -370,22 +287,9 @@ fn write_csv_row(
     wtr: &mut Writer<std::fs::File>,
     features: &HashMap<String, String>,
 ) -> Result<()> {
-    let columns = [
-        "label",
-        "group_id",
-        "subsession_id",
-        "session_id",
-        "query",
-        "file_path",
-        "filename_starts_with_query",
-        "clicks_last_30_days",
-        "modified_today",
-        "is_under_cwd",
-    ];
-
-    let row: Vec<String> = columns
+    let row: Vec<String> = csv_columns()
         .iter()
-        .map(|&col| features.get(col).cloned().unwrap_or_else(|| "".to_string()))
+        .map(|&col| features.get(col).cloned().unwrap_or_default())
         .collect();
 
     wtr.write_record(&row)?;

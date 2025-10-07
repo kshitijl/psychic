@@ -5,6 +5,9 @@ use rusqlite::Connection;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+// Import features module
+use crate::feature_defs::{ClickEvent, FeatureInputs, FEATURE_REGISTRY, feature_names};
+
 #[derive(Debug, Clone)]
 pub struct FileScore {
     pub path: String,
@@ -14,7 +17,8 @@ pub struct FileScore {
 
 pub struct Ranker {
     model: Booster,
-    click_counts: HashMap<String, usize>, // full_path -> click count in last 30 days
+    // Precomputed click data for last 30 days (full_path -> Vec of ClickEvent)
+    clicks_by_file: HashMap<String, Vec<ClickEvent>>,
 }
 
 impl Ranker {
@@ -22,40 +26,42 @@ impl Ranker {
         let model = Booster::from_file(model_path.to_str().unwrap())
             .context("Failed to load LightGBM model")?;
 
-        // Preload all click data from last 30 days
+        // Preload all click events from last 30 days
         let now = Timestamp::now();
         let session_tz = jiff::tz::TimeZone::system();
         let now_zoned = now.to_zoned(session_tz);
         let thirty_days_ago = now_zoned.checked_sub(Span::new().days(30))?.timestamp();
         let thirty_days_ago_ts = thirty_days_ago.as_second();
 
-        let mut click_counts = HashMap::new();
+        let mut clicks_by_file: HashMap<String, Vec<ClickEvent>> = HashMap::new();
 
         let conn = Connection::open(&db_path)
             .context("Failed to open database for preloading clicks")?;
 
         let mut stmt = conn.prepare(
-            "SELECT full_path, COUNT(*) as count
+            "SELECT full_path, timestamp
              FROM events
              WHERE action = 'click'
-             AND timestamp >= ?1
-             GROUP BY full_path"
+             AND timestamp >= ?1"
         )?;
 
         let rows = stmt.query_map([thirty_days_ago_ts], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, usize>(1)?))
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
         })?;
 
         for row in rows {
-            let (path, count) = row?;
-            click_counts.insert(path, count);
+            let (path, timestamp) = row?;
+            clicks_by_file
+                .entry(path)
+                .or_default()
+                .push(ClickEvent { timestamp });
         }
 
-        log::debug!("Loaded {} click counts from last 30 days", click_counts.len());
+        log::debug!("Loaded {} files with click history from last 30 days", clicks_by_file.len());
 
         Ok(Ranker {
             model,
-            click_counts,
+            clicks_by_file,
         })
     }
 
@@ -112,66 +118,34 @@ impl Ranker {
         _session_id: &str,
         cwd: &Path,
     ) -> Result<HashMap<String, f64>> {
+        // Create FeatureInputs for inference
+        let inputs = FeatureInputs {
+            query,
+            file_path,
+            full_path,
+            mtime,
+            cwd,
+            clicks_by_file: &self.clicks_by_file,
+            current_timestamp: Timestamp::now().as_second(),
+            session: None, // No session context at inference time
+        };
+
+        // Compute all features using the registry
         let mut features = HashMap::new();
-
-        // filename_starts_with_query (binary feature)
-        let filename = Path::new(file_path)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
-        let filename_starts_with_query = if !query.is_empty()
-            && filename.to_lowercase().starts_with(&query.to_lowercase())
-        {
-            1.0
-        } else {
-            0.0
-        };
-        features.insert("filename_starts_with_query".to_string(), filename_starts_with_query);
-
-        // clicks_last_30_days - lookup from preloaded data
-        let clicks_last_30_days = self.click_counts
-            .get(&full_path.to_string_lossy().to_string())
-            .copied()
-            .unwrap_or(0);
-        features.insert("clicks_last_30_days".to_string(), clicks_last_30_days as f64);
-
-        // modified_today (binary feature)
-        let modified_today = if let Some(mtime) = mtime {
-            let now = Timestamp::now();
-            let mtime_ts = Timestamp::from_second(mtime)?;
-            let diff = now.duration_since(mtime_ts);
-            if diff.as_secs() < 24 * 3600 {
-                1.0
-            } else {
-                0.0
-            }
-        } else {
-            0.0
-        };
-        features.insert("modified_today".to_string(), modified_today);
-
-        // is_under_cwd (binary feature)
-        let full_path_normalized = full_path.canonicalize().unwrap_or_else(|_| full_path.to_path_buf());
-        let cwd_normalized = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
-        let is_under_cwd = if full_path_normalized.starts_with(&cwd_normalized) {
-            1.0
-        } else {
-            0.0
-        };
-        features.insert("is_under_cwd".to_string(), is_under_cwd);
+        for feature in FEATURE_REGISTRY.iter() {
+            let value = feature.compute(&inputs)?;
+            features.insert(feature.name().to_string(), value);
+        }
 
         Ok(features)
     }
 
     fn features_to_vec(&self, features: &HashMap<String, f64>) -> Vec<f64> {
-        // MUST match the order in training CSV:
-        // filename_starts_with_query, clicks_last_30_days, modified_today, is_under_cwd
-        vec![
-            features.get("filename_starts_with_query").copied().unwrap_or(0.0),
-            features.get("clicks_last_30_days").copied().unwrap_or(0.0),
-            features.get("modified_today").copied().unwrap_or(0.0),
-            features.get("is_under_cwd").copied().unwrap_or(0.0),
-        ]
+        // Automatically uses registry order - guaranteed to match training!
+        feature_names()
+            .iter()
+            .map(|name| features.get(*name).copied().unwrap_or(0.0))
+            .collect()
     }
 }
 

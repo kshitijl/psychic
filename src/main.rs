@@ -1,11 +1,12 @@
 mod context;
 mod db;
+mod feature_defs;
 mod features;
 mod ranker;
 mod walker;
 
 use anyhow::Result;
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 use crossterm::{
     ExecutableCommand,
     event::{self, Event, KeyCode, KeyEventKind},
@@ -37,21 +38,26 @@ enum OutputFormat {
     Json,
 }
 
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Generate features for machine learning from collected events
+    GenerateFeatures {
+        /// Output path for the generated features file
+        #[arg(short, long, value_name = "FILE")]
+        output: Option<PathBuf>,
+
+        /// Output format (csv or json)
+        #[arg(short, long, value_enum, default_value = "csv")]
+        format: OutputFormat,
+    },
+}
+
 /// A terminal-based file browser with fuzzy search and analytics
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
-    /// Generate features for machine learning and exit
-    #[arg(long, default_value_t = false)]
-    generate_features: bool,
-
-    /// Output path for the generated features file
-    #[arg(long, value_name = "FILE")]
-    output: Option<PathBuf>,
-
-    /// Output format (csv or json)
-    #[arg(long, value_enum, default_value = "csv")]
-    format: OutputFormat,
+    #[command(subcommand)]
+    command: Option<Commands>,
 }
 
 struct Subsession {
@@ -449,37 +455,45 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    if cli.generate_features {
-        // Determine default output filename based on format
-        let default_filename = match cli.format {
-            OutputFormat::Csv => "features.csv",
-            OutputFormat::Json => "features.json",
-        };
-        let output_path = cli
-            .output
-            .unwrap_or_else(|| PathBuf::from(default_filename));
-        let db_path = db::Database::get_db_path()?;
+    // Handle subcommands
+    if let Some(command) = cli.command {
+        match command {
+            Commands::GenerateFeatures { output, format } => {
+                // Determine default output filename based on format
+                let default_filename = match format {
+                    OutputFormat::Csv => "features.csv",
+                    OutputFormat::Json => "features.json",
+                };
+                let output_path = output.unwrap_or_else(|| PathBuf::from(default_filename));
+                let db_path = db::Database::get_db_path()?;
 
-        // Convert CLI format to features format
-        let format = match cli.format {
-            OutputFormat::Csv => features::OutputFormat::Csv,
-            OutputFormat::Json => features::OutputFormat::Json,
-        };
+                // Convert CLI format to features format
+                let features_format = match format {
+                    OutputFormat::Csv => features::OutputFormat::Csv,
+                    OutputFormat::Json => features::OutputFormat::Json,
+                };
 
-        let format_str = match format {
-            features::OutputFormat::Csv => "CSV",
-            features::OutputFormat::Json => "JSON",
-        };
+                let format_str = match features_format {
+                    features::OutputFormat::Csv => "CSV",
+                    features::OutputFormat::Json => "JSON",
+                };
 
-        println!(
-            "Generating features ({}) from DB at {:?} and writing to {:?}",
-            format_str, db_path, output_path
-        );
-        features::generate_features(&db_path, &output_path, format)?;
+                println!(
+                    "Generating features ({}) from DB at {:?} and writing to {:?}",
+                    format_str, db_path, output_path
+                );
+                features::generate_features(&db_path, &output_path, features_format)?;
 
-        println!("Done.");
+                // Also write feature schema
+                let schema_path = PathBuf::from("feature_schema.json");
+                let schema_json = feature_defs::export_json();
+                std::fs::write(&schema_path, schema_json)?;
+                println!("Generated feature schema at {:?}", schema_path);
 
-        return Ok(());
+                println!("Done.");
+                return Ok(());
+            }
+        }
     }
 
     // Get current working directory
@@ -726,16 +740,10 @@ fn run_app(
                 debug_lines.push(String::from("Features:"));
                 debug_lines.push(String::from(""));
 
-                let feature_names = [
-                    ("filename_starts_with_query", "Query Match"),
-                    ("clicks_last_30_days", "Clicks (30d)"),
-                    ("modified_today", "Modified Today"),
-                    ("is_under_cwd", "Under CWD"),
-                ];
-
-                for (key, label) in &feature_names {
-                    if let Some(value) = file_score.features.get(*key) {
-                        debug_lines.push(format!("{:17}: {}", label, value));
+                // Show all features from registry
+                for feature in feature_defs::FEATURE_REGISTRY.iter() {
+                    if let Some(value) = file_score.features.get(feature.name()) {
+                        debug_lines.push(format!("{}: {}", feature.name(), value));
                     }
                 }
             } else if app.ranker.is_some() {

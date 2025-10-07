@@ -1,7 +1,7 @@
 ## now
 
-- lambda mart but change each group to be from one click/scroll to the next
-- add another feature: is under cwd
+- add is_hidden: has hidden dir component
+- get rid of the option of there being no ranker, or ranker not working. that's a hard crash.
 - things go kinda wrong when i call it from my root homedir. too many files. it freezes.
 
 ## not now, maybe never

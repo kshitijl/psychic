@@ -20,8 +20,23 @@ from matplotlib.backends.backend_pdf import PdfPages
 import seaborn as sns
 import shap
 import json
+from pathlib import Path
 
 sns.set_style("whitegrid")
+
+# Load feature schema from JSON (required)
+SCHEMA_PATH = Path("feature_schema.json")
+if not SCHEMA_PATH.exists():
+    print("Error: feature_schema.json not found.")
+    print("Run: cargo run --release -- generate-features")
+    print("This will generate both features.csv and feature_schema.json")
+    sys.exit(1)
+
+with open(SCHEMA_PATH) as f:
+    schema = json.load(f)
+FEATURE_NAMES = schema["feature_names"]
+BINARY_FEATURES = schema["binary_features"]
+print(f"Loaded feature schema: {len(FEATURE_NAMES)} features")
 
 
 def load_data(csv_path):
@@ -48,9 +63,9 @@ def prepare_features(df):
     # Also drop metadata columns (including group_id since it's used as query_group)
     X = df.drop(columns=["label", "query_group", "group_id", "subsession_id", "session_id", "query", "file_path"])
 
-    # Ensure numeric features are correct type
+    # Ensure numeric features are correct type using schema
     for col in X.columns:
-        if col in ["filename_starts_with_query", "modified_today", "is_under_cwd"]:
+        if col in BINARY_FEATURES:
             # These are binary 0/1
             X[col] = X[col].astype(int)
         else:
@@ -58,6 +73,12 @@ def prepare_features(df):
             X[col] = X[col].astype(float)
 
     print(f"\nNumeric features: {list(X.columns)}")
+
+    # Verify all features from schema are present
+    missing_features = [f for f in FEATURE_NAMES if f not in X.columns]
+    if missing_features:
+        raise ValueError(f"Missing features from schema: {missing_features}")
+
     return X, y, query_groups, []  # No categorical features
 
 
