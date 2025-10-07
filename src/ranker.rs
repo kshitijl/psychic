@@ -36,14 +36,17 @@ pub struct FeatureImportance {
     pub importance: f64,
 }
 
+pub struct ClickData {
+    pub clicks_by_file: HashMap<String, Vec<ClickEvent>>,
+    pub loaded_at: Timestamp,
+}
+
 pub struct Ranker {
     model: Booster,
-    // Precomputed click data for last 30 days (full_path -> Vec of ClickEvent)
-    pub clicks_by_file: HashMap<String, Vec<ClickEvent>>,
+    pub clicks: ClickData,
     pub db_path: PathBuf,
     pub stats: Option<ModelStats>,
     pub loaded_at: Timestamp,
-    pub clicks_loaded_at: Timestamp,
 }
 
 impl Ranker {
@@ -51,8 +54,7 @@ impl Ranker {
         let model = Booster::from_file(model_path.to_str().unwrap())
             .context("Failed to load LightGBM model")?;
 
-        let now = Timestamp::now();
-        let clicks_by_file = Self::load_clicks(&db_path)?;
+        let clicks = Self::load_clicks(&db_path)?;
 
         // Load model stats from same directory as model
         let stats_path = model_path.parent()
@@ -62,11 +64,10 @@ impl Ranker {
 
         Ok(Ranker {
             model,
-            clicks_by_file,
+            clicks,
             db_path,
             stats,
-            loaded_at: now,
-            clicks_loaded_at: now,
+            loaded_at: Timestamp::now(),
         })
     }
 
@@ -91,7 +92,7 @@ impl Ranker {
     }
 
     /// Load click events from last 30 days from database
-    pub fn load_clicks(db_path: &PathBuf) -> Result<HashMap<String, Vec<ClickEvent>>> {
+    pub fn load_clicks(db_path: &PathBuf) -> Result<ClickData> {
         let now = Timestamp::now();
         let session_tz = jiff::tz::TimeZone::system();
         let now_zoned = now.to_zoned(session_tz);
@@ -124,7 +125,10 @@ impl Ranker {
 
         log::debug!("Loaded {} files with click history from last 30 days", clicks_by_file.len());
 
-        Ok(clicks_by_file)
+        Ok(ClickData {
+            clicks_by_file,
+            loaded_at: now,
+        })
     }
 
     pub fn rank_files(
@@ -187,7 +191,7 @@ impl Ranker {
             full_path,
             mtime,
             cwd,
-            clicks_by_file: &self.clicks_by_file,
+            clicks_by_file: &self.clicks.clicks_by_file,
             current_timestamp: Timestamp::now().as_second(),
             session: None, // No session context at inference time
         };

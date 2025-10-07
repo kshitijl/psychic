@@ -22,7 +22,7 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, Paragraph},
 };
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     env,
     io::{self, stdout},
     path::PathBuf,
@@ -141,10 +141,13 @@ struct App {
     ranker: ranker::Ranker,
     data_dir: PathBuf,
     retraining: bool,
+    log_receiver: Receiver<String>,
+    recent_logs: VecDeque<String>,
+    debug_maximized: bool,
 }
 
 impl App {
-    fn new(root: PathBuf, data_dir: &PathBuf) -> Result<Self> {
+    fn new(root: PathBuf, data_dir: &PathBuf, log_receiver: Receiver<String>) -> Result<Self> {
         use std::collections::hash_map::RandomState;
         use std::hash::{BuildHasher, Hash, Hasher};
 
@@ -210,6 +213,9 @@ impl App {
             ranker,
             data_dir: data_dir.clone(),
             retraining: false,
+            log_receiver,
+            recent_logs: VecDeque::with_capacity(50),
+            debug_maximized: false,
         })
     }
 
@@ -225,8 +231,7 @@ impl App {
     fn reload_and_rerank(&mut self) -> Result<()> {
         log::info!("Reloading click data and reranking files");
         // Reload clicks from database
-        self.ranker.clicks_by_file = ranker::Ranker::load_clicks(&self.ranker.db_path)?;
-        self.ranker.clicks_loaded_at = jiff::Timestamp::now();
+        self.ranker.clicks = ranker::Ranker::load_clicks(&self.ranker.db_path)?;
         // Rerank using existing update_filtered_files logic
         self.update_filtered_files();
         Ok(())
@@ -446,22 +451,29 @@ fn get_time_ago(path: &PathBuf) -> String {
 }
 
 fn main() -> Result<()> {
-    // Initialize logger to write to ~/.local/share/psychic/app.log
+    // Initialize logger with fern to write to both file and memory
+    let (log_tx, log_rx) = mpsc::channel();
+
     if let Ok(home) = std::env::var("HOME") {
         let log_dir = PathBuf::from(&home).join(".local").join("share").join("psychic");
         let _ = std::fs::create_dir_all(&log_dir);
         let log_file = log_dir.join("app.log");
 
-        if let Ok(file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_file)
-        {
-            env_logger::Builder::new()
-                .target(env_logger::Target::Pipe(Box::new(file)))
-                .filter_level(log::LevelFilter::Debug)
-                .init();
-        }
+        fern::Dispatch::new()
+            .format(|out, message, record| {
+                out.finish(format_args!(
+                    "[{} {} {}] {}",
+                    jiff::Timestamp::now().strftime("%Y-%m-%d %H:%M:%S"),
+                    record.level(),
+                    record.target(),
+                    message
+                ))
+            })
+            .level(log::LevelFilter::Debug)
+            .chain(fern::log_file(log_file).expect("Failed to open log file"))
+            .chain(log_tx)
+            .apply()
+            .expect("Failed to initialize logger");
     }
 
     let cli = Cli::parse();
@@ -541,7 +553,7 @@ fn main() -> Result<()> {
     });
 
     // Initialize app
-    let mut app = App::new(root.clone(), &data_dir)?;
+    let mut app = App::new(root.clone(), &data_dir, log_rx)?;
 
     log::info!(
         "Started psychic in directory {}, session {}",
@@ -614,15 +626,27 @@ fn run_app(
                 ])
                 .split(f.area());
 
-            // Split top area horizontally: left for file list, middle for preview, right for features
-            let top_chunks = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([
-                    Constraint::Percentage(35), // File list
-                    Constraint::Percentage(45), // Preview
-                    Constraint::Percentage(20), // Features
-                ])
-                .split(main_chunks[0]);
+            // Split top area horizontally: left for file list, middle for preview, right for debug
+            let top_chunks = if app.debug_maximized {
+                // When debug is maximized, give it most of the space
+                Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([
+                        Constraint::Percentage(25), // File list (smaller)
+                        Constraint::Percentage(0),  // Preview (hidden)
+                        Constraint::Percentage(75), // Debug (maximized)
+                    ])
+                    .split(main_chunks[0])
+            } else {
+                Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([
+                        Constraint::Percentage(35), // File list
+                        Constraint::Percentage(45), // Preview
+                        Constraint::Percentage(20), // Debug
+                    ])
+                    .split(main_chunks[0])
+            };
 
             // Update scroll position based on selection and visible height
             let visible_height = top_chunks[0].height.saturating_sub(2); // subtract border
@@ -840,7 +864,7 @@ fn run_app(
             debug_lines.push(format!("Model load: {}", load_time_ago));
 
             // Add clicks reload time
-            let clicks_duration = now.duration_since(app.ranker.clicks_loaded_at);
+            let clicks_duration = now.duration_since(app.ranker.clicks.loaded_at);
             let clicks_time_ago = formatter.convert(std::time::Duration::from_secs(clicks_duration.as_secs() as u64));
             debug_lines.push(format!("Clicks reload: {}", clicks_time_ago));
 
@@ -860,10 +884,32 @@ fn run_app(
                 debug_lines.push(String::from("Preview: N/A"));
             }
 
+            debug_lines.push(String::from("")); // Separator
+
+            // Add recent logs
+            debug_lines.push(String::from("Recent Logs:"));
+            // Show more log lines when debug is maximized
+            let log_count = if app.debug_maximized { 30 } else { 10 };
+            let log_start = app.recent_logs.len().saturating_sub(log_count);
+            for log_line in app.recent_logs.iter().skip(log_start) {
+                // Truncate long lines to fit
+                let max_len = if app.debug_maximized { 120 } else { 60 };
+                if log_line.len() > max_len {
+                    debug_lines.push(format!("  {}...", &log_line[..(max_len - 3)]));
+                } else {
+                    debug_lines.push(format!("  {}", log_line));
+                }
+            }
+
             let debug_text = debug_lines.join("\n");
 
+            let debug_title = if app.debug_maximized {
+                "Debug (Ctrl-O to minimize)"
+            } else {
+                "Debug (Ctrl-O to maximize)"
+            };
             let debug_pane = Paragraph::new(debug_text)
-                .block(Block::default().borders(Borders::ALL).title("Debug"));
+                .block(Block::default().borders(Borders::ALL).title(debug_title));
             f.render_widget(debug_pane, top_chunks[2]);
 
             // Search input at the bottom
@@ -875,6 +921,16 @@ fn run_app(
         // Check for retraining status updates
         if let Ok(retraining_status) = retrain_rx.try_recv() {
             app.retraining = retraining_status;
+        }
+
+        // Collect new log messages (non-blocking)
+        while let Ok(log_msg) = app.log_receiver.try_recv() {
+            // fern adds a newline to each message sent via channel, so trim it
+            app.recent_logs.push_back(log_msg.trim_end().to_string());
+            // Keep only last 50 messages
+            if app.recent_logs.len() > 50 {
+                app.recent_logs.pop_front();
+            }
         }
 
         // Handle events with timeout
@@ -966,6 +1022,12 @@ fn run_app(
                             // Ctrl-U: clear entire search
                             app.query.clear();
                             app.update_filtered_files();
+                        }
+                        KeyCode::Char('o')
+                            if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
+                        {
+                            // Ctrl-O: toggle debug pane maximization
+                            app.debug_maximized = !app.debug_maximized;
                         }
                         KeyCode::Esc => {
                             return Ok(());

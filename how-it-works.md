@@ -501,6 +501,35 @@ Used in multiple places:
 - Debug pane: Model load time ("Model load: 2 minutes ago")
 - Debug pane: Clicks reload time ("Clicks reload: 5 seconds ago")
 
+**In-memory logging for debug pane:** Uses `fern` crate to dispatch logs to multiple outputs:
+```rust
+let (log_tx, log_rx) = mpsc::channel();
+
+fern::Dispatch::new()
+    .format(|out, message, record| {
+        out.finish(format_args!(
+            "[{} {} {}] {}",
+            timestamp, record.level(), record.target(), message
+        ))
+    })
+    .level(log::LevelFilter::Debug)
+    .chain(fern::log_file(log_file)?)  // File output
+    .chain(log_tx)  // Memory output via channel
+    .apply()?;
+```
+
+Recent logs are collected in a `VecDeque<String>` with max 50 entries (circular buffer):
+- Event loop drains `log_rx` channel (non-blocking)
+- Pushes messages to `app.recent_logs`
+- Pops oldest when over limit
+- Debug pane shows last 10 lines (30 when maximized), truncated to 60 chars (120 when maximized)
+
+**Debug pane maximization:** Press `Ctrl-O` to toggle:
+- Normal view: 35% file list, 45% preview, 20% debug
+- Maximized view: 25% file list, 0% preview (hidden), 75% debug
+- Shows more logs and longer lines when maximized
+- Title updates to show current state and keybinding
+
 **Preview scrolling:**
 - Added `preview_scroll: u16` to `App` state
 - `Paragraph::scroll((app.preview_scroll, 0))` controls vertical offset
