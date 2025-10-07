@@ -129,35 +129,27 @@ def prepare_features(df, feature_names, binary_features):
 
 
 def train_model(X_train, y_train, groups_train, X_val, y_val, groups_val, categorical_features):
-    """Train LightGBM ranking model."""
-    print("\nTraining LightGBM ranking model...")
+    """Train LightGBM regression model."""
+    print("\nTraining LightGBM regression model...")
 
-    # Compute group sizes for LambdaRank
-    # LightGBM needs to know how many items per query group
-    train_group_sizes = groups_train.value_counts().sort_index().values
-    val_group_sizes = groups_val.value_counts().sort_index().values
-
-    # Create LightGBM datasets with group info
+    # Create LightGBM datasets (no group info needed for regression)
     train_data = lgb.Dataset(
         X_train,
         label=y_train,
-        group=train_group_sizes,
         categorical_feature=categorical_features
     )
     val_data = lgb.Dataset(
         X_val,
         label=y_val,
-        group=val_group_sizes,
         categorical_feature=categorical_features,
         reference=train_data
     )
 
-    # LightGBM LambdaRank parameters
+    # LightGBM regression parameters
     # Seeds are critical for deterministic behavior with small sample sizes
     params = {
-        "objective": "lambdarank",
-        "metric": "ndcg",
-        "ndcg_eval_at": [1, 3, 5, 10],
+        "objective": "regression",
+        "metric": "rmse",
         "boosting_type": "gbdt",
         "num_leaves": 31,
         "learning_rate": 0.05,
@@ -201,14 +193,14 @@ def create_visualizations(model, X_train, y_train, groups_train, X_test, y_test,
         # Page 1: Training curves
         fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
-        # NDCG curves - plot NDCG@5 as primary metric
-        train_ndcg = evals_result["train"]["ndcg@5"]
-        val_ndcg = evals_result["val"]["ndcg@5"]
-        axes[0].plot(train_ndcg, label="Train NDCG@5", linewidth=2)
-        axes[0].plot(val_ndcg, label="Validation NDCG@5", linewidth=2)
+        # RMSE curves - plot RMSE as primary metric for regression
+        train_rmse = evals_result["train"]["rmse"]
+        val_rmse = evals_result["val"]["rmse"]
+        axes[0].plot(train_rmse, label="Train RMSE", linewidth=2)
+        axes[0].plot(val_rmse, label="Validation RMSE", linewidth=2)
         axes[0].set_xlabel("Iteration")
-        axes[0].set_ylabel("NDCG@5")
-        axes[0].set_title("Training Progress (Ranking Quality)")
+        axes[0].set_ylabel("RMSE")
+        axes[0].set_title("Training Progress (Regression Error)")
         axes[0].legend()
         axes[0].grid(True)
 
@@ -299,9 +291,8 @@ def create_visualizations(model, X_train, y_train, groups_train, X_test, y_test,
         # Compute SHAP values (keep categorical features as-is for LightGBM)
         shap_values = explainer.shap_values(X_test_sample)
 
-        # SHAP uses [negative_class, positive_class], we want positive class
-        if isinstance(shap_values, list):
-            shap_values = shap_values[1]
+        # For regression, shap_values is not a list (unlike classification)
+        # So no need to extract a specific class
 
         # Convert categorical to numeric ONLY for visualization
         X_test_sample_numeric = X_test_sample.copy()
@@ -349,39 +340,26 @@ def create_visualizations(model, X_train, y_train, groups_train, X_test, y_test,
         pdf.savefig(fig)
         plt.close()
 
-        # Page 5: Ranking Quality Metrics and Score Distribution
+        # Page 5: Regression Quality Metrics and Score Distribution
         y_pred_scores = model.predict(X_test, num_iteration=model.best_iteration)
 
-        # Compute NDCG for test set
-        # Group by query and compute NDCG per query
-        test_df = pd.DataFrame({
-            'group': groups_test.values,
-            'label': y_test.values,
-            'score': y_pred_scores
-        })
+        from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+
+        # Compute regression metrics
+        rmse = np.sqrt(mean_squared_error(y_test, y_pred_scores))
+        mae = mean_absolute_error(y_test, y_pred_scores)
+        r2 = r2_score(y_test, y_pred_scores)
 
         fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
-        # NDCG at different k values
-        ndcg_at_k = {}
-        for k in [1, 3, 5, 10]:
-            ndcgs = []
-            for group_id in test_df['group'].unique():
-                group_data = test_df[test_df['group'] == group_id]
-                # Only compute NDCG if group has at least k items and at least one positive label
-                if len(group_data) > k and group_data['label'].sum() > 0:
-                    y_true = group_data['label'].values.reshape(1, -1)
-                    y_score = group_data['score'].values.reshape(1, -1)
-                    ndcg = ndcg_score(y_true, y_score, k=k)
-                    ndcgs.append(ndcg)
-            ndcg_at_k[k] = np.mean(ndcgs) if ndcgs else 0
-
-        axes[0, 0].bar(ndcg_at_k.keys(), ndcg_at_k.values())
-        axes[0, 0].set_xlabel("k")
-        axes[0, 0].set_ylabel("NDCG@k")
-        axes[0, 0].set_title("NDCG at Different Cutoffs")
-        axes[0, 0].grid(True, axis='y')
+        # Metrics summary
+        metrics_text = f"RMSE: {rmse:.4f}\nMAE: {mae:.4f}\nR²: {r2:.4f}"
+        axes[0, 0].text(0.5, 0.5, metrics_text, ha='center', va='center',
+                       fontsize=16, bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+        axes[0, 0].set_xlim([0, 1])
         axes[0, 0].set_ylim([0, 1])
+        axes[0, 0].set_title("Regression Metrics (Test Set)")
+        axes[0, 0].axis('off')
 
         # Score distribution for clicked vs not clicked
         axes[0, 1].hist(
@@ -404,20 +382,14 @@ def create_visualizations(model, X_train, y_train, groups_train, X_test, y_test,
         axes[0, 1].legend()
         axes[0, 1].grid(True)
 
-        # Rank position analysis - where do clicked items appear?
-        rank_positions = []
-        for group_id in test_df['group'].unique():
-            group_data = test_df[test_df['group'] == group_id].sort_values('score', ascending=False)
-            group_data['rank'] = range(1, len(group_data) + 1)
-            clicked_ranks = group_data[group_data['label'] == 1]['rank'].tolist()
-            rank_positions.extend(clicked_ranks)
-
-        if rank_positions:
-            axes[1, 0].hist(rank_positions, bins=range(1, max(rank_positions) + 2), edgecolor='black')
-            axes[1, 0].set_xlabel("Rank Position")
-            axes[1, 0].set_ylabel("Count of Clicked Items")
-            axes[1, 0].set_title("Distribution of Clicked Item Ranks")
-            axes[1, 0].grid(True, axis='y')
+        # Residuals plot
+        residuals = y_test - y_pred_scores
+        axes[1, 0].scatter(y_pred_scores, residuals, alpha=0.5, s=20)
+        axes[1, 0].axhline(y=0, color='r', linestyle='--', linewidth=2)
+        axes[1, 0].set_xlabel("Predicted Score")
+        axes[1, 0].set_ylabel("Residuals (Actual - Predicted)")
+        axes[1, 0].set_title("Residual Plot")
+        axes[1, 0].grid(True)
 
         # Score vs label scatter
         axes[1, 1].scatter(
@@ -448,15 +420,11 @@ def create_visualizations(model, X_train, y_train, groups_train, X_test, y_test,
         pdf.savefig(fig)
         plt.close()
 
-        # Print ranking metrics
-        print(f"\nRanking Metrics (Test Set):")
-        print(f"  NDCG@1:  {ndcg_at_k.get(1, 0):.4f}")
-        print(f"  NDCG@3:  {ndcg_at_k.get(3, 0):.4f}")
-        print(f"  NDCG@5:  {ndcg_at_k.get(5, 0):.4f}")
-        print(f"  NDCG@10: {ndcg_at_k.get(10, 0):.4f}")
-        if rank_positions:
-            print(f"\nClicked items average rank: {np.mean(rank_positions):.2f}")
-            print(f"Clicked items median rank: {np.median(rank_positions):.1f}")
+        # Print regression metrics
+        print(f"\nRegression Metrics (Test Set):")
+        print(f"  RMSE: {rmse:.4f}")
+        print(f"  MAE:  {mae:.4f}")
+        print(f"  R²:   {r2:.4f}")
 
 
 def save_model(model, output_prefix):
