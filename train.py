@@ -39,12 +39,18 @@ sns.set_style("whitegrid")
 
 def load_schema(data_dir):
     """Load feature schema from data directory."""
+    import hashlib
+
     schema_path = Path(data_dir) / "feature_schema.json"
     if not schema_path.exists():
         print(f"Error: feature_schema.json not found at {schema_path}")
         print("Run: cargo run --release -- generate-features")
         print("This will generate both features.csv and feature_schema.json")
         sys.exit(1)
+
+    # Hash the schema file to verify it's the same across runs
+    with open(schema_path, 'rb') as f:
+        schema_hash = hashlib.md5(f.read()).hexdigest()[:8]
 
     with open(schema_path) as f:
         schema = json.load(f)
@@ -53,14 +59,22 @@ def load_schema(data_dir):
     feature_names = [f["name"] for f in schema["features"]]
     binary_features = [f["name"] for f in schema["features"] if f["type"] == "binary"]
     print(f"Loaded feature schema: {len(feature_names)} features")
+    print(f"  Schema file hash: {schema_hash}")
 
     return feature_names, binary_features
 
 
 def load_data(csv_path):
     """Load features CSV and prepare for training."""
+    import hashlib
+
+    # Hash the CSV file to verify it's the same across runs
+    with open(csv_path, 'rb') as f:
+        csv_hash = hashlib.md5(f.read()).hexdigest()[:8]
+
     df = pd.read_csv(csv_path)
     print(f"Loaded {len(df)} samples from {csv_path}")
+    print(f"  CSV file hash: {csv_hash}")
     print(f"Label distribution:\n{df['label'].value_counts()}")
     print(f"\nFeatures: {[c for c in df.columns if c not in ['label', 'group_id', 'subsession_id', 'session_id']]}")
 
@@ -125,6 +139,7 @@ def train_model(X_train, y_train, groups_train, X_val, y_val, groups_val, catego
     )
 
     # LightGBM LambdaRank parameters
+    # Seeds are critical for deterministic behavior with small sample sizes
     params = {
         "objective": "lambdarank",
         "metric": "ndcg",
@@ -136,6 +151,11 @@ def train_model(X_train, y_train, groups_train, X_val, y_val, groups_val, catego
         "bagging_fraction": 0.8,
         "bagging_freq": 5,
         "verbose": -1,
+        # Deterministic seeds
+        "seed": 42,
+        "bagging_seed": 42,
+        "feature_fraction_seed": 42,
+        "data_random_seed": 42,
     }
 
     # Train with early stopping
@@ -482,12 +502,19 @@ def main():
     groups_train = query_groups.iloc[train_idx].reset_index(drop=True)
     groups_test = query_groups.iloc[test_idx].reset_index(drop=True)
 
+    # Compute hashes to verify deterministic splits
+    import hashlib
+    train_hash = hashlib.md5(str(sorted(train_idx)).encode()).hexdigest()[:8]
+    test_hash = hashlib.md5(str(sorted(test_idx)).encode()).hexdigest()[:8]
+
     print(
         f"\nTrain set: {len(X_train)} samples, {groups_train.nunique()} query groups ({y_train.sum()} positive)"
     )
+    print(f"  Train split hash: {train_hash}")
     print(
         f"Test set: {len(X_test)} samples, {groups_test.nunique()} query groups ({y_test.sum()} positive)"
     )
+    print(f"  Test split hash: {test_hash}")
 
     # Further split train into train/val for early stopping
     splitter_val = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
@@ -500,6 +527,11 @@ def main():
     X_train = X_train.iloc[train_idx2].reset_index(drop=True)
     y_train = y_train.iloc[train_idx2].reset_index(drop=True)
     groups_train = groups_train.iloc[train_idx2].reset_index(drop=True)
+
+    # Print validation split hash
+    val_hash = hashlib.md5(str(sorted(val_idx)).encode()).hexdigest()[:8]
+    print(f"Validation set: {len(X_val)} samples, {groups_val.nunique()} query groups ({y_val.sum()} positive)")
+    print(f"  Validation split hash: {val_hash}")
 
     # Train model
     model, evals_result = train_model(X_train, y_train, groups_train, X_val, y_val, groups_val, categorical_features)

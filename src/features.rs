@@ -122,9 +122,19 @@ impl Accumulator {
     }
 
     fn finalize(mut self) -> Vec<HashMap<String, String>> {
-        // Move all pending impressions to output
-        for (_, impression) in self.pending_impressions {
-            self.output_rows.push(impression.features);
+        // Move all pending impressions to output in deterministic order
+        // Sort by (session_id, subsession_id, full_path) to ensure consistent ordering
+        let mut sorted_keys: Vec<_> = self.pending_impressions.keys().cloned().collect();
+        sorted_keys.sort_by(|a, b| {
+            a.0.cmp(&b.0)  // session_id
+                .then(a.1.cmp(&b.1))  // subsession_id
+                .then(a.2.cmp(&b.2))  // full_path
+        });
+
+        for key in sorted_keys {
+            if let Some(impression) = self.pending_impressions.remove(&key) {
+                self.output_rows.push(impression.features);
+            }
         }
         self.output_rows
     }
