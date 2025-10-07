@@ -29,14 +29,12 @@ def load_data(csv_path):
     df = pd.read_csv(csv_path)
     print(f"Loaded {len(df)} samples from {csv_path}")
     print(f"Label distribution:\n{df['label'].value_counts()}")
-    print(f"\nFeatures: {[c for c in df.columns if c not in ['label', 'subsession_id', 'session_id']]}")
+    print(f"\nFeatures: {[c for c in df.columns if c not in ['label', 'group_id', 'subsession_id', 'session_id']]}")
 
-    # Use subsession_id as query groups (each subsession is one search result list)
-    # Create unique group IDs combining session_id and subsession_id
-    df['query_group'] = df['session_id'].astype(str) + '_' + df['subsession_id'].astype(str)
-    df['query_group'] = df['query_group'].astype('category').cat.codes
+    # Use group_id as query groups (each group spans from one click/scroll to the next)
+    df['query_group'] = df['group_id'].astype(int)
 
-    print(f"Loaded {df['query_group'].nunique()} query groups (subsessions)")
+    print(f"Loaded {df['query_group'].nunique()} query groups (click/scroll sequences)")
     return df
 
 
@@ -47,12 +45,12 @@ def prepare_features(df):
     query_groups = df["query_group"]
 
     # Drop categorical features (query, file_path) since Rust lightgbm3 doesn't support them
-    # Also drop metadata columns
-    X = df.drop(columns=["label", "query_group", "subsession_id", "session_id", "query", "file_path"])
+    # Also drop metadata columns (including group_id since it's used as query_group)
+    X = df.drop(columns=["label", "query_group", "group_id", "subsession_id", "session_id", "query", "file_path"])
 
     # Ensure numeric features are correct type
     for col in X.columns:
-        if col in ["filename_starts_with_query", "modified_today"]:
+        if col in ["filename_starts_with_query", "modified_today", "is_under_cwd"]:
             # These are binary 0/1
             X[col] = X[col].astype(int)
         else:

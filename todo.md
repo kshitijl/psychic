@@ -1,8 +1,8 @@
-- put in log statement of "started sg in directory {cwd}, session {}"
-- put trained model output file next to the db file. and look for it there in the tui code.
-- keyboard shortcut to just clear current search, maybe just Ctrl-a Ctrl-k? can we easily get normal readline stuff to work or no?
-- when we scroll below current page of results it should scroll properly with us, maybe as it gets to bottom 5 it should start scrolling with us
-- in addition to the walkdir from current dir, also include in the results list any file we've ever clicked or scrolled before.
-- the modification time shown in results list isn't properly right justified. so when filenames are different lengths then they don't all appear nicely in a column.
-- get rid of the clone in ranker.rank_files. it should just take a ref. no?
+## now
+
+- lambda mart but change each group to be from one click/scroll to the next
+- add another feature: is under cwd
+- things go kinda wrong when i call it from my root homedir. too many files. it freezes.
+
+## not now, maybe never
 - use tracing subscriber crate so we can have nice spans of time and we can maybe visualize and optimize idk

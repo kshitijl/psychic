@@ -102,22 +102,20 @@ fn get_running_processes() -> String {
 
 fn get_timezone() -> String {
     // Try TZ environment variable first
-    if let Ok(tz) = std::env::var("TZ") {
-        if !tz.is_empty() {
-            return tz;
-        }
+    if let Ok(tz) = std::env::var("TZ")
+        && !tz.is_empty() {
+        return tz;
     }
 
     // Try reading /etc/localtime symlink on Unix systems
-    if let Ok(link) = std::fs::read_link("/etc/localtime") {
-        if let Some(tz_path) = link.to_str() {
-            // Extract timezone from path like /usr/share/zoneinfo/America/Los_Angeles
-            if let Some(tz) = tz_path.strip_prefix("/usr/share/zoneinfo/") {
-                return tz.to_string();
-            }
-            if let Some(tz) = tz_path.strip_prefix("/var/db/timezone/zoneinfo/") {
-                return tz.to_string();
-            }
+    if let Ok(link) = std::fs::read_link("/etc/localtime")
+        && let Some(tz_path) = link.to_str() {
+        // Extract timezone from path like /usr/share/zoneinfo/America/Los_Angeles
+        if let Some(tz) = tz_path.strip_prefix("/usr/share/zoneinfo/") {
+            return tz.to_string();
+        }
+        if let Some(tz) = tz_path.strip_prefix("/var/db/timezone/zoneinfo/") {
+            return tz.to_string();
         }
     }
 

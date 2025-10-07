@@ -64,6 +64,7 @@ impl Ranker {
         query: &str,
         files: &[(String, PathBuf, Option<i64>)], // (relative_path, full_path, mtime)
         session_id: &str,
+        cwd: &Path,
     ) -> Result<Vec<FileScore>> {
         if files.is_empty() {
             return Ok(Vec::new());
@@ -78,6 +79,7 @@ impl Ranker {
                 full_path,
                 *mtime,
                 session_id,
+                cwd,
             )?;
 
             // Convert features to vector in the same order as training
@@ -108,6 +110,7 @@ impl Ranker {
         full_path: &Path,
         mtime: Option<i64>,
         _session_id: &str,
+        cwd: &Path,
     ) -> Result<HashMap<String, f64>> {
         let mut features = HashMap::new();
 
@@ -147,16 +150,27 @@ impl Ranker {
         };
         features.insert("modified_today".to_string(), modified_today);
 
+        // is_under_cwd (binary feature)
+        let full_path_normalized = full_path.canonicalize().unwrap_or_else(|_| full_path.to_path_buf());
+        let cwd_normalized = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+        let is_under_cwd = if full_path_normalized.starts_with(&cwd_normalized) {
+            1.0
+        } else {
+            0.0
+        };
+        features.insert("is_under_cwd".to_string(), is_under_cwd);
+
         Ok(features)
     }
 
     fn features_to_vec(&self, features: &HashMap<String, f64>) -> Vec<f64> {
         // MUST match the order in training CSV:
-        // filename_starts_with_query, clicks_last_30_days, modified_today
+        // filename_starts_with_query, clicks_last_30_days, modified_today, is_under_cwd
         vec![
             features.get("filename_starts_with_query").copied().unwrap_or(0.0),
             features.get("clicks_last_30_days").copied().unwrap_or(0.0),
             features.get("modified_today").copied().unwrap_or(0.0),
+            features.get("is_under_cwd").copied().unwrap_or(0.0),
         ]
     }
 }
@@ -193,7 +207,7 @@ mod tests {
             ("test.md".to_string(), PathBuf::from("/tmp/test.md"), Some(1234567890)),
         ];
 
-        let result = ranker.rank_files("test", test_files, "test_session");
+        let result = ranker.rank_files("test", &test_files, "test_session", &PathBuf::from("/tmp"));
         match &result {
             Ok(file_scores) => {
                 println!("✓ Ranking succeeded");

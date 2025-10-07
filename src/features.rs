@@ -24,6 +24,7 @@ struct Event {
 struct Session {
     session_id: String,
     timezone: String,
+    cwd: String,
 }
 
 // Output format enum
@@ -45,6 +46,10 @@ struct Accumulator {
     // Key: (session_id, subsession_id, full_path)
     pending_impressions: HashMap<(String, u64, String), PendingImpression>,
     output_rows: Vec<HashMap<String, String>>,
+    // Track current group ID - increments with each click/scroll and session change
+    current_group_id: u64,
+    // Track last session to detect session boundaries
+    last_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -59,6 +64,8 @@ impl Accumulator {
             clicks_by_file: HashMap::new(),
             pending_impressions: HashMap::new(),
             output_rows: Vec::new(),
+            current_group_id: 0,
+            last_session_id: None,
         }
     }
 
@@ -72,7 +79,17 @@ impl Accumulator {
             .push(click);
     }
 
-    fn add_impression(&mut self, event: &Event, features: HashMap<String, String>) {
+    fn add_impression(&mut self, event: &Event, mut features: HashMap<String, String>) {
+        // Check if this is a new session - if so, increment group_id
+        if let Some(ref last_session) = self.last_session_id
+            && last_session != &event.session_id {
+            self.current_group_id += 1;
+        }
+        self.last_session_id = Some(event.session_id.clone());
+
+        // Add group_id to features
+        features.insert("group_id".to_string(), self.current_group_id.to_string());
+
         let key = (
             event.session_id.clone(),
             event.subsession_id,
@@ -88,6 +105,13 @@ impl Accumulator {
     }
 
     fn mark_impressions_as_engaged(&mut self, event: &Event) {
+        // Update last_session_id when processing click/scroll
+        if let Some(ref last_session) = self.last_session_id
+            && last_session != &event.session_id {
+            self.current_group_id += 1;
+        }
+        self.last_session_id = Some(event.session_id.clone());
+
         // Find impressions in same subsession with same file that happened BEFORE this click/scroll
         let key = (
             event.session_id.clone(),
@@ -95,11 +119,14 @@ impl Accumulator {
             event.full_path.clone(),
         );
 
-        if let Some(pending) = self.pending_impressions.get_mut(&key) {
-            if pending.timestamp <= event.timestamp {
-                pending.features.insert("label".to_string(), "1".to_string());
-            }
+        if let Some(pending) = self.pending_impressions.get_mut(&key)
+            && pending.timestamp <= event.timestamp {
+            pending.features.insert("label".to_string(), "1".to_string());
         }
+
+        // Increment group_id after each engagement event (click or scroll)
+        // This creates a new group for the next sequence of impressions
+        self.current_group_id += 1;
     }
 
     fn finalize(mut self) -> Vec<HashMap<String, String>> {
@@ -186,11 +213,12 @@ fn fetch_all_events(conn: &Connection) -> Result<Vec<Event>> {
 }
 
 fn fetch_all_sessions(conn: &Connection) -> Result<HashMap<String, Session>> {
-    let mut stmt = conn.prepare("SELECT session_id, timezone FROM sessions")?;
+    let mut stmt = conn.prepare("SELECT session_id, timezone, cwd FROM sessions")?;
     let session_iter = stmt.query_map([], |row| {
         Ok(Session {
             session_id: row.get(0)?,
             timezone: row.get(1)?,
+            cwd: row.get(2)?,
         })
     })?;
 
@@ -287,6 +315,24 @@ fn compute_features_from_accumulator(
         features.insert("modified_today".to_string(), "0".to_string());
     }
 
+    // is_under_cwd - check if file is under the session's cwd
+    if let Some(session) = sessions.get(&impression.session_id) {
+        let full_path_normalized = Path::new(&impression.full_path)
+            .canonicalize()
+            .unwrap_or_else(|_| Path::new(&impression.full_path).to_path_buf());
+        let cwd_normalized = Path::new(&session.cwd)
+            .canonicalize()
+            .unwrap_or_else(|_| Path::new(&session.cwd).to_path_buf());
+
+        let is_under_cwd = full_path_normalized.starts_with(&cwd_normalized);
+        features.insert(
+            "is_under_cwd".to_string(),
+            if is_under_cwd { "1" } else { "0" }.to_string(),
+        );
+    } else {
+        features.insert("is_under_cwd".to_string(), "0".to_string());
+    }
+
     Ok(features)
 }
 
@@ -307,6 +353,7 @@ fn write_features_to_json(
 fn write_csv_header(wtr: &mut Writer<std::fs::File>) -> Result<()> {
     wtr.write_record([
         "label",
+        "group_id",
         "subsession_id",
         "session_id",
         "query",
@@ -314,6 +361,7 @@ fn write_csv_header(wtr: &mut Writer<std::fs::File>) -> Result<()> {
         "filename_starts_with_query",
         "clicks_last_30_days",
         "modified_today",
+        "is_under_cwd",
     ])?;
     Ok(())
 }
@@ -324,6 +372,7 @@ fn write_csv_row(
 ) -> Result<()> {
     let columns = [
         "label",
+        "group_id",
         "subsession_id",
         "session_id",
         "query",
@@ -331,6 +380,7 @@ fn write_csv_row(
         "filename_starts_with_query",
         "clicks_last_30_days",
         "modified_today",
+        "is_under_cwd",
     ];
 
     let row: Vec<String> = columns
@@ -391,6 +441,7 @@ mod tests {
             Session {
                 session_id: "s1".to_string(),
                 timezone: "UTC".to_string(),
+                cwd: "/".to_string(),
             },
         );
 
@@ -413,32 +464,52 @@ mod tests {
 
         let output_rows = acc.finalize();
 
+        // Find rows by subsession_id (order is not guaranteed from HashMap)
+        let first_impression = output_rows
+            .iter()
+            .find(|row| row.get("subsession_id") == Some(&"1".to_string()))
+            .expect("Should have impression from subsession 1");
+        let second_impression = output_rows
+            .iter()
+            .find(|row| row.get("subsession_id") == Some(&"2".to_string()))
+            .expect("Should have impression from subsession 2");
+
         // First impression at T=1000 should NOT see click at T=1200
-        let first_row = &output_rows[0];
         assert_eq!(
-            first_row.get("clicks_last_30_days"),
+            first_impression.get("clicks_last_30_days"),
             Some(&"0".to_string()),
             "First impression should not see future click"
         );
         // But it SHOULD get label=1 because click happened in same subsession
         assert_eq!(
-            first_row.get("label"),
+            first_impression.get("label"),
             Some(&"1".to_string()),
             "First impression should have label=1 from future click in same subsession"
         );
+        // Group ID should be 0 (first group)
+        assert_eq!(
+            first_impression.get("group_id"),
+            Some(&"0".to_string()),
+            "First impression should be in group 0"
+        );
 
         // Second impression at T=1400 SHOULD see click at T=1200
-        let second_row = &output_rows[1];
         assert_eq!(
-            second_row.get("clicks_last_30_days"),
+            second_impression.get("clicks_last_30_days"),
             Some(&"1".to_string()),
             "Second impression should see past click"
         );
         // But label should be 0 (different subsession)
         assert_eq!(
-            second_row.get("label"),
+            second_impression.get("label"),
             Some(&"0".to_string()),
             "Second impression in different subsession should have label=0"
+        );
+        // Group ID should be 1 (second group, after the click)
+        assert_eq!(
+            second_impression.get("group_id"),
+            Some(&"1".to_string()),
+            "Second impression should be in group 1 (after click)"
         );
     }
 

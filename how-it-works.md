@@ -865,6 +865,57 @@ GROUP BY full_path
 
 **Performance:** O(log n) index lookup vs O(n) table scan for 30-day click aggregation.
 
+## LambdaMART Group-Based Ranking (Added)
+
+### What Changed
+
+Modified the grouping strategy for LambdaMART training from subsession-based to engagement-based sequences:
+
+**Previous behavior:**
+- Groups were based on `subsession_id` (one group per query/search)
+- Each unique query within a session created a new group
+- All impressions for that query belonged to the same group
+
+**New behavior:**
+- Groups span from one engagement event (click/scroll) to the next
+- `group_id` starts at 0 and increments on:
+  - Each click or scroll event
+  - Each new session boundary
+- Creates more meaningful ranking tasks where each group represents impressions leading to an action
+
+### Implementation Details
+
+**features.rs changes:**
+1. Added `current_group_id: u64` to `Accumulator` struct
+2. Added `last_session_id: Option<String>` to track session boundaries
+3. `group_id` field added to CSV output
+4. In `add_impression()`: checks for session changes and assigns current `group_id`
+5. In `mark_impressions_as_engaged()`: increments `group_id` after marking labels
+6. New feature: `is_under_cwd` - binary feature indicating if file is under the session's working directory
+
+**train.py changes:**
+- Changed from `subsession_id` to `group_id` for grouping
+- Updated to exclude `group_id` from features (used only for grouping)
+- Added `is_under_cwd` to binary features list
+
+**Why this approach:**
+- More granular ranking tasks - each group represents a coherent search-to-action sequence
+- Better aligns with user behavior - impressions before an action vs after
+- Reduces group size variance - subsessions could have very different lengths
+- Session boundaries create natural breaks in the data
+
+**Example:**
+```
+Session 1:
+  Impression A, B, C → Click on B  [group_id: 0]
+  Impression D, E → Scroll on E    [group_id: 1]
+  Impression F, G, H              [group_id: 2]
+Session 2:
+  Impression I, J → Click on J     [group_id: 3]
+```
+
+Each group becomes a learning-to-rank problem where the model learns which files should be ranked higher.
+
 ## Summary of Session Work
 
 This session added significant ML and performance enhancements:

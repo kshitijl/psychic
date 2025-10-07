@@ -10,10 +10,9 @@ pub fn start_file_walker(root: PathBuf, tx: Sender<PathBuf>) {
             .into_iter()
             .filter_entry(|e| {
                 // Skip ignored directories
-                if e.file_type().is_dir() {
-                    if let Some(name) = e.file_name().to_str() {
-                        return !IGNORED_DIRS.contains(&name);
-                    }
+                if e.file_type().is_dir()
+                    && let Some(name) = e.file_name().to_str() {
+                    return !IGNORED_DIRS.contains(&name);
                 }
                 true
             })

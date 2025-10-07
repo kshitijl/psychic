@@ -259,7 +259,7 @@ impl App {
         // Then, rank them if we have a model, otherwise just use the filtered list
         let rank_start = Instant::now();
         if let Some(ranker) = &self.ranker {
-            match ranker.rank_files(&self.query, &matching_files, &self.session_id) {
+            match ranker.rank_files(&self.query, &matching_files, &self.session_id, &self.root) {
                 Ok(scored) => {
                     // Reorder file_entries based on ranking scores
                     let score_order: Vec<String> =
@@ -416,15 +416,14 @@ fn get_file_metadata(path: &PathBuf) -> (Option<i64>, Option<i64>, Option<i64>) 
 }
 
 fn get_time_ago(path: &PathBuf) -> String {
-    if let Ok(metadata) = std::fs::metadata(path) {
-        if let Ok(modified) = metadata.modified() {
-            let duration = std::time::SystemTime::now()
-                .duration_since(modified)
-                .unwrap_or(Duration::from_secs(0));
+    if let Ok(metadata) = std::fs::metadata(path)
+        && let Ok(modified) = metadata.modified() {
+        let duration = std::time::SystemTime::now()
+            .duration_since(modified)
+            .unwrap_or(Duration::from_secs(0));
 
-            let formatter = timeago::Formatter::new();
-            return formatter.convert(duration);
-        }
+        let formatter = timeago::Formatter::new();
+        return formatter.convert(duration);
     }
     String::from("unknown")
 }
@@ -731,6 +730,7 @@ fn run_app(
                     ("filename_starts_with_query", "Query Match"),
                     ("clicks_last_30_days", "Clicks (30d)"),
                     ("modified_today", "Modified Today"),
+                    ("is_under_cwd", "Under CWD"),
                 ];
 
                 for (key, label) in &feature_names {
@@ -755,7 +755,7 @@ fn run_app(
                 let is_cached = app
                     .preview_cache
                     .as_ref()
-                    .map_or(false, |(p, _)| p == &full_path_str);
+                    .is_some_and(|(p, _)| p == &full_path_str);
                 let cache_status = if is_cached { "Cached" } else { "Live" };
                 debug_lines.push(format!("Preview: {}", cache_status));
             } else {
