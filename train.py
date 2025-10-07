@@ -34,8 +34,10 @@ if not SCHEMA_PATH.exists():
 
 with open(SCHEMA_PATH) as f:
     schema = json.load(f)
-FEATURE_NAMES = schema["feature_names"]
-BINARY_FEATURES = schema["binary_features"]
+
+# Extract feature names and types from schema
+FEATURE_NAMES = [f["name"] for f in schema["features"]]
+BINARY_FEATURES = [f["name"] for f in schema["features"] if f["type"] == "binary"]
 print(f"Loaded feature schema: {len(FEATURE_NAMES)} features")
 
 

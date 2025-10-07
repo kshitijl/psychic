@@ -1,5 +1,5 @@
 use super::schema::{Feature, FeatureType};
-use super::implementations::{ClicksLast30Days, FilenameStartsWithQuery, IsUnderCwd, ModifiedToday};
+use super::implementations::{ClicksLast30Days, FilenameStartsWithQuery, IsHidden, IsUnderCwd, ModifiedToday};
 use once_cell::sync::Lazy;
 use serde_json::json;
 
@@ -11,6 +11,7 @@ pub static FEATURE_REGISTRY: Lazy<Vec<Box<dyn Feature>>> = Lazy::new(|| {
         Box::new(ClicksLast30Days),
         Box::new(ModifiedToday),
         Box::new(IsUnderCwd),
+        Box::new(IsHidden),
     ]
 });
 
@@ -66,11 +67,6 @@ pub fn export_json() -> String {
         })
         .collect();
 
-    let schema = json!({
-        "features": features,
-        "feature_names": feature_names(),
-        "binary_features": binary_features(),
-        "numeric_features": numeric_features(),
-    });
+    let schema = json!({ "features": features });
     serde_json::to_string_pretty(&schema).unwrap()
 }

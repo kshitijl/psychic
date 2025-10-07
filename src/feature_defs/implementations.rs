@@ -141,3 +141,34 @@ impl Feature for IsUnderCwd {
         })
     }
 }
+
+// ============================================================================
+// Feature: is_hidden
+// ============================================================================
+
+pub struct IsHidden;
+
+impl Feature for IsHidden {
+    fn name(&self) -> &'static str {
+        "is_hidden"
+    }
+
+    fn feature_type(&self) -> FeatureType {
+        FeatureType::Binary
+    }
+
+    fn compute(&self, inputs: &FeatureInputs) -> Result<f64> {
+        // Check if any component in the path starts with a dot (hidden)
+        let has_hidden_component = inputs.full_path
+            .components()
+            .any(|component| {
+                component
+                    .as_os_str()
+                    .to_str()
+                    .map(|s| s.starts_with('.'))
+                    .unwrap_or(false)
+            });
+
+        Ok(if has_hidden_component { 1.0 } else { 0.0 })
+    }
+}
