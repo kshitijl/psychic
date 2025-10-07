@@ -209,6 +209,15 @@ impl App {
         })
     }
 
+    fn reload_and_rerank(&mut self) -> Result<()> {
+        log::info!("Reloading click data and reranking files");
+        // Reload clicks from database
+        self.ranker.clicks_by_file = ranker::Ranker::load_clicks(&self.ranker.db_path)?;
+        // Rerank using existing update_filtered_files logic
+        self.update_filtered_files();
+        Ok(())
+    }
+
     fn update_filtered_files(&mut self) {
         let start_time = Instant::now();
         let query_lower = self.query.to_lowercase();
@@ -934,6 +943,11 @@ fn run_app(
 
                                 if let Err(e) = status {
                                     log::error!("Failed to launch editor: {}", e);
+                                }
+
+                                // Reload click data and rerank files after editing
+                                if let Err(e) = app.reload_and_rerank() {
+                                    log::error!("Failed to reload and rerank: {}", e);
                                 }
                             }
                         }

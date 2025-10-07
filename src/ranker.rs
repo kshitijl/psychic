@@ -22,7 +22,8 @@ pub struct FileScore {
 pub struct Ranker {
     model: Booster,
     // Precomputed click data for last 30 days (full_path -> Vec of ClickEvent)
-    clicks_by_file: HashMap<String, Vec<ClickEvent>>,
+    pub clicks_by_file: HashMap<String, Vec<ClickEvent>>,
+    pub db_path: PathBuf,
 }
 
 impl Ranker {
@@ -30,7 +31,17 @@ impl Ranker {
         let model = Booster::from_file(model_path.to_str().unwrap())
             .context("Failed to load LightGBM model")?;
 
-        // Preload all click events from last 30 days
+        let clicks_by_file = Self::load_clicks(&db_path)?;
+
+        Ok(Ranker {
+            model,
+            clicks_by_file,
+            db_path,
+        })
+    }
+
+    /// Load click events from last 30 days from database
+    pub fn load_clicks(db_path: &PathBuf) -> Result<HashMap<String, Vec<ClickEvent>>> {
         let now = Timestamp::now();
         let session_tz = jiff::tz::TimeZone::system();
         let now_zoned = now.to_zoned(session_tz);
@@ -39,7 +50,7 @@ impl Ranker {
 
         let mut clicks_by_file: HashMap<String, Vec<ClickEvent>> = HashMap::new();
 
-        let conn = Connection::open(&db_path)
+        let conn = Connection::open(db_path)
             .context("Failed to open database for preloading clicks")?;
 
         let mut stmt = conn.prepare(
@@ -63,10 +74,7 @@ impl Ranker {
 
         log::debug!("Loaded {} files with click history from last 30 days", clicks_by_file.len());
 
-        Ok(Ranker {
-            model,
-            clicks_by_file,
-        })
+        Ok(clicks_by_file)
     }
 
     pub fn rank_files(
