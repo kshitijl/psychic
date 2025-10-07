@@ -127,7 +127,7 @@ struct App {
     current_subsession: Option<Subsession>,
     next_subsession_id: u64,
     db: Database,
-    ranker: Option<ranker::Ranker>,
+    ranker: ranker::Ranker,
 }
 
 impl App {
@@ -151,31 +151,13 @@ impl App {
 
         // Try to load the ranker model if it exists (stored next to db file)
         let ranker_start = Instant::now();
-        let ranker = {
-            let model_path = db_path
-                .parent()
-                .map(|p| p.join("model.txt"))
-                .unwrap_or_else(|| PathBuf::from("model.txt"));
+        let model_path = db_path
+            .parent()
+            .map(|p| p.join("model.txt"))
+            .unwrap_or_else(|| PathBuf::from("model.txt"));
 
-            if model_path.exists() {
-                match ranker::Ranker::new(&model_path, db_path.clone()) {
-                    Ok(r) => {
-                        log::info!("Loaded ranking model from {:?}", model_path);
-                        Some(r)
-                    }
-                    Err(e) => {
-                        log::warn!("Failed to load ranking model: {}", e);
-                        None
-                    }
-                }
-            } else {
-                log::info!(
-                    "No ranking model found at {:?} - using simple filtering",
-                    model_path
-                );
-                None
-            }
-        };
+        let ranker = ranker::Ranker::new(&model_path, db_path.clone())?;
+        log::info!("Loaded ranking model from {:?}", model_path);
         log::debug!("Ranker initialization took {:?}", ranker_start.elapsed());
 
         // Load previously interacted files
@@ -262,38 +244,33 @@ impl App {
             filter_start.elapsed()
         );
 
-        // Then, rank them if we have a model, otherwise just use the filtered list
+        // Then, rank them with the model
         let rank_start = Instant::now();
-        if let Some(ranker) = &self.ranker {
-            match ranker.rank_files(&self.query, &matching_files, &self.session_id, &self.root) {
-                Ok(scored) => {
-                    // Reorder file_entries based on ranking scores
-                    let score_order: Vec<String> =
-                        scored.iter().map(|fs| fs.path.clone()).collect();
-                    let mut reordered_entries = Vec::new();
+        match self.ranker.rank_files(&self.query, &matching_files, &self.session_id, &self.root) {
+            Ok(scored) => {
+                // Reorder file_entries based on ranking scores
+                let score_order: Vec<String> =
+                    scored.iter().map(|fs| fs.path.clone()).collect();
+                let mut reordered_entries = Vec::new();
 
-                    for score_path in &score_order {
-                        if let Some(entry) =
-                            file_entries.iter().find(|e| &e.display_name == score_path)
-                        {
-                            reordered_entries.push(entry.clone());
-                        }
+                for score_path in &score_order {
+                    if let Some(entry) =
+                        file_entries.iter().find(|e| &e.display_name == score_path)
+                    {
+                        reordered_entries.push(entry.clone());
                     }
+                }
 
-                    self.filtered_files = reordered_entries;
-                    self.file_scores = scored;
-                }
-                Err(e) => {
-                    log::warn!("Ranking failed: {}, falling back to simple filtering", e);
-                    self.file_scores.clear();
-                    self.filtered_files = file_entries;
-                }
+                self.filtered_files = reordered_entries;
+                self.file_scores = scored;
             }
-            log::debug!("Ranking took {:?}", rank_start.elapsed());
-        } else {
-            self.file_scores.clear();
-            self.filtered_files = file_entries;
+            Err(e) => {
+                log::warn!("Ranking failed: {}, falling back to simple filtering", e);
+                self.file_scores.clear();
+                self.filtered_files = file_entries;
+            }
         }
+        log::debug!("Ranking took {:?}", rank_start.elapsed());
 
         log::debug!(
             "update_filtered_files() total time: {:?}",
@@ -435,9 +412,9 @@ fn get_time_ago(path: &PathBuf) -> String {
 }
 
 fn main() -> Result<()> {
-    // Initialize logger to write to ~/.local/share/sg/app.log
+    // Initialize logger to write to ~/.local/share/psychic/app.log
     if let Ok(home) = std::env::var("HOME") {
-        let log_dir = PathBuf::from(&home).join(".local").join("share").join("sg");
+        let log_dir = PathBuf::from(&home).join(".local").join("share").join("psychic");
         let _ = std::fs::create_dir_all(&log_dir);
         let log_file = log_dir.join("app.log");
 
@@ -503,7 +480,7 @@ fn main() -> Result<()> {
     let mut app = App::new(root.clone())?;
 
     log::info!(
-        "Started sg in directory {}, session {}",
+        "Started psychic in directory {}, session {}",
         root.display(),
         app.session_id
     );
@@ -746,12 +723,9 @@ fn run_app(
                         debug_lines.push(format!("{}: {}", feature.name(), value));
                     }
                 }
-            } else if app.ranker.is_some() {
-                debug_lines.push(String::from("No features"));
-                debug_lines.push(String::from("(ranking enabled)"));
             } else {
                 debug_lines.push(String::from("No features"));
-                debug_lines.push(String::from("(ranking disabled)"));
+                debug_lines.push(String::from("(no file selected)"));
             }
 
             debug_lines.push(String::from("")); // Separator

@@ -172,3 +172,57 @@ impl Feature for IsHidden {
         Ok(if has_hidden_component { 1.0 } else { 0.0 })
     }
 }
+
+// ============================================================================
+// Feature: clicks_last_week_parent_dir
+// ============================================================================
+
+pub struct ClicksLastWeekParentDir;
+
+impl Feature for ClicksLastWeekParentDir {
+    fn name(&self) -> &'static str {
+        "clicks_last_week_parent_dir"
+    }
+
+    fn feature_type(&self) -> FeatureType {
+        FeatureType::Numeric
+    }
+
+    fn compute(&self, inputs: &FeatureInputs) -> Result<f64> {
+        // Calculate 7 days ago timestamp
+        let now_ts = Timestamp::from_second(inputs.current_timestamp)?;
+        let session_tz = if let Some(session) = inputs.session {
+            jiff::tz::TimeZone::get(&session.timezone)
+                .unwrap_or(jiff::tz::TimeZone::system())
+        } else {
+            jiff::tz::TimeZone::system()
+        };
+        let now_zoned = now_ts.to_zoned(session_tz);
+        let seven_days_ago = now_zoned.checked_sub(Span::new().days(7))?.timestamp();
+
+        // Get parent directory of the current file
+        let parent_dir = inputs.full_path.parent();
+
+        if parent_dir.is_none() {
+            return Ok(0.0);
+        }
+        let parent_dir = parent_dir.unwrap();
+
+        // Count clicks in parent directory within time window
+        let clicks = inputs
+            .clicks_by_file
+            .iter()
+            .filter(|(path, _)| {
+                // Check if this click is for a file in the same parent directory
+                Path::new(path).parent() == Some(parent_dir)
+            })
+            .flat_map(|(_, clicks)| clicks)
+            .filter(|c| {
+                c.timestamp >= seven_days_ago.as_second()
+                    && c.timestamp <= inputs.current_timestamp
+            })
+            .count();
+
+        Ok(clicks as f64)
+    }
+}

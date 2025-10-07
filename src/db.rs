@@ -42,8 +42,7 @@ impl Database {
             std::fs::create_dir_all(parent)?;
         }
 
-        let conn = Connection::open(&db_path)
-            .context("Failed to open database")?;
+        let conn = Connection::open(&db_path).context("Failed to open database")?;
 
         // Create tables if they don't exist
         conn.execute(
@@ -90,12 +89,11 @@ impl Database {
     }
 
     pub fn get_db_path() -> Result<PathBuf> {
-        let home = std::env::var("HOME")
-            .context("HOME environment variable not set")?;
+        let home = std::env::var("HOME").context("HOME environment variable not set")?;
         Ok(PathBuf::from(home)
             .join(".local")
             .join("share")
-            .join("sg")
+            .join("psychic")
             .join("events.db"))
     }
 
@@ -186,10 +184,11 @@ impl Database {
             "SELECT DISTINCT full_path
              FROM events
              WHERE action IN ('click', 'scroll')
-             ORDER BY timestamp DESC"
+             ORDER BY timestamp DESC",
         )?;
 
-        let paths = stmt.query_map([], |row| row.get::<_, String>(0))?
+        let paths = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<String>, _>>()?;
 
         Ok(paths)

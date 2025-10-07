@@ -3,9 +3,11 @@ use std::sync::mpsc::Sender;
 use walkdir::WalkDir;
 
 const IGNORED_DIRS: &[&str] = &[".git", "node_modules", ".venv", "target"];
+const MAX_FILES: usize = 5000;
 
 pub fn start_file_walker(root: PathBuf, tx: Sender<PathBuf>) {
     std::thread::spawn(move || {
+        let mut file_count = 0;
         for entry in WalkDir::new(&root)
             .into_iter()
             .filter_entry(|e| {
@@ -20,7 +22,11 @@ pub fn start_file_walker(root: PathBuf, tx: Sender<PathBuf>) {
         {
             // Only send files, not directories
             if entry.file_type().is_file() {
+                if file_count >= MAX_FILES {
+                    break;
+                }
                 let _ = tx.send(entry.path().to_path_buf());
+                file_count += 1;
             }
         }
     });

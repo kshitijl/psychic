@@ -2,7 +2,7 @@
 
 ## Overview
 
-`sg` is a terminal-based file browser with fuzzy search, file preview, and click tracking analytics. It's built in Rust using a TUI (Terminal User Interface) framework and logs user interactions to a SQLite database for analysis.
+`psychic` is a terminal-based file browser with fuzzy search, file preview, and click tracking analytics. It's built in Rust using a TUI (Terminal User Interface) framework and logs user interactions to a SQLite database for analysis.
 
 ## Architecture
 
@@ -18,7 +18,7 @@ The application is split into five modules:
 
 ### Module: `db.rs`
 
-Manages SQLite database at `~/.local/share/sg/events.db` with two tables:
+Manages SQLite database at `~/.local/share/psychic/events.db` with two tables:
 
 ```sql
 CREATE TABLE events (
@@ -90,7 +90,7 @@ Gathers system/environment context at startup in a background thread. Captures:
 
 **Why gather this data:**
 - Network context helps understand if user is at home/office/coffee shop
-- Shell history provides clues about what user was doing before launching `sg`
+- Shell history provides clues about what user was doing before launching `psychic`
 - Running processes show what else user is working on
 - All useful features for analyzing search patterns and file access
 
@@ -130,15 +130,15 @@ Main event loop using `ratatui` + `crossterm` for TUI rendering. Also handles co
 
 ## Feature Generation Mode
 
-To support machine learning experiments, `sg` can be run in a non-interactive mode to generate a feature dataset from the existing event logs.
+To support machine learning experiments, `psychic` can be run in a non-interactive mode to generate a feature dataset from the existing event logs.
 
 **Usage:**
 ```bash
 # Generate features and save to features.csv (default)
-sg --generate-features
+psychic generate-features
 
 # Specify a custom output path
-sg --generate-features --output my_features.csv
+psychic generate-features --output my_features.csv
 ```
 
 This is implemented using the `clap` crate for command-line argument parsing. When the `--generate-features` flag is provided, the application calls the `features::generate_features` function and exits, skipping the TUI entirely.
@@ -452,7 +452,7 @@ Spawns immediately at startup but doesn't block file walker or UI. Context comma
 - Could reveal patterns like "always searches for config files when on public WiFi"
 
 **Shell history** reveals:
-- What commands user ran before launching `sg`
+- What commands user ran before launching `psychic`
 - Possible intent (e.g., ran `git log` → likely searching for commit-related files)
 - Workflow patterns
 
@@ -562,7 +562,7 @@ Integrated a **LightGBM LambdaRank** model for learning-to-rank file search resu
 **New components:**
 1. **`ranker.rs`** - LightGBM model inference and feature computation
 2. **`train.py`** - Python script for training ranking model
-3. **Model storage** - `~/.local/share/sg/model.txt` (next to events.db)
+3. **Model storage** - `~/.local/share/psychic/model.txt` (next to events.db)
 4. **3-column TUI layout** - Added ML features display panel
 
 ### Model: `ranker.rs`
@@ -590,7 +590,7 @@ pub struct Ranker {
 **Initialization:**
 ```rust
 let ranker = Ranker::new(&model_path, db_path)?;
-// Loads model from ~/.local/share/sg/model.txt
+// Loads model from ~/.local/share/psychic/model.txt
 // Preloads all click counts into memory
 ```
 
@@ -611,7 +611,7 @@ pub struct FileScore {
 
 ### Training Script: `train.py`
 
-**Purpose:** Train LightGBM ranking model from feature CSV exported by `sg --generate-features`.
+**Purpose:** Train LightGBM ranking model from feature CSV exported by `psychic generate-features`.
 
 **Key characteristics:**
 - **Objective:** `lambdarank` (learning-to-rank)
@@ -621,17 +621,17 @@ pub struct FileScore {
 
 **Usage:**
 ```bash
-sg --generate-features  # Export features.csv
+psychic generate-features  # Export features.csv
 python train.py features.csv output  # Train model
 # Outputs:
 #   - output.txt (model for current directory)
-#   - ~/.local/share/sg/model.txt (model for TUI)
+#   - ~/.local/share/psychic/model.txt (model for TUI)
 #   - output_viz.pdf (feature importance, SHAP analysis, NDCG metrics)
 ```
 
 **Model saves to two locations:**
 1. `output.txt` in current directory (for version control/inspection)
-2. `~/.local/share/sg/model.txt` (where TUI looks for it)
+2. `~/.local/share/psychic/model.txt` (where TUI looks for it)
 
 **Visualizations generated:**
 - Training curves (NDCG@5 over iterations)
@@ -674,7 +674,7 @@ python train.py features.csv output  # Train model
 - Shows "No features (ranking disabled)" when no model found
 
 **Fallback behavior:**
-- If `~/.local/share/sg/model.txt` doesn't exist → simple substring filtering
+- If `~/.local/share/psychic/model.txt` doesn't exist → simple substring filtering
 - Logs: `"No ranking model found at {:?} - using simple filtering"`
 - If model load fails → logs warning and falls back to filtering
 - Application always works, ranking is optional enhancement
@@ -718,7 +718,7 @@ if received_files {
 **Timing instrumentation added:**
 - App::new() timing (database init, ranker init)
 - update_filtered_files() timing (filtering, ranking)
-- All logs go to `~/.local/share/sg/app.log` (not stderr, which disrupts TUI)
+- All logs go to `~/.local/share/psychic/app.log` (not stderr, which disrupts TUI)
 
 ### Logging Infrastructure
 
@@ -744,16 +744,16 @@ env_logger::Builder::new()
 - `log::error!()` - Editor launch failures
 - `log::debug!()` - Timing data, performance metrics
 
-**Logs written to:** `~/.local/share/sg/app.log`
+**Logs written to:** `~/.local/share/psychic/app.log`
 
 **Example log output:**
 ```
-[2025-10-07T02:08:35Z INFO  sg] Started sg in directory /path/to/project, session 12345
-[2025-10-07T02:08:35Z DEBUG sg] Database initialization took 2.3ms
-[2025-10-07T02:08:35Z DEBUG sg] Loaded 143 click counts from last 30 days
-[2025-10-07T02:08:35Z DEBUG sg] Ranker initialization took 45.2ms
-[2025-10-07T02:08:35Z DEBUG sg] Filtering 820 files (with metadata) took 1.4ms
-[2025-10-07T02:08:35Z DEBUG sg] Ranking took 2.2ms
+[2025-10-07T02:08:35Z INFO  psychic] Started sg in directory /path/to/project, session 12345
+[2025-10-07T02:08:35Z DEBUG psychic] Database initialization took 2.3ms
+[2025-10-07T02:08:35Z DEBUG psychic] Loaded 143 click counts from last 30 days
+[2025-10-07T02:08:35Z DEBUG psychic] Ranker initialization took 45.2ms
+[2025-10-07T02:08:35Z DEBUG psychic] Filtering 820 files (with metadata) took 1.4ms
+[2025-10-07T02:08:35Z DEBUG psychic] Ranking took 2.2ms
 ```
 
 ### Database Enhancements
@@ -940,12 +940,114 @@ This session added significant ML and performance enhancements:
 4. Historical files in search results
 
 **Infrastructure:**
-1. Model storage in `~/.local/share/sg/`
+1. Model storage in `~/.local/share/psychic/`
 2. Log output to `app.log`
 3. Startup logging with session/directory info
 4. Comprehensive debug timing
 
 All improvements maintain backward compatibility - app works without model (falls back to simple filtering).
+
+## Trait-Based Feature System Refactor (Added)
+
+### Problem
+
+Adding new features required updating 7+ places manually:
+- Feature computation in features.rs
+- Feature computation in ranker.rs
+- Feature name ordering in multiple places
+- CSV column order
+- Python feature lists
+- Binary vs numeric type tracking
+
+This was brittle and error-prone.
+
+### Solution: Single Source of Truth
+
+Created a trait-based feature registry system where **all features are defined once** in `src/feature_defs/`:
+
+**Core architecture:**
+```rust
+// schema.rs - trait definition
+pub trait Feature: Send + Sync {
+    fn name(&self) -> &'static str;
+    fn feature_type(&self) -> FeatureType;
+    fn compute(&self, inputs: &FeatureInputs) -> Result<f64>;
+}
+
+// implementations.rs - all features in one file
+pub struct FilenameStartsWithQuery;
+impl Feature for FilenameStartsWithQuery {
+    fn name(&self) -> &'static str { "filename_starts_with_query" }
+    fn feature_type(&self) -> FeatureType { FeatureType::Binary }
+    fn compute(&self, inputs: &FeatureInputs) -> Result<f64> { /* ... */ }
+}
+
+// registry.rs - THE SINGLE SOURCE OF TRUTH
+pub static FEATURE_REGISTRY: Lazy<Vec<Box<dyn Feature>>> = Lazy::new(|| {
+    vec![
+        Box::new(FilenameStartsWithQuery),
+        Box::new(ClicksLast30Days),
+        Box::new(ModifiedToday),
+        Box::new(IsUnderCwd),
+        Box::new(IsHidden),
+    ]
+});
+```
+
+**Key benefits:**
+- **Single implementation** - Each feature has one `compute()` method used everywhere
+- **Automatic ordering** - Registry order determines feature vector order (no manual synchronization)
+- **Type safety** - Features export their type (binary/numeric) automatically
+- **Schema export** - JSON schema generated directly from registry
+- **Easy to add features** - Implement trait, add to registry, done
+
+**Cross-language integration:**
+```bash
+# Rust exports schema
+cargo run --release -- generate-features
+# Outputs: features.csv + feature_schema.json
+
+# Python reads schema
+python train.py features.csv output
+# Reads feature_schema.json to get feature names and types
+```
+
+**Schema format (simplified):**
+```json
+{
+  "features": [
+    {"name": "filename_starts_with_query", "type": "binary"},
+    {"name": "clicks_last_30_days", "type": "numeric"},
+    {"name": "is_hidden", "type": "binary"}
+  ]
+}
+```
+
+**Files changed:**
+- `src/feature_defs/` - New module with schema, implementations, registry
+- `src/features.rs` - Now uses registry for computation
+- `src/ranker.rs` - Now uses registry for inference
+- `src/main.rs` - CLI changed to `generate-features` subcommand, auto-generates schema
+- `train.py` - Reads feature_schema.json (errors if missing)
+- `Cargo.toml` - Added once_cell dependency
+
+**New features added using this system:**
+- `is_under_cwd` - File is under current working directory (binary)
+- `is_hidden` - Path contains hidden directory component (binary)
+
+### Renaming: sg → psychic
+
+Changed binary and directory names:
+- Binary: `sg` → `psychic` (in Cargo.toml)
+- Data directory: `~/.local/share/sg/` → `~/.local/share/psychic/`
+- Updated: db.rs, main.rs, train.py, how-it-works.md
+- Log file: `~/.local/share/psychic/app.log`
+- Database: `~/.local/share/psychic/events.db`
+- Model: `~/.local/share/psychic/model.txt`
+
+### Performance Limit
+
+Added MAX_FILES = 5000 limit in walker.rs to cap file discovery for now. Will optimize later.
 
 ## Future Improvements
 

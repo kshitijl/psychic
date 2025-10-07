@@ -1,5 +1,8 @@
 use super::schema::{Feature, FeatureType};
-use super::implementations::{ClicksLast30Days, FilenameStartsWithQuery, IsHidden, IsUnderCwd, ModifiedToday};
+use super::implementations::{
+    ClicksLast30Days, ClicksLastWeekParentDir, FilenameStartsWithQuery, IsHidden, IsUnderCwd,
+    ModifiedToday,
+};
 use once_cell::sync::Lazy;
 use serde_json::json;
 
@@ -12,30 +15,13 @@ pub static FEATURE_REGISTRY: Lazy<Vec<Box<dyn Feature>>> = Lazy::new(|| {
         Box::new(ModifiedToday),
         Box::new(IsUnderCwd),
         Box::new(IsHidden),
+        Box::new(ClicksLastWeekParentDir),
     ]
 });
 
 /// Get all feature names in order
 pub fn feature_names() -> Vec<&'static str> {
     FEATURE_REGISTRY.iter().map(|f| f.name()).collect()
-}
-
-/// Get names of binary features only
-pub fn binary_features() -> Vec<&'static str> {
-    FEATURE_REGISTRY
-        .iter()
-        .filter(|f| matches!(f.feature_type(), FeatureType::Binary))
-        .map(|f| f.name())
-        .collect()
-}
-
-/// Get names of numeric features only
-pub fn numeric_features() -> Vec<&'static str> {
-    FEATURE_REGISTRY
-        .iter()
-        .filter(|f| matches!(f.feature_type(), FeatureType::Numeric))
-        .map(|f| f.name())
-        .collect()
 }
 
 /// Get CSV column names (metadata + features)
