@@ -214,6 +214,11 @@ impl Ranker {
 /// Find train.py by searching: binary dir -> parent dir -> grandparent dir
 fn find_train_py() -> Result<PathBuf> {
     let exe_path = std::env::current_exe().context("Failed to get current executable path")?;
+
+    // Canonicalize to resolve symlinks
+    let exe_path = exe_path.canonicalize()
+        .context("Failed to canonicalize executable path")?;
+
     let exe_dir = exe_path
         .parent()
         .context("Failed to get executable directory")?;
