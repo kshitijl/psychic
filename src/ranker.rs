@@ -51,7 +51,7 @@ impl Ranker {
             click_counts.insert(path, count);
         }
 
-        eprintln!("Loaded {} click counts from last 30 days", click_counts.len());
+        log::debug!("Loaded {} click counts from last 30 days", click_counts.len());
 
         Ok(Ranker {
             model,

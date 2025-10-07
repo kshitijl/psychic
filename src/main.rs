@@ -83,34 +83,43 @@ impl App {
         use std::collections::hash_map::RandomState;
         use std::hash::{BuildHasher, Hash, Hasher};
 
+        let start_time = Instant::now();
+        log::debug!("App::new() started");
+
         // Generate random 64-bit session ID
         let mut hasher = RandomState::new().build_hasher();
         Instant::now().hash(&mut hasher);
         std::process::id().hash(&mut hasher);
         let session_id = hasher.finish().to_string();
 
+        let db_start = Instant::now();
         let db = Database::new()?;
         let db_path = db.db_path();
+        log::debug!("Database initialization took {:?}", db_start.elapsed());
 
         // Try to load the ranker model if it exists
+        let ranker_start = Instant::now();
         let ranker = {
             let model_path = PathBuf::from("output.txt");
             if model_path.exists() {
                 match ranker::Ranker::new(&model_path, db_path) {
                     Ok(r) => {
-                        eprintln!("Loaded ranking model from output.txt");
+                        log::info!("Loaded ranking model from output.txt");
                         Some(r)
                     }
                     Err(e) => {
-                        eprintln!("Warning: Failed to load ranking model: {}", e);
+                        log::warn!("Failed to load ranking model: {}", e);
                         None
                     }
                 }
             } else {
-                eprintln!("No ranking model found at output.txt - using simple filtering");
+                log::info!("No ranking model found at output.txt - using simple filtering");
                 None
             }
         };
+        log::debug!("Ranker initialization took {:?}", ranker_start.elapsed());
+
+        log::debug!("App::new() total time: {:?}", start_time.elapsed());
 
         Ok(App {
             query: String::new(),
@@ -131,9 +140,11 @@ impl App {
     }
 
     fn update_filtered_files(&mut self) {
+        let start_time = Instant::now();
         let query_lower = self.query.to_lowercase();
 
         // First, filter files that match the query
+        let filter_start = Instant::now();
         let matching_files: Vec<(String, PathBuf, Option<i64>)> = self
             .files
             .iter()
@@ -153,8 +164,10 @@ impl App {
                 }
             })
             .collect();
+        log::debug!("Filtering {} files (with metadata) took {:?}", matching_files.len(), filter_start.elapsed());
 
         // Then, rank them if we have a model, otherwise just use the filtered list
+        let rank_start = Instant::now();
         if let Some(ranker) = &self.ranker {
             match ranker.rank_files(&self.query, matching_files.clone(), &self.session_id) {
                 Ok(scored) => {
@@ -162,19 +175,19 @@ impl App {
                     self.filtered_files = scored.into_iter().map(|fs| fs.path).collect();
                 }
                 Err(e) => {
-                    eprintln!(
-                        "Warning: Ranking failed: {}, falling back to simple filtering",
-                        e
-                    );
+                    log::warn!("Ranking failed: {}, falling back to simple filtering", e);
                     self.file_scores.clear();
                     self.filtered_files =
                         matching_files.into_iter().map(|(rel, _, _)| rel).collect();
                 }
             }
+            log::debug!("Ranking took {:?}", rank_start.elapsed());
         } else {
             self.file_scores.clear();
             self.filtered_files = matching_files.into_iter().map(|(rel, _, _)| rel).collect();
         }
+
+        log::debug!("update_filtered_files() total time: {:?}", start_time.elapsed());
 
         // Reset selection if out of bounds
         if self.selected_index >= self.filtered_files.len() && !self.filtered_files.is_empty() {
@@ -294,6 +307,24 @@ fn get_time_ago(path: &PathBuf) -> String {
 }
 
 fn main() -> Result<()> {
+    // Initialize logger to write to ~/.local/share/sg/app.log
+    if let Ok(home) = std::env::var("HOME") {
+        let log_dir = PathBuf::from(&home).join(".local").join("share").join("sg");
+        let _ = std::fs::create_dir_all(&log_dir);
+        let log_file = log_dir.join("app.log");
+
+        if let Ok(file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_file)
+        {
+            env_logger::Builder::new()
+                .target(env_logger::Target::Pipe(Box::new(file)))
+                .filter_level(log::LevelFilter::Debug)
+                .init();
+        }
+    }
+
     let cli = Cli::parse();
 
     if cli.generate_features {
@@ -373,8 +404,14 @@ fn run_app(
 ) -> Result<()> {
     loop {
         // Receive new files from walker (non-blocking)
+        let mut received_files = false;
         while let Ok(path) = rx.try_recv() {
             app.files.push(path);
+            received_files = true;
+        }
+
+        // Only update filtered files once after receiving all available files
+        if received_files {
             app.update_filtered_files();
         }
 
@@ -667,7 +704,7 @@ fn run_app(
                                 terminal.clear()?;
 
                                 if let Err(e) = status {
-                                    eprintln!("Failed to launch editor: {}", e);
+                                    log::error!("Failed to launch editor: {}", e);
                                 }
                             }
                         }

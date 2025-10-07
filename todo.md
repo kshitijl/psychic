@@ -1,3 +1,4 @@
+- put in log statement of "started sg in directory {cwd}, session {}"
 - automated tests that can be run using cargo test, in test modules in each file.
 - put trained model output file next to the db file. and look for it there in the tui code.
 - keyboard shortcut to just clear current search, maybe just Ctrl-a Ctrl-k
@@ -6,3 +7,4 @@
 - the modification time shown in results list isn't properly right justified. so when filenames are different lengths then they don't all appear nicely in a column.
 - get rid of the clone in ranker.rank_files. it should just take a ref. no?
 - make sure we don't do something inefficeint like query the db over and over, once for each feature or for each file we need to compute a feature on. we gotta query the db ONCE, accumulate all data we'll need and then hold that data in memory, ready for when queries happen and we need to compute features.
+- use tracing subscriber crate so we can have nice spans of time and we can maybe visualize and optimize idk
