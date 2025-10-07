@@ -61,11 +61,58 @@ struct Subsession {
     impressions_logged: bool,
 }
 
+#[derive(Debug, Clone)]
+struct FileEntry {
+    full_path: PathBuf,
+    display_name: String,
+    from_history: bool,
+}
+
+impl FileEntry {
+    fn from_walkdir(full_path: PathBuf, root: &PathBuf) -> Self {
+        let display_name = full_path
+            .strip_prefix(root)
+            .unwrap_or(&full_path)
+            .to_string_lossy()
+            .to_string();
+
+        FileEntry {
+            full_path,
+            display_name,
+            from_history: false,
+        }
+    }
+
+    fn from_history(full_path: PathBuf, root: &PathBuf) -> Self {
+        let display_name = if full_path.strip_prefix(root).is_ok() {
+            // File is in current tree - show relative path normally
+            full_path
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
+        } else {
+            // File is from elsewhere - show .../{filename}
+            let filename = full_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown");
+            format!(".../{}", filename)
+        };
+
+        FileEntry {
+            full_path,
+            display_name,
+            from_history: true,
+        }
+    }
+}
+
 struct App {
     query: String,
     files: Vec<PathBuf>,
     historical_files: Vec<PathBuf>, // Previously clicked/scrolled files
-    filtered_files: Vec<String>,
+    filtered_files: Vec<FileEntry>,
     file_scores: Vec<ranker::FileScore>, // Scores and features for filtered files
     selected_index: usize,
     file_list_scroll: u16, // Scroll offset for file list
@@ -168,64 +215,63 @@ impl App {
 
         // First, filter files that match the query from walkdir
         let filter_start = Instant::now();
-        let mut matching_files: Vec<(String, PathBuf, Option<i64>)> = self
-            .files
-            .iter()
-            .filter_map(|path| {
-                let relative = path
-                    .strip_prefix(&self.root)
-                    .unwrap_or(path)
-                    .to_string_lossy()
-                    .to_string();
+        let mut file_entries: Vec<FileEntry> = Vec::new();
+        let mut matching_files: Vec<(String, PathBuf, Option<i64>)> = Vec::new();
 
-                if query_lower.is_empty() || relative.to_lowercase().contains(&query_lower) {
-                    let (mtime, _, _) = get_file_metadata(path);
-                    // let mtime = Some(17989998119);
-                    Some((relative, path.clone(), mtime))
-                } else {
-                    None
-                }
-            })
-            .collect();
+        for path in &self.files {
+            let entry = FileEntry::from_walkdir(path.clone(), &self.root);
+
+            if query_lower.is_empty() || entry.display_name.to_lowercase().contains(&query_lower) {
+                let (mtime, _, _) = get_file_metadata(&entry.full_path);
+                matching_files.push((entry.display_name.clone(), entry.full_path.clone(), mtime));
+                file_entries.push(entry);
+            }
+        }
 
         // Also include historical files that match the query (and aren't already in results)
-        let existing_paths: HashSet<PathBuf> = matching_files.iter().map(|(_, p, _)| p.clone()).collect();
+        let existing_paths: HashSet<PathBuf> = file_entries.iter().map(|e| e.full_path.clone()).collect();
         for path in &self.historical_files {
             if !existing_paths.contains(path) {
-                let relative = path
-                    .strip_prefix(&self.root)
-                    .unwrap_or(path)
-                    .to_string_lossy()
-                    .to_string();
+                let entry = FileEntry::from_history(path.clone(), &self.root);
 
-                if query_lower.is_empty() || relative.to_lowercase().contains(&query_lower) {
-                    let (mtime, _, _) = get_file_metadata(path);
-                    matching_files.push((relative, path.clone(), mtime));
+                if query_lower.is_empty() || entry.display_name.to_lowercase().contains(&query_lower) {
+                    let (mtime, _, _) = get_file_metadata(&entry.full_path);
+                    matching_files.push((entry.display_name.clone(), entry.full_path.clone(), mtime));
+                    file_entries.push(entry);
                 }
             }
         }
 
-        log::debug!("Filtering {} files (with metadata) took {:?}", matching_files.len(), filter_start.elapsed());
+        log::debug!("Filtering {} files (with metadata) took {:?}", file_entries.len(), filter_start.elapsed());
 
         // Then, rank them if we have a model, otherwise just use the filtered list
         let rank_start = Instant::now();
         if let Some(ranker) = &self.ranker {
             match ranker.rank_files(&self.query, &matching_files, &self.session_id) {
                 Ok(scored) => {
-                    self.filtered_files = scored.iter().map(|fs| fs.path.clone()).collect();
+                    // Reorder file_entries based on ranking scores
+                    let score_order: Vec<String> = scored.iter().map(|fs| fs.path.clone()).collect();
+                    let mut reordered_entries = Vec::new();
+
+                    for score_path in &score_order {
+                        if let Some(entry) = file_entries.iter().find(|e| &e.display_name == score_path) {
+                            reordered_entries.push(entry.clone());
+                        }
+                    }
+
+                    self.filtered_files = reordered_entries;
                     self.file_scores = scored;
                 }
                 Err(e) => {
                     log::warn!("Ranking failed: {}, falling back to simple filtering", e);
                     self.file_scores.clear();
-                    self.filtered_files =
-                        matching_files.into_iter().map(|(rel, _, _)| rel).collect();
+                    self.filtered_files = file_entries;
                 }
             }
             log::debug!("Ranking took {:?}", rank_start.elapsed());
         } else {
             self.file_scores.clear();
-            self.filtered_files = matching_files.into_iter().map(|(rel, _, _)| rel).collect();
+            self.filtered_files = file_entries;
         }
 
         log::debug!("update_filtered_files() total time: {:?}", start_time.elapsed());
@@ -274,12 +320,11 @@ impl App {
             .filtered_files
             .iter()
             .take(10)
-            .map(|relative| {
-                let full_path = self.root.join(relative);
-                let (mtime, atime, file_size) = get_file_metadata(&full_path);
+            .map(|entry| {
+                let (mtime, atime, file_size) = get_file_metadata(&entry.full_path);
                 (
-                    relative.clone(),
-                    full_path.to_string_lossy().to_string(),
+                    entry.display_name.clone(),
+                    entry.full_path.to_string_lossy().to_string(),
                     mtime,
                     atime,
                     file_size,
@@ -513,9 +558,8 @@ fn run_app(
                 .enumerate()
                 .skip(app.file_list_scroll as usize)
                 .take(visible_height as usize)
-                .map(|(i, file)| {
-                    let full_path = app.root.join(file);
-                    let time_ago = get_time_ago(&full_path);
+                .map(|(i, entry)| {
+                    let time_ago = get_time_ago(&entry.full_path);
                     let rank = i + 1;
 
                     // Calculate space: "N. " takes 4 chars, time_ago length, we need padding between
@@ -528,10 +572,10 @@ fn run_app(
                     let file_width = available.saturating_sub(2); // leave at least 2 spaces padding
 
                     // Right-justify time by padding filename to fill available space
-                    let line = if file.len() > file_width {
-                        format!("{}{:<width$}  {}", rank_prefix, &file[..file_width], time_ago, width = file_width)
+                    let line = if entry.display_name.len() > file_width {
+                        format!("{}{:<width$}  {}", rank_prefix, &entry.display_name[..file_width], time_ago, width = file_width)
                     } else {
-                        format!("{}{:<width$}  {}", rank_prefix, file, time_ago, width = file_width)
+                        format!("{}{:<width$}  {}", rank_prefix, &entry.display_name, time_ago, width = file_width)
                     };
 
                     let style = if i == app.selected_index {
@@ -552,9 +596,8 @@ fn run_app(
 
             // Preview on the right using bat (with caching)
             let preview_text = if !app.filtered_files.is_empty() {
-                let selected_file = &app.filtered_files[app.selected_index];
-                let full_path = app.root.join(selected_file);
-                let full_path_str = full_path.to_string_lossy().to_string();
+                let selected_entry = &app.filtered_files[app.selected_index];
+                let full_path_str = selected_entry.full_path.to_string_lossy().to_string();
 
                 // Check cache
                 let cached = app
@@ -571,7 +614,7 @@ fn run_app(
                         .arg("--color=always")
                         .arg("--style=numbers")
                         .arg("--paging=never")
-                        .arg(&full_path)
+                        .arg(&selected_entry.full_path)
                         .output()
                     {
                         Ok(output) => {
@@ -583,7 +626,7 @@ fn run_app(
                         }
                         Err(_) => {
                             // Fallback to plain file read if bat is not available
-                            match std::fs::read_to_string(&full_path) {
+                            match std::fs::read_to_string(&selected_entry.full_path) {
                                 Ok(content) => Text::from(content),
                                 Err(_) => Text::from("[Unable to preview file]"),
                             }
@@ -659,18 +702,17 @@ fn run_app(
                                 // Force log impressions before scroll
                                 let _ = app.check_and_log_impressions(true);
 
-                                let selected_file = &app.filtered_files[app.selected_index];
-                                let full_path = app.root.join(selected_file);
-                                let full_path_str = full_path.to_string_lossy().to_string();
+                                let selected_entry = &app.filtered_files[app.selected_index];
+                                let full_path_str = selected_entry.full_path.to_string_lossy().to_string();
                                 let key = (app.query.clone(), full_path_str.clone());
 
                                 if !app.scrolled_files.contains(&key) {
-                                    let (mtime, atime, file_size) = get_file_metadata(&full_path);
+                                    let (mtime, atime, file_size) = get_file_metadata(&selected_entry.full_path);
                                     let subsession_id =
                                         app.current_subsession.as_ref().map(|s| s.id).unwrap_or(1);
                                     let _ = app.db.log_scroll(EventData {
                                         query: &app.query,
-                                        file_path: selected_file,
+                                        file_path: &selected_entry.display_name,
                                         full_path: &full_path_str,
                                         mtime,
                                         atime,
@@ -691,18 +733,17 @@ fn run_app(
                                 // Force log impressions before scroll
                                 let _ = app.check_and_log_impressions(true);
 
-                                let selected_file = &app.filtered_files[app.selected_index];
-                                let full_path = app.root.join(selected_file);
-                                let full_path_str = full_path.to_string_lossy().to_string();
+                                let selected_entry = &app.filtered_files[app.selected_index];
+                                let full_path_str = selected_entry.full_path.to_string_lossy().to_string();
                                 let key = (app.query.clone(), full_path_str.clone());
 
                                 if !app.scrolled_files.contains(&key) {
-                                    let (mtime, atime, file_size) = get_file_metadata(&full_path);
+                                    let (mtime, atime, file_size) = get_file_metadata(&selected_entry.full_path);
                                     let subsession_id =
                                         app.current_subsession.as_ref().map(|s| s.id).unwrap_or(1);
                                     let _ = app.db.log_scroll(EventData {
                                         query: &app.query,
-                                        file_path: selected_file,
+                                        file_path: &selected_entry.display_name,
                                         full_path: &full_path_str,
                                         mtime,
                                         atime,
@@ -754,17 +795,16 @@ fn run_app(
                                 // Force log impressions before click
                                 app.check_and_log_impressions(true)?;
 
-                                let selected_file = &app.filtered_files[app.selected_index];
-                                let full_path = app.root.join(selected_file);
-                                let (mtime, atime, file_size) = get_file_metadata(&full_path);
+                                let selected_entry = &app.filtered_files[app.selected_index];
+                                let (mtime, atime, file_size) = get_file_metadata(&selected_entry.full_path);
 
                                 // Log the click
                                 let subsession_id =
                                     app.current_subsession.as_ref().map(|s| s.id).unwrap_or(1);
                                 app.db.log_click(EventData {
                                     query: &app.query,
-                                    file_path: selected_file,
-                                    full_path: &full_path.to_string_lossy(),
+                                    file_path: &selected_entry.display_name,
+                                    full_path: &selected_entry.full_path.to_string_lossy(),
                                     mtime,
                                     atime,
                                     file_size,
@@ -782,7 +822,7 @@ fn run_app(
 
                                 // Launch hx editor
                                 let status =
-                                    std::process::Command::new("hx").arg(&full_path).status();
+                                    std::process::Command::new("hx").arg(&selected_entry.full_path).status();
 
                                 // Resume TUI
                                 enable_raw_mode()?;
