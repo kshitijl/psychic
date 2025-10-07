@@ -62,7 +62,7 @@ impl Ranker {
     pub fn rank_files(
         &self,
         query: &str,
-        files: Vec<(String, PathBuf, Option<i64>)>, // (relative_path, full_path, mtime)
+        files: &[(String, PathBuf, Option<i64>)], // (relative_path, full_path, mtime)
         session_id: &str,
     ) -> Result<Vec<FileScore>> {
         if files.is_empty() {
@@ -74,9 +74,9 @@ impl Ranker {
         for (relative_path, full_path, mtime) in files {
             let features = self.compute_features(
                 query,
-                &relative_path,
-                &full_path,
-                mtime,
+                relative_path,
+                full_path,
+                *mtime,
                 session_id,
             )?;
 
@@ -89,9 +89,9 @@ impl Ranker {
                 .context("Failed to predict with model")?[0];
 
             scored_files.push(FileScore {
-                path: relative_path,
+                path: relative_path.clone(),
                 score,
-                features: features.clone(),
+                features,
             });
         }
 

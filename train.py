@@ -390,9 +390,20 @@ def create_visualizations(model, X_train, y_train, groups_train, X_test, y_test,
 
 def save_model(model, output_prefix):
     """Save LightGBM model to file."""
+    import os
+
+    # Save to current directory with given prefix
     model_path = f"{output_prefix}.txt"
     model.save_model(model_path)
     print(f"Model saved to: {model_path}")
+
+    # Also save to ~/.local/share/sg/model.txt
+    home = os.path.expanduser("~")
+    sg_dir = os.path.join(home, ".local", "share", "sg")
+    os.makedirs(sg_dir, exist_ok=True)
+    sg_model_path = os.path.join(sg_dir, "model.txt")
+    model.save_model(sg_model_path)
+    print(f"Model also saved to: {sg_model_path}")
 
 
 def main():

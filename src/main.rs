@@ -64,9 +64,11 @@ struct Subsession {
 struct App {
     query: String,
     files: Vec<PathBuf>,
+    historical_files: Vec<PathBuf>, // Previously clicked/scrolled files
     filtered_files: Vec<String>,
     file_scores: Vec<ranker::FileScore>, // Scores and features for filtered files
     selected_index: usize,
+    file_list_scroll: u16, // Scroll offset for file list
     preview_scroll: u16,
     preview_cache: Option<(String, Text<'static>)>, // (file_path, rendered_text)
     scrolled_files: HashSet<(String, String)>, // (query, full_path) - track what we've logged scroll for
@@ -97,14 +99,17 @@ impl App {
         let db_path = db.db_path();
         log::debug!("Database initialization took {:?}", db_start.elapsed());
 
-        // Try to load the ranker model if it exists
+        // Try to load the ranker model if it exists (stored next to db file)
         let ranker_start = Instant::now();
         let ranker = {
-            let model_path = PathBuf::from("output.txt");
+            let model_path = db_path.parent()
+                .map(|p| p.join("model.txt"))
+                .unwrap_or_else(|| PathBuf::from("model.txt"));
+
             if model_path.exists() {
-                match ranker::Ranker::new(&model_path, db_path) {
+                match ranker::Ranker::new(&model_path, db_path.clone()) {
                     Ok(r) => {
-                        log::info!("Loaded ranking model from output.txt");
+                        log::info!("Loaded ranking model from {:?}", model_path);
                         Some(r)
                     }
                     Err(e) => {
@@ -113,20 +118,38 @@ impl App {
                     }
                 }
             } else {
-                log::info!("No ranking model found at output.txt - using simple filtering");
+                log::info!("No ranking model found at {:?} - using simple filtering", model_path);
                 None
             }
         };
         log::debug!("Ranker initialization took {:?}", ranker_start.elapsed());
+
+        // Load previously interacted files
+        let historical_start = Instant::now();
+        let historical_files = db.get_previously_interacted_files()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|p| {
+                let path = PathBuf::from(&p);
+                if path.exists() {
+                    Some(path)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        log::debug!("Loading historical files took {:?}", historical_start.elapsed());
 
         log::debug!("App::new() total time: {:?}", start_time.elapsed());
 
         Ok(App {
             query: String::new(),
             files: Vec::new(),
+            historical_files,
             filtered_files: Vec::new(),
             file_scores: Vec::new(),
             selected_index: 0,
+            file_list_scroll: 0,
             preview_scroll: 0,
             preview_cache: None,
             scrolled_files: HashSet::new(),
@@ -143,9 +166,9 @@ impl App {
         let start_time = Instant::now();
         let query_lower = self.query.to_lowercase();
 
-        // First, filter files that match the query
+        // First, filter files that match the query from walkdir
         let filter_start = Instant::now();
-        let matching_files: Vec<(String, PathBuf, Option<i64>)> = self
+        let mut matching_files: Vec<(String, PathBuf, Option<i64>)> = self
             .files
             .iter()
             .filter_map(|path| {
@@ -164,15 +187,33 @@ impl App {
                 }
             })
             .collect();
+
+        // Also include historical files that match the query (and aren't already in results)
+        let existing_paths: HashSet<PathBuf> = matching_files.iter().map(|(_, p, _)| p.clone()).collect();
+        for path in &self.historical_files {
+            if !existing_paths.contains(path) {
+                let relative = path
+                    .strip_prefix(&self.root)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .to_string();
+
+                if query_lower.is_empty() || relative.to_lowercase().contains(&query_lower) {
+                    let (mtime, _, _) = get_file_metadata(path);
+                    matching_files.push((relative, path.clone(), mtime));
+                }
+            }
+        }
+
         log::debug!("Filtering {} files (with metadata) took {:?}", matching_files.len(), filter_start.elapsed());
 
         // Then, rank them if we have a model, otherwise just use the filtered list
         let rank_start = Instant::now();
         if let Some(ranker) = &self.ranker {
-            match ranker.rank_files(&self.query, matching_files.clone(), &self.session_id) {
+            match ranker.rank_files(&self.query, &matching_files, &self.session_id) {
                 Ok(scored) => {
-                    self.file_scores = scored.clone();
-                    self.filtered_files = scored.into_iter().map(|fs| fs.path).collect();
+                    self.filtered_files = scored.iter().map(|fs| fs.path.clone()).collect();
+                    self.file_scores = scored;
                 }
                 Err(e) => {
                     log::warn!("Ranking failed: {}, falling back to simple filtering", e);
@@ -267,6 +308,25 @@ impl App {
         // Reset preview scroll and clear cache when changing selection
         self.preview_scroll = 0;
         self.preview_cache = None;
+    }
+
+    fn update_scroll(&mut self, visible_height: u16) {
+        // Auto-scroll the file list when selection is near top or bottom
+        let selected = self.selected_index as u16;
+        let scroll = self.file_list_scroll;
+
+        // If selected item is above visible area, scroll up
+        if selected < scroll {
+            self.file_list_scroll = selected;
+        }
+        // If selected item is below visible area, scroll down
+        else if selected >= scroll + visible_height {
+            self.file_list_scroll = selected.saturating_sub(visible_height - 1);
+        }
+        // If we're in the bottom 5 items and there's more to see, keep scrolling
+        else if selected >= scroll + visible_height.saturating_sub(5) {
+            self.file_list_scroll = selected.saturating_sub(visible_height.saturating_sub(5));
+        }
     }
 }
 
@@ -366,6 +426,8 @@ fn main() -> Result<()> {
     // Initialize app
     let mut app = App::new(root.clone())?;
 
+    log::info!("Started sg in directory {}, session {}", root.display(), app.session_id);
+
     // Gather context in background thread
     let session_id_clone = app.session_id.clone();
     std::thread::spawn(move || {
@@ -439,18 +501,38 @@ fn run_app(
                 ])
                 .split(main_chunks[0]);
 
+            // Update scroll position based on selection and visible height
+            let visible_height = top_chunks[0].height.saturating_sub(2); // subtract border
+            app.update_scroll(visible_height);
+
             // File list on the left
+            let list_width = top_chunks[0].width.saturating_sub(2) as usize; // subtract borders
             let items: Vec<ListItem> = app
                 .filtered_files
                 .iter()
                 .enumerate()
+                .skip(app.file_list_scroll as usize)
+                .take(visible_height as usize)
                 .map(|(i, file)| {
                     let full_path = app.root.join(file);
                     let time_ago = get_time_ago(&full_path);
                     let rank = i + 1;
 
-                    // Format: "1. src/main.rs                      2 days ago"
-                    let line = format!("{:2}. {:<50} {}", rank, file, time_ago);
+                    // Calculate space: "N. " takes 4 chars, time_ago length, we need padding between
+                    let rank_prefix = format!("{:2}. ", rank);
+                    let prefix_len = rank_prefix.len();
+                    let time_len = time_ago.len();
+
+                    // Available space for filename and padding
+                    let available = list_width.saturating_sub(prefix_len + time_len);
+                    let file_width = available.saturating_sub(2); // leave at least 2 spaces padding
+
+                    // Right-justify time by padding filename to fill available space
+                    let line = if file.len() > file_width {
+                        format!("{}{:<width$}  {}", rank_prefix, &file[..file_width], time_ago, width = file_width)
+                    } else {
+                        format!("{}{:<width$}  {}", rank_prefix, file, time_ago, width = file_width)
+                    };
 
                     let style = if i == app.selected_index {
                         Style::default()
@@ -642,6 +724,13 @@ fn run_app(
                             if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
                         {
                             return Ok(());
+                        }
+                        KeyCode::Char('u')
+                            if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
+                        {
+                            // Ctrl-U: clear entire search
+                            app.query.clear();
+                            app.update_filtered_files();
                         }
                         KeyCode::Esc => {
                             return Ok(());

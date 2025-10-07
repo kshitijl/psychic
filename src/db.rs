@@ -179,4 +179,19 @@ impl Database {
     pub fn log_scroll(&self, event: EventData) -> Result<()> {
         self.log_event(event)
     }
+
+    pub fn get_previously_interacted_files(&self) -> Result<Vec<String>> {
+        // Get all unique full_paths that have been clicked or scrolled
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT full_path
+             FROM events
+             WHERE action IN ('click', 'scroll')
+             ORDER BY timestamp DESC"
+        )?;
+
+        let paths = stmt.query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<String>, _>>()?;
+
+        Ok(paths)
+    }
 }
