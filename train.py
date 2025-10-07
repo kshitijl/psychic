@@ -81,7 +81,21 @@ def load_data(csv_path):
     # Use group_id as query groups (each group spans from one click/scroll to the next)
     df['query_group'] = df['group_id'].astype(int)
 
+    # Filter out query groups with no positive labels (no clicks/scrolls)
+    # LambdaRank needs at least one positive example per query group
+    groups_with_positives = df.groupby('query_group')['label'].sum()
+    valid_groups = groups_with_positives[groups_with_positives > 0].index
+
+    original_samples = len(df)
+    original_groups = df['query_group'].nunique()
+
+    df = df[df['query_group'].isin(valid_groups)].reset_index(drop=True)
+
+    filtered_samples = original_samples - len(df)
+    filtered_groups = original_groups - df['query_group'].nunique()
+
     print(f"Loaded {df['query_group'].nunique()} query groups (click/scroll sequences)")
+    print(f"  Filtered out {filtered_groups} groups ({filtered_samples} samples) with no positive labels")
     return df
 
 
