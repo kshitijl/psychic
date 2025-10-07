@@ -139,6 +139,23 @@ struct App {
     next_subsession_id: u64,
     db: Database,
     ranker: ranker::Ranker,
+    model_stats: Option<ModelStats>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct ModelStats {
+    training_duration_seconds: f64,
+    num_features: usize,
+    num_total_examples: usize,
+    num_positive_examples: usize,
+    num_negative_examples: usize,
+    top_3_features: Vec<FeatureImportance>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct FeatureImportance {
+    feature: String,
+    importance: f64,
 }
 
 impl App {
@@ -189,6 +206,26 @@ impl App {
 
         log::debug!("App::new() total time: {:?}", start_time.elapsed());
 
+        // Load model stats if available
+        let stats_path = data_dir.join("model_stats.json");
+        let model_stats = if stats_path.exists() {
+            match std::fs::read_to_string(&stats_path) {
+                Ok(contents) => match serde_json::from_str::<ModelStats>(&contents) {
+                    Ok(stats) => Some(stats),
+                    Err(e) => {
+                        log::warn!("Failed to parse model stats: {}", e);
+                        None
+                    }
+                },
+                Err(e) => {
+                    log::warn!("Failed to read model stats: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Ok(App {
             query: String::new(),
             files: Vec::new(),
@@ -206,6 +243,7 @@ impl App {
             next_subsession_id: 1,
             db,
             ranker,
+            model_stats,
         })
     }
 
@@ -760,6 +798,25 @@ fn run_app(
             } else {
                 debug_lines.push(String::from("No features"));
                 debug_lines.push(String::from("(no file selected)"));
+            }
+
+            debug_lines.push(String::from("")); // Separator
+
+            // Add model stats
+            if let Some(ref stats) = app.model_stats {
+                debug_lines.push(String::from("Model Stats:"));
+                debug_lines.push(format!("  Training: {:.2}s", stats.training_duration_seconds));
+                debug_lines.push(format!("  Features: {}", stats.num_features));
+                debug_lines.push(format!("  Examples: {} ({} pos, {} neg)",
+                    stats.num_total_examples,
+                    stats.num_positive_examples,
+                    stats.num_negative_examples));
+                debug_lines.push(String::from("  Top features:"));
+                for feat in &stats.top_3_features {
+                    debug_lines.push(format!("    {}: {:.1}", feat.feature, feat.importance));
+                }
+            } else {
+                debug_lines.push(String::from("Model Stats: N/A"));
             }
 
             debug_lines.push(String::from("")); // Separator

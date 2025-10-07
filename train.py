@@ -444,6 +444,9 @@ def save_model(model, output_prefix):
 
 
 def main():
+    import time
+    training_start = time.time()
+
     parser = argparse.ArgumentParser(
         description="Train LightGBM ranking model on psychic feature data"
     )
@@ -506,6 +509,32 @@ def main():
 
     # Generate visualizations
     create_visualizations(model, X_train, y_train, groups_train, X_test, y_test, groups_test, evals_result, output_pdf)
+
+    # Calculate training duration
+    training_duration = time.time() - training_start
+
+    # Get feature importance (top 3)
+    importance = model.feature_importance(importance_type="gain")
+    feature_names_list = model.feature_name()
+    feature_importance_df = pd.DataFrame(
+        {"feature": feature_names_list, "importance": importance}
+    ).sort_values("importance", ascending=False)
+    top_3_features = feature_importance_df.head(3)[["feature", "importance"]].to_dict('records')
+
+    # Write model stats to JSON
+    stats = {
+        "training_duration_seconds": round(training_duration, 2),
+        "num_features": len(feature_names),
+        "num_total_examples": len(df),
+        "num_positive_examples": int(y.sum()),
+        "num_negative_examples": int(len(y) - y.sum()),
+        "top_3_features": top_3_features
+    }
+
+    stats_path = Path(args.data_dir) / "model_stats.json"
+    with open(stats_path, 'w') as f:
+        json.dump(stats, f, indent=2)
+    print(f"  - Stats: {stats_path}")
 
     print(f"\n✓ Training complete!")
     print(f"  - Model: {output_prefix}.txt")
