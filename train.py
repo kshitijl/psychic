@@ -522,7 +522,9 @@ def main():
     top_3_features = feature_importance_df.head(3)[["feature", "importance"]].to_dict('records')
 
     # Write model stats to JSON
+    import datetime
     stats = {
+        "trained_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "training_duration_seconds": round(training_duration, 2),
         "num_features": len(feature_names),
         "num_total_examples": len(df),

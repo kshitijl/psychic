@@ -19,11 +19,29 @@ pub struct FileScore {
     pub features: HashMap<String, f64>,
 }
 
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ModelStats {
+    pub trained_at: String,
+    pub training_duration_seconds: f64,
+    pub num_features: usize,
+    pub num_total_examples: usize,
+    pub num_positive_examples: usize,
+    pub num_negative_examples: usize,
+    pub top_3_features: Vec<FeatureImportance>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct FeatureImportance {
+    pub feature: String,
+    pub importance: f64,
+}
+
 pub struct Ranker {
     model: Booster,
     // Precomputed click data for last 30 days (full_path -> Vec of ClickEvent)
     pub clicks_by_file: HashMap<String, Vec<ClickEvent>>,
     pub db_path: PathBuf,
+    pub stats: Option<ModelStats>,
 }
 
 impl Ranker {
@@ -33,11 +51,38 @@ impl Ranker {
 
         let clicks_by_file = Self::load_clicks(&db_path)?;
 
+        // Load model stats from same directory as model
+        let stats_path = model_path.parent()
+            .map(|p| p.join("model_stats.json"))
+            .unwrap_or_else(|| PathBuf::from("model_stats.json"));
+        let stats = Self::load_stats(&stats_path);
+
         Ok(Ranker {
             model,
             clicks_by_file,
             db_path,
+            stats,
         })
+    }
+
+    fn load_stats(stats_path: &PathBuf) -> Option<ModelStats> {
+        if stats_path.exists() {
+            match std::fs::read_to_string(stats_path) {
+                Ok(contents) => match serde_json::from_str::<ModelStats>(&contents) {
+                    Ok(stats) => Some(stats),
+                    Err(e) => {
+                        log::warn!("Failed to parse model stats: {}", e);
+                        None
+                    }
+                },
+                Err(e) => {
+                    log::warn!("Failed to read model stats: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        }
     }
 
     /// Load click events from last 30 days from database
@@ -185,7 +230,10 @@ fn find_train_py() -> Result<PathBuf> {
         }
     }
 
-    anyhow::bail!("train.py not found in binary directory or 2 levels above")
+    anyhow::bail!(
+        "train.py not found in binary directory or 2 levels above. Binary directory: {:?}",
+        exe_dir
+    )
 }
 
 /// Retrain the model by generating features and running train.py
