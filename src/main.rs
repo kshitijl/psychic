@@ -4,6 +4,7 @@ mod features;
 mod walker;
 
 use anyhow::Result;
+use clap::{Parser, ValueEnum};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -28,6 +29,37 @@ use std::{
 };
 use walker::start_file_walker;
 
+/// Output format for feature generation
+#[derive(Debug, Clone, ValueEnum)]
+enum OutputFormat {
+    Csv,
+    Json,
+}
+
+/// A terminal-based file browser with fuzzy search and analytics
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Cli {
+    /// Generate features for machine learning and exit
+    #[arg(long, default_value_t = false)]
+    generate_features: bool,
+
+    /// Output path for the generated features file
+    #[arg(long, value_name = "FILE")]
+    output: Option<PathBuf>,
+
+    /// Output format (csv or json)
+    #[arg(long, value_enum, default_value = "csv")]
+    format: OutputFormat,
+}
+
+struct Subsession {
+    id: u64,
+    query: String,
+    created_at: Instant,
+    impressions_logged: bool,
+}
+
 struct App {
     query: String,
     files: Vec<PathBuf>,
@@ -38,9 +70,9 @@ struct App {
     scrolled_files: HashSet<(String, String)>, // (query, full_path) - track what we've logged scroll for
     root: PathBuf,
     session_id: String,
-    current_subsession_id: u64,
+    current_subsession: Option<Subsession>,
+    next_subsession_id: u64,
     db: Database,
-    last_impression_log: Instant,
 }
 
 impl App {
@@ -64,9 +96,9 @@ impl App {
             scrolled_files: HashSet::new(),
             root,
             session_id,
-            current_subsession_id: 1,
+            current_subsession: None,
+            next_subsession_id: 1,
             db: Database::new()?,
-            last_impression_log: Instant::now(),
         })
     }
 
@@ -95,11 +127,38 @@ impl App {
         if self.selected_index >= self.filtered_files.len() && !self.filtered_files.is_empty() {
             self.selected_index = 0;
         }
+
+        // Create new subsession if query changed
+        let should_create_new = match &self.current_subsession {
+            None => true,
+            Some(subsession) => subsession.query != self.query,
+        };
+
+        if should_create_new {
+            self.current_subsession = Some(Subsession {
+                id: self.next_subsession_id,
+                query: self.query.clone(),
+                created_at: Instant::now(),
+                impressions_logged: false,
+            });
+            self.next_subsession_id += 1;
+        }
     }
 
-    fn log_impressions_debounced(&mut self) -> Result<()> {
-        // Debounce impressions by 200ms
-        if self.last_impression_log.elapsed() < Duration::from_millis(200) {
+    fn check_and_log_impressions(&mut self, force: bool) -> Result<()> {
+        let subsession = match &mut self.current_subsession {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+
+        // Skip if already logged
+        if subsession.impressions_logged {
+            return Ok(());
+        }
+
+        // Check if we should log: either forced or >200ms old
+        let should_log = force || subsession.created_at.elapsed() >= Duration::from_millis(200);
+        if !should_log {
             return Ok(());
         }
 
@@ -122,9 +181,8 @@ impl App {
             .collect();
 
         if !top_10.is_empty() {
-            self.db.log_impressions(&self.query, &top_10, self.current_subsession_id, &self.session_id)?;
-            self.last_impression_log = Instant::now();
-            self.current_subsession_id += 1;
+            self.db.log_impressions(&subsession.query, &top_10, subsession.id, &self.session_id)?;
+            subsession.impressions_logged = true;
         }
 
         Ok(())
@@ -182,6 +240,41 @@ fn get_time_ago(path: &PathBuf) -> String {
 }
 
 fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    if cli.generate_features {
+        // Determine default output filename based on format
+        let default_filename = match cli.format {
+            OutputFormat::Csv => "features.csv",
+            OutputFormat::Json => "features.json",
+        };
+        let output_path = cli.output.unwrap_or_else(|| PathBuf::from(default_filename));
+        let db_path = db::Database::get_db_path()?;
+
+        // Convert CLI format to features format
+        let format = match cli.format {
+            OutputFormat::Csv => features::OutputFormat::Csv,
+            OutputFormat::Json => features::OutputFormat::Json,
+        };
+
+        let format_str = match format {
+            features::OutputFormat::Csv => "CSV",
+            features::OutputFormat::Json => "JSON",
+        };
+
+        println!(
+            "Generating features ({}) from DB at {:?} and writing to {:?}",
+            format_str,
+            db_path,
+            output_path
+        );
+        features::generate_features(&db_path, &output_path, format)?;
+
+        println!("Done.");
+
+        return Ok(());
+    }
+
     // Get current working directory
     let root = env::current_dir()?;
 
@@ -230,6 +323,9 @@ fn run_app(
             app.files.push(path);
             app.update_filtered_files();
         }
+
+        // Check and log impressions if >200ms old
+        let _ = app.check_and_log_impressions(false);
 
         // Draw UI
         terminal.draw(|f| {
@@ -352,6 +448,9 @@ fn run_app(
 
                             // Log scroll event (deduplicated by query + full_path)
                             if !app.filtered_files.is_empty() {
+                                // Force log impressions before scroll
+                                let _ = app.check_and_log_impressions(true);
+
                                 let selected_file = &app.filtered_files[app.selected_index];
                                 let full_path = app.root.join(selected_file);
                                 let full_path_str = full_path.to_string_lossy().to_string();
@@ -359,6 +458,7 @@ fn run_app(
 
                                 if !app.scrolled_files.contains(&key) {
                                     let (mtime, atime, file_size) = get_file_metadata(&full_path);
+                                    let subsession_id = app.current_subsession.as_ref().map(|s| s.id).unwrap_or(1);
                                     let _ = app.db.log_scroll(EventData {
                                         query: &app.query,
                                         file_path: selected_file,
@@ -366,7 +466,7 @@ fn run_app(
                                         mtime,
                                         atime,
                                         file_size,
-                                        subsession_id: app.current_subsession_id,
+                                        subsession_id,
                                         action: "scroll",
                                         session_id: &app.session_id,
                                     });
@@ -379,6 +479,9 @@ fn run_app(
 
                             // Log scroll event (deduplicated by query + full_path)
                             if !app.filtered_files.is_empty() {
+                                // Force log impressions before scroll
+                                let _ = app.check_and_log_impressions(true);
+
                                 let selected_file = &app.filtered_files[app.selected_index];
                                 let full_path = app.root.join(selected_file);
                                 let full_path_str = full_path.to_string_lossy().to_string();
@@ -386,6 +489,7 @@ fn run_app(
 
                                 if !app.scrolled_files.contains(&key) {
                                     let (mtime, atime, file_size) = get_file_metadata(&full_path);
+                                    let subsession_id = app.current_subsession.as_ref().map(|s| s.id).unwrap_or(1);
                                     let _ = app.db.log_scroll(EventData {
                                         query: &app.query,
                                         file_path: selected_file,
@@ -393,7 +497,7 @@ fn run_app(
                                         mtime,
                                         atime,
                                         file_size,
-                                        subsession_id: app.current_subsession_id,
+                                        subsession_id,
                                         action: "scroll",
                                         session_id: &app.session_id,
                                     });
@@ -415,12 +519,10 @@ fn run_app(
                         KeyCode::Char(c) => {
                             app.query.push(c);
                             app.update_filtered_files();
-                            app.log_impressions_debounced()?;
                         }
                         KeyCode::Backspace => {
                             app.query.pop();
                             app.update_filtered_files();
-                            app.log_impressions_debounced()?;
                         }
                         KeyCode::Up => {
                             app.move_selection(-1);
@@ -430,11 +532,15 @@ fn run_app(
                         }
                         KeyCode::Enter => {
                             if !app.filtered_files.is_empty() {
+                                // Force log impressions before click
+                                app.check_and_log_impressions(true)?;
+
                                 let selected_file = &app.filtered_files[app.selected_index];
                                 let full_path = app.root.join(selected_file);
                                 let (mtime, atime, file_size) = get_file_metadata(&full_path);
 
                                 // Log the click
+                                let subsession_id = app.current_subsession.as_ref().map(|s| s.id).unwrap_or(1);
                                 app.db.log_click(EventData {
                                     query: &app.query,
                                     file_path: selected_file,
@@ -442,7 +548,7 @@ fn run_app(
                                     mtime,
                                     atime,
                                     file_size,
-                                    subsession_id: app.current_subsession_id,
+                                    subsession_id,
                                     action: "click",
                                     session_id: &app.session_id,
                                 })?;

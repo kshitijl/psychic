@@ -1,12 +1,17 @@
 use anyhow::{Context, Result};
 use csv::Writer;
+use jiff::{Timestamp, Span};
 use regex::Regex;
 use rusqlite::Connection;
 use std::collections::HashMap;
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 
-#[derive(Debug)]
-struct ImpressionEvent {
+// Data structures for holding event and session data in memory
+
+#[derive(Debug, Clone)]
+struct Event {
+    id: i64,
     session_id: String,
     subsession_id: u64,
     query: String,
@@ -16,545 +21,345 @@ struct ImpressionEvent {
     mtime: Option<i64>,
     atime: Option<i64>,
     file_size: Option<i64>,
-    rank: usize,
+    action: String,
 }
 
-#[derive(Debug)]
-struct SessionContext {
+#[derive(Debug, Clone)]
+struct Session {
+    session_id: String,
     cwd: String,
-    gateway: String,
-    subnet: String,
-    dns: String,
-    shell_history: String,
-    running_processes: String,
     timezone: String,
+    subnet: String,
     created_at: i64,
 }
 
-pub fn generate_features(db_path: &Path, output_path: &Path) -> Result<()> {
-    let conn = Connection::open(db_path).context("Failed to open database")?;
+// Output format enum
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum OutputFormat {
+    Csv,
+    Json,
+}
 
-    // Get all impressions with rank
-    let impressions = fetch_impressions(&conn)?;
+// Helper structs for accumulator
+#[derive(Debug, Clone)]
+struct ClickEvent {
+    timestamp: i64,
+    session_id: String,
+    full_path: String,
+}
 
-    // Get all clicks/scrolls (label=1)
-    let labels = fetch_labels(&conn)?;
+#[derive(Debug, Clone)]
+struct ScrollEvent {
+    timestamp: i64,
+    session_id: String,
+    full_path: String,
+}
 
-    // Get session contexts
-    let sessions = fetch_sessions(&conn)?;
+// Accumulator for fold-based processing
+struct Accumulator {
+    clicks_by_file: HashMap<String, Vec<ClickEvent>>,
+    scrolls_by_file: HashMap<String, Vec<ScrollEvent>>,
+    // Key: (session_id, subsession_id, full_path)
+    pending_impressions: HashMap<(String, u64, String), PendingImpression>,
+    output_rows: Vec<HashMap<String, String>>,
+}
 
-    // Build feature rows
-    let mut wtr = Writer::from_path(output_path)?;
+#[derive(Debug, Clone)]
+struct PendingImpression {
+    features: HashMap<String, String>,
+    timestamp: i64,
+}
 
-    // Write CSV header
-    write_csv_header(&mut wtr)?;
-
-    // Generate features for each impression
-    for impression in impressions {
-        let features = compute_features(&impression, &labels, &sessions, &conn)?;
-        write_csv_row(&mut wtr, &features)?;
+impl Accumulator {
+    fn new() -> Self {
+        Self {
+            clicks_by_file: HashMap::new(),
+            scrolls_by_file: HashMap::new(),
+            pending_impressions: HashMap::new(),
+            output_rows: Vec::new(),
+        }
     }
 
-    wtr.flush()?;
+    fn record_click(&mut self, event: &Event) {
+        let click = ClickEvent {
+            timestamp: event.timestamp,
+            session_id: event.session_id.clone(),
+            full_path: event.full_path.clone(),
+        };
+        self.clicks_by_file
+            .entry(event.full_path.clone())
+            .or_default()
+            .push(click);
+    }
+
+    fn record_scroll(&mut self, event: &Event) {
+        let scroll = ScrollEvent {
+            timestamp: event.timestamp,
+            session_id: event.session_id.clone(),
+            full_path: event.full_path.clone(),
+        };
+        self.scrolls_by_file
+            .entry(event.full_path.clone())
+            .or_default()
+            .push(scroll);
+    }
+
+    fn add_impression(&mut self, event: &Event, features: HashMap<String, String>) {
+        let key = (
+            event.session_id.clone(),
+            event.subsession_id,
+            event.full_path.clone(),
+        );
+        self.pending_impressions.insert(
+            key,
+            PendingImpression {
+                features,
+                timestamp: event.timestamp,
+            },
+        );
+    }
+
+    fn mark_impressions_as_engaged(&mut self, event: &Event) {
+        // Find impressions in same subsession with same file that happened BEFORE this click/scroll
+        let key = (
+            event.session_id.clone(),
+            event.subsession_id,
+            event.full_path.clone(),
+        );
+
+        if let Some(pending) = self.pending_impressions.get_mut(&key) {
+            if pending.timestamp <= event.timestamp {
+                pending.features.insert("label".to_string(), "1".to_string());
+            }
+        }
+    }
+
+    fn finalize(mut self) -> Vec<HashMap<String, String>> {
+        // Move all pending impressions to output
+        for (_, impression) in self.pending_impressions {
+            self.output_rows.push(impression.features);
+        }
+        self.output_rows
+    }
+}
+
+// Main function to generate features
+
+pub fn generate_features(db_path: &Path, output_path: &Path, format: OutputFormat) -> Result<()> {
+    let conn = Connection::open(db_path).context("Failed to open database")?;
+    let mut all_events = fetch_all_events(&conn)?;
+    let all_sessions = fetch_all_sessions(&conn)?;
+
+    // Sort events by timestamp (critical for temporal correctness)
+    all_events.sort_by_key(|e| e.timestamp);
+
+    let mut acc = Accumulator::new();
+
+    for event in &all_events {
+        match event.action.as_str() {
+            "impression" => {
+                let features = compute_features_from_accumulator(event, &acc, &all_sessions)?;
+                acc.add_impression(event, features);
+            }
+            "click" => {
+                acc.record_click(event);
+                acc.mark_impressions_as_engaged(event);
+            }
+            "scroll" => {
+                acc.record_scroll(event);
+                acc.mark_impressions_as_engaged(event);
+            }
+            _ => {} // Ignore unknown actions
+        }
+    }
+
+    let output_rows = acc.finalize();
+
+    match format {
+        OutputFormat::Csv => {
+            let mut wtr = Writer::from_path(output_path)?;
+            write_csv_header(&mut wtr)?;
+            for row in &output_rows {
+                write_csv_row(&mut wtr, row)?;
+            }
+            wtr.flush()?;
+        }
+        OutputFormat::Json => {
+            write_features_to_json(&output_rows, output_path)?;
+        }
+    }
+
     Ok(())
 }
 
-fn fetch_impressions(conn: &Connection) -> Result<Vec<ImpressionEvent>> {
+// Database fetching functions
+
+fn fetch_all_events(conn: &Connection) -> Result<Vec<Event>> {
     let mut stmt = conn.prepare(
-        "SELECT session_id, subsession_id, query, file_path, full_path, timestamp, mtime, atime, file_size
-         FROM events
-         WHERE action = 'impression'
-         ORDER BY session_id, subsession_id, timestamp",
+        "SELECT id, session_id, subsession_id, query, file_path, full_path, timestamp, mtime, atime, file_size, action FROM events ORDER BY timestamp, id",
     )?;
-
-    let mut impressions = Vec::new();
-    let mut current_subsession = (String::new(), 0u64);
-    let mut rank = 1;
-
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, u64>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, String>(4)?,
-            row.get::<_, i64>(5)?,
-            row.get::<_, Option<i64>>(6)?,
-            row.get::<_, Option<i64>>(7)?,
-            row.get::<_, Option<i64>>(8)?,
-        ))
+    let event_iter = stmt.query_map([], |row| {
+        Ok(Event {
+            id: row.get(0)?,
+            session_id: row.get(1)?,
+            subsession_id: row.get(2)?,
+            query: row.get(3)?,
+            file_path: row.get(4)?,
+            full_path: row.get(5)?,
+            timestamp: row.get(6)?,
+            mtime: row.get(7)?,
+            atime: row.get(8)?,
+            file_size: row.get(9)?,
+            action: row.get(10)?,
+        })
     })?;
 
-    for row in rows {
-        let (session_id, subsession_id, query, file_path, full_path, timestamp, mtime, atime, file_size) = row?;
-
-        // Reset rank for new subsession
-        if current_subsession != (session_id.clone(), subsession_id) {
-            current_subsession = (session_id.clone(), subsession_id);
-            rank = 1;
-        }
-
-        impressions.push(ImpressionEvent {
-            session_id,
-            subsession_id,
-            query,
-            file_path,
-            full_path,
-            timestamp,
-            mtime,
-            atime,
-            file_size,
-            rank,
-        });
-
-        rank += 1;
+    let mut events = Vec::new();
+    for event in event_iter {
+        events.push(event?);
     }
-
-    Ok(impressions)
+    Ok(events)
 }
 
-fn fetch_labels(conn: &Connection) -> Result<HashMap<(String, u64, String), bool>> {
-    let mut stmt = conn.prepare(
-        "SELECT session_id, subsession_id, full_path
-         FROM events
-         WHERE action IN ('click', 'scroll')",
-    )?;
-
-    let mut labels = HashMap::new();
-
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, u64>(1)?,
-            row.get::<_, String>(2)?,
-        ))
+fn fetch_all_sessions(conn: &Connection) -> Result<HashMap<String, Session>> {
+    let mut stmt = conn.prepare("SELECT session_id, cwd, timezone, subnet, created_at FROM sessions")?;
+    let session_iter = stmt.query_map([], |row| {
+        Ok(Session {
+            session_id: row.get(0)?,
+            cwd: row.get(1)?,
+            timezone: row.get(2)?,
+            subnet: row.get(3)?,
+            created_at: row.get(4)?,
+        })
     })?;
-
-    for row in rows {
-        let (session_id, subsession_id, full_path) = row?;
-        labels.insert((session_id, subsession_id, full_path), true);
-    }
-
-    Ok(labels)
-}
-
-fn fetch_sessions(conn: &Connection) -> Result<HashMap<String, SessionContext>> {
-    let mut stmt = conn.prepare(
-        "SELECT session_id, cwd, gateway, subnet, dns, shell_history, running_processes, timezone, created_at
-         FROM sessions",
-    )?;
 
     let mut sessions = HashMap::new();
-
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            SessionContext {
-                cwd: row.get(1)?,
-                gateway: row.get(2)?,
-                subnet: row.get(3)?,
-                dns: row.get(4)?,
-                shell_history: row.get(5)?,
-                running_processes: row.get(6)?,
-                timezone: row.get(7)?,
-                created_at: row.get(8)?,
-            },
-        ))
-    })?;
-
-    for row in rows {
-        let (session_id, context) = row?;
-        sessions.insert(session_id, context);
+    for session in session_iter {
+        let session = session?;
+        sessions.insert(session.session_id.clone(), session);
     }
-
     Ok(sessions)
 }
 
-fn compute_features(
-    impression: &ImpressionEvent,
-    labels: &HashMap<(String, u64, String), bool>,
-    sessions: &HashMap<String, SessionContext>,
-    conn: &Connection,
+// Feature computation from accumulator state
+
+fn compute_features_from_accumulator(
+    impression: &Event,
+    acc: &Accumulator,
+    sessions: &HashMap<String, Session>,
 ) -> Result<HashMap<String, String>> {
     let mut features = HashMap::new();
 
-    // Label
-    let label = if labels.contains_key(&(
-        impression.session_id.clone(),
-        impression.subsession_id,
-        impression.full_path.clone(),
-    )) {
-        "1"
-    } else {
-        "0"
-    };
-    features.insert("label".to_string(), label.to_string());
+    // Label starts as 0, will be updated to 1 if click/scroll happens later
+    features.insert("label".to_string(), "0".to_string());
 
-    // Session and query info
-    features.insert("session_id".to_string(), impression.session_id.clone());
-    features.insert("subsession_id".to_string(), impression.subsession_id.to_string());
+    // Query
     features.insert("query".to_string(), impression.query.clone());
+
+    // File path
     features.insert("file_path".to_string(), impression.file_path.clone());
-    features.insert("full_path".to_string(), impression.full_path.clone());
 
-    // Ranking features
-    features.insert("rank".to_string(), impression.rank.to_string());
+    // filename_starts_with_query
+    let filename = Path::new(&impression.file_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    features.insert(
+        "filename_starts_with_query".to_string(),
+        if !impression.query.is_empty()
+            && filename
+                .to_lowercase()
+                .starts_with(&impression.query.to_lowercase())
+        {
+            "1"
+        } else {
+            "0"
+        }
+        .to_string(),
+    );
 
-    // Static file features
-    compute_static_features(&mut features, impression);
+    // clicks_last_30_days - only count clicks BEFORE this impression
+    if let Some(session) = sessions.get(&impression.session_id) {
+        let now_ts = Timestamp::from_second(impression.timestamp)?;
+        let session_tz =
+            jiff::tz::TimeZone::get(&session.timezone).unwrap_or(jiff::tz::TimeZone::system());
+        let now_zoned = now_ts.to_zoned(session_tz);
+        let thirty_days_ago = now_zoned.checked_sub(Span::new().days(30))?.timestamp();
 
-    // Temporal features
-    compute_temporal_features(&mut features, impression, sessions);
+        let clicks_last_30_days = acc
+            .clicks_by_file
+            .get(&impression.full_path)
+            .map(|clicks| {
+                clicks
+                    .iter()
+                    .filter(|c| {
+                        c.timestamp >= thirty_days_ago.as_second()
+                            && c.timestamp <= impression.timestamp // Only past clicks!
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
 
-    // Query-based features
-    compute_query_features(&mut features, impression);
-
-    // Historical features
-    compute_historical_features(&mut features, impression, conn)?;
-
-    // Session context features
-    if let Some(session_ctx) = sessions.get(&impression.session_id) {
-        features.insert("timezone".to_string(), session_ctx.timezone.clone());
-        features.insert("subnet".to_string(), session_ctx.subnet.clone());
+        features.insert(
+            "clicks_last_30_days".to_string(),
+            clicks_last_30_days.to_string(),
+        );
     } else {
-        features.insert("timezone".to_string(), "unknown".to_string());
-        features.insert("subnet".to_string(), "unknown".to_string());
+        features.insert("clicks_last_30_days".to_string(), "0".to_string());
+    }
+
+    // modified_today
+    if let Some(mtime) = impression.mtime {
+        let seconds_since_mod = impression.timestamp - mtime;
+        let hours = seconds_since_mod / 3600;
+        features.insert(
+            "modified_today".to_string(),
+            if hours < 24 { "1" } else { "0" }.to_string(),
+        );
+    } else {
+        features.insert("modified_today".to_string(), "0".to_string());
     }
 
     Ok(features)
 }
 
-fn compute_static_features(features: &mut HashMap<String, String>, impression: &ImpressionEvent) {
-    let path = Path::new(&impression.file_path);
+// JSON writing
 
-    // Extension
-    let extension = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("none")
-        .to_string();
-    features.insert("extension".to_string(), extension);
-
-    // Filename
-    let filename = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("")
-        .to_string();
-    features.insert("filename".to_string(), filename.clone());
-
-    // Path depth
-    let depth = impression.file_path.matches('/').count();
-    features.insert("path_depth".to_string(), depth.to_string());
-
-    // Filename length
-    features.insert("filename_len".to_string(), filename.len().to_string());
-
-    // Path length
-    features.insert("path_len".to_string(), impression.file_path.len().to_string());
-
-    // Is hidden
-    let is_hidden = if filename.starts_with('.') { "1" } else { "0" };
-    features.insert("is_hidden".to_string(), is_hidden.to_string());
-
-    // File size
-    let file_size = impression.file_size.unwrap_or(0);
-    features.insert("file_size".to_string(), file_size.to_string());
-
-    // Special directory patterns
-    let path_str = &impression.file_path;
-    features.insert("in_src".to_string(), if path_str.contains("/src/") { "1" } else { "0" }.to_string());
-    features.insert("in_test".to_string(), if path_str.contains("/test") || path_str.contains("_test") { "1" } else { "0" }.to_string());
-    features.insert("in_lib".to_string(), if path_str.contains("/lib/") { "1" } else { "0" }.to_string());
-    features.insert("in_bin".to_string(), if path_str.contains("/bin/") { "1" } else { "0" }.to_string());
-    features.insert("in_config".to_string(), if path_str.contains("config") || path_str.ends_with(".toml") || path_str.ends_with(".yaml") { "1" } else { "0" }.to_string());
-
-    // Has version in path (e.g., v1, v2)
-    let version_regex = Regex::new(r"v\d+").unwrap();
-    features.insert("has_version".to_string(), if version_regex.is_match(path_str) { "1" } else { "0" }.to_string());
-
-    // Has UUID pattern
-    let uuid_regex = Regex::new(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}").unwrap();
-    features.insert("has_uuid".to_string(), if uuid_regex.is_match(path_str) { "1" } else { "0" }.to_string());
-
-    // Has hash pattern (8+ hex chars)
-    let hash_regex = Regex::new(r"[0-9a-f]{8,}").unwrap();
-    features.insert("has_hash".to_string(), if hash_regex.is_match(path_str) { "1" } else { "0" }.to_string());
-
-    // Number of dots in filename
-    let dot_count = filename.matches('.').count();
-    features.insert("filename_dots".to_string(), dot_count.to_string());
-
-    // Shannon entropy of filename (complexity measure)
-    let entropy = calculate_shannon_entropy(&filename);
-    features.insert("filename_entropy".to_string(), format!("{:.4}", entropy));
-
-    // Is readme
-    let is_readme = if filename.to_lowercase().contains("readme") { "1" } else { "0" };
-    features.insert("is_readme".to_string(), is_readme.to_string());
-
-    // Is main file
-    let is_main = if filename.contains("main") || filename.contains("index") { "1" } else { "0" };
-    features.insert("is_main".to_string(), is_main.to_string());
-}
-
-fn compute_temporal_features(
-    features: &mut HashMap<String, String>,
-    impression: &ImpressionEvent,
-    sessions: &HashMap<String, SessionContext>,
-) {
-    let now = impression.timestamp;
-
-    // Time since modification
-    if let Some(mtime) = impression.mtime {
-        let seconds_since_mod = now - mtime;
-        features.insert("seconds_since_mod".to_string(), seconds_since_mod.to_string());
-
-        // Buckets
-        let hours = seconds_since_mod / 3600;
-        features.insert("modified_today".to_string(), if hours < 24 { "1" } else { "0" }.to_string());
-        features.insert("modified_this_week".to_string(), if hours < 168 { "1" } else { "0" }.to_string());
-        features.insert("modified_this_month".to_string(), if hours < 720 { "1" } else { "0" }.to_string());
-    } else {
-        features.insert("seconds_since_mod".to_string(), "-1".to_string());
-        features.insert("modified_today".to_string(), "0".to_string());
-        features.insert("modified_this_week".to_string(), "0".to_string());
-        features.insert("modified_this_month".to_string(), "0".to_string());
-    }
-
-    // Time since access
-    if let Some(atime) = impression.atime {
-        let seconds_since_access = now - atime;
-        features.insert("seconds_since_access".to_string(), seconds_since_access.to_string());
-
-        let hours = seconds_since_access / 3600;
-        features.insert("accessed_today".to_string(), if hours < 24 { "1" } else { "0" }.to_string());
-    } else {
-        features.insert("seconds_since_access".to_string(), "-1".to_string());
-        features.insert("accessed_today".to_string(), "0".to_string());
-    }
-
-    // Session time
-    if let Some(session_ctx) = sessions.get(&impression.session_id) {
-        let session_duration = now - session_ctx.created_at;
-        features.insert("session_duration_seconds".to_string(), session_duration.to_string());
-    } else {
-        features.insert("session_duration_seconds".to_string(), "0".to_string());
-    }
-}
-
-fn compute_query_features(features: &mut HashMap<String, String>, impression: &ImpressionEvent) {
-    let query = &impression.query;
-    let filename = Path::new(&impression.file_path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
-    let path = &impression.file_path;
-
-    // Query length
-    features.insert("query_len".to_string(), query.len().to_string());
-
-    // Is empty query
-    features.insert("query_empty".to_string(), if query.is_empty() { "1" } else { "0" }.to_string());
-
-    // Exact match
-    features.insert("query_exact_match".to_string(), if filename == query { "1" } else { "0" }.to_string());
-
-    // Starts with query
-    features.insert("filename_starts_with_query".to_string(),
-        if !query.is_empty() && filename.to_lowercase().starts_with(&query.to_lowercase()) { "1" } else { "0" }.to_string());
-
-    // Contains query
-    features.insert("filename_contains_query".to_string(),
-        if !query.is_empty() && filename.to_lowercase().contains(&query.to_lowercase()) { "1" } else { "0" }.to_string());
-
-    // Path contains query
-    features.insert("path_contains_query".to_string(),
-        if !query.is_empty() && path.to_lowercase().contains(&query.to_lowercase()) { "1" } else { "0" }.to_string());
-
-    // Query matches extension
-    features.insert("query_matches_extension".to_string(),
-        if query == Path::new(&impression.file_path).extension().and_then(|e| e.to_str()).unwrap_or("") { "1" } else { "0" }.to_string());
-
-    // Number of query tokens
-    let query_tokens: Vec<&str> = query.split_whitespace().collect();
-    features.insert("query_token_count".to_string(), query_tokens.len().to_string());
-
-    // Filename word match count
-    let filename_lower = filename.to_lowercase();
-    let matching_tokens = query_tokens.iter().filter(|&&token| filename_lower.contains(&token.to_lowercase())).count();
-    features.insert("filename_matching_tokens".to_string(), matching_tokens.to_string());
-}
-
-fn compute_historical_features(
-    features: &mut HashMap<String, String>,
-    impression: &ImpressionEvent,
-    conn: &Connection,
+fn write_features_to_json(
+    feature_rows: &[HashMap<String, String>],
+    output_path: &Path,
 ) -> Result<()> {
-    // Count how many times this file was clicked in previous sessions
-    let mut stmt = conn.prepare(
-        "SELECT COUNT(*) FROM events WHERE full_path = ?1 AND action = 'click' AND session_id != ?2",
-    )?;
-    let prev_clicks: i64 = stmt.query_row([&impression.full_path, &impression.session_id], |row| row.get(0))?;
-    features.insert("prev_session_clicks".to_string(), prev_clicks.to_string());
-
-    // Count scrolls
-    let mut stmt = conn.prepare(
-        "SELECT COUNT(*) FROM events WHERE full_path = ?1 AND action = 'scroll' AND session_id != ?2",
-    )?;
-    let prev_scrolls: i64 = stmt.query_row([&impression.full_path, &impression.session_id], |row| row.get(0))?;
-    features.insert("prev_session_scrolls".to_string(), prev_scrolls.to_string());
-
-    // Total engagement (clicks + scrolls)
-    features.insert("prev_session_engagement".to_string(), (prev_clicks + prev_scrolls).to_string());
-
-    // Count clicks for same query
-    let mut stmt = conn.prepare(
-        "SELECT COUNT(*) FROM events WHERE full_path = ?1 AND query = ?2 AND action = 'click' AND session_id != ?3",
-    )?;
-    let query_clicks: i64 = stmt.query_row([&impression.full_path, &impression.query, &impression.session_id], |row| row.get(0))?;
-    features.insert("prev_query_clicks".to_string(), query_clicks.to_string());
-
-    // Has been clicked ever (global)
-    features.insert("ever_clicked".to_string(), if prev_clicks > 0 { "1" } else { "0" }.to_string());
-
-    // Clicks in current session (before this impression)
-    let mut stmt = conn.prepare(
-        "SELECT COUNT(*) FROM events WHERE full_path = ?1 AND action = 'click' AND session_id = ?2 AND timestamp < ?3",
-    )?;
-    let current_session_clicks: i64 = stmt.query_row([&impression.full_path, &impression.session_id, &impression.timestamp.to_string()], |row| row.get(0))?;
-    features.insert("current_session_clicks".to_string(), current_session_clicks.to_string());
-
+    let json_output = serde_json::to_string_pretty(feature_rows)
+        .context("Failed to serialize features to JSON")?;
+    fs::write(output_path, json_output).context("Failed to write JSON file")?;
     Ok(())
 }
 
-fn calculate_shannon_entropy(s: &str) -> f64 {
-    if s.is_empty() {
-        return 0.0;
-    }
-
-    let mut freq: HashMap<char, usize> = HashMap::new();
-    for c in s.chars() {
-        *freq.entry(c).or_insert(0) += 1;
-    }
-
-    let len = s.len() as f64;
-    freq.values()
-        .map(|&count| {
-            let p = count as f64 / len;
-            -p * p.log2()
-        })
-        .sum()
-}
+// CSV writing
 
 fn write_csv_header(wtr: &mut Writer<std::fs::File>) -> Result<()> {
-    wtr.write_record(&[
+    wtr.write_record([
         "label",
-        "session_id",
-        "subsession_id",
         "query",
         "file_path",
-        "full_path",
-        "rank",
-        "extension",
-        "filename",
-        "path_depth",
-        "filename_len",
-        "path_len",
-        "is_hidden",
-        "file_size",
-        "in_src",
-        "in_test",
-        "in_lib",
-        "in_bin",
-        "in_config",
-        "has_version",
-        "has_uuid",
-        "has_hash",
-        "filename_dots",
-        "filename_entropy",
-        "is_readme",
-        "is_main",
-        "seconds_since_mod",
-        "modified_today",
-        "modified_this_week",
-        "modified_this_month",
-        "seconds_since_access",
-        "accessed_today",
-        "session_duration_seconds",
-        "query_len",
-        "query_empty",
-        "query_exact_match",
         "filename_starts_with_query",
-        "filename_contains_query",
-        "path_contains_query",
-        "query_matches_extension",
-        "query_token_count",
-        "filename_matching_tokens",
-        "prev_session_clicks",
-        "prev_session_scrolls",
-        "prev_session_engagement",
-        "prev_query_clicks",
-        "ever_clicked",
-        "current_session_clicks",
-        "timezone",
-        "subnet",
+        "clicks_last_30_days",
+        "modified_today",
     ])?;
     Ok(())
 }
 
-fn write_csv_row(wtr: &mut Writer<std::fs::File>, features: &HashMap<String, String>) -> Result<()> {
+fn write_csv_row(
+    wtr: &mut Writer<std::fs::File>,
+    features: &HashMap<String, String>,
+) -> Result<()> {
     let columns = [
         "label",
-        "session_id",
-        "subsession_id",
         "query",
         "file_path",
-        "full_path",
-        "rank",
-        "extension",
-        "filename",
-        "path_depth",
-        "filename_len",
-        "path_len",
-        "is_hidden",
-        "file_size",
-        "in_src",
-        "in_test",
-        "in_lib",
-        "in_bin",
-        "in_config",
-        "has_version",
-        "has_uuid",
-        "has_hash",
-        "filename_dots",
-        "filename_entropy",
-        "is_readme",
-        "is_main",
-        "seconds_since_mod",
-        "modified_today",
-        "modified_this_week",
-        "modified_this_month",
-        "seconds_since_access",
-        "accessed_today",
-        "session_duration_seconds",
-        "query_len",
-        "query_empty",
-        "query_exact_match",
         "filename_starts_with_query",
-        "filename_contains_query",
-        "path_contains_query",
-        "query_matches_extension",
-        "query_token_count",
-        "filename_matching_tokens",
-        "prev_session_clicks",
-        "prev_session_scrolls",
-        "prev_session_engagement",
-        "prev_query_clicks",
-        "ever_clicked",
-        "current_session_clicks",
-        "timezone",
-        "subnet",
+        "clicks_last_30_days",
+        "modified_today",
     ];
 
     let row: Vec<String> = columns
@@ -564,4 +369,139 @@ fn write_csv_row(wtr: &mut Writer<std::fs::File>, features: &HashMap<String, Str
 
     wtr.write_record(&row)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn test_temporal_correctness() {
+        // Test that impressions don't see future clicks in their click counts
+        let now = 1000i64;
+
+        let events = vec![
+            Event {
+                id: 1,
+                session_id: "s1".to_string(),
+                subsession_id: 1,
+                query: "test".to_string(),
+                file_path: "test.rs".to_string(),
+                full_path: "/test.rs".to_string(),
+                timestamp: now,
+                mtime: Some(now - 100),
+                atime: None,
+                file_size: None,
+                action: "impression".to_string(),
+            },
+            Event {
+                id: 2,
+                session_id: "s1".to_string(),
+                subsession_id: 1,
+                query: "test".to_string(),
+                file_path: "test.rs".to_string(),
+                full_path: "/test.rs".to_string(),
+                timestamp: now + 200, // Future click
+                mtime: None,
+                atime: None,
+                file_size: None,
+                action: "click".to_string(),
+            },
+            Event {
+                id: 3,
+                session_id: "s1".to_string(),
+                subsession_id: 2,
+                query: "test".to_string(),
+                file_path: "test.rs".to_string(),
+                full_path: "/test.rs".to_string(),
+                timestamp: now + 400, // Another impression after the click
+                mtime: Some(now - 100),
+                atime: None,
+                file_size: None,
+                action: "impression".to_string(),
+            },
+        ];
+
+        let mut sessions = HashMap::new();
+        sessions.insert(
+            "s1".to_string(),
+            Session {
+                session_id: "s1".to_string(),
+                cwd: "/".to_string(),
+                timezone: "UTC".to_string(),
+                subnet: "192.168".to_string(),
+                created_at: now - 1000,
+            },
+        );
+
+        let mut acc = Accumulator::new();
+
+        for event in &events {
+            match event.action.as_str() {
+                "impression" => {
+                    let features = compute_features_from_accumulator(event, &acc, &sessions)
+                        .expect("Failed to compute features");
+                    acc.add_impression(event, features);
+                }
+                "click" => {
+                    acc.record_click(event);
+                    acc.mark_impressions_as_engaged(event);
+                }
+                _ => {}
+            }
+        }
+
+        let output_rows = acc.finalize();
+
+        // First impression at T=1000 should NOT see click at T=1200
+        let first_row = &output_rows[0];
+        assert_eq!(
+            first_row.get("clicks_last_30_days"),
+            Some(&"0".to_string()),
+            "First impression should not see future click"
+        );
+        // But it SHOULD get label=1 because click happened in same subsession
+        assert_eq!(
+            first_row.get("label"),
+            Some(&"1".to_string()),
+            "First impression should have label=1 from future click in same subsession"
+        );
+
+        // Second impression at T=1400 SHOULD see click at T=1200
+        let second_row = &output_rows[1];
+        assert_eq!(
+            second_row.get("clicks_last_30_days"),
+            Some(&"1".to_string()),
+            "Second impression should see past click"
+        );
+        // But label should be 0 (different subsession)
+        assert_eq!(
+            second_row.get("label"),
+            Some(&"0".to_string()),
+            "Second impression in different subsession should have label=0"
+        );
+    }
+
+    #[test]
+    fn test_basic_feature_generation() {
+        use std::path::PathBuf;
+
+        let db_path = PathBuf::from("test/events.db");
+        if !db_path.exists() {
+            eprintln!("Skipping test - test/events.db not found");
+            return;
+        }
+
+        let output_path = PathBuf::from("test/features_test.csv");
+        generate_features(&db_path, &output_path, OutputFormat::Csv)
+            .expect("Failed to generate features");
+
+        // Verify CSV was created
+        let csv_content = std::fs::read_to_string(&output_path).expect("Failed to read CSV");
+        let lines: Vec<&str> = csv_content.lines().collect();
+
+        assert!(!lines.is_empty(), "CSV should not be empty");
+        assert_eq!(lines[0], "label,query,file_path,filename_starts_with_query,clicks_last_30_days,modified_today");
+    }
 }

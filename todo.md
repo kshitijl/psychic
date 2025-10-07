@@ -1,0 +1,4 @@
+- automated tests that can be run using cargo test, in test modules in each file.
+- keyboard shortcut to just clear current search, maybe just Ctrl-a Ctrl-k
+- when we scroll below current page of results it should scroll properly with us, maybe as it gets to bottom 5 it should start scrolling with us
+- the modification time shown in results list isn't properly right justified. so when filenames are different lengths then they don't all appear nicely in a column.

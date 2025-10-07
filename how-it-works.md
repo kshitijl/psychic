@@ -1,4 +1,4 @@
-# How It Works
+'''# How It Works
 
 ## Overview
 
@@ -8,12 +8,13 @@
 
 ### Core Components
 
-The application is split into four modules:
+The application is split into five modules:
 
 1. **`db.rs`** - Database layer for event logging
 2. **`walker.rs`** - Background file discovery
 3. **`context.rs`** - System context gathering
-4. **`main.rs`** - TUI event loop and rendering
+4. **`features.rs`** - Feature generation for machine learning
+5. **`main.rs`** - TUI event loop and rendering
 
 ### Module: `db.rs`
 
@@ -93,9 +94,21 @@ Gathers system/environment context at startup in a background thread. Captures:
 - Running processes show what else user is working on
 - All useful features for analyzing search patterns and file access
 
+### Module: `features.rs`
+
+This module is responsible for reading the `events` and `sessions` tables from the database, computing a wide range of features for each impression event, and exporting the results to a CSV file suitable for training a machine learning model (e.g., with LightGBM in Python).
+
+**Key Features Generated:**
+- **Static File Features:** `path_depth`, `filename_len`, `extension`, `is_hidden`, `file_size`, `in_src`, `has_uuid`, `filename_entropy`, `path_entropy`, `digit_ratio`, `special_char_ratio`, `uppercase_ratio`, `num_underscores_in_filename`, `num_hyphens_in_filename`, etc.
+- **Temporal Features:** `seconds_since_mod`, `modified_today`, `seconds_since_access`, `session_duration_seconds`.
+- **Query-based Features:** `query_len`, `query_exact_match`, `filename_contains_query`, `path_contains_query`.
+- **Historical Features:** `prev_session_clicks`, `prev_session_scrolls`, `ever_clicked`, `current_session_clicks`.
+- **Ranking Features:** `rank`, `rank_most_recently_modified`, `rank_most_recently_clicked` of the file in the search results for a given query.
+- **Label:** `1` if the file was clicked or scrolled in the same subsession, `0` otherwise.
+
 ### Module: `main.rs`
 
-Main event loop using `ratatui` + `crossterm` for TUI rendering.
+Main event loop using `ratatui` + `crossterm` for TUI rendering. Also handles command-line argument parsing to switch between TUI mode and feature generation mode.
 
 **Layout (fzf-style):**
 ```
@@ -114,6 +127,34 @@ Main event loop using `ratatui` + `crossterm` for TUI rendering.
 - Input box at bottom (like fzf, not at top)
 - Split top area 50/50 for results and preview
 - Preview uses `bat` for syntax highlighting
+
+## Feature Generation Mode
+
+To support machine learning experiments, `sg` can be run in a non-interactive mode to generate a feature dataset from the existing event logs.
+
+**Usage:**
+```bash
+# Generate features and save to features.csv (default)
+sg --generate-features
+
+# Specify a custom output path
+sg --generate-features --output my_features.csv
+```
+
+This is implemented using the `clap` crate for command-line argument parsing. When the `--generate-features` flag is provided, the application calls the `features::generate_features` function and exits, skipping the TUI entirely.
+
+## Refactoring for Testability and Performance
+
+The `features.rs` module was initially written to query the database for each feature, for each impression. This resulted in a large number of database queries, making feature generation slow and difficult to test.
+
+To address this, the module is being refactored to:
+
+1.  **Fetch all data upfront:** All `events` and `sessions` are read from the database into in-memory data structures at the beginning of the feature generation process.
+2.  **Compute features from in-memory data:** All feature computation functions now operate on these in-memory data structures, eliminating the need for repeated database queries.
+
+This change has several benefits:
+- **Performance:** Feature generation is significantly faster as it avoids thousands of small database queries.
+- **Testability:** Unit tests can be written for the feature computation logic without needing to interact with a database. This makes the tests faster, more reliable, and easier to write.
 
 ## Key Technical Decisions
 
@@ -265,6 +306,7 @@ self.files.iter().filter(|path| {
 - `anyhow` - Error handling
 - `jiff` - Timestamps
 - `ansi-to-tui` - Convert ANSI escape codes to ratatui Text
+- `clap` - Command-line argument parsing
 - External: `bat` - Syntax highlighting (optional, has fallback)
 
 ## Gotchas and Lessons Learned
@@ -470,3 +512,4 @@ Potential enhancements (not implemented):
 - Better binary file handling (currently tries to preview everything)
 - Ranking based on previous clicks (use the analytics data!)
 - Cache `bat` output to avoid re-rendering on every frame
+'''
