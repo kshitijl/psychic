@@ -45,22 +45,22 @@ def prepare_features(df):
     # Separate label and query_group from features
     y = df["label"].astype(int)
     query_groups = df["query_group"]
-    X = df.drop(columns=["label", "query_group", "subsession_id", "session_id"])
 
-    # Track categorical features (keep as category dtype for LightGBM)
-    categorical_features = []
+    # Drop categorical features (query, file_path) since Rust lightgbm3 doesn't support them
+    # Also drop metadata columns
+    X = df.drop(columns=["label", "query_group", "subsession_id", "session_id", "query", "file_path"])
 
+    # Ensure numeric features are correct type
     for col in X.columns:
-        if X[col].dtype == "object":
-            # Convert to category dtype - LightGBM handles this natively
-            X[col] = X[col].astype("category")
-            categorical_features.append(col)
-        elif col in ["filename_starts_with_query", "modified_today"]:
-            # These are binary 0/1 but might be read as int
+        if col in ["filename_starts_with_query", "modified_today"]:
+            # These are binary 0/1
             X[col] = X[col].astype(int)
+        else:
+            # Everything else should be numeric
+            X[col] = X[col].astype(float)
 
-    print(f"\nCategorical features: {categorical_features}")
-    return X, y, query_groups, categorical_features
+    print(f"\nNumeric features: {list(X.columns)}")
+    return X, y, query_groups, []  # No categorical features
 
 
 def train_model(X_train, y_train, groups_train, X_val, y_val, groups_val, categorical_features):

@@ -30,6 +30,7 @@ pub struct EventData<'a> {
 
 pub struct Database {
     conn: Connection,
+    db_path: PathBuf,
 }
 
 impl Database {
@@ -77,7 +78,7 @@ impl Database {
             [],
         )?;
 
-        Ok(Database { conn })
+        Ok(Database { conn, db_path })
     }
 
     pub fn get_db_path() -> Result<PathBuf> {
@@ -88,6 +89,10 @@ impl Database {
             .join("share")
             .join("sg")
             .join("events.db"))
+    }
+
+    pub fn db_path(&self) -> PathBuf {
+        self.db_path.clone()
     }
 
     pub fn log_session(&self, session_id: &str, context: &ContextData) -> Result<()> {

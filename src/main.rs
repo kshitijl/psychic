@@ -1,6 +1,7 @@
 mod context;
 mod db;
 mod features;
+mod ranker;
 mod walker;
 
 use anyhow::Result;
@@ -73,6 +74,7 @@ struct App {
     current_subsession: Option<Subsession>,
     next_subsession_id: u64,
     db: Database,
+    ranker: Option<ranker::Ranker>,
 }
 
 impl App {
@@ -86,6 +88,29 @@ impl App {
         std::process::id().hash(&mut hasher);
         let session_id = hasher.finish().to_string();
 
+        let db = Database::new()?;
+        let db_path = db.db_path();
+
+        // Try to load the ranker model if it exists
+        let ranker = {
+            let model_path = PathBuf::from("output.txt");
+            if model_path.exists() {
+                match ranker::Ranker::new(&model_path, db_path) {
+                    Ok(r) => {
+                        eprintln!("Loaded ranking model from output.txt");
+                        Some(r)
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: Failed to load ranking model: {}", e);
+                        None
+                    }
+                }
+            } else {
+                eprintln!("No ranking model found at output.txt - using simple filtering");
+                None
+            }
+        };
+
         Ok(App {
             query: String::new(),
             files: Vec::new(),
@@ -98,14 +123,16 @@ impl App {
             session_id,
             current_subsession: None,
             next_subsession_id: 1,
-            db: Database::new()?,
+            db,
+            ranker,
         })
     }
 
     fn update_filtered_files(&mut self) {
         let query_lower = self.query.to_lowercase();
 
-        self.filtered_files = self
+        // First, filter files that match the query
+        let matching_files: Vec<(String, PathBuf, Option<i64>)> = self
             .files
             .iter()
             .filter_map(|path| {
@@ -116,12 +143,26 @@ impl App {
                     .to_string();
 
                 if query_lower.is_empty() || relative.to_lowercase().contains(&query_lower) {
-                    Some(relative)
+                    let (mtime, _, _) = get_file_metadata(path);
+                    Some((relative, path.clone(), mtime))
                 } else {
                     None
                 }
             })
             .collect();
+
+        // Then, rank them if we have a model, otherwise just use the filtered list
+        self.filtered_files = if let Some(ranker) = &self.ranker {
+            match ranker.rank_files(&self.query, matching_files.clone(), &self.session_id) {
+                Ok(ranked) => ranked,
+                Err(e) => {
+                    eprintln!("Warning: Ranking failed: {}, falling back to simple filtering", e);
+                    matching_files.into_iter().map(|(rel, _, _)| rel).collect()
+                }
+            }
+        } else {
+            matching_files.into_iter().map(|(rel, _, _)| rel).collect()
+        };
 
         // Reset selection if out of bounds
         if self.selected_index >= self.filtered_files.len() && !self.filtered_files.is_empty() {

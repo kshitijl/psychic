@@ -354,7 +354,6 @@ mod tests {
 
         let events = vec![
             Event {
-                id: 1,
                 session_id: "s1".to_string(),
                 subsession_id: 1,
                 query: "test".to_string(),
@@ -362,12 +361,9 @@ mod tests {
                 full_path: "/test.rs".to_string(),
                 timestamp: now,
                 mtime: Some(now - 100),
-                atime: None,
-                file_size: None,
                 action: "impression".to_string(),
             },
             Event {
-                id: 2,
                 session_id: "s1".to_string(),
                 subsession_id: 1,
                 query: "test".to_string(),
@@ -375,12 +371,9 @@ mod tests {
                 full_path: "/test.rs".to_string(),
                 timestamp: now + 200, // Future click
                 mtime: None,
-                atime: None,
-                file_size: None,
                 action: "click".to_string(),
             },
             Event {
-                id: 3,
                 session_id: "s1".to_string(),
                 subsession_id: 2,
                 query: "test".to_string(),
@@ -388,8 +381,6 @@ mod tests {
                 full_path: "/test.rs".to_string(),
                 timestamp: now + 400, // Another impression after the click
                 mtime: Some(now - 100),
-                atime: None,
-                file_size: None,
                 action: "impression".to_string(),
             },
         ];
@@ -399,10 +390,7 @@ mod tests {
             "s1".to_string(),
             Session {
                 session_id: "s1".to_string(),
-                cwd: "/".to_string(),
                 timezone: "UTC".to_string(),
-                subnet: "192.168".to_string(),
-                created_at: now - 1000,
             },
         );
 
