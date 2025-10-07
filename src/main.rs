@@ -140,6 +140,7 @@ struct App {
     db: Database,
     ranker: ranker::Ranker,
     data_dir: PathBuf,
+    retraining: bool,
 }
 
 impl App {
@@ -208,6 +209,7 @@ impl App {
             db,
             ranker,
             data_dir: data_dir.clone(),
+            retraining: false,
         })
     }
 
@@ -224,6 +226,7 @@ impl App {
         log::info!("Reloading click data and reranking files");
         // Reload clicks from database
         self.ranker.clicks_by_file = ranker::Ranker::load_clicks(&self.ranker.db_path)?;
+        self.ranker.clicks_loaded_at = jiff::Timestamp::now();
         // Rerank using existing update_filtered_files logic
         self.update_filtered_files();
         Ok(())
@@ -520,16 +523,21 @@ fn main() -> Result<()> {
     // Get data directory for main app
     let data_dir = cli.data_dir.unwrap_or_else(|| get_default_data_dir().expect("Failed to get default data directory"));
 
+    // Create channel for retraining status
+    let (retrain_tx, retrain_rx) = mpsc::channel();
+
     // Start background retraining in a new thread
     let data_dir_clone = data_dir.clone();
     let training_log_path = data_dir.join("training.log");
     std::thread::spawn(move || {
+        let _ = retrain_tx.send(true); // Signal retraining started
         log::info!("Starting background model retraining");
         if let Err(e) = ranker::retrain_model(&data_dir_clone, Some(training_log_path)) {
             log::error!("Background retraining failed: {}", e);
         } else {
             log::info!("Background retraining completed successfully");
         }
+        let _ = retrain_tx.send(false); // Signal retraining completed
     });
 
     // Initialize app
@@ -563,7 +571,7 @@ fn main() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     // Run the app
-    let result = run_app(&mut terminal, &mut app, rx);
+    let result = run_app(&mut terminal, &mut app, rx, retrain_rx);
 
     // Cleanup
     disable_raw_mode()?;
@@ -577,6 +585,7 @@ fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
     rx: Receiver<PathBuf>,
+    retrain_rx: Receiver<bool>,
 ) -> Result<()> {
     loop {
         // Receive new files from walker (non-blocking)
@@ -787,7 +796,14 @@ fn run_app(
 
             debug_lines.push(String::from("")); // Separator
 
+            // Add retraining status
+            if app.retraining {
+                debug_lines.push(String::from("Retraining model..."));
+                debug_lines.push(String::from("")); // Separator
+            }
+
             // Add model stats
+            let formatter = timeago::Formatter::new();
             if let Some(ref stats) = app.ranker.stats {
                 debug_lines.push(String::from("Model Stats:"));
 
@@ -795,16 +811,7 @@ fn run_app(
                 if let Ok(trained_at) = stats.trained_at.parse::<jiff::Timestamp>() {
                     let now = jiff::Timestamp::now();
                     let duration = now.duration_since(trained_at);
-                    let seconds = duration.as_secs();
-                    let time_ago = if seconds < 60 {
-                        format!("{}s ago", seconds)
-                    } else if seconds < 3600 {
-                        format!("{}m ago", seconds / 60)
-                    } else if seconds < 86400 {
-                        format!("{}h ago", seconds / 3600)
-                    } else {
-                        format!("{}d ago", seconds / 86400)
-                    };
+                    let time_ago = formatter.convert(std::time::Duration::from_secs(duration.as_secs() as u64));
                     debug_lines.push(format!("  Trained: {}", time_ago));
                 } else {
                     debug_lines.push(format!("  Trained: {}", stats.trained_at));
@@ -823,6 +830,19 @@ fn run_app(
             } else {
                 debug_lines.push(String::from("Model Stats: N/A"));
             }
+
+            debug_lines.push(String::from("")); // Separator
+
+            // Add model load time
+            let now = jiff::Timestamp::now();
+            let load_duration = now.duration_since(app.ranker.loaded_at);
+            let load_time_ago = formatter.convert(std::time::Duration::from_secs(load_duration.as_secs() as u64));
+            debug_lines.push(format!("Model load: {}", load_time_ago));
+
+            // Add clicks reload time
+            let clicks_duration = now.duration_since(app.ranker.clicks_loaded_at);
+            let clicks_time_ago = formatter.convert(std::time::Duration::from_secs(clicks_duration.as_secs() as u64));
+            debug_lines.push(format!("Clicks reload: {}", clicks_time_ago));
 
             debug_lines.push(String::from("")); // Separator
 
@@ -851,6 +871,11 @@ fn run_app(
                 .block(Block::default().borders(Borders::ALL).title("Search"));
             f.render_widget(input, main_chunks[1]);
         })?;
+
+        // Check for retraining status updates
+        if let Ok(retraining_status) = retrain_rx.try_recv() {
+            app.retraining = retraining_status;
+        }
 
         // Handle events with timeout
         if event::poll(Duration::from_millis(100))? {

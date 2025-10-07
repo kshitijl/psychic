@@ -42,6 +42,8 @@ pub struct Ranker {
     pub clicks_by_file: HashMap<String, Vec<ClickEvent>>,
     pub db_path: PathBuf,
     pub stats: Option<ModelStats>,
+    pub loaded_at: Timestamp,
+    pub clicks_loaded_at: Timestamp,
 }
 
 impl Ranker {
@@ -49,6 +51,7 @@ impl Ranker {
         let model = Booster::from_file(model_path.to_str().unwrap())
             .context("Failed to load LightGBM model")?;
 
+        let now = Timestamp::now();
         let clicks_by_file = Self::load_clicks(&db_path)?;
 
         // Load model stats from same directory as model
@@ -62,6 +65,8 @@ impl Ranker {
             clicks_by_file,
             db_path,
             stats,
+            loaded_at: now,
+            clicks_loaded_at: now,
         })
     }
 

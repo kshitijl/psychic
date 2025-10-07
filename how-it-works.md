@@ -495,6 +495,12 @@ formatter.convert(duration)
 
 Produces output like "just now", "5 minutes ago", "2 days ago", "3 weeks ago", etc. Much more readable than unix timestamps or ISO dates.
 
+Used in multiple places:
+- Historical files list (showing when files were last accessed)
+- Debug pane: Model trained timestamp
+- Debug pane: Model load time ("Model load: 2 minutes ago")
+- Debug pane: Clicks reload time ("Clicks reload: 5 seconds ago")
+
 **Preview scrolling:**
 - Added `preview_scroll: u16` to `App` state
 - `Paragraph::scroll((app.preview_scroll, 0))` controls vertical offset
