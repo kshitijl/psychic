@@ -7,18 +7,18 @@ mod walker;
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
+    event::{self, Event, KeyCode, KeyEventKind},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use db::{Database, EventData, FileMetadata};
 use ratatui::{
+    Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::Text,
     widgets::{Block, Borders, List, ListItem, Paragraph},
-    Terminal,
 };
 use std::{
     collections::HashSet,
@@ -65,7 +65,6 @@ struct Subsession {
 struct FileEntry {
     full_path: PathBuf,
     display_name: String,
-    from_history: bool,
 }
 
 impl FileEntry {
@@ -79,7 +78,6 @@ impl FileEntry {
         FileEntry {
             full_path,
             display_name,
-            from_history: false,
         }
     }
 
@@ -103,7 +101,6 @@ impl FileEntry {
         FileEntry {
             full_path,
             display_name,
-            from_history: true,
         }
     }
 }
@@ -149,7 +146,8 @@ impl App {
         // Try to load the ranker model if it exists (stored next to db file)
         let ranker_start = Instant::now();
         let ranker = {
-            let model_path = db_path.parent()
+            let model_path = db_path
+                .parent()
                 .map(|p| p.join("model.txt"))
                 .unwrap_or_else(|| PathBuf::from("model.txt"));
 
@@ -165,7 +163,10 @@ impl App {
                     }
                 }
             } else {
-                log::info!("No ranking model found at {:?} - using simple filtering", model_path);
+                log::info!(
+                    "No ranking model found at {:?} - using simple filtering",
+                    model_path
+                );
                 None
             }
         };
@@ -173,19 +174,19 @@ impl App {
 
         // Load previously interacted files
         let historical_start = Instant::now();
-        let historical_files = db.get_previously_interacted_files()
+        let historical_files = db
+            .get_previously_interacted_files()
             .unwrap_or_default()
             .into_iter()
             .filter_map(|p| {
                 let path = PathBuf::from(&p);
-                if path.exists() {
-                    Some(path)
-                } else {
-                    None
-                }
+                if path.exists() { Some(path) } else { None }
             })
             .collect();
-        log::debug!("Loading historical files took {:?}", historical_start.elapsed());
+        log::debug!(
+            "Loading historical files took {:?}",
+            historical_start.elapsed()
+        );
 
         log::debug!("App::new() total time: {:?}", start_time.elapsed());
 
@@ -229,20 +230,31 @@ impl App {
         }
 
         // Also include historical files that match the query (and aren't already in results)
-        let existing_paths: HashSet<PathBuf> = file_entries.iter().map(|e| e.full_path.clone()).collect();
+        let existing_paths: HashSet<PathBuf> =
+            file_entries.iter().map(|e| e.full_path.clone()).collect();
         for path in &self.historical_files {
             if !existing_paths.contains(path) {
                 let entry = FileEntry::from_history(path.clone(), &self.root);
 
-                if query_lower.is_empty() || entry.display_name.to_lowercase().contains(&query_lower) {
+                if query_lower.is_empty()
+                    || entry.display_name.to_lowercase().contains(&query_lower)
+                {
                     let (mtime, _, _) = get_file_metadata(&entry.full_path);
-                    matching_files.push((entry.display_name.clone(), entry.full_path.clone(), mtime));
+                    matching_files.push((
+                        entry.display_name.clone(),
+                        entry.full_path.clone(),
+                        mtime,
+                    ));
                     file_entries.push(entry);
                 }
             }
         }
 
-        log::debug!("Filtering {} files (with metadata) took {:?}", file_entries.len(), filter_start.elapsed());
+        log::debug!(
+            "Filtering {} files (with metadata) took {:?}",
+            file_entries.len(),
+            filter_start.elapsed()
+        );
 
         // Then, rank them if we have a model, otherwise just use the filtered list
         let rank_start = Instant::now();
@@ -250,11 +262,14 @@ impl App {
             match ranker.rank_files(&self.query, &matching_files, &self.session_id) {
                 Ok(scored) => {
                     // Reorder file_entries based on ranking scores
-                    let score_order: Vec<String> = scored.iter().map(|fs| fs.path.clone()).collect();
+                    let score_order: Vec<String> =
+                        scored.iter().map(|fs| fs.path.clone()).collect();
                     let mut reordered_entries = Vec::new();
 
                     for score_path in &score_order {
-                        if let Some(entry) = file_entries.iter().find(|e| &e.display_name == score_path) {
+                        if let Some(entry) =
+                            file_entries.iter().find(|e| &e.display_name == score_path)
+                        {
                             reordered_entries.push(entry.clone());
                         }
                     }
@@ -274,7 +289,10 @@ impl App {
             self.filtered_files = file_entries;
         }
 
-        log::debug!("update_filtered_files() total time: {:?}", start_time.elapsed());
+        log::debug!(
+            "update_filtered_files() total time: {:?}",
+            start_time.elapsed()
+        );
 
         // Reset selection if out of bounds
         if self.selected_index >= self.filtered_files.len() && !self.filtered_files.is_empty() {
@@ -471,7 +489,11 @@ fn main() -> Result<()> {
     // Initialize app
     let mut app = App::new(root.clone())?;
 
-    log::info!("Started sg in directory {}, session {}", root.display(), app.session_id);
+    log::info!(
+        "Started sg in directory {}, session {}",
+        root.display(),
+        app.session_id
+    );
 
     // Gather context in background thread
     let session_id_clone = app.session_id.clone();
@@ -573,9 +595,21 @@ fn run_app(
 
                     // Right-justify time by padding filename to fill available space
                     let line = if entry.display_name.len() > file_width {
-                        format!("{}{:<width$}  {}", rank_prefix, &entry.display_name[..file_width], time_ago, width = file_width)
+                        format!(
+                            "{}{:<width$}  {}",
+                            rank_prefix,
+                            &entry.display_name[..file_width],
+                            time_ago,
+                            width = file_width
+                        )
                     } else {
-                        format!("{}{:<width$}  {}", rank_prefix, &entry.display_name, time_ago, width = file_width)
+                        format!(
+                            "{}{:<width$}  {}",
+                            rank_prefix,
+                            &entry.display_name,
+                            time_ago,
+                            width = file_width
+                        )
                     };
 
                     let style = if i == app.selected_index {
@@ -594,48 +628,85 @@ fn run_app(
             ));
             f.render_widget(list, top_chunks[0]);
 
-            // Preview on the right using bat (with caching)
+            // Preview on the right using bat (with smart caching)
+            let preview_height = top_chunks[1].height.saturating_sub(2);
             let preview_text = if !app.filtered_files.is_empty() {
                 let selected_entry = &app.filtered_files[app.selected_index];
                 let full_path_str = selected_entry.full_path.to_string_lossy().to_string();
 
-                // Check cache
-                let cached = app
-                    .preview_cache
-                    .as_ref()
-                    .filter(|(path, _)| path == &full_path_str)
-                    .map(|(_, text)| text.clone());
-
-                if let Some(text) = cached {
-                    text
+                // Check for a full, cached preview
+                if let Some(cached_text) = app.preview_cache.as_ref().and_then(|(path, text)| {
+                    if path == &full_path_str {
+                        Some(text.clone())
+                    } else {
+                        None
+                    }
+                }) {
+                    // FAST PATH: Full preview is cached, just use it.
+                    cached_text
                 } else {
-                    // Cache miss - fetch full file with bat
-                    let text = match std::process::Command::new("bat")
-                        .arg("--color=always")
-                        .arg("--style=numbers")
-                        .arg("--paging=never")
-                        .arg(&selected_entry.full_path)
-                        .output()
-                    {
-                        Ok(output) => {
-                            // Convert ANSI codes to ratatui Text
-                            match ansi_to_tui::IntoText::into_text(&output.stdout) {
+                    // SLOW PATH: No full preview in cache.
+                    // Decide whether to render a light preview or a full one.
+                    let (text_to_render, should_cache) = if app.preview_scroll == 0 {
+                        // Initial view (unscrolled): render a light preview of N lines.
+                        let line_range = format!(":{}", preview_height);
+                        let bat_output = std::process::Command::new("bat")
+                            .arg("--color=always")
+                            .arg("--style=numbers")
+                            .arg("--line-range")
+                            .arg(&line_range)
+                            .arg(&selected_entry.full_path)
+                            .output();
+
+                        let text = match bat_output {
+                            Ok(output) => match ansi_to_tui::IntoText::into_text(&output.stdout) {
                                 Ok(text) => text,
                                 Err(_) => Text::from("[Unable to parse preview]"),
+                            },
+                            Err(_) => {
+                                // Fallback for light preview
+                                match std::fs::read_to_string(&selected_entry.full_path) {
+                                    Ok(content) => Text::from(
+                                        content
+                                            .lines()
+                                            .take(preview_height as usize)
+                                            .collect::<Vec<_>>()
+                                            .join("\n"),
+                                    ),
+                                    Err(_) => Text::from("[Unable to preview file]"),
+                                }
                             }
-                        }
-                        Err(_) => {
-                            // Fallback to plain file read if bat is not available
-                            match std::fs::read_to_string(&selected_entry.full_path) {
-                                Ok(content) => Text::from(content),
-                                Err(_) => Text::from("[Unable to preview file]"),
+                        };
+                        (text, false) // Don't cache the light preview
+                    } else {
+                        // User is scrolling, and we need to generate the full preview.
+                        let bat_output = std::process::Command::new("bat")
+                            .arg("--color=always")
+                            .arg("--style=numbers")
+                            .arg("--paging=never")
+                            .arg(&selected_entry.full_path)
+                            .output();
+
+                        let text = match bat_output {
+                            Ok(output) => match ansi_to_tui::IntoText::into_text(&output.stdout) {
+                                Ok(text) => text,
+                                Err(_) => Text::from("[Unable to parse preview]"),
+                            },
+                            Err(_) => {
+                                // Fallback for full preview
+                                match std::fs::read_to_string(&selected_entry.full_path) {
+                                    Ok(content) => Text::from(content),
+                                    Err(_) => Text::from("[Unable to preview file]"),
+                                }
                             }
-                        }
+                        };
+                        (text, true) // Cache the full preview
                     };
 
-                    // Cache the result
-                    app.preview_cache = Some((full_path_str, text.clone()));
-                    text
+                    if should_cache {
+                        app.preview_cache = Some((full_path_str, text_to_render.clone()));
+                    }
+                    text_to_render
                 }
             } else {
                 Text::from("")
@@ -646,40 +717,56 @@ fn run_app(
                 .block(Block::default().borders(Borders::ALL).title("Preview"));
             f.render_widget(preview, top_chunks[1]);
 
-            // Features panel on the right
-            let features_text =
-                if !app.file_scores.is_empty() && app.selected_index < app.file_scores.len() {
-                    let file_score = &app.file_scores[app.selected_index];
-                    let mut lines = Vec::new();
+            // Debug panel on the right
+            let mut debug_lines = Vec::new();
 
-                    lines.push(format!("Score: {:.4}", file_score.score));
-                    lines.push(String::new());
-                    lines.push("Features:".to_string());
-                    lines.push(String::new());
+            if !app.file_scores.is_empty() && app.selected_index < app.file_scores.len() {
+                let file_score = &app.file_scores[app.selected_index];
+                debug_lines.push(format!("Score: {:.4}", file_score.score));
+                debug_lines.push(String::from(""));
+                debug_lines.push(String::from("Features:"));
+                debug_lines.push(String::from(""));
 
-                    // Display features in a nice format
-                    let feature_names = [
-                        ("filename_starts_with_query", "Query Match"),
-                        ("clicks_last_30_days", "Clicks (30d)"),
-                        ("modified_today", "Modified Today"),
-                    ];
+                let feature_names = [
+                    ("filename_starts_with_query", "Query Match"),
+                    ("clicks_last_30_days", "Clicks (30d)"),
+                    ("modified_today", "Modified Today"),
+                ];
 
-                    for (key, label) in &feature_names {
-                        if let Some(value) = file_score.features.get(*key) {
-                            lines.push(format!("{:17}: {}", label, value));
-                        }
+                for (key, label) in &feature_names {
+                    if let Some(value) = file_score.features.get(*key) {
+                        debug_lines.push(format!("{:17}: {}", label, value));
                     }
+                }
+            } else if app.ranker.is_some() {
+                debug_lines.push(String::from("No features"));
+                debug_lines.push(String::from("(ranking enabled)"));
+            } else {
+                debug_lines.push(String::from("No features"));
+                debug_lines.push(String::from("(ranking disabled)"));
+            }
 
-                    lines.join("\n")
-                } else if app.ranker.is_some() {
-                    "No features\n(ranking enabled)".to_string()
-                } else {
-                    "No features\n(ranking disabled)".to_string()
-                };
+            debug_lines.push(String::from("")); // Separator
 
-            let features = Paragraph::new(features_text)
-                .block(Block::default().borders(Borders::ALL).title("ML Features"));
-            f.render_widget(features, top_chunks[2]);
+            // Add preview cache status
+            if !app.filtered_files.is_empty() {
+                let selected_entry = &app.filtered_files[app.selected_index];
+                let full_path_str = selected_entry.full_path.to_string_lossy().to_string();
+                let is_cached = app
+                    .preview_cache
+                    .as_ref()
+                    .map_or(false, |(p, _)| p == &full_path_str);
+                let cache_status = if is_cached { "Cached" } else { "Live" };
+                debug_lines.push(format!("Preview: {}", cache_status));
+            } else {
+                debug_lines.push(String::from("Preview: N/A"));
+            }
+
+            let debug_text = debug_lines.join("\n");
+
+            let debug_pane = Paragraph::new(debug_text)
+                .block(Block::default().borders(Borders::ALL).title("Debug"));
+            f.render_widget(debug_pane, top_chunks[2]);
 
             // Search input at the bottom
             let input = Paragraph::new(app.query.as_str())
@@ -703,11 +790,13 @@ fn run_app(
                                 let _ = app.check_and_log_impressions(true);
 
                                 let selected_entry = &app.filtered_files[app.selected_index];
-                                let full_path_str = selected_entry.full_path.to_string_lossy().to_string();
+                                let full_path_str =
+                                    selected_entry.full_path.to_string_lossy().to_string();
                                 let key = (app.query.clone(), full_path_str.clone());
 
                                 if !app.scrolled_files.contains(&key) {
-                                    let (mtime, atime, file_size) = get_file_metadata(&selected_entry.full_path);
+                                    let (mtime, atime, file_size) =
+                                        get_file_metadata(&selected_entry.full_path);
                                     let subsession_id =
                                         app.current_subsession.as_ref().map(|s| s.id).unwrap_or(1);
                                     let _ = app.db.log_scroll(EventData {
@@ -734,11 +823,13 @@ fn run_app(
                                 let _ = app.check_and_log_impressions(true);
 
                                 let selected_entry = &app.filtered_files[app.selected_index];
-                                let full_path_str = selected_entry.full_path.to_string_lossy().to_string();
+                                let full_path_str =
+                                    selected_entry.full_path.to_string_lossy().to_string();
                                 let key = (app.query.clone(), full_path_str.clone());
 
                                 if !app.scrolled_files.contains(&key) {
-                                    let (mtime, atime, file_size) = get_file_metadata(&selected_entry.full_path);
+                                    let (mtime, atime, file_size) =
+                                        get_file_metadata(&selected_entry.full_path);
                                     let subsession_id =
                                         app.current_subsession.as_ref().map(|s| s.id).unwrap_or(1);
                                     let _ = app.db.log_scroll(EventData {
@@ -796,7 +887,8 @@ fn run_app(
                                 app.check_and_log_impressions(true)?;
 
                                 let selected_entry = &app.filtered_files[app.selected_index];
-                                let (mtime, atime, file_size) = get_file_metadata(&selected_entry.full_path);
+                                let (mtime, atime, file_size) =
+                                    get_file_metadata(&selected_entry.full_path);
 
                                 // Log the click
                                 let subsession_id =
@@ -821,8 +913,9 @@ fn run_app(
                                 terminal.backend_mut().execute(LeaveAlternateScreen)?;
 
                                 // Launch hx editor
-                                let status =
-                                    std::process::Command::new("hx").arg(&selected_entry.full_path).status();
+                                let status = std::process::Command::new("hx")
+                                    .arg(&selected_entry.full_path)
+                                    .status();
 
                                 // Resume TUI
                                 enable_raw_mode()?;
