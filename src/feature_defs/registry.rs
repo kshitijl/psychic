@@ -1,8 +1,5 @@
 use super::schema::{Feature, FeatureType};
-use super::clicks_last_30_days::ClicksLast30Days;
-use super::filename_starts_with_query::FilenameStartsWithQuery;
-use super::is_under_cwd::IsUnderCwd;
-use super::modified_today::ModifiedToday;
+use super::implementations::{ClicksLast30Days, FilenameStartsWithQuery, IsUnderCwd, ModifiedToday};
 use once_cell::sync::Lazy;
 use serde_json::json;
 

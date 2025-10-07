@@ -1,11 +1,8 @@
 // Feature schema and trait definition
 pub mod schema;
 
-// Individual feature implementations
-mod clicks_last_30_days;
-mod filename_starts_with_query;
-mod is_under_cwd;
-mod modified_today;
+// All feature implementations in one file
+mod implementations;
 
 // Feature registry - single source of truth
 pub mod registry;
