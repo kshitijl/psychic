@@ -4,9 +4,13 @@ use lightgbm3::Booster;
 use rusqlite::Connection;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::thread;
+use std::time::Instant;
 
 // Import features module
 use crate::feature_defs::{ClickEvent, FeatureInputs, FEATURE_REGISTRY, feature_names};
+use crate::{db, features};
 
 #[derive(Debug, Clone)]
 pub struct FileScore {
@@ -147,6 +151,147 @@ impl Ranker {
             .map(|name| features.get(*name).copied().unwrap_or(0.0))
             .collect()
     }
+}
+
+/// Find train.py by searching: binary dir -> parent dir -> grandparent dir
+fn find_train_py() -> Result<PathBuf> {
+    let exe_path = std::env::current_exe().context("Failed to get current executable path")?;
+    let exe_dir = exe_path
+        .parent()
+        .context("Failed to get executable directory")?;
+
+    // Search in 3 levels: exe_dir, parent, grandparent
+    for level in 0..3 {
+        let mut search_dir = exe_dir.to_path_buf();
+        for _ in 0..level {
+            search_dir = search_dir
+                .parent()
+                .context("No parent directory")?
+                .to_path_buf();
+        }
+
+        let train_py = search_dir.join("train.py");
+        if train_py.exists() {
+            log::debug!("Found train.py at {:?}", train_py);
+            return Ok(train_py);
+        }
+    }
+
+    anyhow::bail!("train.py not found in binary directory or 2 levels above")
+}
+
+/// Retrain the model by generating features and running train.py
+/// Runs in a spawned thread and blocks until complete
+///
+/// If `training_log_path` is provided, training output is appended to that file.
+/// Otherwise, output is printed to stdout.
+pub fn retrain_model(data_dir: &Path, training_log_path: Option<PathBuf>) -> Result<()> {
+    let data_dir = data_dir.to_path_buf();
+
+    // Spawn a thread for the training process
+    let handle = thread::spawn(move || -> Result<()> {
+        let total_start = Instant::now();
+
+        // Step 1: Generate features
+        log::info!("Generating features...");
+        let feature_start = Instant::now();
+        let db_path = db::Database::get_db_path(&data_dir)?;
+        let features_csv = data_dir.join("features.csv");
+        let schema_json = data_dir.join("feature_schema.json");
+
+        std::fs::create_dir_all(&data_dir)?;
+
+        features::generate_features(
+            &db_path,
+            &features_csv,
+            &schema_json,
+            features::OutputFormat::Csv,
+        )?;
+        let feature_duration = feature_start.elapsed();
+        log::info!("Features generated at {:?} ({:.2}s)", features_csv, feature_duration.as_secs_f64());
+
+        // Step 2: Find train.py
+        let train_py = find_train_py()?;
+        log::info!("Found train.py at {:?}", train_py);
+
+        // Step 3: Run training
+        log::info!("Training model...");
+        let training_start = Instant::now();
+        let output_prefix = data_dir.join("model");
+        let output_prefix_str = output_prefix
+            .to_str()
+            .context("Failed to convert output prefix to string")?;
+
+        let data_dir_str = data_dir
+            .to_str()
+            .context("Failed to convert data_dir to string")?;
+
+        let output = Command::new("uv")
+            .arg("run")
+            .arg(&train_py)
+            .arg(&features_csv)
+            .arg(output_prefix_str)
+            .arg("--data-dir")
+            .arg(data_dir_str)
+            .output()
+            .context("Failed to run train.py with uv")?;
+
+        // Handle training output - either to file or stdout
+        if let Some(log_path) = training_log_path {
+            // Append to log file
+            use std::fs::OpenOptions;
+            use std::io::Write;
+
+            let mut log_file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+                .context("Failed to open training log file")?;
+
+            // Write timestamp header
+            let now = Timestamp::now();
+            let tz = jiff::tz::TimeZone::system();
+            let zoned = now.to_zoned(tz);
+            let timestamp = zoned.strftime("%Y-%m-%d %H:%M:%S");
+            writeln!(log_file, "\n=== Training run at {} ===", timestamp)?;
+
+            if !output.stdout.is_empty() {
+                log_file.write_all(&output.stdout)?;
+            }
+            if !output.stderr.is_empty() {
+                log_file.write_all(&output.stderr)?;
+            }
+
+            log::info!("Training output appended to {:?}", log_path);
+        } else {
+            // Print to stdout/stderr
+            if !output.stdout.is_empty() {
+                let stdout_str = String::from_utf8_lossy(&output.stdout);
+                print!("{}", stdout_str);
+            }
+
+            if !output.stderr.is_empty() {
+                let stderr_str = String::from_utf8_lossy(&output.stderr);
+                eprint!("{}", stderr_str);
+            }
+        }
+
+        if !output.status.success() {
+            anyhow::bail!("Training failed with exit code: {:?}", output.status.code());
+        }
+
+        let training_duration = training_start.elapsed();
+        log::info!("Training complete! ({:.2}s)", training_duration.as_secs_f64());
+        log::info!("Model saved at {:?}", output_prefix.with_extension("txt"));
+
+        let total_duration = total_start.elapsed();
+        log::info!("Total retraining time: {:.2}s", total_duration.as_secs_f64());
+
+        Ok(())
+    });
+
+    // Wait for the thread to complete and return its result
+    handle.join().unwrap()
 }
 
 #[cfg(test)]

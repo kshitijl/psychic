@@ -132,7 +132,7 @@ impl Accumulator {
 
 // Main function to generate features
 
-pub fn generate_features(db_path: &Path, output_path: &Path, format: OutputFormat) -> Result<()> {
+pub fn generate_features(db_path: &Path, output_path: &Path, schema_path: &Path, format: OutputFormat) -> Result<()> {
     let conn = Connection::open(db_path).context("Failed to open database")?;
     let mut all_events = fetch_all_events(&conn)?;
     let all_sessions = fetch_all_sessions(&conn)?;
@@ -174,6 +174,10 @@ pub fn generate_features(db_path: &Path, output_path: &Path, format: OutputForma
             write_features_to_json(&output_rows, output_path)?;
         }
     }
+
+    // Write feature schema
+    let schema_json = crate::feature_defs::export_json();
+    fs::write(schema_path, schema_json).context("Failed to write feature schema")?;
 
     Ok(())
 }

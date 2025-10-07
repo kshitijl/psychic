@@ -1,9 +1,19 @@
 #!/usr/bin/env python3
+# /// script
+# dependencies = [
+#   "lightgbm>=4.6.0",
+#   "matplotlib>=3.10.6",
+#   "pandas>=2.3.3",
+#   "scikit-learn>=1.7.2",
+#   "seaborn>=0.13.2",
+#   "shap>=0.48.0",
+# ]
+# ///
 """
 Train LightGBM ranking model on psychic feature data and generate evaluation visualizations.
 
 Usage:
-    python train.py features.csv output_prefix
+    python train.py features.csv output_prefix [--data-dir DIR]
 """
 
 import sys
@@ -21,24 +31,30 @@ import seaborn as sns
 import shap
 import json
 from pathlib import Path
+import os
+import argparse
 
 sns.set_style("whitegrid")
 
-# Load feature schema from JSON (required)
-SCHEMA_PATH = Path("feature_schema.json")
-if not SCHEMA_PATH.exists():
-    print("Error: feature_schema.json not found.")
-    print("Run: cargo run --release -- generate-features")
-    print("This will generate both features.csv and feature_schema.json")
-    sys.exit(1)
 
-with open(SCHEMA_PATH) as f:
-    schema = json.load(f)
+def load_schema(data_dir):
+    """Load feature schema from data directory."""
+    schema_path = Path(data_dir) / "feature_schema.json"
+    if not schema_path.exists():
+        print(f"Error: feature_schema.json not found at {schema_path}")
+        print("Run: cargo run --release -- generate-features")
+        print("This will generate both features.csv and feature_schema.json")
+        sys.exit(1)
 
-# Extract feature names and types from schema
-FEATURE_NAMES = [f["name"] for f in schema["features"]]
-BINARY_FEATURES = [f["name"] for f in schema["features"] if f["type"] == "binary"]
-print(f"Loaded feature schema: {len(FEATURE_NAMES)} features")
+    with open(schema_path) as f:
+        schema = json.load(f)
+
+    # Extract feature names and types from schema
+    feature_names = [f["name"] for f in schema["features"]]
+    binary_features = [f["name"] for f in schema["features"] if f["type"] == "binary"]
+    print(f"Loaded feature schema: {len(feature_names)} features")
+
+    return feature_names, binary_features
 
 
 def load_data(csv_path):
@@ -55,7 +71,7 @@ def load_data(csv_path):
     return df
 
 
-def prepare_features(df):
+def prepare_features(df, feature_names, binary_features):
     """Convert features to numeric and prepare X, y, query_groups."""
     # Separate label and query_group from features
     y = df["label"].astype(int)
@@ -67,7 +83,7 @@ def prepare_features(df):
 
     # Ensure numeric features are correct type using schema
     for col in X.columns:
-        if col in BINARY_FEATURES:
+        if col in binary_features:
             # These are binary 0/1
             X[col] = X[col].astype(int)
         else:
@@ -77,7 +93,7 @@ def prepare_features(df):
     print(f"\nNumeric features: {list(X.columns)}")
 
     # Verify all features from schema are present
-    missing_features = [f for f in FEATURE_NAMES if f not in X.columns]
+    missing_features = [f for f in feature_names if f not in X.columns]
     if missing_features:
         raise ValueError(f"Missing features from schema: {missing_features}")
 
@@ -428,21 +444,29 @@ def save_model(model, output_prefix):
 
 
 def main():
-    if len(sys.argv) != 3:
-        print("Usage: python train.py <features.csv> <output_prefix>")
-        print("  Example: python train.py features.csv model")
-        print("  Outputs: model.txt (LightGBM ranking model), model_viz.pdf")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(
+        description="Train LightGBM ranking model on psychic feature data"
+    )
+    parser.add_argument("csv_path", help="Path to features CSV file")
+    parser.add_argument("output_prefix", help="Output prefix for model and visualizations")
+    parser.add_argument("--data-dir", type=str,
+                       default=os.path.expanduser("~/.local/share/psychic"),
+                       help="Data directory for schema and outputs (default: ~/.local/share/psychic)")
 
-    csv_path = sys.argv[1]
-    output_prefix = sys.argv[2]
+    args = parser.parse_args()
+
+    csv_path = args.csv_path
+    output_prefix = args.output_prefix
     output_pdf = f"{output_prefix}_viz.pdf"
+
+    # Load schema
+    feature_names, binary_features = load_schema(args.data_dir)
 
     # Load data
     df = load_data(csv_path)
 
     # Prepare features
-    X, y, query_groups, categorical_features = prepare_features(df)
+    X, y, query_groups, categorical_features = prepare_features(df, feature_names, binary_features)
 
     # Split data by query groups (so each query stays together)
     splitter = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)

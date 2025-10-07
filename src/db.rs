@@ -34,8 +34,8 @@ pub struct Database {
 }
 
 impl Database {
-    pub fn new() -> Result<Self> {
-        let db_path = Self::get_db_path()?;
+    pub fn new(data_dir: &PathBuf) -> Result<Self> {
+        let db_path = Self::get_db_path(data_dir)?;
 
         // Create parent directory if it doesn't exist
         if let Some(parent) = db_path.parent() {
@@ -88,13 +88,8 @@ impl Database {
         Ok(Database { conn, db_path })
     }
 
-    pub fn get_db_path() -> Result<PathBuf> {
-        let home = std::env::var("HOME").context("HOME environment variable not set")?;
-        Ok(PathBuf::from(home)
-            .join(".local")
-            .join("share")
-            .join("psychic")
-            .join("events.db"))
+    pub fn get_db_path(data_dir: &PathBuf) -> Result<PathBuf> {
+        Ok(data_dir.join("events.db"))
     }
 
     pub fn db_path(&self) -> PathBuf {

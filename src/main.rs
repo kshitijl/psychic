@@ -5,7 +5,7 @@ mod features;
 mod ranker;
 mod walker;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use crossterm::{
     ExecutableCommand,
@@ -42,22 +42,33 @@ enum OutputFormat {
 enum Commands {
     /// Generate features for machine learning from collected events
     GenerateFeatures {
-        /// Output path for the generated features file
-        #[arg(short, long, value_name = "FILE")]
-        output: Option<PathBuf>,
-
         /// Output format (csv or json)
         #[arg(short, long, value_enum, default_value = "csv")]
         format: OutputFormat,
     },
+    /// Retrain the ranking model using collected events
+    Retrain,
 }
 
 /// A terminal-based file browser with fuzzy search and analytics
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
+    /// Data directory for database and training files (default: ~/.local/share/psychic)
+    #[arg(long, global = true, value_name = "DIR")]
+    data_dir: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Option<Commands>,
+}
+
+/// Get the default data directory
+fn get_default_data_dir() -> Result<PathBuf> {
+    let home = env::var("HOME").context("HOME environment variable not set")?;
+    Ok(PathBuf::from(home)
+        .join(".local")
+        .join("share")
+        .join("psychic"))
 }
 
 struct Subsession {
@@ -131,7 +142,7 @@ struct App {
 }
 
 impl App {
-    fn new(root: PathBuf) -> Result<Self> {
+    fn new(root: PathBuf, data_dir: &PathBuf) -> Result<Self> {
         use std::collections::hash_map::RandomState;
         use std::hash::{BuildHasher, Hash, Hasher};
 
@@ -145,7 +156,7 @@ impl App {
         let session_id = hasher.finish().to_string();
 
         let db_start = Instant::now();
-        let db = Database::new()?;
+        let db = Database::new(data_dir)?;
         let db_path = db.db_path();
         log::debug!("Database initialization took {:?}", db_start.elapsed());
 
@@ -434,15 +445,22 @@ fn main() -> Result<()> {
 
     // Handle subcommands
     if let Some(command) = cli.command {
+        // Get data directory (global option)
+        let data_dir = cli.data_dir.unwrap_or_else(|| get_default_data_dir().expect("Failed to get default data directory"));
+
         match command {
-            Commands::GenerateFeatures { output, format } => {
-                // Determine default output filename based on format
+            Commands::GenerateFeatures { format } => {
+                // Create data directory if it doesn't exist
+                std::fs::create_dir_all(&data_dir)?;
+
+                // Determine output paths
                 let default_filename = match format {
                     OutputFormat::Csv => "features.csv",
                     OutputFormat::Json => "features.json",
                 };
-                let output_path = output.unwrap_or_else(|| PathBuf::from(default_filename));
-                let db_path = db::Database::get_db_path()?;
+                let output_path = data_dir.join(default_filename);
+                let schema_path = data_dir.join("feature_schema.json");
+                let db_path = db::Database::get_db_path(&data_dir)?;
 
                 // Convert CLI format to features format
                 let features_format = match format {
@@ -459,14 +477,17 @@ fn main() -> Result<()> {
                     "Generating features ({}) from DB at {:?} and writing to {:?}",
                     format_str, db_path, output_path
                 );
-                features::generate_features(&db_path, &output_path, features_format)?;
+                features::generate_features(&db_path, &output_path, &schema_path, features_format)?;
 
-                // Also write feature schema
-                let schema_path = PathBuf::from("feature_schema.json");
-                let schema_json = feature_defs::export_json();
-                std::fs::write(&schema_path, schema_json)?;
+                println!("Generated features at {:?}", output_path);
                 println!("Generated feature schema at {:?}", schema_path);
-
+                println!("Done.");
+                return Ok(());
+            }
+            Commands::Retrain => {
+                println!("Retraining model with data directory: {:?}", data_dir);
+                // When called from CLI, print to stdout (no log file)
+                ranker::retrain_model(&data_dir, None)?;
                 println!("Done.");
                 return Ok(());
             }
@@ -476,8 +497,11 @@ fn main() -> Result<()> {
     // Get current working directory
     let root = env::current_dir()?;
 
+    // Get data directory for main app
+    let data_dir = cli.data_dir.unwrap_or_else(|| get_default_data_dir().expect("Failed to get default data directory"));
+
     // Initialize app
-    let mut app = App::new(root.clone())?;
+    let mut app = App::new(root.clone(), &data_dir)?;
 
     log::info!(
         "Started psychic in directory {}, session {}",
@@ -487,9 +511,10 @@ fn main() -> Result<()> {
 
     // Gather context in background thread
     let session_id_clone = app.session_id.clone();
+    let data_dir_clone = data_dir.clone();
     std::thread::spawn(move || {
         let context = context::gather_context();
-        if let Ok(db) = db::Database::new() {
+        if let Ok(db) = db::Database::new(&data_dir_clone) {
             let _ = db.log_session(&session_id_clone, &context);
         }
     });
