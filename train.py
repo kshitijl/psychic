@@ -1,23 +1,19 @@
 #!/usr/bin/env python3
 """
-Train LightGBM model on psychic feature data and generate evaluation visualizations.
+Train LightGBM ranking model on psychic feature data and generate evaluation visualizations.
 
 Usage:
-    python train.py /tmp/features.csv output.pdf
+    python train.py features.csv output_prefix
 """
 
 import sys
 import pandas as pd
 import numpy as np
 import lightgbm as lgb
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GroupShuffleSplit
 from sklearn.metrics import (
-    confusion_matrix,
-    roc_curve,
-    auc,
-    precision_recall_curve,
-    average_precision_score,
-    classification_report,
+    ndcg_score,
+    label_ranking_average_precision_score,
 )
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
@@ -33,15 +29,23 @@ def load_data(csv_path):
     df = pd.read_csv(csv_path)
     print(f"Loaded {len(df)} samples from {csv_path}")
     print(f"Label distribution:\n{df['label'].value_counts()}")
-    print(f"\nFeatures: {[c for c in df.columns if c != 'label']}")
+    print(f"\nFeatures: {[c for c in df.columns if c not in ['label', 'subsession_id', 'session_id']]}")
+
+    # Use subsession_id as query groups (each subsession is one search result list)
+    # Create unique group IDs combining session_id and subsession_id
+    df['query_group'] = df['session_id'].astype(str) + '_' + df['subsession_id'].astype(str)
+    df['query_group'] = df['query_group'].astype('category').cat.codes
+
+    print(f"Loaded {df['query_group'].nunique()} query groups (subsessions)")
     return df
 
 
 def prepare_features(df):
-    """Convert features to numeric and prepare X, y."""
-    # Separate label from features
+    """Convert features to numeric and prepare X, y, query_groups."""
+    # Separate label and query_group from features
     y = df["label"].astype(int)
-    X = df.drop(columns=["label"])
+    query_groups = df["query_group"]
+    X = df.drop(columns=["label", "query_group", "subsession_id", "session_id"])
 
     # Track categorical features (keep as category dtype for LightGBM)
     categorical_features = []
@@ -56,25 +60,38 @@ def prepare_features(df):
             X[col] = X[col].astype(int)
 
     print(f"\nCategorical features: {categorical_features}")
-    return X, y, categorical_features
+    return X, y, query_groups, categorical_features
 
 
-def train_model(X_train, y_train, X_val, y_val, categorical_features):
-    """Train LightGBM classifier."""
-    print("\nTraining LightGBM model...")
+def train_model(X_train, y_train, groups_train, X_val, y_val, groups_val, categorical_features):
+    """Train LightGBM ranking model."""
+    print("\nTraining LightGBM ranking model...")
 
-    # Create LightGBM datasets
+    # Compute group sizes for LambdaRank
+    # LightGBM needs to know how many items per query group
+    train_group_sizes = groups_train.value_counts().sort_index().values
+    val_group_sizes = groups_val.value_counts().sort_index().values
+
+    # Create LightGBM datasets with group info
     train_data = lgb.Dataset(
-        X_train, label=y_train, categorical_feature=categorical_features
+        X_train,
+        label=y_train,
+        group=train_group_sizes,
+        categorical_feature=categorical_features
     )
     val_data = lgb.Dataset(
-        X_val, label=y_val, categorical_feature=categorical_features, reference=train_data
+        X_val,
+        label=y_val,
+        group=val_group_sizes,
+        categorical_feature=categorical_features,
+        reference=train_data
     )
 
-    # LightGBM parameters
+    # LightGBM LambdaRank parameters
     params = {
-        "objective": "binary",
-        "metric": "auc",
+        "objective": "lambdarank",
+        "metric": "ndcg",
+        "ndcg_eval_at": [1, 3, 5, 10],
         "boosting_type": "gbdt",
         "num_leaves": 31,
         "learning_rate": 0.05,
@@ -105,7 +122,7 @@ def train_model(X_train, y_train, X_val, y_val, categorical_features):
     return model, evals_result
 
 
-def create_visualizations(model, X_train, y_train, X_test, y_test, evals_result, output_pdf):
+def create_visualizations(model, X_train, y_train, groups_train, X_test, y_test, groups_test, evals_result, output_pdf):
     """Generate all visualizations and save to PDF."""
     print(f"\nGenerating visualizations to {output_pdf}...")
 
@@ -113,14 +130,14 @@ def create_visualizations(model, X_train, y_train, X_test, y_test, evals_result,
         # Page 1: Training curves
         fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
-        # AUC curves
-        train_auc = evals_result["train"]["auc"]
-        val_auc = evals_result["val"]["auc"]
-        axes[0].plot(train_auc, label="Train AUC", linewidth=2)
-        axes[0].plot(val_auc, label="Validation AUC", linewidth=2)
+        # NDCG curves - plot NDCG@5 as primary metric
+        train_ndcg = evals_result["train"]["ndcg@5"]
+        val_ndcg = evals_result["val"]["ndcg@5"]
+        axes[0].plot(train_ndcg, label="Train NDCG@5", linewidth=2)
+        axes[0].plot(val_ndcg, label="Validation NDCG@5", linewidth=2)
         axes[0].set_xlabel("Iteration")
-        axes[0].set_ylabel("AUC")
-        axes[0].set_title("Training Progress")
+        axes[0].set_ylabel("NDCG@5")
+        axes[0].set_title("Training Progress (Ranking Quality)")
         axes[0].legend()
         axes[0].grid(True)
 
@@ -261,129 +278,114 @@ def create_visualizations(model, X_train, y_train, X_test, y_test, evals_result,
         pdf.savefig(fig)
         plt.close()
 
-        # Page 5: ROC Curve and Precision-Recall
-        y_pred_proba = model.predict(X_test, num_iteration=model.best_iteration)
-        fpr, tpr, _ = roc_curve(y_test, y_pred_proba)
-        roc_auc = auc(fpr, tpr)
+        # Page 5: Ranking Quality Metrics and Score Distribution
+        y_pred_scores = model.predict(X_test, num_iteration=model.best_iteration)
 
-        precision, recall, _ = precision_recall_curve(y_test, y_pred_proba)
-        avg_precision = average_precision_score(y_test, y_pred_proba)
+        # Compute NDCG for test set
+        # Group by query and compute NDCG per query
+        test_df = pd.DataFrame({
+            'group': groups_test.values,
+            'label': y_test.values,
+            'score': y_pred_scores
+        })
 
-        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
-        # ROC curve
-        axes[0].plot(fpr, tpr, linewidth=2, label=f"AUC = {roc_auc:.3f}")
-        axes[0].plot([0, 1], [0, 1], "k--", linewidth=1, label="Random")
-        axes[0].set_xlabel("False Positive Rate")
-        axes[0].set_ylabel("True Positive Rate")
-        axes[0].set_title("ROC Curve")
-        axes[0].legend()
-        axes[0].grid(True)
+        # NDCG at different k values
+        ndcg_at_k = {}
+        for k in [1, 3, 5, 10]:
+            ndcgs = []
+            for group_id in test_df['group'].unique():
+                group_data = test_df[test_df['group'] == group_id]
+                # Only compute NDCG if group has at least k items and at least one positive label
+                if len(group_data) > k and group_data['label'].sum() > 0:
+                    y_true = group_data['label'].values.reshape(1, -1)
+                    y_score = group_data['score'].values.reshape(1, -1)
+                    ndcg = ndcg_score(y_true, y_score, k=k)
+                    ndcgs.append(ndcg)
+            ndcg_at_k[k] = np.mean(ndcgs) if ndcgs else 0
 
-        # Precision-Recall curve
-        axes[1].plot(recall, precision, linewidth=2, label=f"AP = {avg_precision:.3f}")
-        axes[1].set_xlabel("Recall")
-        axes[1].set_ylabel("Precision")
-        axes[1].set_title("Precision-Recall Curve")
-        axes[1].legend()
-        axes[1].grid(True)
+        axes[0, 0].bar(ndcg_at_k.keys(), ndcg_at_k.values())
+        axes[0, 0].set_xlabel("k")
+        axes[0, 0].set_ylabel("NDCG@k")
+        axes[0, 0].set_title("NDCG at Different Cutoffs")
+        axes[0, 0].grid(True, axis='y')
+        axes[0, 0].set_ylim([0, 1])
 
-        plt.tight_layout()
-        pdf.savefig(fig)
-        plt.close()
-
-        # Page 6: Confusion Matrix and Predicted Distribution
-        y_pred = (y_pred_proba >= 0.5).astype(int)
-        cm = confusion_matrix(y_test, y_pred)
-
-        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-
-        # Confusion matrix
-        sns.heatmap(
-            cm,
-            annot=True,
-            fmt="d",
-            cmap="Blues",
-            ax=axes[0],
-            xticklabels=["Predicted 0", "Predicted 1"],
-            yticklabels=["Actual 0", "Actual 1"],
-        )
-        axes[0].set_title("Confusion Matrix (threshold=0.5)")
-
-        # Predicted probability distribution
-        axes[1].hist(
-            y_pred_proba[y_test == 0],
-            bins=50,
+        # Score distribution for clicked vs not clicked
+        axes[0, 1].hist(
+            y_pred_scores[y_test == 0],
+            bins=30,
             alpha=0.5,
-            label="Actual 0",
+            label="Not Clicked",
             color="blue",
         )
-        axes[1].hist(
-            y_pred_proba[y_test == 1],
-            bins=50,
+        axes[0, 1].hist(
+            y_pred_scores[y_test == 1],
+            bins=30,
             alpha=0.5,
-            label="Actual 1",
+            label="Clicked",
             color="red",
         )
-        axes[1].axvline(0.5, color="black", linestyle="--", linewidth=1, label="Threshold")
-        axes[1].set_xlabel("Predicted Probability")
-        axes[1].set_ylabel("Count")
-        axes[1].set_title("Predicted Probability Distribution")
-        axes[1].legend()
-        axes[1].grid(True)
+        axes[0, 1].set_xlabel("Predicted Score")
+        axes[0, 1].set_ylabel("Count")
+        axes[0, 1].set_title("Score Distribution by Label")
+        axes[0, 1].legend()
+        axes[0, 1].grid(True)
+
+        # Rank position analysis - where do clicked items appear?
+        rank_positions = []
+        for group_id in test_df['group'].unique():
+            group_data = test_df[test_df['group'] == group_id].sort_values('score', ascending=False)
+            group_data['rank'] = range(1, len(group_data) + 1)
+            clicked_ranks = group_data[group_data['label'] == 1]['rank'].tolist()
+            rank_positions.extend(clicked_ranks)
+
+        if rank_positions:
+            axes[1, 0].hist(rank_positions, bins=range(1, max(rank_positions) + 2), edgecolor='black')
+            axes[1, 0].set_xlabel("Rank Position")
+            axes[1, 0].set_ylabel("Count of Clicked Items")
+            axes[1, 0].set_title("Distribution of Clicked Item Ranks")
+            axes[1, 0].grid(True, axis='y')
+
+        # Score vs label scatter
+        axes[1, 1].scatter(
+            y_pred_scores[y_test == 0],
+            np.random.normal(0, 0.05, sum(y_test == 0)),
+            alpha=0.3,
+            s=20,
+            label="Not Clicked",
+            color="blue"
+        )
+        axes[1, 1].scatter(
+            y_pred_scores[y_test == 1],
+            np.random.normal(1, 0.05, sum(y_test == 1)),
+            alpha=0.8,
+            s=40,
+            label="Clicked",
+            color="red"
+        )
+        axes[1, 1].set_xlabel("Predicted Score")
+        axes[1, 1].set_ylabel("Label (jittered)")
+        axes[1, 1].set_title("Scores by Label")
+        axes[1, 1].set_yticks([0, 1])
+        axes[1, 1].set_yticklabels(["Not Clicked", "Clicked"])
+        axes[1, 1].legend()
+        axes[1, 1].grid(True)
 
         plt.tight_layout()
         pdf.savefig(fig)
         plt.close()
 
-        # Page 7: Calibration and predicted vs actual
-        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-
-        # Calibration curve (binned predicted prob vs actual positive rate)
-        n_bins = 10
-        bins = np.linspace(0, 1, n_bins + 1)
-        bin_centers = (bins[:-1] + bins[1:]) / 2
-        bin_indices = np.digitize(y_pred_proba, bins) - 1
-        bin_indices = np.clip(bin_indices, 0, n_bins - 1)
-
-        bin_sums = np.bincount(bin_indices, weights=y_test, minlength=n_bins)
-        bin_counts = np.bincount(bin_indices, minlength=n_bins)
-        bin_true = np.divide(
-            bin_sums, bin_counts, out=np.zeros_like(bin_sums), where=bin_counts != 0
-        )
-
-        axes[0].plot([0, 1], [0, 1], "k--", linewidth=1, label="Perfect calibration")
-        axes[0].plot(bin_centers, bin_true, "o-", linewidth=2, label="Model")
-        axes[0].set_xlabel("Predicted Probability")
-        axes[0].set_ylabel("Actual Positive Rate")
-        axes[0].set_title("Calibration Curve")
-        axes[0].legend()
-        axes[0].grid(True)
-
-        # Predicted vs actual scatter (jittered for visibility)
-        jitter = 0.05
-        y_test_jittered = y_test + np.random.uniform(-jitter, jitter, len(y_test))
-        axes[1].scatter(
-            y_pred_proba, y_test_jittered, alpha=0.3, s=10, c=y_test, cmap="coolwarm"
-        )
-        axes[1].set_xlabel("Predicted Probability")
-        axes[1].set_ylabel("Actual Label (jittered)")
-        axes[1].set_title("Predicted vs Actual (scatter)")
-        axes[1].grid(True)
-
-        plt.tight_layout()
-        pdf.savefig(fig)
-        plt.close()
-
-        print(f"\nClassification Report (threshold=0.5):")
-        # Handle case where test set might not have both classes
-        labels_in_test = sorted(y_test.unique())
-        if len(labels_in_test) == 2:
-            print(classification_report(y_test, y_pred, target_names=["Not Clicked", "Clicked"], labels=[0, 1]))
-        else:
-            print(f"Warning: Test set only contains class {labels_in_test}. Cannot generate full classification report.")
-            print(f"Test set distribution: {y_test.value_counts().to_dict()}")
-            print(f"Predictions distribution: {pd.Series(y_pred).value_counts().to_dict()}")
+        # Print ranking metrics
+        print(f"\nRanking Metrics (Test Set):")
+        print(f"  NDCG@1:  {ndcg_at_k.get(1, 0):.4f}")
+        print(f"  NDCG@3:  {ndcg_at_k.get(3, 0):.4f}")
+        print(f"  NDCG@5:  {ndcg_at_k.get(5, 0):.4f}")
+        print(f"  NDCG@10: {ndcg_at_k.get(10, 0):.4f}")
+        if rank_positions:
+            print(f"\nClicked items average rank: {np.mean(rank_positions):.2f}")
+            print(f"Clicked items median rank: {np.median(rank_positions):.1f}")
 
 
 def save_model(model, output_prefix):
@@ -396,8 +398,8 @@ def save_model(model, output_prefix):
 def main():
     if len(sys.argv) != 3:
         print("Usage: python train.py <features.csv> <output_prefix>")
-        print("  Example: python train.py /tmp/features.csv model")
-        print("  Outputs: model.txt (LightGBM model), model_viz.pdf")
+        print("  Example: python train.py features.csv model")
+        print("  Outputs: model.txt (LightGBM ranking model), model_viz.pdf")
         sys.exit(1)
 
     csv_path = sys.argv[1]
@@ -408,32 +410,46 @@ def main():
     df = load_data(csv_path)
 
     # Prepare features
-    X, y, categorical_features = prepare_features(df)
+    X, y, query_groups, categorical_features = prepare_features(df)
 
-    # Split data
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
+    # Split data by query groups (so each query stays together)
+    splitter = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
+    train_idx, test_idx = next(splitter.split(X, y, groups=query_groups))
+
+    X_train = X.iloc[train_idx].reset_index(drop=True)
+    X_test = X.iloc[test_idx].reset_index(drop=True)
+    y_train = y.iloc[train_idx].reset_index(drop=True)
+    y_test = y.iloc[test_idx].reset_index(drop=True)
+    groups_train = query_groups.iloc[train_idx].reset_index(drop=True)
+    groups_test = query_groups.iloc[test_idx].reset_index(drop=True)
+
+    print(
+        f"\nTrain set: {len(X_train)} samples, {groups_train.nunique()} query groups ({y_train.sum()} positive)"
     )
     print(
-        f"\nTrain set: {len(X_train)} samples ({y_train.sum()} positive, {(~y_train.astype(bool)).sum()} negative)"
-    )
-    print(
-        f"Test set: {len(X_test)} samples ({y_test.sum()} positive, {(~y_test.astype(bool)).sum()} negative)"
+        f"Test set: {len(X_test)} samples, {groups_test.nunique()} query groups ({y_test.sum()} positive)"
     )
 
     # Further split train into train/val for early stopping
-    X_train, X_val, y_train, y_val = train_test_split(
-        X_train, y_train, test_size=0.2, random_state=42, stratify=y_train
-    )
+    splitter_val = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
+    train_idx2, val_idx = next(splitter_val.split(X_train, y_train, groups=groups_train))
+
+    X_val = X_train.iloc[val_idx].reset_index(drop=True)
+    y_val = y_train.iloc[val_idx].reset_index(drop=True)
+    groups_val = groups_train.iloc[val_idx].reset_index(drop=True)
+
+    X_train = X_train.iloc[train_idx2].reset_index(drop=True)
+    y_train = y_train.iloc[train_idx2].reset_index(drop=True)
+    groups_train = groups_train.iloc[train_idx2].reset_index(drop=True)
 
     # Train model
-    model, evals_result = train_model(X_train, y_train, X_val, y_val, categorical_features)
+    model, evals_result = train_model(X_train, y_train, groups_train, X_val, y_val, groups_val, categorical_features)
 
     # Save model
     save_model(model, output_prefix)
 
     # Generate visualizations
-    create_visualizations(model, X_train, y_train, X_test, y_test, evals_result, output_pdf)
+    create_visualizations(model, X_train, y_train, groups_train, X_test, y_test, groups_test, evals_result, output_pdf)
 
     print(f"\n✓ Training complete!")
     print(f"  - Model: {output_prefix}.txt")

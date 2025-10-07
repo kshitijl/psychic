@@ -214,6 +214,12 @@ fn compute_features_from_accumulator(
     // Label starts as 0, will be updated to 1 if click/scroll happens later
     features.insert("label".to_string(), "0".to_string());
 
+    // Subsession ID (for grouping in LambdaRank)
+    features.insert("subsession_id".to_string(), impression.subsession_id.to_string());
+
+    // Session ID (for potential session-level features)
+    features.insert("session_id".to_string(), impression.session_id.clone());
+
     // Query
     features.insert("query".to_string(), impression.query.clone());
 
@@ -301,6 +307,8 @@ fn write_features_to_json(
 fn write_csv_header(wtr: &mut Writer<std::fs::File>) -> Result<()> {
     wtr.write_record([
         "label",
+        "subsession_id",
+        "session_id",
         "query",
         "file_path",
         "filename_starts_with_query",
@@ -316,6 +324,8 @@ fn write_csv_row(
 ) -> Result<()> {
     let columns = [
         "label",
+        "subsession_id",
+        "session_id",
         "query",
         "file_path",
         "filename_starts_with_query",
