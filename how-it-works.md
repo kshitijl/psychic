@@ -176,21 +176,70 @@ std::process::id().hash(&mut hasher);
 let session_id = hasher.finish().to_string();
 ```
 
-### 2. Impression Logging with Debouncing
+### 2. Subsession Tracking and Impression Logging
 
-**Problem:** Every keystroke changes query → changes results → would spam database with impressions
+**Problem:** Every keystroke changes query → changes results → would spam database with impressions. Also need to ensure clicks/scrolls are associated with the correct query and impressions.
 
-**Solution:** 200ms debounce on impression logging
+**Solution:** Subsession-based tracking with debounced impression logging
 
 ```rust
-if self.last_impression_log.elapsed() < Duration::from_millis(200) {
-    return Ok(());
+struct Subsession {
+    id: u64,
+    query: String,
+    created_at: Instant,
+    impressions_logged: bool,
 }
 ```
 
-Only logs impressions for the top 10 visible results after user stops typing for 200ms.
+**How it works:**
+1. When query changes, a new `Subsession` is created with incremented ID
+2. Every frame, `check_and_log_impressions(false)` is called - logs impressions if subsession is >200ms old and not yet logged
+3. When user clicks or scrolls, `check_and_log_impressions(true)` is called first - forces immediate impression logging if not already done
+4. Subsession is marked as logged to prevent duplicate logging
 
-### 3. Editor Launch and TUI Suspend/Resume
+**Key guarantees:**
+- All clicks/scrolls have their impressions logged first (temporal consistency)
+- Same query always maps to same subsession_id
+- Impressions are debounced by 200ms for normal typing
+- Engagement events force immediate logging to ensure data completeness
+
+**Why this matters for ML:**
+- Label=1 means "user clicked/scrolled this file in this subsession"
+- Features are computed from the impressions shown in that subsession
+- Prevents query/subsession mismatches that would create incorrect training data
+
+### 3. Feature Generation with Fold-Based Architecture
+
+**Problem:** Initial implementation had O(n²) complexity - for each impression, it scanned all events to compute features. Also had future data leakage - features could see clicks that happened AFTER the impression.
+
+**Solution:** Single-pass fold with Accumulator struct
+
+```rust
+struct Accumulator {
+    clicks_by_file: HashMap<String, Vec<ClickEvent>>,
+    scrolls_by_file: HashMap<String, Vec<ScrollEvent>>,
+    pending_impressions: HashMap<(String, u64, String), PendingImpression>,
+    output_rows: Vec<HashMap<String, String>>,
+}
+```
+
+**How it works:**
+1. Load all events and sessions from database into memory
+2. Sort events by timestamp (critical for temporal correctness)
+3. Single forward pass through events:
+   - **Impression**: Compute features using only data in accumulator (past events), add to pending_impressions
+   - **Click/Scroll**: Record in accumulator, mark matching pending impressions as label=1
+4. After pass completes, output all pending impressions as feature rows
+
+**Temporal correctness:**
+- Features like `clicks_last_30_days` filter with `c.timestamp <= impression.timestamp`
+- Only past events contribute to features
+- Labels CAN use future events (click happens after impression in same subsession)
+- This matches production: at inference time, model only sees past data
+
+**Performance:** O(n) instead of O(n²) - single pass through events
+
+### 4. Editor Launch and TUI Suspend/Resume
 
 **Challenge:** Need to suspend TUI, launch `hx` editor, then resume TUI when editor closes.
 

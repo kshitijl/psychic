@@ -1,17 +1,15 @@
 use anyhow::{Context, Result};
 use csv::Writer;
 use jiff::{Timestamp, Span};
-use regex::Regex;
 use rusqlite::Connection;
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 // Data structures for holding event and session data in memory
 
 #[derive(Debug, Clone)]
 struct Event {
-    id: i64,
     session_id: String,
     subsession_id: u64,
     query: String,
@@ -19,18 +17,13 @@ struct Event {
     full_path: String,
     timestamp: i64,
     mtime: Option<i64>,
-    atime: Option<i64>,
-    file_size: Option<i64>,
     action: String,
 }
 
 #[derive(Debug, Clone)]
 struct Session {
     session_id: String,
-    cwd: String,
     timezone: String,
-    subnet: String,
-    created_at: i64,
 }
 
 // Output format enum
@@ -44,21 +37,11 @@ pub enum OutputFormat {
 #[derive(Debug, Clone)]
 struct ClickEvent {
     timestamp: i64,
-    session_id: String,
-    full_path: String,
-}
-
-#[derive(Debug, Clone)]
-struct ScrollEvent {
-    timestamp: i64,
-    session_id: String,
-    full_path: String,
 }
 
 // Accumulator for fold-based processing
 struct Accumulator {
     clicks_by_file: HashMap<String, Vec<ClickEvent>>,
-    scrolls_by_file: HashMap<String, Vec<ScrollEvent>>,
     // Key: (session_id, subsession_id, full_path)
     pending_impressions: HashMap<(String, u64, String), PendingImpression>,
     output_rows: Vec<HashMap<String, String>>,
@@ -74,7 +57,6 @@ impl Accumulator {
     fn new() -> Self {
         Self {
             clicks_by_file: HashMap::new(),
-            scrolls_by_file: HashMap::new(),
             pending_impressions: HashMap::new(),
             output_rows: Vec::new(),
         }
@@ -83,25 +65,11 @@ impl Accumulator {
     fn record_click(&mut self, event: &Event) {
         let click = ClickEvent {
             timestamp: event.timestamp,
-            session_id: event.session_id.clone(),
-            full_path: event.full_path.clone(),
         };
         self.clicks_by_file
             .entry(event.full_path.clone())
             .or_default()
             .push(click);
-    }
-
-    fn record_scroll(&mut self, event: &Event) {
-        let scroll = ScrollEvent {
-            timestamp: event.timestamp,
-            session_id: event.session_id.clone(),
-            full_path: event.full_path.clone(),
-        };
-        self.scrolls_by_file
-            .entry(event.full_path.clone())
-            .or_default()
-            .push(scroll);
     }
 
     fn add_impression(&mut self, event: &Event, features: HashMap<String, String>) {
@@ -166,7 +134,6 @@ pub fn generate_features(db_path: &Path, output_path: &Path, format: OutputForma
                 acc.mark_impressions_as_engaged(event);
             }
             "scroll" => {
-                acc.record_scroll(event);
                 acc.mark_impressions_as_engaged(event);
             }
             _ => {} // Ignore unknown actions
@@ -196,21 +163,18 @@ pub fn generate_features(db_path: &Path, output_path: &Path, format: OutputForma
 
 fn fetch_all_events(conn: &Connection) -> Result<Vec<Event>> {
     let mut stmt = conn.prepare(
-        "SELECT id, session_id, subsession_id, query, file_path, full_path, timestamp, mtime, atime, file_size, action FROM events ORDER BY timestamp, id",
+        "SELECT session_id, subsession_id, query, file_path, full_path, timestamp, mtime, action FROM events ORDER BY timestamp, id",
     )?;
     let event_iter = stmt.query_map([], |row| {
         Ok(Event {
-            id: row.get(0)?,
-            session_id: row.get(1)?,
-            subsession_id: row.get(2)?,
-            query: row.get(3)?,
-            file_path: row.get(4)?,
-            full_path: row.get(5)?,
-            timestamp: row.get(6)?,
-            mtime: row.get(7)?,
-            atime: row.get(8)?,
-            file_size: row.get(9)?,
-            action: row.get(10)?,
+            session_id: row.get(0)?,
+            subsession_id: row.get(1)?,
+            query: row.get(2)?,
+            file_path: row.get(3)?,
+            full_path: row.get(4)?,
+            timestamp: row.get(5)?,
+            mtime: row.get(6)?,
+            action: row.get(7)?,
         })
     })?;
 
@@ -222,14 +186,11 @@ fn fetch_all_events(conn: &Connection) -> Result<Vec<Event>> {
 }
 
 fn fetch_all_sessions(conn: &Connection) -> Result<HashMap<String, Session>> {
-    let mut stmt = conn.prepare("SELECT session_id, cwd, timezone, subnet, created_at FROM sessions")?;
+    let mut stmt = conn.prepare("SELECT session_id, timezone FROM sessions")?;
     let session_iter = stmt.query_map([], |row| {
         Ok(Session {
             session_id: row.get(0)?,
-            cwd: row.get(1)?,
-            timezone: row.get(2)?,
-            subnet: row.get(3)?,
-            created_at: row.get(4)?,
+            timezone: row.get(1)?,
         })
     })?;
 
