@@ -4,6 +4,5 @@
 - when we scroll below current page of results it should scroll properly with us, maybe as it gets to bottom 5 it should start scrolling with us
 - in addition to the walkdir from current dir, also include in the results list any file we've ever clicked or scrolled before.
 - the modification time shown in results list isn't properly right justified. so when filenames are different lengths then they don't all appear nicely in a column.
-- show the lightgbm model score
 - get rid of the clone in ranker.rank_files. it should just take a ref. no?
 - make sure we don't do something inefficeint like query the db over and over, once for each feature or for each file we need to compute a feature on. we gotta query the db ONCE, accumulate all data we'll need and then hold that data in memory, ready for when queries happen and we need to compute features.

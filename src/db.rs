@@ -78,6 +78,14 @@ impl Database {
             [],
         )?;
 
+        // Create index for efficient click count queries
+        // Covers: WHERE action = 'click' AND timestamp >= ? GROUP BY full_path
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_click_lookup
+             ON events(action, timestamp, full_path)",
+            [],
+        )?;
+
         Ok(Database { conn, db_path })
     }
 

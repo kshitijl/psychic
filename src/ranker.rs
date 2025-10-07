@@ -5,16 +5,58 @@ use rusqlite::Connection;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+#[derive(Debug, Clone)]
+pub struct FileScore {
+    pub path: String,
+    pub score: f64,
+    pub features: HashMap<String, f64>,
+}
+
 pub struct Ranker {
     model: Booster,
-    db_path: PathBuf,
+    click_counts: HashMap<String, usize>, // full_path -> click count in last 30 days
 }
 
 impl Ranker {
     pub fn new(model_path: &Path, db_path: PathBuf) -> Result<Self> {
         let model = Booster::from_file(model_path.to_str().unwrap())
             .context("Failed to load LightGBM model")?;
-        Ok(Ranker { model, db_path })
+
+        // Preload all click data from last 30 days
+        let now = Timestamp::now();
+        let session_tz = jiff::tz::TimeZone::system();
+        let now_zoned = now.to_zoned(session_tz);
+        let thirty_days_ago = now_zoned.checked_sub(Span::new().days(30))?.timestamp();
+        let thirty_days_ago_ts = thirty_days_ago.as_second();
+
+        let mut click_counts = HashMap::new();
+
+        let conn = Connection::open(&db_path)
+            .context("Failed to open database for preloading clicks")?;
+
+        let mut stmt = conn.prepare(
+            "SELECT full_path, COUNT(*) as count
+             FROM events
+             WHERE action = 'click'
+             AND timestamp >= ?1
+             GROUP BY full_path"
+        )?;
+
+        let rows = stmt.query_map([thirty_days_ago_ts], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, usize>(1)?))
+        })?;
+
+        for row in rows {
+            let (path, count) = row?;
+            click_counts.insert(path, count);
+        }
+
+        eprintln!("Loaded {} click counts from last 30 days", click_counts.len());
+
+        Ok(Ranker {
+            model,
+            click_counts,
+        })
     }
 
     pub fn rank_files(
@@ -22,7 +64,7 @@ impl Ranker {
         query: &str,
         files: Vec<(String, PathBuf, Option<i64>)>, // (relative_path, full_path, mtime)
         session_id: &str,
-    ) -> Result<Vec<String>> {
+    ) -> Result<Vec<FileScore>> {
         if files.is_empty() {
             return Ok(Vec::new());
         }
@@ -46,13 +88,17 @@ impl Ranker {
                 .predict_with_params(&feature_vec, feature_vec.len() as i32, true, "num_threads=1")
                 .context("Failed to predict with model")?[0];
 
-            scored_files.push((relative_path, score));
+            scored_files.push(FileScore {
+                path: relative_path,
+                score,
+                features: features.clone(),
+            });
         }
 
         // Sort by score descending (higher scores first)
-        scored_files.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored_files.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
 
-        Ok(scored_files.into_iter().map(|(path, _)| path).collect())
+        Ok(scored_files)
     }
 
     fn compute_features(
@@ -61,7 +107,7 @@ impl Ranker {
         file_path: &str,
         full_path: &Path,
         mtime: Option<i64>,
-        session_id: &str,
+        _session_id: &str,
     ) -> Result<HashMap<String, f64>> {
         let mut features = HashMap::new();
 
@@ -79,8 +125,11 @@ impl Ranker {
         };
         features.insert("filename_starts_with_query".to_string(), filename_starts_with_query);
 
-        // clicks_last_30_days - query the database
-        let clicks_last_30_days = self.count_clicks_last_30_days(full_path, session_id)?;
+        // clicks_last_30_days - lookup from preloaded data
+        let clicks_last_30_days = self.click_counts
+            .get(&full_path.to_string_lossy().to_string())
+            .copied()
+            .unwrap_or(0);
         features.insert("clicks_last_30_days".to_string(), clicks_last_30_days as f64);
 
         // modified_today (binary feature)
@@ -99,44 +148,6 @@ impl Ranker {
         features.insert("modified_today".to_string(), modified_today);
 
         Ok(features)
-    }
-
-    fn count_clicks_last_30_days(&self, full_path: &Path, session_id: &str) -> Result<usize> {
-        let conn = Connection::open(&self.db_path)
-            .context("Failed to open database for click counting")?;
-
-        // Get timezone for the session
-        let timezone: String = conn
-            .query_row(
-                "SELECT timezone FROM sessions WHERE session_id = ?1",
-                [session_id],
-                |row| row.get(0),
-            )
-            .unwrap_or_else(|_| "UTC".to_string());
-
-        let now = Timestamp::now();
-        let session_tz =
-            jiff::tz::TimeZone::get(&timezone).unwrap_or(jiff::tz::TimeZone::system());
-        let now_zoned = now.to_zoned(session_tz);
-        let thirty_days_ago = now_zoned.checked_sub(Span::new().days(30))?.timestamp();
-
-        let count: usize = conn
-            .query_row(
-                "SELECT COUNT(*) FROM events
-                 WHERE action = 'click'
-                 AND full_path = ?1
-                 AND timestamp >= ?2
-                 AND timestamp <= ?3",
-                [
-                    full_path.to_string_lossy().to_string(),
-                    thirty_days_ago.as_second().to_string(),
-                    now.as_second().to_string(),
-                ],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-
-        Ok(count)
     }
 
     fn features_to_vec(&self, features: &HashMap<String, f64>) -> Vec<f64> {
@@ -184,7 +195,12 @@ mod tests {
 
         let result = ranker.rank_files("test", test_files, "test_session");
         match &result {
-            Ok(files) => println!("✓ Ranking succeeded: {:?}", files),
+            Ok(file_scores) => {
+                println!("✓ Ranking succeeded");
+                for fs in file_scores {
+                    println!("  {} - score: {:.4}, features: {:?}", fs.path, fs.score, fs.features);
+                }
+            }
             Err(e) => {
                 eprintln!("✗ Ranking failed: {}", e);
                 eprintln!("  Full error chain:");
