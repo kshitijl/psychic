@@ -23,7 +23,14 @@ pub struct FileCandidate {
 pub struct FileScore {
     pub path: String,
     pub score: f64,
-    pub features: HashMap<String, f64>,
+    pub features: Vec<f64>, // Feature vector in registry order
+}
+
+impl FileScore {
+    /// Get feature HashMap for display purposes
+    pub fn features_map(&self) -> HashMap<String, f64> {
+        features_to_map(&self.features)
+    }
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -158,15 +165,12 @@ impl Ranker {
         for file in files {
             let features = self.compute_features(query, file, current_timestamp, cwd)?;
 
-            // Convert features to vector in the same order as training
-            let feature_vec = self.features_to_vec(&features);
-
             // Get prediction score
             let score = self
                 .model
                 .predict_with_params(
-                    &feature_vec,
-                    feature_vec.len() as i32,
+                    &features,
+                    features.len() as i32,
                     true,
                     "num_threads=1",
                 )
@@ -195,7 +199,7 @@ impl Ranker {
         file: &FileCandidate,
         current_timestamp: i64,
         cwd: &Path,
-    ) -> Result<HashMap<String, f64>> {
+    ) -> Result<Vec<f64>> {
         compute_features(
             query,
             file,
@@ -204,28 +208,26 @@ impl Ranker {
             &self.clicks.clicks_by_file,
         )
     }
-
-    fn features_to_vec(&self, features: &HashMap<String, f64>) -> Vec<f64> {
-        features_to_vec(features)
-    }
 }
 
-/// Convert feature HashMap to vector in registry order (matches training)
-fn features_to_vec(features: &HashMap<String, f64>) -> Vec<f64> {
+/// Convert feature vector to HashMap (for display purposes)
+fn features_to_map(features: &[f64]) -> HashMap<String, f64> {
     feature_names()
         .iter()
-        .map(|name| features.get(*name).copied().unwrap_or(0.0))
+        .zip(features.iter())
+        .map(|(name, value)| (name.to_string(), *value))
         .collect()
 }
 
 /// Compute features for a file (standalone function, no Ranker needed)
+/// Returns feature vector in registry order (matches training)
 fn compute_features(
     query: &str,
     file: &FileCandidate,
     current_timestamp: i64,
     cwd: &Path,
     clicks_by_file: &HashMap<String, Vec<ClickEvent>>,
-) -> Result<HashMap<String, f64>> {
+) -> Result<Vec<f64>> {
     // Create FeatureInputs for inference
     let inputs = FeatureInputs {
         query,
@@ -238,11 +240,11 @@ fn compute_features(
         session: None, // No session context at inference time
     };
 
-    // Compute all features using the registry
-    let mut features = HashMap::new();
+    // Compute all features using the registry (in order)
+    let mut features = Vec::with_capacity(FEATURE_REGISTRY.len());
     for feature in FEATURE_REGISTRY.iter() {
         let value = feature.compute(&inputs)?;
-        features.insert(feature.name().to_string(), value);
+        features.push(value);
     }
 
     Ok(features)
@@ -514,11 +516,8 @@ mod tests {
         let features = compute_features(query, &file, current_timestamp, &cwd, &clicks_by_file)
             .expect("Failed to compute features");
 
-        // Convert to vector (in the same order as training)
-        let feature_vec = features_to_vec(&features);
-
         // Format as string for expect-test style comparison
-        let actual = format!("{:?}", feature_vec);
+        let actual = format!("{:?}", features);
 
         // Expected output: [filename_starts_with_query, clicks_last_30_days, modified_today, is_under_cwd, is_hidden, clicks_last_week_parent_dir]
         // filename_starts_with_query=0 (bar.txt doesn't start with "test")

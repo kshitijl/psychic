@@ -827,8 +827,9 @@ fn run_app(
                 debug_lines.push(String::from(""));
 
                 // Show all features from registry
+                let features_map = file_score.features_map();
                 for feature in feature_defs::FEATURE_REGISTRY.iter() {
-                    if let Some(value) = file_score.features.get(feature.name()) {
+                    if let Some(value) = features_map.get(feature.name()) {
                         debug_lines.push(format!("{}: {}", feature.name(), value));
                     }
                 }
