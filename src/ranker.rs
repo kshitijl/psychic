@@ -165,7 +165,10 @@ impl Ranker {
         }
 
         // Compute features for each file
+        let compute_start = Instant::now();
         let mut scored_files = Vec::new();
+        let mut total_predict_time = Duration::ZERO;
+
         for file in files {
             let (features, timings) = self.compute_features_with_timing(query, file, current_timestamp, cwd)?;
 
@@ -173,11 +176,14 @@ impl Ranker {
             for (feature_name, duration) in timings {
                 *self.feature_timings.entry(feature_name).or_insert(Duration::ZERO) += duration;
             }
+
             // Get prediction score
+            let predict_start = Instant::now();
             let score = self
                 .model
                 .predict_with_params(&features, features.len() as i32, true, "num_threads=1")
                 .context("Failed to predict with model")?[0];
+            total_predict_time += predict_start.elapsed();
 
             scored_files.push(FileScore {
                 file_id: file.file_id,
@@ -185,13 +191,17 @@ impl Ranker {
                 features,
             });
         }
+        log::debug!("Feature computation + prediction for {} files took {:?}", files.len(), compute_start.elapsed());
+        log::debug!("  - Model prediction total: {:?}", total_predict_time);
 
         // Sort by score descending (higher scores first)
+        let sort_start = Instant::now();
         scored_files.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
+        log::debug!("Sorting {} scored files took {:?}", scored_files.len(), sort_start.elapsed());
 
         Ok(scored_files)
     }

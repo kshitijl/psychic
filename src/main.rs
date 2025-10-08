@@ -282,6 +282,7 @@ impl App {
         );
 
         // Convert to FileCandidate structs
+        let candidate_start = Instant::now();
         let file_candidates: Vec<ranker::FileCandidate> = matching_file_ids
             .iter()
             .map(|&file_id| {
@@ -295,6 +296,7 @@ impl App {
                 }
             })
             .collect();
+        log::debug!("Building FileCandidate vec took {:?}", candidate_start.elapsed());
 
         // Get current subsession timestamp (or use current time if no subsession)
         let current_timestamp = self
@@ -313,9 +315,11 @@ impl App {
             .rank_files(&self.query, &file_candidates, current_timestamp, &self.root)
         {
             Ok(scored) => {
+                let reorder_start = Instant::now();
                 // Extract FileIds from scores (already sorted by score)
                 self.filtered_files = scored.iter().map(|fs| FileId(fs.file_id)).collect();
                 self.file_scores = scored;
+                log::debug!("Reordering results took {:?}", reorder_start.elapsed());
             }
             Err(e) => {
                 log::warn!("Ranking failed: {}, falling back to simple filtering", e);
@@ -323,7 +327,7 @@ impl App {
                 self.filtered_files = matching_file_ids;
             }
         }
-        log::debug!("Ranking took {:?}", rank_start.elapsed());
+        log::debug!("Ranking (total) took {:?}", rank_start.elapsed());
 
         // Log feature timings (aggregate costs for this filter operation)
         if !self.ranker.feature_timings.is_empty() {
