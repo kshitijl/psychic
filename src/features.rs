@@ -268,17 +268,21 @@ fn compute_features_from_accumulator(
         .map(|s| Path::new(&s.cwd))
         .unwrap_or_else(|| Path::new("/"));
 
+    // Check if file is under cwd - files under cwd at impression time would have come from walker
+    let full_path = Path::new(&impression.full_path);
+    let is_from_walker = full_path.starts_with(cwd);
+
     let inputs = FeatureInputs {
         query: &impression.query,
         file_path: &impression.file_path,
-        full_path: Path::new(&impression.full_path),
+        full_path,
         mtime: impression.mtime,
         cwd,
         clicks_by_file: &acc.clicks_by_file,
         clicks_by_parent_dir: &acc.clicks_by_parent_dir,
         current_timestamp: impression.timestamp,
         session,
-        is_from_walker: false, // Training data doesn't track this
+        is_from_walker,
     };
 
     // Compute all features using the registry
