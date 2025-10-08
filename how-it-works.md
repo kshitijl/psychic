@@ -1084,9 +1084,192 @@ Changed binary and directory names:
 
 Added MAX_FILES = 5000 limit in walker.rs to cap file discovery for now. Will optimize later.
 
-## File Registry Refactor (Added)
+## Async Worker Thread Architecture (Added)
 
 ### Problem
+
+The synchronous filtering/ranking implementation caused UI lag:
+
+1. **Blocking on every keystroke**: Each character typed would block for 30-80ms while filtering/ranking
+2. **Cumulative lag**: Typing "hello" = 5 × 50ms = 250ms of UI freezing
+3. **Poor responsiveness**: No ability to type ahead or cancel outdated queries
+4. **Wasted computation**: If user types quickly, intermediate queries are computed but never used
+
+### Solution: Worker Thread with Async Communication
+
+Moved all file data and ranking logic to a dedicated worker thread that processes queries asynchronously:
+
+**Thread architecture:**
+```rust
+// Main UI Thread: Renders UI, handles events, polls for updates
+// Worker Thread: Owns all file data, does filtering/ranking
+// Walker Thread: Discovers files, sends to worker (not main)
+```
+
+**Data flow:**
+```
+[Walker] → (path, mtime) → [Worker]
+[Main] → UpdateQuery("foo") → [Worker]
+[Worker] → QueryUpdated{visible_slice, total} → [Main]
+```
+
+**Worker thread owns:**
+- `file_registry: Vec<FileInfo>` - All file metadata
+- `path_to_id: HashMap<PathBuf, FileId>` - Deduplication map
+- `filtered_files: Vec<FileId>` - Ranked results
+- `file_scores: Vec<FileScore>` - Scores and features
+- `ranker: Ranker` - ML model (wrapped in SendRanker for thread safety)
+
+**Main thread only keeps:**
+- `visible_files: Vec<DisplayFileInfo>` - Only what's visible (20-40 items)
+- `total_results: usize` - Count of filtered files
+- `query: String` - Current search query
+- Channels for worker communication
+
+**Communication types:**
+```rust
+enum WorkerRequest {
+    UpdateQuery(String),
+    GetVisibleSlice { start: usize, count: usize },
+    ReloadModel,
+    ReloadClicks,
+}
+
+enum WorkerResponse {
+    QueryUpdated {
+        query: String,
+        total_results: usize,
+        total_files: usize,
+        visible_slice: Vec<DisplayFileInfo>,
+        model_stats: Option<ModelStats>,
+    },
+    VisibleSlice(Vec<DisplayFileInfo>),
+}
+
+struct DisplayFileInfo {
+    display_name: String,
+    full_path: PathBuf,
+    score: f64,
+    features: Vec<f64>,  // For debug display
+}
+```
+
+**Worker loop:**
+```rust
+fn worker_thread_loop(
+    rx: Receiver<WorkerRequest>,
+    result_tx: Sender<WorkerResponse>,
+    walker_rx: Receiver<(PathBuf, Option<i64>)>,
+    mut state: WorkerState,
+) {
+    let mut last_update = Instant::now();
+    let mut files_changed = false;
+
+    loop {
+        // Process walker updates (non-blocking)
+        while let Ok((path, mtime)) = walker_rx.try_recv() {
+            state.add_file(path, mtime);
+            files_changed = true;
+        }
+
+        // Auto-refresh if files changed and >100ms elapsed
+        if files_changed && last_update.elapsed() > Duration::from_millis(100) {
+            state.filter_and_rank(&state.current_query)?;
+            let visible_slice = state.get_slice(0, 20);
+            let _ = result_tx.send(WorkerResponse::QueryUpdated {
+                query: state.current_query.clone(),
+                total_results: state.filtered_files.len(),
+                total_files: state.file_registry.len(),
+                visible_slice,
+                model_stats: state.ranker.0.stats.clone(),
+            });
+            files_changed = false;
+            last_update = Instant::now();
+        }
+
+        // Process work requests with 5ms timeout (for debouncing)
+        match rx.recv_timeout(Duration::from_millis(5)) {
+            Ok(WorkerRequest::UpdateQuery(query)) => {
+                // Drain all pending queries, process only latest
+                let query = drain_latest_query(&rx, query);
+                state.filter_and_rank(&query)?;
+                // Send results...
+            }
+            Ok(WorkerRequest::ReloadModel) => {
+                state.reload_model()?;
+                state.filter_and_rank(&state.current_query)?;
+                // Send results...
+            }
+            // ... other requests
+        }
+    }
+}
+```
+
+**Debouncing:**
+```rust
+// Helper to drain all pending queries and return latest
+fn drain_latest_query(rx: &Receiver<WorkerRequest>, initial: String) -> String {
+    let mut latest = initial;
+    while let Ok(WorkerRequest::UpdateQuery(query)) = rx.try_recv() {
+        latest = query;
+    }
+    latest
+}
+```
+
+**Main thread integration:**
+```rust
+// On keystroke
+KeyCode::Char(c) => {
+    app.query.push(c);
+    let _ = app.worker_tx.send(WorkerRequest::UpdateQuery(app.query.clone()));
+    // Continue immediately, UI renders with old visible_files
+}
+
+// Poll for results (non-blocking)
+while let Ok(response) = app.worker_rx.try_recv() {
+    match response {
+        WorkerResponse::QueryUpdated { query, visible_slice, total_results, model_stats, .. } => {
+            if query == app.query {  // Only apply if still current
+                app.visible_files = visible_slice;
+                app.total_results = total_results;
+                app.model_stats_cache = model_stats;
+                // ... create subsession
+            }
+        }
+        WorkerResponse::VisibleSlice(slice) => {
+            app.visible_files = slice;
+        }
+    }
+}
+```
+
+**Auto-refresh on file discovery:**
+- Worker receives files from walker via `walker_rx`
+- Sets `files_changed = true` flag
+- Every 100ms, re-filters/ranks current query and sends updated results to main thread
+- Main thread automatically sees new files without user interaction
+
+**Thread safety for LightGBM:**
+```rust
+// Ranker contains raw pointers (not Send by default)
+struct SendRanker(ranker::Ranker);
+unsafe impl Send for SendRanker {}
+// Safe because: model only used for read-only inference
+```
+
+### Performance Gains
+
+1. **Non-blocking input**: Keystrokes take <1ms (just channel send)
+2. **Debounced processing**: Typing "hello" quickly = 1 query processed (not 5)
+3. **Responsive UI**: Can type ahead while worker processes previous query
+4. **Auto-updating results**: New files appear automatically as walker discovers them
+5. **Stale results OK**: User sees old results briefly while new ones compute (acceptable trade-off)
+
+### File Registry Refactor (Added)
+
+**Note:** File registry is now owned by WorkerState, not App. Main thread only has visible slice.
 
 The previous implementation had major performance issues:
 
@@ -1096,9 +1279,7 @@ The previous implementation had major performance issues:
 4. **Excessive string cloning**: FileScore contained `path: String`, then cloned into Vec, then searched by it
 5. **Walker metadata thrown away**: walkdir caches metadata from syscall, but we only sent PathBuf then re-fetched metadata later
 
-### Solution: File Registry with Integer IDs
-
-Created a central file registry where all files are stored once with their metadata:
+Created a central file registry where all files are stored once with their metadata (now in WorkerState):
 
 **Core architecture:**
 ```rust

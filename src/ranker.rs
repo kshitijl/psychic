@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use jiff::{Span, Timestamp};
 use lightgbm3::Booster;
+use rayon::prelude::*;
 use rusqlite::Connection;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -28,12 +29,6 @@ pub struct FileScore {
     pub features: Vec<f64>, // Feature vector in registry order
 }
 
-impl FileScore {
-    /// Get feature HashMap for display purposes
-    pub fn features_map(&self) -> HashMap<String, f64> {
-        features_to_map(&self.features)
-    }
-}
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct ModelStats {
@@ -55,16 +50,12 @@ pub struct FeatureImportance {
 pub struct ClickData {
     pub clicks_by_file: HashMap<String, Vec<ClickEvent>>,
     pub clicks_by_parent_dir: HashMap<PathBuf, Vec<ClickEvent>>,
-    pub loaded_at: Timestamp,
 }
 
 pub struct Ranker {
     model: Booster,
     pub clicks: ClickData,
-    pub db_path: PathBuf,
     pub stats: Option<ModelStats>,
-    pub loaded_at: Timestamp,
-    pub feature_timings: HashMap<String, Duration>,
 }
 
 impl Ranker {
@@ -84,10 +75,7 @@ impl Ranker {
         Ok(Ranker {
             model,
             clicks,
-            db_path,
             stats,
-            loaded_at: Timestamp::now(),
-            feature_timings: HashMap::new(),
         })
     }
 
@@ -166,7 +154,6 @@ impl Ranker {
         Ok(ClickData {
             clicks_by_file,
             clicks_by_parent_dir,
-            loaded_at: now,
         })
     }
 
@@ -181,21 +168,28 @@ impl Ranker {
             return Ok(Vec::new());
         }
 
-        // Compute features for all files
+        // Compute features for all files in parallel
         let compute_start = Instant::now();
-        let mut all_features = Vec::with_capacity(files.len());
 
-        for file in files {
-            let (features, timings) = self.compute_features_with_timing(query, file, current_timestamp, cwd)?;
+        // Capture what we need for parallel computation
+        let clicks_by_file = &self.clicks.clicks_by_file;
+        let clicks_by_parent_dir = &self.clicks.clicks_by_parent_dir;
 
-            // Aggregate timings
-            for (feature_name, duration) in timings {
-                *self.feature_timings.entry(feature_name).or_insert(Duration::ZERO) += duration;
-            }
+        let all_features: Vec<Vec<f64>> = files
+            .par_iter()
+            .map(|file| {
+                compute_features(
+                    query,
+                    file,
+                    current_timestamp,
+                    cwd,
+                    clicks_by_file,
+                    clicks_by_parent_dir
+                ).expect("Feature computation failed")
+            })
+            .collect();
 
-            all_features.push(features);
-        }
-        log::debug!("Feature computation for {} files took {:?}", files.len(), compute_start.elapsed());
+        log::debug!("Parallel feature computation for {} files took {:?}", files.len(), compute_start.elapsed());
 
         // Batch predict all files at once
         // Flatten features into a single vector for batch prediction
@@ -233,26 +227,10 @@ impl Ranker {
         Ok(scored_files)
     }
 
-    fn compute_features_with_timing(
-        &self,
-        query: &str,
-        file: &FileCandidate,
-        current_timestamp: i64,
-        cwd: &Path,
-    ) -> Result<(Vec<f64>, HashMap<String, Duration>)> {
-        compute_features_with_timing(
-            query,
-            file,
-            current_timestamp,
-            cwd,
-            &self.clicks.clicks_by_file,
-            &self.clicks.clicks_by_parent_dir,
-        )
-    }
 }
 
 /// Convert feature vector to HashMap (for display purposes)
-fn features_to_map(features: &[f64]) -> HashMap<String, f64> {
+pub fn features_to_map(features: &[f64]) -> HashMap<String, f64> {
     feature_names()
         .iter()
         .zip(features.iter())

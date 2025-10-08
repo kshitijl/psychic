@@ -1,264 +1,357 @@
-# Plan: Async Filtering/Ranking to Fix UI Lag
+# Async Filtering Implementation - Current State
 
-## Problem
+## Design Overview
 
-Currently, every keystroke in the search bar blocks the UI thread while:
-1. Filtering 5000 files
-2. Getting file metadata for each match
-3. Running ML model inference
-4. Computing features for ranking
+Worker thread owns all file data. Main thread only keeps what's visible (20 items).
 
-This causes noticeable lag when typing, especially with large file counts.
+### Thread Architecture:
+1. **Main UI Thread**: Renders UI, handles events, polls for updates
+2. **Walker Thread**: Discovers files, sends to worker
+3. **Filter/Rank Worker Thread**: Owns data, does filtering/ranking
 
-## Current Flow (Blocking)
-
+### Data Flow:
 ```
-User types 'a'
-  → app.query.push('a')
-  → app.update_filtered_files()  // BLOCKS HERE (100-500ms)
-      → Filter all 5000 files
-      → Get metadata for matches
-      → Run ranker.rank_files() (ML inference + feature computation)
-      → Update app.filtered_files and app.file_scores
-  → Render UI
-  → User sees update
+[Walker] → (path, mtime) → [Worker]
+[Main] → UpdateQuery("foo") → [Worker]
+[Worker] → QueryUpdated{visible_slice, total} → [Main]
+[Main] → GetVisibleSlice{start, count} → [Worker]
+[Worker] → VisibleSlice(vec) → [Main]
 ```
 
-## Solution: Background Thread with Debouncing
+## Implementation Progress
 
-Move filtering/ranking to a background thread. Main thread stays responsive.
+### ✅ Completed:
 
-```
-User types 'a'
-  → app.query.push('a')
-  → Send query to filter_tx channel
-  → Render UI immediately (shows old results)
-  → Check filter_rx for results
-  → If available: update and re-render
-
-Background thread:
-  → Receive query from channel
-  → Debounce: wait 50ms, check if newer query arrived
-  → If still latest: run filter + rank
-  → Send FilterResult back to main thread
-```
-
-## Implementation Details
-
-### 1. New Types
-
+1. **Created communication types** (lines 134-155):
 ```rust
-struct FilterResult {
-    query: String,
-    filtered_files: Vec<FileEntry>,
-    file_scores: Vec<ranker::FileScore>,
+struct DisplayFileInfo {
+    file_id: FileId,
+    display_name: String,
+    score: f64,
 }
 
-enum FilterRequest {
-    Update(String),  // New query to process
-    Shutdown,        // Tell thread to exit
+enum WorkerRequest {
+    UpdateQuery(String),
+    GetVisibleSlice { start: usize, count: usize },
+    Shutdown,
+}
+
+enum WorkerResponse {
+    QueryUpdated {
+        query: String,
+        total_results: usize,
+        visible_slice: Vec<DisplayFileInfo>,
+    },
+    VisibleSlice(Vec<DisplayFileInfo>),
 }
 ```
 
-### 2. Modify App Struct
-
+2. **Created unsafe Send wrapper** for Ranker (lines 157-159):
 ```rust
-struct App {
-    // ... existing fields ...
-
-    // New fields for async filtering
-    filter_tx: Sender<FilterRequest>,
-    filter_rx: Receiver<FilterResult>,
-    pending_query: Option<String>,  // Track what's being processed
-}
+struct SendRanker(ranker::Ranker);
+unsafe impl Send for SendRanker {}
 ```
+LightGBM Booster contains raw pointers, not Send by default. Safe for read-only ops.
 
-### 3. Setup in App::new()
+3. **Created WorkerState** (lines 161-284):
+   - Owns: file_registry, path_to_id, filtered_files, file_scores, ranker
+   - Methods: new(), add_file(), filter_and_rank(), get_slice()
+   - Moved ALL filtering/ranking logic from App
 
+4. **Implemented worker_thread_loop** (lines 286-353):
+   - Processes walker updates (non-blocking via try_recv)
+   - Receives worker requests with 10ms timeout
+   - Debounces queries (drains all pending, keeps latest)
+   - Sends back results with first 20 items
+
+5. **Updated App struct** (lines 355-377):
+   - Removed: file_registry, path_to_id, filtered_files, file_scores, ranker
+   - Added: visible_files (Vec<DisplayFileInfo>), total_results, worker_tx, worker_rx
+   - Only keeps what's visible on screen
+
+6. **Updated App::new()** (lines 380-457):
+   - Creates worker/walker channels
+   - Initializes WorkerState with ranker
+   - Spawns worker thread
+   - Spawns walker thread (directly to worker)
+
+## ❌ Remaining Work (46 compilation errors)
+
+### 1. Remove/Update Old Methods
+
+**Files to modify:**
+
+#### `reload_model()` (line ~459)
+- Currently tries to access `self.ranker` (doesn't exist)
+- **Solution**: Send UpdateQuery to worker to trigger re-filter with new model
+  - Or: Add `ReloadModel` variant to WorkerRequest
+  - Worker would reload ranker, re-filter current query
+
+#### `reload_and_rerank()` (line ~468)
+- Currently tries to access `self.ranker.clicks`
+- **Solution**: Add `ReloadClicks` variant to WorkerRequest
+  - Worker reloads clicks, re-filters current query
+
+#### `update_filtered_files()` (line ~477)
+- Entire method is obsolete
+- **Solution**: Delete it entirely
+  - All callers should send WorkerRequest::UpdateQuery instead
+
+### 2. Update Event Handlers
+
+**Keyboard input** (in main event loop):
 ```rust
-fn new(root: PathBuf) -> Result<Self> {
-    // ... existing setup ...
-
-    // Create channels
-    let (filter_tx, filter_task_rx) = mpsc::channel::<FilterRequest>();
-    let (filter_result_tx, filter_rx) = mpsc::channel::<FilterResult>();
-
-    // Clone data needed by background thread
-    let files_clone = files.clone();
-    let historical_clone = historical_files.clone();
-    let root_clone = root.clone();
-    let session_id_clone = session_id.clone();
-    let ranker_clone = /* Need to make Ranker cloneable or use Arc */;
-
-    // Spawn background filtering thread
-    std::thread::spawn(move || {
-        let mut last_query: Option<String> = None;
-
-        loop {
-            // Receive next filter request
-            match filter_task_rx.recv() {
-                Ok(FilterRequest::Shutdown) => break,
-                Ok(FilterRequest::Update(query)) => {
-                    // Debounce: wait 50ms for more updates
-                    std::thread::sleep(Duration::from_millis(50));
-
-                    // Check if newer query arrived
-                    if let Ok(FilterRequest::Update(newer)) = filter_task_rx.try_recv() {
-                        // Skip this one, process newer query
-                        continue;
-                    }
-
-                    // Still latest, process it
-                    let result = do_filtering_and_ranking(
-                        &query,
-                        &files_clone,
-                        &historical_clone,
-                        &root_clone,
-                        &session_id_clone,
-                        &ranker_clone,
-                    );
-
-                    let _ = filter_result_tx.send(result);
-                }
-                Err(_) => break,
-            }
-        }
-    });
-
-    Ok(App {
-        // ... existing fields ...
-        filter_tx,
-        filter_rx,
-        pending_query: None,
-    })
-}
-```
-
-### 4. Extract Filtering Logic
-
-```rust
-fn do_filtering_and_ranking(
-    query: &str,
-    files: &[PathBuf],
-    historical_files: &[PathBuf],
-    root: &Path,
-    session_id: &str,
-    ranker: &ranker::Ranker,
-) -> FilterResult {
-    // This is the current update_filtered_files() logic
-    // Move it to a standalone function
-
-    let query_lower = query.to_lowercase();
-    let mut file_entries = Vec::new();
-    let mut matching_files = Vec::new();
-
-    // Filter files...
-    // Get metadata...
-    // Run ranker...
-
-    FilterResult {
-        query: query.to_string(),
-        filtered_files: file_entries,
-        file_scores: scored,
-    }
-}
-```
-
-### 5. Update Key Handling
-
-```rust
-// In main event loop
+// OLD:
 KeyCode::Char(c) => {
     app.query.push(c);
-    // Send to background thread (non-blocking)
-    let _ = app.filter_tx.send(FilterRequest::Update(app.query.clone()));
-    app.pending_query = Some(app.query.clone());
-    // UI renders immediately with old results
+    app.update_filtered_files();  // BLOCKS
 }
 
-KeyCode::Backspace => {
-    app.query.pop();
-    let _ = app.filter_tx.send(FilterRequest::Update(app.query.clone()));
-    app.pending_query = Some(app.query.clone());
+// NEW:
+KeyCode::Char(c) => {
+    app.query.push(c);
+    let _ = app.worker_tx.send(WorkerRequest::UpdateQuery(app.query.clone()));
+    // Continue immediately, UI renders with old visible_files
 }
 ```
 
-### 6. Poll for Results in Main Loop
-
+**Backspace:**
 ```rust
-// After rendering, check for filter results
-if let Ok(result) = app.filter_rx.try_recv() {
-    // Only apply if this matches our pending query
-    if app.pending_query.as_ref() == Some(&result.query) {
-        app.filtered_files = result.filtered_files;
-        app.file_scores = result.file_scores;
-        app.pending_query = None;
+// OLD:
+KeyCode::Backspace => {
+    app.query.pop();
+    app.update_filtered_files();
+}
 
-        // Reset selection if needed
-        if app.selected_index >= app.filtered_files.len() && !app.filtered_files.is_empty() {
-            app.selected_index = 0;
-        }
+// NEW:
+KeyCode::Backspace => {
+    app.query.pop();
+    let _ = app.worker_tx.send(WorkerRequest::UpdateQuery(app.query.clone()));
+}
+```
 
-        // Re-render with new results (will happen on next iteration)
+**Scroll/Navigation:**
+```rust
+// OLD:
+KeyCode::Down => {
+    app.selected_index += 1;
+    if app.selected_index >= app.filtered_files.len() {
+        app.selected_index = app.filtered_files.len().saturating_sub(1);
+    }
+}
+
+// NEW:
+KeyCode::Down => {
+    app.selected_index += 1;
+    if app.selected_index >= app.total_results {
+        app.selected_index = app.total_results.saturating_sub(1);
+    }
+
+    // Check if we need more visible data
+    let visible_start = app.file_list_scroll as usize;
+    let visible_end = visible_start + 20;
+    if app.selected_index >= visible_end - 5 {
+        // Request next slice
+        let _ = app.worker_tx.send(WorkerRequest::GetVisibleSlice {
+            start: visible_start,
+            count: 40,  // Get more to avoid constant requests
+        });
     }
 }
 ```
 
-### 7. Cleanup on Exit
+### 3. Add Result Polling in Main Loop
 
+**After event handling, before rendering:**
 ```rust
-// Before exiting main()
-let _ = app.filter_tx.send(FilterRequest::Shutdown);
+// Poll for worker responses (non-blocking)
+while let Ok(response) = app.worker_rx.try_recv() {
+    match response {
+        WorkerResponse::QueryUpdated { query, total_results, visible_slice } => {
+            // Only apply if query still matches
+            if query == app.query {
+                app.visible_files = visible_slice;
+                app.total_results = total_results;
+
+                // Reset selection if needed
+                if app.selected_index >= total_results {
+                    app.selected_index = 0;
+                }
+
+                // Create subsession
+                app.current_subsession = Some(Subsession {
+                    id: app.next_subsession_id,
+                    query: query.clone(),
+                    created_at: jiff::Timestamp::now(),
+                    impressions_logged: false,
+                });
+                app.next_subsession_id += 1;
+            }
+        }
+        WorkerResponse::VisibleSlice(slice) => {
+            app.visible_files = slice;
+        }
+    }
+}
 ```
 
-## Ranker Sharing Strategy
+### 4. Update UI Rendering
 
-The ranker needs to be shared between main thread and filter thread. Options:
-
-### Option 1: Arc<Ranker>
+**File list rendering:**
 ```rust
-use std::sync::Arc;
+// OLD:
+let items: Vec<ListItem> = app.filtered_files
+    .iter()
+    .enumerate()
+    .skip(scroll_offset)
+    .take(visible_count)
+    .map(|(i, file_id)| {
+        let file_info = &app.file_registry[file_id.0];
+        // ... render
+    })
+    .collect();
 
-struct App {
-    ranker: Arc<ranker::Ranker>,
+// NEW:
+let items: Vec<ListItem> = app.visible_files
+    .iter()
+    .enumerate()
+    .map(|(i, display_info)| {
+        // display_info has: file_id, display_name, score
+        // ... render using display_info
+    })
+    .collect();
+```
+
+**Status line:**
+```rust
+// OLD:
+format!("{}/{} files", app.selected_index + 1, app.filtered_files.len())
+
+// NEW:
+format!("{}/{} files", app.selected_index + 1, app.total_results)
+```
+
+### 5. Update Check/Log Impressions
+
+**Problem**: Main thread needs file paths to log impressions, but only has visible_files
+
+**Solution A**: Add file_path to DisplayFileInfo
+```rust
+struct DisplayFileInfo {
+    file_id: FileId,
+    display_name: String,
+    full_path: PathBuf,  // ADD THIS
+    score: f64,
+}
+```
+
+**Solution B**: Add GetFilePath request to worker
+```rust
+enum WorkerRequest {
     // ...
+    GetFilePath(FileId),
 }
 
-// Clone Arc for background thread
-let ranker_clone = Arc::clone(&ranker);
+enum WorkerResponse {
+    // ...
+    FilePath(FileId, PathBuf),
+}
 ```
 
-### Option 2: Make Ranker Clone (if lightweight)
+Recommendation: **Solution A** - include full_path in DisplayFileInfo since impressions need it.
+
+### 6. Update Preview Loading
+
+**Problem**: Preview loading needs full file path
+
+**Solutions**: Same as impressions - add full_path to DisplayFileInfo
+
+### 7. Handle Shutdown
+
+**In main cleanup:**
 ```rust
-// In ranker.rs, if model can be shared
-#[derive(Clone)]
-pub struct Ranker { /* ... */ }
+// Before exiting
+let _ = app.worker_tx.send(WorkerRequest::Shutdown);
 ```
-
-**Recommendation: Use Arc<Ranker>** since LightGBM model is read-only after loading.
-
-## Expected Performance
-
-- **Before:** 100-500ms blocking on each keystroke
-- **After:**
-  - UI renders in <16ms (responsive immediately)
-  - Results appear 50-150ms after user stops typing
-  - Smooth typing experience even with 5000 files
-
-## Testing Plan
-
-1. Test with 5000 files, verify no lag when typing
-2. Test rapid typing (ensure debouncing works)
-3. Test that results match current implementation
-4. Test edge cases: empty query, no matches, etc.
 
 ## Files to Modify
 
-- `src/main.rs`: Main changes (channels, background thread, key handling)
-- `src/ranker.rs`: Possibly add Clone or use Arc
+1. **src/main.rs**:
+   - Delete `update_filtered_files()` method
+   - Update `reload_model()` to send worker request
+   - Update `reload_and_rerank()` to send worker request
+   - Update all keyboard handlers (search event loop for `app.query.push`, `app.query.pop`)
+   - Add result polling in main loop
+   - Update all `app.filtered_files` references to `app.visible_files`
+   - Update all `app.file_registry` lookups (no longer exists)
+   - Update rendering code
+   - Update impression logging
+   - Update preview loading
+   - Add shutdown message
 
-## Notes
+2. **src/main.rs** (DisplayFileInfo):
+   - Add `full_path: PathBuf` field
 
-- Keep logging in background thread (already goes to app.log)
-- Consider increasing debounce delay if 50ms isn't enough
-- Could add visual indicator for "searching..." state
+3. **src/main.rs** (WorkerState::get_slice):
+   - Include `full_path` when building DisplayFileInfo
+
+## Search Patterns to Find All References
+
+```bash
+# Find all places that need updating:
+rg "app\.filtered_files" src/main.rs
+rg "app\.file_registry" src/main.rs
+rg "app\.file_scores" src/main.rs
+rg "app\.ranker" src/main.rs
+rg "update_filtered_files" src/main.rs
+rg "app\.query\.push" src/main.rs
+rg "app\.query\.pop" src/main.rs
+```
+
+## Testing Plan
+
+1. **Basic typing**: Type query, verify results appear (with slight delay)
+2. **Fast typing**: Type quickly, verify debouncing works (only latest query processed)
+3. **Scrolling**: Scroll through results, verify new slices load
+4. **Empty query**: Clear query, verify shows all files
+5. **No matches**: Type gibberish, verify empty result
+6. **Retraining**: Trigger retrain, verify works with worker thread
+7. **Preview**: Select file, verify preview loads
+
+## Performance Expectations
+
+**Before async:**
+- Each keystroke blocks UI for 30-80ms
+- Typing "hello" = 5 × 50ms = 250ms of lag
+
+**After async:**
+- Each keystroke: <1ms (just channel send)
+- Results appear 50-150ms after typing stops
+- Smooth, responsive typing even with 5000 files
+
+## Known Issues / Limitations
+
+1. **Stale results possible**: User might see old results briefly while new ones compute
+   - This is acceptable and expected behavior
+   - Alternative would be to show "Loading..." but that's more jarring
+
+2. **No model reload in worker yet**: Need to add ReloadModel request variant
+
+3. **Subsession timing**: Currently creates subsession when results arrive, not when query changes
+   - Might want to track "pending query" separately
+
+4. **Preview might fail**: If file is only in visible_files and user scrolls before preview loads
+   - Need to ensure full_path is in DisplayFileInfo
+
+## Next Steps
+
+1. Add `full_path` to DisplayFileInfo
+2. Delete `update_filtered_files()`
+3. Update `reload_model()` and `reload_and_rerank()`
+4. Find/replace all `app.filtered_files` → `app.visible_files`
+5. Find/replace all `app.file_registry` access (need different approach)
+6. Update keyboard handlers to use channels
+7. Add result polling in main loop
+8. Update UI rendering
+9. Update impression logging
+10. Test thoroughly

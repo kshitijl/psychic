@@ -25,7 +25,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     env,
     io::{self, stdout},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::mpsc::{self, Receiver},
     time::{Duration, Instant},
 };
@@ -131,32 +131,338 @@ impl FileInfo {
     }
 }
 
-struct App {
-    query: String,
+// Worker thread communication types
+#[derive(Debug, Clone)]
+struct DisplayFileInfo {
+    display_name: String,
+    full_path: PathBuf,
+    score: f64,
+    features: Vec<f64>,
+}
+
+enum WorkerRequest {
+    UpdateQuery(String),
+    GetVisibleSlice { start: usize, count: usize },
+    ReloadModel,
+    ReloadClicks,
+}
+
+enum WorkerResponse {
+    QueryUpdated {
+        query: String,
+        total_results: usize,
+        total_files: usize,
+        visible_slice: Vec<DisplayFileInfo>,
+        model_stats: Option<ranker::ModelStats>,
+    },
+    VisibleSlice(Vec<DisplayFileInfo>),
+}
+
+// Unsafe Send wrapper for Ranker (LightGBM is thread-safe for read-only ops)
+struct SendRanker(ranker::Ranker);
+unsafe impl Send for SendRanker {}
+
+// Worker thread state - owns all file data
+struct WorkerState {
     file_registry: Vec<FileInfo>,
     path_to_id: HashMap<PathBuf, FileId>,
     filtered_files: Vec<FileId>,
-    file_scores: Vec<ranker::FileScore>, // Scores and features for filtered files
+    file_scores: Vec<ranker::FileScore>,
+    current_query: String,
+    root: PathBuf,
+    ranker: SendRanker,
+    model_path: PathBuf,
+    db_path: PathBuf,
+}
+
+impl WorkerState {
+    fn new(root: PathBuf, ranker: ranker::Ranker, db: &Database, model_path: PathBuf, db_path: PathBuf) -> Result<Self> {
+        // Load historical files into registry
+        let mut file_registry = Vec::new();
+        let mut path_to_id: HashMap<PathBuf, FileId> = HashMap::new();
+
+        let historical_paths: Vec<PathBuf> = db
+            .get_previously_interacted_files()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|p| {
+                let path = PathBuf::from(&p);
+                if path.exists() { Some(path) } else { None }
+            })
+            .collect();
+
+        for path in historical_paths {
+            // Canonicalize historical paths once at startup
+            let canonical_path = path.canonicalize().unwrap_or(path);
+            let (mtime, _, _) = get_file_metadata(&canonical_path);
+            let file_info = FileInfo::from_history(canonical_path.clone(), mtime, &root);
+            let file_id = FileId(file_registry.len());
+            path_to_id.insert(canonical_path, file_id);
+            file_registry.push(file_info);
+        }
+
+        log::debug!("WorkerState loaded {} historical files", file_registry.len());
+
+        Ok(WorkerState {
+            file_registry,
+            path_to_id,
+            filtered_files: Vec::new(),
+            file_scores: Vec::new(),
+            current_query: String::new(),
+            root,
+            ranker: SendRanker(ranker),
+            model_path,
+            db_path,
+        })
+    }
+
+    fn add_file(&mut self, path: PathBuf, mtime: Option<i64>) {
+        if !self.path_to_id.contains_key(&path) {
+            let file_info = FileInfo::from_walkdir(path.clone(), mtime, &self.root);
+            let file_id = FileId(self.file_registry.len());
+            self.path_to_id.insert(path, file_id);
+            self.file_registry.push(file_info);
+        }
+    }
+
+    fn filter_and_rank(&mut self, query: &str) -> Result<()> {
+        self.current_query = query.to_string();
+        let query_lower = query.to_lowercase();
+
+        // Filter files that match the query
+        let matching_file_ids: Vec<FileId> = (0..self.file_registry.len())
+            .map(FileId)
+            .filter(|&file_id| {
+                let file_info = &self.file_registry[file_id.0];
+                query_lower.is_empty() || file_info.display_name.to_lowercase().contains(&query_lower)
+            })
+            .collect();
+
+        // Convert to FileCandidate structs
+        let file_candidates: Vec<ranker::FileCandidate> = matching_file_ids
+            .iter()
+            .map(|&file_id| {
+                let file_info = &self.file_registry[file_id.0];
+                ranker::FileCandidate {
+                    file_id: file_id.0,
+                    relative_path: file_info.display_name.clone(),
+                    full_path: file_info.full_path.clone(),
+                    mtime: file_info.mtime,
+                    is_from_walker: file_info.is_from_walker,
+                }
+            })
+            .collect();
+
+        // Rank them with the model
+        let current_timestamp = jiff::Timestamp::now().as_second();
+        match self.ranker.0.rank_files(query, &file_candidates, current_timestamp, &self.root) {
+            Ok(scored) => {
+                self.filtered_files = scored.iter().map(|fs| FileId(fs.file_id)).collect();
+                self.file_scores = scored;
+            }
+            Err(e) => {
+                log::warn!("Ranking failed: {}, falling back to simple filtering", e);
+                self.file_scores.clear();
+                self.filtered_files = matching_file_ids;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn get_slice(&self, start: usize, count: usize) -> Vec<DisplayFileInfo> {
+        self.filtered_files
+            .iter()
+            .skip(start)
+            .take(count)
+            .map(|&file_id| {
+                let file_info = &self.file_registry[file_id.0];
+                let file_score = self.file_scores
+                    .iter()
+                    .find(|fs| fs.file_id == file_id.0);
+
+                let score = file_score.map(|fs| fs.score).unwrap_or(0.0);
+                let features = file_score.map(|fs| fs.features.clone()).unwrap_or_default();
+
+                DisplayFileInfo {
+                    display_name: file_info.display_name.clone(),
+                    full_path: file_info.full_path.clone(),
+                    score,
+                    features,
+                }
+            })
+            .collect()
+    }
+
+    fn reload_model(&mut self) -> Result<()> {
+        log::info!("Worker: Reloading model from disk");
+        self.ranker.0 = ranker::Ranker::new(&self.model_path, self.db_path.clone())?;
+        log::info!("Worker: Model reloaded successfully");
+        Ok(())
+    }
+
+    fn reload_clicks(&mut self) -> Result<()> {
+        log::info!("Worker: Reloading click data");
+        self.ranker.0.clicks = ranker::Ranker::load_clicks(&self.db_path)?;
+        log::info!("Worker: Click data reloaded successfully");
+        Ok(())
+    }
+}
+
+// Worker thread main loop
+fn worker_thread_loop(
+    task_rx: mpsc::Receiver<WorkerRequest>,
+    result_tx: mpsc::Sender<WorkerResponse>,
+    walker_rx: mpsc::Receiver<(PathBuf, Option<i64>)>,
+    mut state: WorkerState,
+) {
+    use std::sync::mpsc::RecvTimeoutError;
+    use std::time::Instant;
+
+    let mut last_update = Instant::now();
+    let mut files_changed = false;
+
+    loop {
+        // Process walker updates (non-blocking)
+        while let Ok((path, mtime)) = walker_rx.try_recv() {
+            state.add_file(path, mtime);
+            files_changed = true;
+        }
+
+        // If files changed and enough time passed, send update
+        if files_changed && last_update.elapsed() > Duration::from_millis(100) {
+            if let Err(e) = state.filter_and_rank(&state.current_query.clone()) {
+                log::error!("Auto-refresh filter/rank failed: {}", e);
+            } else {
+                let visible_slice = state.get_slice(0, 60);
+                let _ = result_tx.send(WorkerResponse::QueryUpdated {
+                    query: state.current_query.clone(),
+                    total_results: state.filtered_files.len(),
+                    total_files: state.file_registry.len(),
+                    visible_slice,
+                    model_stats: state.ranker.0.stats.clone(),
+                });
+                last_update = Instant::now();
+                files_changed = false;
+            }
+        }
+
+        // Wait for worker requests with timeout
+        match task_rx.recv_timeout(Duration::from_millis(5)) {
+            Ok(WorkerRequest::UpdateQuery(query)) => {
+                // Debounce: drain all pending queries and keep the latest
+                let query = drain_latest_query(&task_rx, query);
+                state.current_query = query.clone();
+
+                // Filter and rank
+                if let Err(e) = state.filter_and_rank(&query) {
+                    log::error!("Filter/rank failed: {}", e);
+                    continue;
+                }
+
+                // Send back results with enough items to fill screen (assume ~50 lines)
+                let visible_slice = state.get_slice(0, 60);
+                let _ = result_tx.send(WorkerResponse::QueryUpdated {
+                    query,
+                    total_results: state.filtered_files.len(),
+                    total_files: state.file_registry.len(),
+                    visible_slice,
+                    model_stats: state.ranker.0.stats.clone(),
+                });
+                last_update = Instant::now();
+                files_changed = false;
+            }
+            Ok(WorkerRequest::GetVisibleSlice { start, count }) => {
+                let slice = state.get_slice(start, count);
+                let _ = result_tx.send(WorkerResponse::VisibleSlice(slice));
+            }
+            Ok(WorkerRequest::ReloadModel) => {
+                if let Err(e) = state.reload_model() {
+                    log::error!("Failed to reload model: {}", e);
+                } else {
+                    // Re-filter and rank with new model
+                    let query = state.current_query.clone();
+                    if let Err(e) = state.filter_and_rank(&query) {
+                        log::error!("Filter/rank failed after model reload: {}", e);
+                    } else {
+                        let visible_slice = state.get_slice(0, 60);
+                        let _ = result_tx.send(WorkerResponse::QueryUpdated {
+                            query,
+                            total_results: state.filtered_files.len(),
+                            total_files: state.file_registry.len(),
+                            visible_slice,
+                            model_stats: state.ranker.0.stats.clone(),
+                        });
+                    }
+                }
+            }
+            Ok(WorkerRequest::ReloadClicks) => {
+                if let Err(e) = state.reload_clicks() {
+                    log::error!("Failed to reload clicks: {}", e);
+                } else {
+                    // Re-filter and rank with new clicks
+                    let query = state.current_query.clone();
+                    if let Err(e) = state.filter_and_rank(&query) {
+                        log::error!("Filter/rank failed after clicks reload: {}", e);
+                    } else {
+                        let visible_slice = state.get_slice(0, 60);
+                        let _ = result_tx.send(WorkerResponse::QueryUpdated {
+                            query,
+                            total_results: state.filtered_files.len(),
+                            total_files: state.file_registry.len(),
+                            visible_slice,
+                            model_stats: state.ranker.0.stats.clone(),
+                        });
+                    }
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                // No work to do, loop again
+                continue;
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                log::debug!("Worker thread channel disconnected");
+                break;
+            }
+        }
+    }
+}
+
+// Helper to drain all pending queries and return the latest one
+fn drain_latest_query(rx: &mpsc::Receiver<WorkerRequest>, initial: String) -> String {
+    let mut latest = initial;
+    while let Ok(WorkerRequest::UpdateQuery(query)) = rx.try_recv() {
+        latest = query;
+    }
+    latest
+}
+
+struct App {
+    query: String,
+    visible_files: Vec<DisplayFileInfo>, // Only what's currently visible
+    total_results: usize, // Total number of filtered files
+    total_files: usize, // Total number of files in index
     selected_index: usize,
     file_list_scroll: u16, // Scroll offset for file list
     preview_scroll: u16,
     preview_cache: Option<(String, Text<'static>)>, // (file_path, rendered_text)
     scrolled_files: HashSet<(String, String)>, // (query, full_path) - track what we've logged scroll for
-    root: PathBuf,
     session_id: String,
     current_subsession: Option<Subsession>,
     next_subsession_id: u64,
     db: Database,
-    ranker: ranker::Ranker,
-    data_dir: PathBuf,
+    model_stats_cache: Option<ranker::ModelStats>, // Cached from worker, refreshed periodically
     retraining: bool,
     log_receiver: Receiver<String>,
     recent_logs: VecDeque<String>,
     debug_maximized: bool,
+    // Worker thread communication
+    worker_tx: mpsc::Sender<WorkerRequest>,
+    worker_rx: mpsc::Receiver<WorkerResponse>,
 }
 
 impl App {
-    fn new(root: PathBuf, data_dir: &PathBuf, log_receiver: Receiver<String>) -> Result<Self> {
+    fn new(root: PathBuf, data_dir: &Path, log_receiver: Receiver<String>) -> Result<Self> {
         use std::collections::hash_map::RandomState;
         use std::hash::{BuildHasher, Hash, Hasher};
 
@@ -185,186 +491,76 @@ impl App {
         log::info!("Loaded ranking model from {:?}", model_path);
         log::debug!("Ranker initialization took {:?}", ranker_start.elapsed());
 
-        // Load previously interacted files into registry
-        let historical_start = Instant::now();
-        let mut file_registry = Vec::new();
-        let mut path_to_id: HashMap<PathBuf, FileId> = HashMap::new();
+        // Create channels for worker thread
+        let (worker_tx, worker_task_rx) = mpsc::channel::<WorkerRequest>();
+        let (worker_result_tx, worker_rx) = mpsc::channel::<WorkerResponse>();
+        let (walker_tx, walker_rx) = mpsc::channel::<(PathBuf, Option<i64>)>();
 
-        let historical_paths: Vec<PathBuf> = db
-            .get_previously_interacted_files()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|p| {
-                let path = PathBuf::from(&p);
-                if path.exists() { Some(path) } else { None }
-            })
-            .collect();
+        // Initialize worker state
+        let worker_state = WorkerState::new(
+            root.clone(),
+            ranker,
+            &db,
+            model_path.clone(),
+            db_path.clone(),
+        )?;
 
-        for path in historical_paths {
-            // Canonicalize historical paths once at startup
-            let canonical_path = path.canonicalize().unwrap_or(path);
-            let (mtime, _, _) = get_file_metadata(&canonical_path);
-            let file_info = FileInfo::from_history(canonical_path.clone(), mtime, &root);
-            let file_id = FileId(file_registry.len());
-            path_to_id.insert(canonical_path, file_id);
-            file_registry.push(file_info);
-        }
+        // Spawn worker thread
+        std::thread::spawn(move || {
+            worker_thread_loop(worker_task_rx, worker_result_tx, walker_rx, worker_state);
+        });
 
-        log::debug!(
-            "Loading {} historical files took {:?}",
-            file_registry.len(),
-            historical_start.elapsed()
-        );
+        // Spawn walker thread
+        let root_clone = root.clone();
+        std::thread::spawn(move || {
+            start_file_walker(root_clone, walker_tx);
+        });
 
         log::debug!("App::new() total time: {:?}", start_time.elapsed());
 
-        Ok(App {
+        let app = App {
             query: String::new(),
-            file_registry,
-            path_to_id,
-            filtered_files: Vec::new(),
-            file_scores: Vec::new(),
+            visible_files: Vec::new(),
+            total_results: 0,
+            total_files: 0,
             selected_index: 0,
             file_list_scroll: 0,
             preview_scroll: 0,
             preview_cache: None,
             scrolled_files: HashSet::new(),
-            root,
             session_id,
             current_subsession: None,
             next_subsession_id: 1,
             db,
-            ranker,
-            data_dir: data_dir.clone(),
+            model_stats_cache: None,
             retraining: false,
             log_receiver,
             recent_logs: VecDeque::with_capacity(50),
             debug_maximized: false,
-        })
+            worker_tx: worker_tx.clone(),
+            worker_rx,
+        };
+
+        // Send initial query to worker
+        let _ = worker_tx.send(WorkerRequest::UpdateQuery(String::new()));
+
+        Ok(app)
     }
 
     fn reload_model(&mut self) -> Result<()> {
-        log::info!("Reloading model from disk");
-        let model_path = self.data_dir.join("model.txt");
-        let db_path = self.db.db_path();
-        self.ranker = ranker::Ranker::new(&model_path, db_path)?;
-        log::info!("Model reloaded successfully");
+        log::info!("Requesting model reload from worker");
+        self.worker_tx.send(WorkerRequest::ReloadModel)
+            .context("Failed to send ReloadModel request to worker")?;
         Ok(())
     }
 
     fn reload_and_rerank(&mut self) -> Result<()> {
-        log::info!("Reloading click data and reranking files");
-        // Reload clicks from database
-        self.ranker.clicks = ranker::Ranker::load_clicks(&self.ranker.db_path)?;
-        // Rerank using existing update_filtered_files logic
-        self.update_filtered_files();
+        log::info!("Requesting clicks reload from worker");
+        self.worker_tx.send(WorkerRequest::ReloadClicks)
+            .context("Failed to send ReloadClicks request to worker")?;
         Ok(())
     }
 
-    fn update_filtered_files(&mut self) {
-        let start_time = Instant::now();
-        let query_lower = self.query.to_lowercase();
-
-        // Filter files that match the query
-        let filter_start = Instant::now();
-        let matching_file_ids: Vec<FileId> = (0..self.file_registry.len())
-            .map(FileId)
-            .filter(|&file_id| {
-                let file_info = &self.file_registry[file_id.0];
-                query_lower.is_empty() || file_info.display_name.to_lowercase().contains(&query_lower)
-            })
-            .collect();
-
-        log::debug!(
-            "Filtering {} files took {:?}",
-            matching_file_ids.len(),
-            filter_start.elapsed()
-        );
-
-        // Convert to FileCandidate structs
-        let candidate_start = Instant::now();
-        let file_candidates: Vec<ranker::FileCandidate> = matching_file_ids
-            .iter()
-            .map(|&file_id| {
-                let file_info = &self.file_registry[file_id.0];
-                ranker::FileCandidate {
-                    file_id: file_id.0,
-                    relative_path: file_info.display_name.clone(),
-                    full_path: file_info.full_path.clone(),
-                    mtime: file_info.mtime,
-                    is_from_walker: file_info.is_from_walker,
-                }
-            })
-            .collect();
-        log::debug!("Building FileCandidate vec took {:?}", candidate_start.elapsed());
-
-        // Get current subsession timestamp (or use current time if no subsession)
-        let current_timestamp = self
-            .current_subsession
-            .as_ref()
-            .map(|s| s.created_at.as_second())
-            .unwrap_or_else(|| jiff::Timestamp::now().as_second());
-
-        // Reset feature timings before ranking
-        self.ranker.feature_timings.clear();
-
-        // Then, rank them with the model
-        let rank_start = Instant::now();
-        match self
-            .ranker
-            .rank_files(&self.query, &file_candidates, current_timestamp, &self.root)
-        {
-            Ok(scored) => {
-                let reorder_start = Instant::now();
-                // Extract FileIds from scores (already sorted by score)
-                self.filtered_files = scored.iter().map(|fs| FileId(fs.file_id)).collect();
-                self.file_scores = scored;
-                log::debug!("Reordering results took {:?}", reorder_start.elapsed());
-            }
-            Err(e) => {
-                log::warn!("Ranking failed: {}, falling back to simple filtering", e);
-                self.file_scores.clear();
-                self.filtered_files = matching_file_ids;
-            }
-        }
-        log::debug!("Ranking (total) took {:?}", rank_start.elapsed());
-
-        // Log feature timings (aggregate costs for this filter operation)
-        if !self.ranker.feature_timings.is_empty() {
-            let mut sorted_timings: Vec<_> = self.ranker.feature_timings.iter().collect();
-            sorted_timings.sort_by(|a, b| b.1.cmp(a.1)); // Sort by duration descending
-            log::debug!("Feature computation costs:");
-            for (name, duration) in sorted_timings.iter().take(10) {
-                log::debug!("  {}: {:?}", name, duration);
-            }
-        }
-
-        log::debug!(
-            "update_filtered_files() total time: {:?}",
-            start_time.elapsed()
-        );
-
-        // Reset selection if out of bounds
-        if self.selected_index >= self.filtered_files.len() && !self.filtered_files.is_empty() {
-            self.selected_index = 0;
-        }
-
-        // Create new subsession if query changed
-        let should_create_new = match &self.current_subsession {
-            None => true,
-            Some(subsession) => subsession.query != self.query,
-        };
-
-        if should_create_new {
-            self.current_subsession = Some(Subsession {
-                id: self.next_subsession_id,
-                query: self.query.clone(),
-                created_at: jiff::Timestamp::now(),
-                impressions_logged: false,
-            });
-            self.next_subsession_id += 1;
-        }
-    }
 
     fn check_and_log_impressions(&mut self, force: bool) -> Result<()> {
         let subsession = match &mut self.current_subsession {
@@ -387,15 +583,14 @@ impl App {
 
         // Log top 10 visible files with metadata
         let top_10: Vec<FileMetadata> = self
-            .filtered_files
+            .visible_files
             .iter()
             .take(10)
-            .map(|&file_id| {
-                let file_info = &self.file_registry[file_id.0];
-                let (mtime, atime, file_size) = get_file_metadata(&file_info.full_path);
+            .map(|display_info| {
+                let (mtime, atime, file_size) = get_file_metadata(&display_info.full_path);
                 (
-                    file_info.display_name.clone(),
-                    file_info.full_path.to_string_lossy().to_string(),
+                    display_info.display_name.clone(),
+                    display_info.full_path.to_string_lossy().to_string(),
                     mtime,
                     atime,
                     file_size,
@@ -413,11 +608,11 @@ impl App {
     }
 
     fn move_selection(&mut self, delta: isize) {
-        if self.filtered_files.is_empty() {
+        if self.total_results == 0 {
             return;
         }
 
-        let len = self.filtered_files.len() as isize;
+        let len = self.total_results as isize;
         let new_index = (self.selected_index as isize + delta).rem_euclid(len);
         self.selected_index = new_index as usize;
 
@@ -442,6 +637,20 @@ impl App {
         // If we're in the bottom 5 items and there's more to see, keep scrolling
         else if selected >= scroll + visible_height.saturating_sub(5) {
             self.file_list_scroll = selected.saturating_sub(visible_height.saturating_sub(5));
+        }
+
+        // Request more visible items if we're getting close to the edge
+        let scroll_offset = self.file_list_scroll as usize;
+        let current_visible_end = scroll_offset + self.visible_files.len();
+        let needed_end = scroll_offset + visible_height as usize + 10; // 10 item buffer
+
+        if needed_end > current_visible_end && current_visible_end < self.total_results {
+            // Request more items
+            let count = (visible_height as usize * 2).max(60); // At least 60 or 2x screen height
+            let _ = self.worker_tx.send(WorkerRequest::GetVisibleSlice {
+                start: scroll_offset,
+                count,
+            });
         }
     }
 }
@@ -610,9 +819,6 @@ fn main() -> Result<()> {
         }
     });
 
-    // Start file walker
-    let (tx, rx) = mpsc::channel();
-    start_file_walker(root.clone(), tx);
 
     // Setup terminal
     enable_raw_mode()?;
@@ -622,7 +828,7 @@ fn main() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     // Run the app
-    let result = run_app(&mut terminal, &mut app, rx, retrain_rx);
+    let result = run_app(&mut terminal, &mut app, retrain_rx);
 
     // Cleanup
     disable_raw_mode()?;
@@ -635,27 +841,10 @@ fn main() -> Result<()> {
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
-    rx: Receiver<(PathBuf, Option<i64>)>,
     retrain_rx: Receiver<bool>,
 ) -> Result<()> {
     loop {
-        // Receive new files from walker (non-blocking)
-        let mut received_files = false;
-        while let Ok((path, mtime)) = rx.try_recv() {
-            // Add to registry if not already present
-            if !app.path_to_id.contains_key(&path) {
-                let file_info = FileInfo::from_walkdir(path.clone(), mtime, &app.root);
-                let file_id = FileId(app.file_registry.len());
-                app.path_to_id.insert(path, file_id);
-                app.file_registry.push(file_info);
-                received_files = true;
-            }
-        }
-
-        // Only update filtered files once after receiving all available files
-        if received_files {
-            app.update_filtered_files();
-        }
+        // Walker files are now handled by the worker thread
 
         // Check and log impressions if >200ms old
         let _ = app.check_and_log_impressions(false);
@@ -699,15 +888,14 @@ fn run_app(
 
             // File list on the left
             let list_width = top_chunks[0].width.saturating_sub(2) as usize; // subtract borders
+            let scroll_offset = app.file_list_scroll as usize;
             let items: Vec<ListItem> = app
-                .filtered_files
+                .visible_files
                 .iter()
                 .enumerate()
-                .skip(app.file_list_scroll as usize)
-                .take(visible_height as usize)
-                .map(|(i, &file_id)| {
-                    let file_info = &app.file_registry[file_id.0];
-                    let time_ago = get_time_ago(&file_info.full_path);
+                .map(|(visible_idx, display_info)| {
+                    let i = scroll_offset + visible_idx;
+                    let time_ago = get_time_ago(&display_info.full_path);
                     let rank = i + 1;
 
                     // Calculate space: "N. " takes 4 chars, time_ago length, we need padding between
@@ -720,11 +908,11 @@ fn run_app(
                     let file_width = available.saturating_sub(2); // leave at least 2 spaces padding
 
                     // Right-justify time by padding filename to fill available space
-                    let line = if file_info.display_name.len() > file_width {
+                    let line = if display_info.display_name.len() > file_width {
                         format!(
                             "{}{:<width$}  {}",
                             rank_prefix,
-                            &file_info.display_name[..file_width],
+                            &display_info.display_name[..file_width],
                             time_ago,
                             width = file_width
                         )
@@ -732,7 +920,7 @@ fn run_app(
                         format!(
                             "{}{:<width$}  {}",
                             rank_prefix,
-                            &file_info.display_name,
+                            &display_info.display_name,
                             time_ago,
                             width = file_width
                         )
@@ -750,16 +938,27 @@ fn run_app(
                 .collect();
 
             let list = List::new(items).block(Block::default().borders(Borders::ALL).title(
-                format!("Files ({}/{})", app.filtered_files.len(), app.file_registry.len()),
+                format!("Files ({}/{})", app.total_results, app.total_files),
             ));
             f.render_widget(list, top_chunks[0]);
 
             // Preview on the right using bat (with smart caching)
             let preview_height = top_chunks[1].height.saturating_sub(2);
-            let preview_text = if !app.filtered_files.is_empty() {
-                let file_id = app.filtered_files[app.selected_index];
-                let file_info = &app.file_registry[file_id.0];
-                let full_path_str = file_info.full_path.to_string_lossy().to_string();
+            let preview_text = if !app.visible_files.is_empty() && app.total_results > 0 {
+                let scroll_offset = app.file_list_scroll as usize;
+                let visible_idx = app.selected_index.saturating_sub(scroll_offset);
+
+                let full_path_str = if visible_idx < app.visible_files.len() {
+                    app.visible_files[visible_idx].full_path.to_string_lossy().to_string()
+                } else {
+                    // Selected file not in visible slice yet, show placeholder
+                    String::from("[Loading...]")
+                };
+
+                if full_path_str == "[Loading...]" {
+                    Text::from("[Loading preview...]")
+                } else {
+                    let full_path = PathBuf::from(&full_path_str);
 
                 // Check for a full, cached preview
                 if let Some(cached_text) = app.preview_cache.as_ref().and_then(|(path, text)| {
@@ -782,7 +981,7 @@ fn run_app(
                             .arg("--style=numbers")
                             .arg("--line-range")
                             .arg(&line_range)
-                            .arg(&file_info.full_path)
+                            .arg(&full_path)
                             .output();
 
                         let text = match bat_output {
@@ -792,7 +991,7 @@ fn run_app(
                             },
                             Err(_) => {
                                 // Fallback for light preview
-                                match std::fs::read_to_string(&file_info.full_path) {
+                                match std::fs::read_to_string(&full_path) {
                                     Ok(content) => Text::from(
                                         content
                                             .lines()
@@ -811,7 +1010,7 @@ fn run_app(
                             .arg("--color=always")
                             .arg("--style=numbers")
                             .arg("--paging=never")
-                            .arg(&file_info.full_path)
+                            .arg(&full_path)
                             .output();
 
                         let text = match bat_output {
@@ -821,7 +1020,7 @@ fn run_app(
                             },
                             Err(_) => {
                                 // Fallback for full preview
-                                match std::fs::read_to_string(&file_info.full_path) {
+                                match std::fs::read_to_string(&full_path) {
                                     Ok(content) => Text::from(content),
                                     Err(_) => Text::from("[Unable to preview file]"),
                                 }
@@ -835,6 +1034,7 @@ fn run_app(
                     }
                     text_to_render
                 }
+                }
             } else {
                 Text::from("")
             };
@@ -847,23 +1047,33 @@ fn run_app(
             // Debug panel on the right
             let mut debug_lines = Vec::new();
 
-            if !app.file_scores.is_empty() && app.selected_index < app.file_scores.len() {
-                let file_score = &app.file_scores[app.selected_index];
-                debug_lines.push(format!("Score: {:.4}", file_score.score));
-                debug_lines.push(String::from(""));
-                debug_lines.push(String::from("Features:"));
-                debug_lines.push(String::from(""));
+            // Show current selection info
+            if !app.visible_files.is_empty() && app.total_results > 0 {
+                let scroll_offset = app.file_list_scroll as usize;
+                let visible_idx = app.selected_index.saturating_sub(scroll_offset);
+                if visible_idx < app.visible_files.len() {
+                    let display_info = &app.visible_files[visible_idx];
+                    debug_lines.push(format!("Score: {:.4}", display_info.score));
+                    debug_lines.push(String::from(""));
+                    debug_lines.push(String::from("Features:"));
+                    debug_lines.push(String::from(""));
 
-                // Show all features from registry
-                let features_map = file_score.features_map();
-                for feature in feature_defs::FEATURE_REGISTRY.iter() {
-                    if let Some(value) = features_map.get(feature.name()) {
-                        debug_lines.push(format!("{}: {}", feature.name(), value));
+                    // Show all features from registry
+                    if !display_info.features.is_empty() {
+                        let features_map = ranker::features_to_map(&display_info.features);
+                        for feature in feature_defs::FEATURE_REGISTRY.iter() {
+                            if let Some(value) = features_map.get(feature.name()) {
+                                debug_lines.push(format!("  {}: {}", feature.name(), value));
+                            }
+                        }
+                    } else {
+                        debug_lines.push(String::from("  (no features)"));
                     }
+                } else {
+                    debug_lines.push(String::from("(loading...)"));
                 }
             } else {
-                debug_lines.push(String::from("No features"));
-                debug_lines.push(String::from("(no file selected)"));
+                debug_lines.push(String::from("No results"));
             }
 
             debug_lines.push(String::from("")); // Separator
@@ -875,9 +1085,9 @@ fn run_app(
             }
 
             // Add model stats
-            let formatter = timeago::Formatter::new();
-            if let Some(ref stats) = app.ranker.stats {
+            if let Some(ref stats) = app.model_stats_cache {
                 debug_lines.push(String::from("Model Stats:"));
+                let formatter = timeago::Formatter::new();
 
                 // Parse timestamp and show how long ago
                 if let Ok(trained_at) = stats.trained_at.parse::<jiff::Timestamp>() {
@@ -890,10 +1100,7 @@ fn run_app(
                     debug_lines.push(format!("  Trained: {}", stats.trained_at));
                 }
 
-                debug_lines.push(format!(
-                    "  Duration: {:.2}s",
-                    stats.training_duration_seconds
-                ));
+                debug_lines.push(format!("  Duration: {:.2}s", stats.training_duration_seconds));
                 debug_lines.push(format!("  Features: {}", stats.num_features));
                 debug_lines.push(format!(
                     "  Examples: {} ({} pos, {} neg)",
@@ -905,40 +1112,25 @@ fn run_app(
                 for feat in &stats.top_3_features {
                     debug_lines.push(format!("    {}: {:.1}", feat.feature, feat.importance));
                 }
-            } else {
-                debug_lines.push(String::from("Model Stats: N/A"));
+                debug_lines.push(String::from("")); // Separator
             }
 
-            debug_lines.push(String::from("")); // Separator
-
-            // Add model load time
-            let now = jiff::Timestamp::now();
-            let load_duration = now.duration_since(app.ranker.loaded_at);
-            let load_time_ago = formatter.convert(std::time::Duration::from_secs(
-                load_duration.as_secs() as u64,
-            ));
-            debug_lines.push(format!("Model load: {}", load_time_ago));
-
-            // Add clicks reload time
-            let clicks_duration = now.duration_since(app.ranker.clicks.loaded_at);
-            let clicks_time_ago = formatter.convert(std::time::Duration::from_secs(
-                clicks_duration.as_secs() as u64,
-            ));
-            debug_lines.push(format!("Clicks reload: {}", clicks_time_ago));
-
-            debug_lines.push(String::from("")); // Separator
-
             // Add preview cache status
-            if !app.filtered_files.is_empty() {
-                let file_id = app.filtered_files[app.selected_index];
-                let file_info = &app.file_registry[file_id.0];
-                let full_path_str = file_info.full_path.to_string_lossy().to_string();
-                let is_cached = app
-                    .preview_cache
-                    .as_ref()
-                    .is_some_and(|(p, _)| p == &full_path_str);
-                let cache_status = if is_cached { "Cached" } else { "Live" };
-                debug_lines.push(format!("Preview: {}", cache_status));
+            if !app.visible_files.is_empty() && app.total_results > 0 {
+                let scroll_offset = app.file_list_scroll as usize;
+                let visible_idx = app.selected_index.saturating_sub(scroll_offset);
+                if visible_idx < app.visible_files.len() {
+                    let display_info = &app.visible_files[visible_idx];
+                    let full_path_str = display_info.full_path.to_string_lossy().to_string();
+                    let is_cached = app
+                        .preview_cache
+                        .as_ref()
+                        .is_some_and(|(p, _)| p == &full_path_str);
+                    let cache_status = if is_cached { "Cached" } else { "Live" };
+                    debug_lines.push(format!("Preview: {}", cache_status));
+                } else {
+                    debug_lines.push(String::from("Preview: N/A"));
+                }
             } else {
                 debug_lines.push(String::from("Preview: N/A"));
             }
@@ -992,6 +1184,38 @@ fn run_app(
             }
         }
 
+        // Poll for worker responses (non-blocking)
+        while let Ok(response) = app.worker_rx.try_recv() {
+            match response {
+                WorkerResponse::QueryUpdated { query, total_results, total_files, visible_slice, model_stats } => {
+                    // Only apply if query still matches
+                    if query == app.query {
+                        app.visible_files = visible_slice;
+                        app.total_results = total_results;
+                        app.total_files = total_files;
+                        app.model_stats_cache = model_stats;
+
+                        // Reset selection if needed
+                        if app.selected_index >= total_results {
+                            app.selected_index = 0;
+                        }
+
+                        // Create subsession
+                        app.current_subsession = Some(Subsession {
+                            id: app.next_subsession_id,
+                            query: query.clone(),
+                            created_at: jiff::Timestamp::now(),
+                            impressions_logged: false,
+                        });
+                        app.next_subsession_id += 1;
+                    }
+                }
+                WorkerResponse::VisibleSlice(slice) => {
+                    app.visible_files = slice;
+                }
+            }
+        }
+
         // Handle events with timeout
         if event::poll(Duration::from_millis(100))? {
             let event_read = event::read()?;
@@ -1003,33 +1227,35 @@ fn run_app(
                             app.preview_scroll = app.preview_scroll.saturating_add(3);
 
                             // Log scroll event (deduplicated by query + full_path)
-                            if !app.filtered_files.is_empty() {
+                            if !app.visible_files.is_empty() && app.total_results > 0 {
                                 // Force log impressions before scroll
                                 let _ = app.check_and_log_impressions(true);
 
-                                let file_id = app.filtered_files[app.selected_index];
-                                let file_info = &app.file_registry[file_id.0];
-                                let full_path_str =
-                                    file_info.full_path.to_string_lossy().to_string();
-                                let key = (app.query.clone(), full_path_str.clone());
+                                let scroll_offset = app.file_list_scroll as usize;
+                                let visible_idx = app.selected_index.saturating_sub(scroll_offset);
+                                if visible_idx < app.visible_files.len() {
+                                    let display_info = &app.visible_files[visible_idx];
+                                    let full_path_str = display_info.full_path.to_string_lossy().to_string();
+                                    let key = (app.query.clone(), full_path_str.clone());
 
-                                if !app.scrolled_files.contains(&key) {
-                                    let (mtime, atime, file_size) =
-                                        get_file_metadata(&file_info.full_path);
-                                    let subsession_id =
-                                        app.current_subsession.as_ref().map(|s| s.id).unwrap_or(1);
-                                    let _ = app.db.log_scroll(EventData {
-                                        query: &app.query,
-                                        file_path: &file_info.display_name,
-                                        full_path: &full_path_str,
-                                        mtime,
-                                        atime,
-                                        file_size,
-                                        subsession_id,
-                                        action: "scroll",
-                                        session_id: &app.session_id,
-                                    });
-                                    app.scrolled_files.insert(key);
+                                    if !app.scrolled_files.contains(&key) {
+                                        let (mtime, atime, file_size) =
+                                            get_file_metadata(&display_info.full_path);
+                                        let subsession_id =
+                                            app.current_subsession.as_ref().map(|s| s.id).unwrap_or(1);
+                                        let _ = app.db.log_scroll(EventData {
+                                            query: &app.query,
+                                            file_path: &display_info.display_name,
+                                            full_path: &full_path_str,
+                                            mtime,
+                                            atime,
+                                            file_size,
+                                            subsession_id,
+                                            action: "scroll",
+                                            session_id: &app.session_id,
+                                        });
+                                        app.scrolled_files.insert(key);
+                                    }
                                 }
                             }
                         }
@@ -1037,33 +1263,35 @@ fn run_app(
                             app.preview_scroll = app.preview_scroll.saturating_sub(3);
 
                             // Log scroll event (deduplicated by query + full_path)
-                            if !app.filtered_files.is_empty() {
+                            if !app.visible_files.is_empty() && app.total_results > 0 {
                                 // Force log impressions before scroll
                                 let _ = app.check_and_log_impressions(true);
 
-                                let file_id = app.filtered_files[app.selected_index];
-                                let file_info = &app.file_registry[file_id.0];
-                                let full_path_str =
-                                    file_info.full_path.to_string_lossy().to_string();
-                                let key = (app.query.clone(), full_path_str.clone());
+                                let scroll_offset = app.file_list_scroll as usize;
+                                let visible_idx = app.selected_index.saturating_sub(scroll_offset);
+                                if visible_idx < app.visible_files.len() {
+                                    let display_info = &app.visible_files[visible_idx];
+                                    let full_path_str = display_info.full_path.to_string_lossy().to_string();
+                                    let key = (app.query.clone(), full_path_str.clone());
 
-                                if !app.scrolled_files.contains(&key) {
-                                    let (mtime, atime, file_size) =
-                                        get_file_metadata(&file_info.full_path);
-                                    let subsession_id =
-                                        app.current_subsession.as_ref().map(|s| s.id).unwrap_or(1);
-                                    let _ = app.db.log_scroll(EventData {
-                                        query: &app.query,
-                                        file_path: &file_info.display_name,
-                                        full_path: &full_path_str,
-                                        mtime,
-                                        atime,
-                                        file_size,
-                                        subsession_id,
-                                        action: "scroll",
-                                        session_id: &app.session_id,
-                                    });
-                                    app.scrolled_files.insert(key);
+                                    if !app.scrolled_files.contains(&key) {
+                                        let (mtime, atime, file_size) =
+                                            get_file_metadata(&display_info.full_path);
+                                        let subsession_id =
+                                            app.current_subsession.as_ref().map(|s| s.id).unwrap_or(1);
+                                        let _ = app.db.log_scroll(EventData {
+                                            query: &app.query,
+                                            file_path: &display_info.display_name,
+                                            full_path: &full_path_str,
+                                            mtime,
+                                            atime,
+                                            file_size,
+                                            subsession_id,
+                                            action: "scroll",
+                                            session_id: &app.session_id,
+                                        });
+                                        app.scrolled_files.insert(key);
+                                    }
                                 }
                             }
                         }
@@ -1082,7 +1310,7 @@ fn run_app(
                         {
                             // Ctrl-U: clear entire search
                             app.query.clear();
-                            app.update_filtered_files();
+                            let _ = app.worker_tx.send(WorkerRequest::UpdateQuery(app.query.clone()));
                         }
                         KeyCode::Char('o')
                             if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
@@ -1095,11 +1323,11 @@ fn run_app(
                         }
                         KeyCode::Char(c) => {
                             app.query.push(c);
-                            app.update_filtered_files();
+                            let _ = app.worker_tx.send(WorkerRequest::UpdateQuery(app.query.clone()));
                         }
                         KeyCode::Backspace => {
                             app.query.pop();
-                            app.update_filtered_files();
+                            let _ = app.worker_tx.send(WorkerRequest::UpdateQuery(app.query.clone()));
                         }
                         KeyCode::Up => {
                             app.move_selection(-1);
@@ -1108,62 +1336,65 @@ fn run_app(
                             app.move_selection(1);
                         }
                         KeyCode::Enter => {
-                            if !app.filtered_files.is_empty() {
+                            if !app.visible_files.is_empty() && app.total_results > 0 {
                                 // Force log impressions before click
                                 app.check_and_log_impressions(true)?;
 
-                                let file_id = app.filtered_files[app.selected_index];
-                                let file_info = &app.file_registry[file_id.0];
-                                let (mtime, atime, file_size) =
-                                    get_file_metadata(&file_info.full_path);
+                                let scroll_offset = app.file_list_scroll as usize;
+                                let visible_idx = app.selected_index.saturating_sub(scroll_offset);
+                                if visible_idx < app.visible_files.len() {
+                                    let display_info = &app.visible_files[visible_idx];
+                                    let (mtime, atime, file_size) =
+                                        get_file_metadata(&display_info.full_path);
 
-                                // Log the click
-                                let subsession_id =
-                                    app.current_subsession.as_ref().map(|s| s.id).unwrap_or(1);
-                                app.db.log_click(EventData {
-                                    query: &app.query,
-                                    file_path: &file_info.display_name,
-                                    full_path: &file_info.full_path.to_string_lossy(),
-                                    mtime,
-                                    atime,
-                                    file_size,
-                                    subsession_id,
-                                    action: "click",
-                                    session_id: &app.session_id,
-                                })?;
+                                    // Log the click
+                                    let subsession_id =
+                                        app.current_subsession.as_ref().map(|s| s.id).unwrap_or(1);
+                                    app.db.log_click(EventData {
+                                        query: &app.query,
+                                        file_path: &display_info.display_name,
+                                        full_path: &display_info.full_path.to_string_lossy(),
+                                        mtime,
+                                        atime,
+                                        file_size,
+                                        subsession_id,
+                                        action: "click",
+                                        session_id: &app.session_id,
+                                    })?;
 
-                                // Suspend TUI and launch editor
-                                disable_raw_mode()?;
-                                terminal
-                                    .backend_mut()
-                                    .execute(crossterm::event::DisableMouseCapture)?;
-                                terminal.backend_mut().execute(LeaveAlternateScreen)?;
+                                    // Suspend TUI and launch editor
+                                    disable_raw_mode()?;
+                                    terminal
+                                        .backend_mut()
+                                        .execute(crossterm::event::DisableMouseCapture)?;
+                                    terminal.backend_mut().execute(LeaveAlternateScreen)?;
 
-                                // Launch hx editor
-                                let status = std::process::Command::new("hx")
-                                    .arg(&file_info.full_path)
-                                    .status();
+                                    // Launch hx editor
+                                    let status = std::process::Command::new("hx")
+                                        .arg(&display_info.full_path)
+                                        .status();
 
-                                // Resume TUI
-                                enable_raw_mode()?;
-                                terminal.backend_mut().execute(EnterAlternateScreen)?;
-                                terminal
-                                    .backend_mut()
-                                    .execute(crossterm::event::EnableMouseCapture)?;
-                                terminal.clear()?;
+                                    // Resume TUI
+                                    enable_raw_mode()?;
+                                    terminal.backend_mut().execute(EnterAlternateScreen)?;
+                                    terminal
+                                        .backend_mut()
+                                        .execute(crossterm::event::EnableMouseCapture)?;
+                                    terminal.clear()?;
 
-                                if let Err(e) = status {
-                                    log::error!("Failed to launch editor: {}", e);
-                                }
+                                    if let Err(e) = status {
+                                        log::error!("Failed to launch editor: {}", e);
+                                    }
 
-                                // Reload model (may have been retrained in background)
-                                if let Err(e) = app.reload_model() {
-                                    log::error!("Failed to reload model: {}", e);
-                                }
+                                    // Reload model (may have been retrained in background)
+                                    if let Err(e) = app.reload_model() {
+                                        log::error!("Failed to reload model: {}", e);
+                                    }
 
-                                // Reload click data and rerank files after editing
-                                if let Err(e) = app.reload_and_rerank() {
-                                    log::error!("Failed to reload and rerank: {}", e);
+                                    // Reload click data and rerank files after editing
+                                    if let Err(e) = app.reload_and_rerank() {
+                                        log::error!("Failed to reload and rerank: {}", e);
+                                    }
                                 }
                             }
                         }

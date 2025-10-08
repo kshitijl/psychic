@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // Type alias for file metadata tuples
 pub type FileMetadata = (String, String, Option<i64>, Option<i64>, Option<i64>); // (relative, full, mtime, atime, file_size)
@@ -34,7 +34,7 @@ pub struct Database {
 }
 
 impl Database {
-    pub fn new(data_dir: &PathBuf) -> Result<Self> {
+    pub fn new(data_dir: &Path) -> Result<Self> {
         let db_path = Self::get_db_path(data_dir)?;
 
         // Create parent directory if it doesn't exist
@@ -88,7 +88,7 @@ impl Database {
         Ok(Database { conn, db_path })
     }
 
-    pub fn get_db_path(data_dir: &PathBuf) -> Result<PathBuf> {
+    pub fn get_db_path(data_dir: &Path) -> Result<PathBuf> {
         Ok(data_dir.join("events.db"))
     }
 
