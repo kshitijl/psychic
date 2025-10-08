@@ -74,8 +74,7 @@ fn get_default_data_dir() -> Result<PathBuf> {
 struct Subsession {
     id: u64,
     query: String,
-    created_at: Instant,
-    timestamp: i64, // Unix timestamp when subsession was created
+    created_at: jiff::Timestamp, // When subsession was created
     impressions_logged: bool,
 }
 
@@ -298,21 +297,22 @@ impl App {
         let current_timestamp = self
             .current_subsession
             .as_ref()
-            .map(|s| s.timestamp)
+            .map(|s| s.created_at.as_second())
             .unwrap_or_else(|| jiff::Timestamp::now().as_second());
 
         // Then, rank them with the model
         let rank_start = Instant::now();
-        match self.ranker.rank_files(&self.query, &file_candidates, current_timestamp, &self.root) {
+        match self
+            .ranker
+            .rank_files(&self.query, &file_candidates, current_timestamp, &self.root)
+        {
             Ok(scored) => {
                 // Reorder file_entries based on ranking scores
-                let score_order: Vec<String> =
-                    scored.iter().map(|fs| fs.path.clone()).collect();
+                let score_order: Vec<String> = scored.iter().map(|fs| fs.path.clone()).collect();
                 let mut reordered_entries = Vec::new();
 
                 for score_path in &score_order {
-                    if let Some(entry) =
-                        file_entries.iter().find(|e| &e.display_name == score_path)
+                    if let Some(entry) = file_entries.iter().find(|e| &e.display_name == score_path)
                     {
                         reordered_entries.push(entry.clone());
                     }
@@ -349,8 +349,7 @@ impl App {
             self.current_subsession = Some(Subsession {
                 id: self.next_subsession_id,
                 query: self.query.clone(),
-                created_at: Instant::now(),
-                timestamp: jiff::Timestamp::now().as_second(),
+                created_at: jiff::Timestamp::now(),
                 impressions_logged: false,
             });
             self.next_subsession_id += 1;
@@ -369,7 +368,9 @@ impl App {
         }
 
         // Check if we should log: either forced or >200ms old
-        let should_log = force || subsession.created_at.elapsed() >= Duration::from_millis(200);
+        let elapsed = jiff::Timestamp::now().duration_since(subsession.created_at);
+        let threshold = jiff::SignedDuration::from_millis(200);
+        let should_log = force || elapsed >= threshold;
         if !should_log {
             return Ok(());
         }
@@ -458,7 +459,8 @@ fn get_file_metadata(path: &PathBuf) -> (Option<i64>, Option<i64>, Option<i64>) 
 
 fn get_time_ago(path: &PathBuf) -> String {
     if let Ok(metadata) = std::fs::metadata(path)
-        && let Ok(modified) = metadata.modified() {
+        && let Ok(modified) = metadata.modified()
+    {
         let duration = std::time::SystemTime::now()
             .duration_since(modified)
             .unwrap_or(Duration::from_secs(0));
@@ -474,7 +476,10 @@ fn main() -> Result<()> {
     let (log_tx, log_rx) = mpsc::channel();
 
     if let Ok(home) = std::env::var("HOME") {
-        let log_dir = PathBuf::from(&home).join(".local").join("share").join("psychic");
+        let log_dir = PathBuf::from(&home)
+            .join(".local")
+            .join("share")
+            .join("psychic");
         let _ = std::fs::create_dir_all(&log_dir);
         let log_file = log_dir.join("app.log");
 
@@ -500,7 +505,9 @@ fn main() -> Result<()> {
     // Handle subcommands
     if let Some(command) = cli.command {
         // Get data directory (global option)
-        let data_dir = cli.data_dir.unwrap_or_else(|| get_default_data_dir().expect("Failed to get default data directory"));
+        let data_dir = cli.data_dir.unwrap_or_else(|| {
+            get_default_data_dir().expect("Failed to get default data directory")
+        });
 
         match command {
             Commands::GenerateFeatures { format } => {
@@ -552,7 +559,9 @@ fn main() -> Result<()> {
     let root = env::current_dir()?;
 
     // Get data directory for main app
-    let data_dir = cli.data_dir.unwrap_or_else(|| get_default_data_dir().expect("Failed to get default data directory"));
+    let data_dir = cli
+        .data_dir
+        .unwrap_or_else(|| get_default_data_dir().expect("Failed to get default data directory"));
 
     // Create channel for retraining status
     let (retrain_tx, retrain_rx) = mpsc::channel();
@@ -855,18 +864,24 @@ fn run_app(
                 if let Ok(trained_at) = stats.trained_at.parse::<jiff::Timestamp>() {
                     let now = jiff::Timestamp::now();
                     let duration = now.duration_since(trained_at);
-                    let time_ago = formatter.convert(std::time::Duration::from_secs(duration.as_secs() as u64));
+                    let time_ago = formatter
+                        .convert(std::time::Duration::from_secs(duration.as_secs() as u64));
                     debug_lines.push(format!("  Trained: {}", time_ago));
                 } else {
                     debug_lines.push(format!("  Trained: {}", stats.trained_at));
                 }
 
-                debug_lines.push(format!("  Duration: {:.2}s", stats.training_duration_seconds));
+                debug_lines.push(format!(
+                    "  Duration: {:.2}s",
+                    stats.training_duration_seconds
+                ));
                 debug_lines.push(format!("  Features: {}", stats.num_features));
-                debug_lines.push(format!("  Examples: {} ({} pos, {} neg)",
+                debug_lines.push(format!(
+                    "  Examples: {} ({} pos, {} neg)",
                     stats.num_total_examples,
                     stats.num_positive_examples,
-                    stats.num_negative_examples));
+                    stats.num_negative_examples
+                ));
                 debug_lines.push(String::from("  Top features:"));
                 for feat in &stats.top_3_features {
                     debug_lines.push(format!("    {}: {:.1}", feat.feature, feat.importance));
@@ -880,12 +895,16 @@ fn run_app(
             // Add model load time
             let now = jiff::Timestamp::now();
             let load_duration = now.duration_since(app.ranker.loaded_at);
-            let load_time_ago = formatter.convert(std::time::Duration::from_secs(load_duration.as_secs() as u64));
+            let load_time_ago = formatter.convert(std::time::Duration::from_secs(
+                load_duration.as_secs() as u64,
+            ));
             debug_lines.push(format!("Model load: {}", load_time_ago));
 
             // Add clicks reload time
             let clicks_duration = now.duration_since(app.ranker.clicks.loaded_at);
-            let clicks_time_ago = formatter.convert(std::time::Duration::from_secs(clicks_duration.as_secs() as u64));
+            let clicks_time_ago = formatter.convert(std::time::Duration::from_secs(
+                clicks_duration.as_secs() as u64,
+            ));
             debug_lines.push(format!("Clicks reload: {}", clicks_time_ago));
 
             debug_lines.push(String::from("")); // Separator
