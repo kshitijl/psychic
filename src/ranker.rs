@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 // Import features module
 use crate::feature_defs::{ClickEvent, FEATURE_REGISTRY, FeatureInputs, feature_names};
@@ -62,6 +62,7 @@ pub struct Ranker {
     pub db_path: PathBuf,
     pub stats: Option<ModelStats>,
     pub loaded_at: Timestamp,
+    pub feature_timings: HashMap<String, Duration>,
 }
 
 impl Ranker {
@@ -84,6 +85,7 @@ impl Ranker {
             db_path,
             stats,
             loaded_at: Timestamp::now(),
+            feature_timings: HashMap::new(),
         })
     }
 
@@ -151,7 +153,7 @@ impl Ranker {
     }
 
     pub fn rank_files(
-        &self,
+        &mut self,
         query: &str,
         files: &[FileCandidate],
         current_timestamp: i64,
@@ -164,7 +166,12 @@ impl Ranker {
         // Compute features for each file
         let mut scored_files = Vec::new();
         for file in files {
-            let features = self.compute_features(query, file, current_timestamp, cwd)?;
+            let (features, timings) = self.compute_features_with_timing(query, file, current_timestamp, cwd)?;
+
+            // Aggregate timings
+            for (feature_name, duration) in timings {
+                *self.feature_timings.entry(feature_name).or_insert(Duration::ZERO) += duration;
+            }
             // Get prediction score
             let score = self
                 .model
@@ -188,14 +195,14 @@ impl Ranker {
         Ok(scored_files)
     }
 
-    fn compute_features(
+    fn compute_features_with_timing(
         &self,
         query: &str,
         file: &FileCandidate,
         current_timestamp: i64,
         cwd: &Path,
-    ) -> Result<Vec<f64>> {
-        compute_features(
+    ) -> Result<(Vec<f64>, HashMap<String, Duration>)> {
+        compute_features_with_timing(
             query,
             file,
             current_timestamp,
@@ -214,8 +221,7 @@ fn features_to_map(features: &[f64]) -> HashMap<String, f64> {
         .collect()
 }
 
-/// Compute features for a file (standalone function, no Ranker needed)
-/// Returns feature vector in registry order (matches training)
+/// Compute features for a file (for tests, no timing)
 fn compute_features(
     query: &str,
     file: &FileCandidate,
@@ -223,6 +229,18 @@ fn compute_features(
     cwd: &Path,
     clicks_by_file: &HashMap<String, Vec<ClickEvent>>,
 ) -> Result<Vec<f64>> {
+    let (features, _timings) = compute_features_with_timing(query, file, current_timestamp, cwd, clicks_by_file)?;
+    Ok(features)
+}
+
+/// Compute features with timing for each feature
+fn compute_features_with_timing(
+    query: &str,
+    file: &FileCandidate,
+    current_timestamp: i64,
+    cwd: &Path,
+    clicks_by_file: &HashMap<String, Vec<ClickEvent>>,
+) -> Result<(Vec<f64>, HashMap<String, Duration>)> {
     // Create FeatureInputs for inference
     let inputs = FeatureInputs {
         query,
@@ -232,17 +250,23 @@ fn compute_features(
         cwd,
         clicks_by_file,
         current_timestamp,
-        session: None, // No session context at inference time
+        session: None,
     };
 
-    // Compute all features using the registry (in order)
+    // Compute all features using the registry, tracking time for each
     let mut features = Vec::with_capacity(FEATURE_REGISTRY.len());
+    let mut timings = HashMap::new();
+
     for feature in FEATURE_REGISTRY.iter() {
+        let start = Instant::now();
         let value = feature.compute(&inputs)?;
+        let elapsed = start.elapsed();
+
         features.push(value);
+        timings.insert(feature.name().to_string(), elapsed);
     }
 
-    Ok(features)
+    Ok((features, timings))
 }
 
 /// Find train.py by searching: binary dir -> parent dir -> grandparent dir
@@ -436,7 +460,7 @@ mod tests {
             }
         }
 
-        let ranker = ranker.unwrap();
+        let mut ranker = ranker.unwrap();
 
         // Test with simple data
         let test_files = vec![FileCandidate {

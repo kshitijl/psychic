@@ -297,6 +297,9 @@ impl App {
             .map(|s| s.created_at.as_second())
             .unwrap_or_else(|| jiff::Timestamp::now().as_second());
 
+        // Reset feature timings before ranking
+        self.ranker.feature_timings.clear();
+
         // Then, rank them with the model
         let rank_start = Instant::now();
         match self
@@ -315,6 +318,16 @@ impl App {
             }
         }
         log::debug!("Ranking took {:?}", rank_start.elapsed());
+
+        // Log feature timings (aggregate costs for this filter operation)
+        if !self.ranker.feature_timings.is_empty() {
+            let mut sorted_timings: Vec<_> = self.ranker.feature_timings.iter().collect();
+            sorted_timings.sort_by(|a, b| b.1.cmp(a.1)); // Sort by duration descending
+            log::debug!("Feature computation costs:");
+            for (name, duration) in sorted_timings.iter().take(10) {
+                log::debug!("  {}: {:?}", name, duration);
+            }
+        }
 
         log::debug!(
             "update_filtered_files() total time: {:?}",
