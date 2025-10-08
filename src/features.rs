@@ -442,7 +442,8 @@ mod tests {
         }
 
         let output_path = PathBuf::from("test/features_test.csv");
-        generate_features(&db_path, &output_path, OutputFormat::Csv)
+        let schema_path = PathBuf::from("test/feature_schema_test.json");
+        generate_features(&db_path, &output_path, &schema_path, OutputFormat::Csv)
             .expect("Failed to generate features");
 
         // Verify CSV was created

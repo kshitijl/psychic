@@ -9,8 +9,15 @@ use std::thread;
 use std::time::Instant;
 
 // Import features module
-use crate::feature_defs::{ClickEvent, FeatureInputs, FEATURE_REGISTRY, feature_names};
+use crate::feature_defs::{ClickEvent, FEATURE_REGISTRY, FeatureInputs, feature_names};
 use crate::{db, features};
+
+#[derive(Debug, Clone)]
+pub struct FileCandidate {
+    pub relative_path: String,
+    pub full_path: PathBuf,
+    pub mtime: Option<i64>,
+}
 
 #[derive(Debug, Clone)]
 pub struct FileScore {
@@ -57,7 +64,8 @@ impl Ranker {
         let clicks = Self::load_clicks(&db_path)?;
 
         // Load model stats from same directory as model
-        let stats_path = model_path.parent()
+        let stats_path = model_path
+            .parent()
             .map(|p| p.join("model_stats.json"))
             .unwrap_or_else(|| PathBuf::from("model_stats.json"));
         let stats = Self::load_stats(&stats_path);
@@ -101,14 +109,14 @@ impl Ranker {
 
         let mut clicks_by_file: HashMap<String, Vec<ClickEvent>> = HashMap::new();
 
-        let conn = Connection::open(db_path)
-            .context("Failed to open database for preloading clicks")?;
+        let conn =
+            Connection::open(db_path).context("Failed to open database for preloading clicks")?;
 
         let mut stmt = conn.prepare(
             "SELECT full_path, timestamp
              FROM events
              WHERE action = 'click'
-             AND timestamp >= ?1"
+             AND timestamp >= ?1",
         )?;
 
         let rows = stmt.query_map([thirty_days_ago_ts], |row| {
@@ -123,7 +131,10 @@ impl Ranker {
                 .push(ClickEvent { timestamp });
         }
 
-        log::debug!("Loaded {} files with click history from last 30 days", clicks_by_file.len());
+        log::debug!(
+            "Loaded {} files with click history from last 30 days",
+            clicks_by_file.len()
+        );
 
         Ok(ClickData {
             clicks_by_file,
@@ -134,8 +145,8 @@ impl Ranker {
     pub fn rank_files(
         &self,
         query: &str,
-        files: &[(String, PathBuf, Option<i64>)], // (relative_path, full_path, mtime)
-        session_id: &str,
+        files: &[FileCandidate],
+        current_timestamp: i64,
         cwd: &Path,
     ) -> Result<Vec<FileScore>> {
         if files.is_empty() {
@@ -144,33 +155,36 @@ impl Ranker {
 
         // Compute features for each file
         let mut scored_files = Vec::new();
-        for (relative_path, full_path, mtime) in files {
-            let features = self.compute_features(
-                query,
-                relative_path,
-                full_path,
-                *mtime,
-                session_id,
-                cwd,
-            )?;
+        for file in files {
+            let features = self.compute_features(query, file, current_timestamp, cwd)?;
 
             // Convert features to vector in the same order as training
             let feature_vec = self.features_to_vec(&features);
 
             // Get prediction score
-            let score = self.model
-                .predict_with_params(&feature_vec, feature_vec.len() as i32, true, "num_threads=1")
+            let score = self
+                .model
+                .predict_with_params(
+                    &feature_vec,
+                    feature_vec.len() as i32,
+                    true,
+                    "num_threads=1",
+                )
                 .context("Failed to predict with model")?[0];
 
             scored_files.push(FileScore {
-                path: relative_path.clone(),
+                path: file.relative_path.clone(),
                 score,
                 features,
             });
         }
 
         // Sort by score descending (higher scores first)
-        scored_files.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        scored_files.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         Ok(scored_files)
     }
@@ -178,41 +192,60 @@ impl Ranker {
     fn compute_features(
         &self,
         query: &str,
-        file_path: &str,
-        full_path: &Path,
-        mtime: Option<i64>,
-        _session_id: &str,
+        file: &FileCandidate,
+        current_timestamp: i64,
         cwd: &Path,
     ) -> Result<HashMap<String, f64>> {
-        // Create FeatureInputs for inference
-        let inputs = FeatureInputs {
+        compute_features(
             query,
-            file_path,
-            full_path,
-            mtime,
+            file,
+            current_timestamp,
             cwd,
-            clicks_by_file: &self.clicks.clicks_by_file,
-            current_timestamp: Timestamp::now().as_second(),
-            session: None, // No session context at inference time
-        };
-
-        // Compute all features using the registry
-        let mut features = HashMap::new();
-        for feature in FEATURE_REGISTRY.iter() {
-            let value = feature.compute(&inputs)?;
-            features.insert(feature.name().to_string(), value);
-        }
-
-        Ok(features)
+            &self.clicks.clicks_by_file,
+        )
     }
 
     fn features_to_vec(&self, features: &HashMap<String, f64>) -> Vec<f64> {
-        // Automatically uses registry order - guaranteed to match training!
-        feature_names()
-            .iter()
-            .map(|name| features.get(*name).copied().unwrap_or(0.0))
-            .collect()
+        features_to_vec(features)
     }
+}
+
+/// Convert feature HashMap to vector in registry order (matches training)
+fn features_to_vec(features: &HashMap<String, f64>) -> Vec<f64> {
+    feature_names()
+        .iter()
+        .map(|name| features.get(*name).copied().unwrap_or(0.0))
+        .collect()
+}
+
+/// Compute features for a file (standalone function, no Ranker needed)
+fn compute_features(
+    query: &str,
+    file: &FileCandidate,
+    current_timestamp: i64,
+    cwd: &Path,
+    clicks_by_file: &HashMap<String, Vec<ClickEvent>>,
+) -> Result<HashMap<String, f64>> {
+    // Create FeatureInputs for inference
+    let inputs = FeatureInputs {
+        query,
+        file_path: &file.relative_path,
+        full_path: &file.full_path,
+        mtime: file.mtime,
+        cwd,
+        clicks_by_file,
+        current_timestamp,
+        session: None, // No session context at inference time
+    };
+
+    // Compute all features using the registry
+    let mut features = HashMap::new();
+    for feature in FEATURE_REGISTRY.iter() {
+        let value = feature.compute(&inputs)?;
+        features.insert(feature.name().to_string(), value);
+    }
+
+    Ok(features)
 }
 
 /// Find train.py by searching: binary dir -> parent dir -> grandparent dir
@@ -220,7 +253,8 @@ fn find_train_py() -> Result<PathBuf> {
     let exe_path = std::env::current_exe().context("Failed to get current executable path")?;
 
     // Canonicalize to resolve symlinks
-    let exe_path = exe_path.canonicalize()
+    let exe_path = exe_path
+        .canonicalize()
         .context("Failed to canonicalize executable path")?;
 
     let exe_dir = exe_path
@@ -278,7 +312,11 @@ pub fn retrain_model(data_dir: &Path, training_log_path: Option<PathBuf>) -> Res
             features::OutputFormat::Csv,
         )?;
         let feature_duration = feature_start.elapsed();
-        log::info!("Features generated at {:?} ({:.2}s)", features_csv, feature_duration.as_secs_f64());
+        log::info!(
+            "Features generated at {:?} ({:.2}s)",
+            features_csv,
+            feature_duration.as_secs_f64()
+        );
 
         // Step 2: Find train.py
         let train_py = find_train_py()?;
@@ -351,11 +389,17 @@ pub fn retrain_model(data_dir: &Path, training_log_path: Option<PathBuf>) -> Res
         }
 
         let training_duration = training_start.elapsed();
-        log::info!("Training complete! ({:.2}s)", training_duration.as_secs_f64());
+        log::info!(
+            "Training complete! ({:.2}s)",
+            training_duration.as_secs_f64()
+        );
         log::info!("Model saved at {:?}", output_prefix.with_extension("txt"));
 
         let total_duration = total_start.elapsed();
-        log::info!("Total retraining time: {:.2}s", total_duration.as_secs_f64());
+        log::info!(
+            "Total retraining time: {:.2}s",
+            total_duration.as_secs_f64()
+        );
 
         Ok(())
     });
@@ -378,7 +422,13 @@ mod tests {
             return;
         }
 
-        let db_path = Database::get_db_path().expect("Failed to get db path");
+        let data_dir = std::env::var("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("/tmp"))
+            .join(".local")
+            .join("share")
+            .join("psychic");
+        let db_path = Database::get_db_path(&data_dir).expect("Failed to get db path");
 
         let ranker = Ranker::new(&model_path, db_path);
         match &ranker {
@@ -392,16 +442,26 @@ mod tests {
         let ranker = ranker.unwrap();
 
         // Test with simple data
-        let test_files = vec![
-            ("test.md".to_string(), PathBuf::from("/tmp/test.md"), Some(1234567890)),
-        ];
+        let test_files = vec![FileCandidate {
+            relative_path: "test.md".to_string(),
+            full_path: PathBuf::from("/tmp/test.md"),
+            mtime: Some(1234567890),
+        }];
 
-        let result = ranker.rank_files("test", &test_files, "test_session", &PathBuf::from("/tmp"));
+        let result = ranker.rank_files(
+            "test",
+            &test_files,
+            Timestamp::now().as_second(),
+            &PathBuf::from("/tmp"),
+        );
         match &result {
             Ok(file_scores) => {
                 println!("✓ Ranking succeeded");
                 for fs in file_scores {
-                    println!("  {} - score: {:.4}, features: {:?}", fs.path, fs.score, fs.features);
+                    println!(
+                        "  {} - score: {:.4}, features: {:?}",
+                        fs.path, fs.score, fs.features
+                    );
                 }
             }
             Err(e) => {
@@ -415,5 +475,60 @@ mod tests {
                 panic!("Ranking failed: {}", e);
             }
         }
+    }
+
+    #[test]
+    fn test_feature_computation() {
+        // This test verifies the exact feature vector computed for a known file
+        let query = "test";
+        let current_timestamp = 1700086400i64; // Nov 15, 2023
+        let cwd = PathBuf::from("/tmp");
+
+        // Create file candidate
+        let file = FileCandidate {
+            relative_path: "foo/bar.txt".to_string(),
+            full_path: PathBuf::from("/tmp/foo/bar.txt"),
+            mtime: Some(1700000000i64), // Nov 14, 2023
+        };
+
+        // Create synthetic click data
+        let mut clicks_by_file = HashMap::new();
+        // Add 3 clicks to bar.txt
+        clicks_by_file.insert(
+            "/tmp/foo/bar.txt".to_string(),
+            vec![
+                ClickEvent { timestamp: 1700000000 },
+                ClickEvent { timestamp: 1700010000 },
+                ClickEvent { timestamp: 1700020000 },
+            ],
+        );
+        // Add some clicks to a different file in the same directory (for parent_dir feature)
+        clicks_by_file.insert(
+            "/tmp/foo/other.txt".to_string(),
+            vec![
+                ClickEvent { timestamp: 1700000000 },
+            ],
+        );
+
+        // Compute features using the standalone function
+        let features = compute_features(query, &file, current_timestamp, &cwd, &clicks_by_file)
+            .expect("Failed to compute features");
+
+        // Convert to vector (in the same order as training)
+        let feature_vec = features_to_vec(&features);
+
+        // Format as string for expect-test style comparison
+        let actual = format!("{:?}", feature_vec);
+
+        // Expected output: [filename_starts_with_query, clicks_last_30_days, modified_today, is_under_cwd, is_hidden, clicks_last_week_parent_dir]
+        // filename_starts_with_query=0 (bar.txt doesn't start with "test")
+        // clicks_last_30_days=3 (3 clicks on bar.txt itself)
+        // modified_today=0 (mtime is old - Nov 2023, test runs in 2025)
+        // is_under_cwd=0 (file doesn't exist on disk so canonicalize fails, falls back to non-matching path)
+        // is_hidden=0 (no dot-prefixed components)
+        // clicks_last_week_parent_dir=4 (3 clicks on bar.txt + 1 click on other.txt in /tmp/foo/)
+        let expected = "[0.0, 3.0, 0.0, 0.0, 0.0, 4.0]";
+
+        assert_eq!(actual, expected, "Feature vector mismatch");
     }
 }

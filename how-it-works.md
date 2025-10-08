@@ -1,4 +1,4 @@
-'''# How It Works
+# How It Works
 
 ## Overview
 
@@ -1097,4 +1097,3 @@ Potential enhancements (not implemented):
 - Categorical features in ranking model (need manual encoding for Rust lightgbm3)
 - Cross-session feature aggregation (global click patterns, not just session-local)
 - A/B testing framework for ranking experiments
-'''

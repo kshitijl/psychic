@@ -75,6 +75,7 @@ struct Subsession {
     id: u64,
     query: String,
     created_at: Instant,
+    timestamp: i64, // Unix timestamp when subsession was created
     impressions_logged: bool,
 }
 
@@ -283,9 +284,26 @@ impl App {
             filter_start.elapsed()
         );
 
+        // Convert to FileCandidate structs
+        let file_candidates: Vec<ranker::FileCandidate> = matching_files
+            .into_iter()
+            .map(|(relative_path, full_path, mtime)| ranker::FileCandidate {
+                relative_path,
+                full_path,
+                mtime,
+            })
+            .collect();
+
+        // Get current subsession timestamp (or use current time if no subsession)
+        let current_timestamp = self
+            .current_subsession
+            .as_ref()
+            .map(|s| s.timestamp)
+            .unwrap_or_else(|| jiff::Timestamp::now().as_second());
+
         // Then, rank them with the model
         let rank_start = Instant::now();
-        match self.ranker.rank_files(&self.query, &matching_files, &self.session_id, &self.root) {
+        match self.ranker.rank_files(&self.query, &file_candidates, current_timestamp, &self.root) {
             Ok(scored) => {
                 // Reorder file_entries based on ranking scores
                 let score_order: Vec<String> =
@@ -332,6 +350,7 @@ impl App {
                 id: self.next_subsession_id,
                 query: self.query.clone(),
                 created_at: Instant::now(),
+                timestamp: jiff::Timestamp::now().as_second(),
                 impressions_logged: false,
             });
             self.next_subsession_id += 1;
