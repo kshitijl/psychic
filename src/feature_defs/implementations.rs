@@ -204,19 +204,20 @@ impl Feature for ClicksLastWeekParentDir {
         }
         let parent_dir = parent_dir.unwrap();
 
-        // Count clicks in parent directory within time window
+        // Look up clicks in parent directory from precomputed index
         let clicks = inputs
-            .clicks_by_file
-            .iter()
-            .filter(|(path, _)| {
-                // Check if this click is for a file in the same parent directory
-                Path::new(path).parent() == Some(parent_dir)
+            .clicks_by_parent_dir
+            .get(parent_dir)
+            .map(|clicks| {
+                clicks
+                    .iter()
+                    .filter(|c| {
+                        c.timestamp >= seven_days_ago.as_second()
+                            && c.timestamp <= inputs.current_timestamp
+                    })
+                    .count()
             })
-            .flat_map(|(_, clicks)| clicks)
-            .filter(|c| {
-                c.timestamp >= seven_days_ago.as_second() && c.timestamp <= inputs.current_timestamp
-            })
-            .count();
+            .unwrap_or(0);
 
         Ok(clicks as f64)
     }

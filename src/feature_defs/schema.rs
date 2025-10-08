@@ -1,6 +1,6 @@
 use anyhow::Result;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 // Re-export from parent features module
 use crate::features::{ClickEvent, Session};
@@ -19,6 +19,7 @@ pub struct FeatureInputs<'a> {
     pub mtime: Option<i64>,
     pub cwd: &'a Path,
     pub clicks_by_file: &'a HashMap<String, Vec<ClickEvent>>,
+    pub clicks_by_parent_dir: &'a HashMap<PathBuf, Vec<ClickEvent>>,
     pub current_timestamp: i64,
     pub session: Option<&'a Session>,
     pub is_from_walker: bool,

@@ -54,6 +54,7 @@ pub struct FeatureImportance {
 
 pub struct ClickData {
     pub clicks_by_file: HashMap<String, Vec<ClickEvent>>,
+    pub clicks_by_parent_dir: HashMap<PathBuf, Vec<ClickEvent>>,
     pub loaded_at: Timestamp,
 }
 
@@ -142,13 +143,29 @@ impl Ranker {
                 .push(ClickEvent { timestamp });
         }
 
+        // Build parent directory index
+        let mut clicks_by_parent_dir: HashMap<PathBuf, Vec<ClickEvent>> = HashMap::new();
+        for (path, clicks) in &clicks_by_file {
+            if let Some(parent) = Path::new(path).parent() {
+                clicks_by_parent_dir
+                    .entry(parent.to_path_buf())
+                    .or_default()
+                    .extend(clicks.iter().copied());
+            }
+        }
+
         log::debug!(
             "Loaded {} files with click history from last 30 days",
             clicks_by_file.len()
         );
+        log::debug!(
+            "Indexed {} parent directories",
+            clicks_by_parent_dir.len()
+        );
 
         Ok(ClickData {
             clicks_by_file,
+            clicks_by_parent_dir,
             loaded_at: now,
         })
     }
@@ -164,10 +181,9 @@ impl Ranker {
             return Ok(Vec::new());
         }
 
-        // Compute features for each file
+        // Compute features for all files
         let compute_start = Instant::now();
-        let mut scored_files = Vec::new();
-        let mut total_predict_time = Duration::ZERO;
+        let mut all_features = Vec::with_capacity(files.len());
 
         for file in files {
             let (features, timings) = self.compute_features_with_timing(query, file, current_timestamp, cwd)?;
@@ -177,22 +193,33 @@ impl Ranker {
                 *self.feature_timings.entry(feature_name).or_insert(Duration::ZERO) += duration;
             }
 
-            // Get prediction score
-            let predict_start = Instant::now();
-            let score = self
-                .model
-                .predict_with_params(&features, features.len() as i32, true, "num_threads=1")
-                .context("Failed to predict with model")?[0];
-            total_predict_time += predict_start.elapsed();
+            all_features.push(features);
+        }
+        log::debug!("Feature computation for {} files took {:?}", files.len(), compute_start.elapsed());
 
+        // Batch predict all files at once
+        // Flatten features into a single vector for batch prediction
+        let flatten_start = Instant::now();
+        let num_features = if all_features.is_empty() { 0 } else { all_features[0].len() };
+        let flat_features: Vec<f64> = all_features.iter().flatten().copied().collect();
+        log::debug!("Flattening features for {} files took {:?}", files.len(), flatten_start.elapsed());
+
+        let predict_start = Instant::now();
+        let prediction_results = self
+            .model
+            .predict_with_params(&flat_features, num_features as i32, true, "num_threads=8")
+            .context("Failed to batch predict with model")?;
+        log::debug!("Batch model prediction for {} files took {:?}", files.len(), predict_start.elapsed());
+
+        // Build scored files
+        let mut scored_files = Vec::with_capacity(files.len());
+        for (idx, file) in files.iter().enumerate() {
             scored_files.push(FileScore {
                 file_id: file.file_id,
-                score,
-                features,
+                score: prediction_results[idx],
+                features: all_features[idx].clone(),
             });
         }
-        log::debug!("Feature computation + prediction for {} files took {:?}", files.len(), compute_start.elapsed());
-        log::debug!("  - Model prediction total: {:?}", total_predict_time);
 
         // Sort by score descending (higher scores first)
         let sort_start = Instant::now();
@@ -219,6 +246,7 @@ impl Ranker {
             current_timestamp,
             cwd,
             &self.clicks.clicks_by_file,
+            &self.clicks.clicks_by_parent_dir,
         )
     }
 }
@@ -239,8 +267,9 @@ fn compute_features(
     current_timestamp: i64,
     cwd: &Path,
     clicks_by_file: &HashMap<String, Vec<ClickEvent>>,
+    clicks_by_parent_dir: &HashMap<PathBuf, Vec<ClickEvent>>,
 ) -> Result<Vec<f64>> {
-    let (features, _timings) = compute_features_with_timing(query, file, current_timestamp, cwd, clicks_by_file)?;
+    let (features, _timings) = compute_features_with_timing(query, file, current_timestamp, cwd, clicks_by_file, clicks_by_parent_dir)?;
     Ok(features)
 }
 
@@ -251,6 +280,7 @@ fn compute_features_with_timing(
     current_timestamp: i64,
     cwd: &Path,
     clicks_by_file: &HashMap<String, Vec<ClickEvent>>,
+    clicks_by_parent_dir: &HashMap<PathBuf, Vec<ClickEvent>>,
 ) -> Result<(Vec<f64>, HashMap<String, Duration>)> {
     // Create FeatureInputs for inference
     let inputs = FeatureInputs {
@@ -260,6 +290,7 @@ fn compute_features_with_timing(
         mtime: file.mtime,
         cwd,
         clicks_by_file,
+        clicks_by_parent_dir,
         current_timestamp,
         session: None,
         is_from_walker: file.is_from_walker,
@@ -553,8 +584,19 @@ mod tests {
             }],
         );
 
+        // Build parent directory index
+        let mut clicks_by_parent_dir = HashMap::new();
+        for (path, clicks) in &clicks_by_file {
+            if let Some(parent) = Path::new(path).parent() {
+                clicks_by_parent_dir
+                    .entry(parent.to_path_buf())
+                    .or_insert_with(Vec::new)
+                    .extend(clicks.iter().copied());
+            }
+        }
+
         // Compute features using the standalone function
-        let features = compute_features(query, &file, current_timestamp, &cwd, &clicks_by_file)
+        let features = compute_features(query, &file, current_timestamp, &cwd, &clicks_by_file, &clicks_by_parent_dir)
             .expect("Failed to compute features");
 
         // Format as string for expect-test style comparison

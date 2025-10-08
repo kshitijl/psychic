@@ -12,7 +12,7 @@ pub use schema::FeatureInputs;
 pub use registry::{FEATURE_REGISTRY, feature_names, csv_columns, export_json};
 
 // These types are shared between parent and this module
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct ClickEvent {
     pub timestamp: i64,
 }

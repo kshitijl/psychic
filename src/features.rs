@@ -35,6 +35,7 @@ pub enum OutputFormat {
 // Accumulator for fold-based processing
 struct Accumulator {
     clicks_by_file: HashMap<String, Vec<ClickEvent>>,
+    clicks_by_parent_dir: HashMap<std::path::PathBuf, Vec<ClickEvent>>,
     // Key: (session_id, subsession_id, full_path)
     pending_impressions: HashMap<(String, u64, String), PendingImpression>,
     output_rows: Vec<HashMap<String, String>>,
@@ -54,6 +55,7 @@ impl Accumulator {
     fn new() -> Self {
         Self {
             clicks_by_file: HashMap::new(),
+            clicks_by_parent_dir: HashMap::new(),
             pending_impressions: HashMap::new(),
             output_rows: Vec::new(),
             current_group_id: 0,
@@ -69,6 +71,14 @@ impl Accumulator {
             .entry(event.full_path.clone())
             .or_default()
             .push(click);
+
+        // Also index by parent directory
+        if let Some(parent) = Path::new(&event.full_path).parent() {
+            self.clicks_by_parent_dir
+                .entry(parent.to_path_buf())
+                .or_default()
+                .push(click);
+        }
     }
 
     fn add_impression(&mut self, event: &Event, mut features: HashMap<String, String>) {
@@ -265,6 +275,7 @@ fn compute_features_from_accumulator(
         mtime: impression.mtime,
         cwd,
         clicks_by_file: &acc.clicks_by_file,
+        clicks_by_parent_dir: &acc.clicks_by_parent_dir,
         current_timestamp: impression.timestamp,
         session,
         is_from_walker: false, // Training data doesn't track this
