@@ -13,7 +13,8 @@ pub fn start_file_walker(root: PathBuf, tx: Sender<(PathBuf, Option<i64>)>) {
             .filter_entry(|e| {
                 // Skip ignored directories
                 if e.file_type().is_dir()
-                    && let Some(name) = e.file_name().to_str() {
+                    && let Some(name) = e.file_name().to_str()
+                {
                     return !IGNORED_DIRS.contains(&name);
                 }
                 true
@@ -27,7 +28,8 @@ pub fn start_file_walker(root: PathBuf, tx: Sender<(PathBuf, Option<i64>)>) {
                 }
 
                 // Extract mtime from cached metadata
-                let mtime = entry.metadata()
+                let mtime = entry
+                    .metadata()
                     .ok()
                     .and_then(|m| m.modified().ok())
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
