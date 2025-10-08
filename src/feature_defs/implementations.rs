@@ -24,15 +24,17 @@ impl Feature for FilenameStartsWithQuery {
             .and_then(|s| s.to_str())
             .unwrap_or("");
 
-        Ok(if !inputs.query.is_empty()
-            && filename
-                .to_lowercase()
-                .starts_with(&inputs.query.to_lowercase())
-        {
-            1.0
-        } else {
-            0.0
-        })
+        Ok(
+            if !inputs.query.is_empty()
+                && filename
+                    .to_lowercase()
+                    .starts_with(&inputs.query.to_lowercase())
+            {
+                1.0
+            } else {
+                0.0
+            },
+        )
     }
 }
 
@@ -55,8 +57,7 @@ impl Feature for ClicksLast30Days {
         // Calculate 30 days ago timestamp
         let now_ts = Timestamp::from_second(inputs.current_timestamp)?;
         let session_tz = if let Some(session) = inputs.session {
-            jiff::tz::TimeZone::get(&session.timezone)
-                .unwrap_or(jiff::tz::TimeZone::system())
+            jiff::tz::TimeZone::get(&session.timezone).unwrap_or(jiff::tz::TimeZone::system())
         } else {
             jiff::tz::TimeZone::system()
         };
@@ -159,15 +160,13 @@ impl Feature for IsHidden {
 
     fn compute(&self, inputs: &FeatureInputs) -> Result<f64> {
         // Check if any component in the path starts with a dot (hidden)
-        let has_hidden_component = inputs.full_path
-            .components()
-            .any(|component| {
-                component
-                    .as_os_str()
-                    .to_str()
-                    .map(|s| s.starts_with('.'))
-                    .unwrap_or(false)
-            });
+        let has_hidden_component = inputs.full_path.components().any(|component| {
+            component
+                .as_os_str()
+                .to_str()
+                .map(|s| s.starts_with('.'))
+                .unwrap_or(false)
+        });
 
         Ok(if has_hidden_component { 1.0 } else { 0.0 })
     }
@@ -192,8 +191,7 @@ impl Feature for ClicksLastWeekParentDir {
         // Calculate 7 days ago timestamp
         let now_ts = Timestamp::from_second(inputs.current_timestamp)?;
         let session_tz = if let Some(session) = inputs.session {
-            jiff::tz::TimeZone::get(&session.timezone)
-                .unwrap_or(jiff::tz::TimeZone::system())
+            jiff::tz::TimeZone::get(&session.timezone).unwrap_or(jiff::tz::TimeZone::system())
         } else {
             jiff::tz::TimeZone::system()
         };
@@ -218,8 +216,7 @@ impl Feature for ClicksLastWeekParentDir {
             })
             .flat_map(|(_, clicks)| clicks)
             .filter(|c| {
-                c.timestamp >= seven_days_ago.as_second()
-                    && c.timestamp <= inputs.current_timestamp
+                c.timestamp >= seven_days_ago.as_second() && c.timestamp <= inputs.current_timestamp
             })
             .count();
 

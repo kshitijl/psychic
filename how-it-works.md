@@ -1084,6 +1084,136 @@ Changed binary and directory names:
 
 Added MAX_FILES = 5000 limit in walker.rs to cap file discovery for now. Will optimize later.
 
+## File Registry Refactor (Added)
+
+### Problem
+
+The previous implementation had major performance issues:
+
+1. **Metadata fetched on every filter**: `get_file_metadata()` called repeatedly for same files whenever query changed
+2. **Display paths recomputed on every filter**: `FileEntry::from_walkdir()` / `from_history()` called repeatedly
+3. **String-based lookups were O(n²)**: After ranking, linear search through file_entries for each scored file
+4. **Excessive string cloning**: FileScore contained `path: String`, then cloned into Vec, then searched by it
+5. **Walker metadata thrown away**: walkdir caches metadata from syscall, but we only sent PathBuf then re-fetched metadata later
+
+### Solution: File Registry with Integer IDs
+
+Created a central file registry where all files are stored once with their metadata:
+
+**Core architecture:**
+```rust
+// Newtype for type safety
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct FileId(usize);
+
+#[derive(Debug, Clone)]
+struct FileInfo {
+    full_path: PathBuf,
+    display_name: String,
+    mtime: Option<i64>,
+}
+
+struct App {
+    file_registry: Vec<FileInfo>,           // All known files
+    path_to_id: HashMap<PathBuf, FileId>,   // Deduplication
+    filtered_files: Vec<FileId>,            // Just IDs, not full structs
+    // ... removed: files, historical_files
+}
+```
+
+**Walker sends metadata:**
+```rust
+// walker.rs - extract mtime from cached metadata
+let mtime = entry.metadata()
+    .ok()
+    .and_then(|m| m.modified().ok())
+    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+    .map(|d| d.as_secs() as i64);
+
+tx.send((entry.path().to_path_buf(), mtime))
+```
+
+**Receiver populates registry:**
+```rust
+// main.rs - walker receiver
+while let Ok((path, mtime)) = rx.try_recv() {
+    if !app.path_to_id.contains_key(&path) {
+        let file_info = FileInfo::from_walkdir(path.clone(), mtime, &app.root);
+        let file_id = FileId(app.file_registry.len());
+        app.path_to_id.insert(path, file_id);
+        app.file_registry.push(file_info);
+    }
+}
+```
+
+**Filtering becomes trivial:**
+```rust
+// Just iterate FileIds, check display_name (no syscalls, no allocations)
+let matching_file_ids: Vec<FileId> = (0..self.file_registry.len())
+    .map(FileId)
+    .filter(|&file_id| {
+        let file_info = &self.file_registry[file_id.0];
+        query_lower.is_empty() || file_info.display_name.to_lowercase().contains(&query_lower)
+    })
+    .collect();
+```
+
+**Ranking uses FileIds:**
+```rust
+// ranker.rs
+pub struct FileCandidate {
+    pub file_id: usize,  // Index into registry
+    pub relative_path: String,
+    pub full_path: PathBuf,
+    pub mtime: Option<i64>,
+}
+
+pub struct FileScore {
+    pub file_id: usize,  // Index into registry (not String path!)
+    pub score: f64,
+    pub features: Vec<f64>,
+}
+```
+
+**Ranking reorder is now O(n):**
+```rust
+// BEFORE: O(n²) string-based linear search
+let score_order: Vec<String> = scored.iter().map(|fs| fs.path.clone()).collect();
+for score_path in &score_order {
+    if let Some(entry) = file_entries.iter().find(|e| &e.display_name == score_path) {
+        reordered_entries.push(entry.clone());
+    }
+}
+
+// AFTER: O(n) direct mapping
+self.filtered_files = scored.iter().map(|fs| FileId(fs.file_id)).collect();
+```
+
+**UI rendering looks up from registry:**
+```rust
+// Iterate FileIds, look up FileInfo
+for (i, &file_id) in app.filtered_files.iter().enumerate() {
+    let file_info = &app.file_registry[file_id.0];
+    // Use file_info.display_name, file_info.full_path, etc.
+}
+```
+
+### Performance Gains
+
+1. **Metadata fetched once**: Walker extracts from cached walkdir metadata (no extra syscalls), historical files call get_file_metadata once at startup
+2. **Display paths computed once**: Each file's display_name computed when added to registry
+3. **Filtering is O(n)**: Just iterate FileIds and check display_name (no allocations)
+4. **Ranking reorder is O(n)**: Changed from string-based linear search to direct FileId mapping
+5. **No string cloning in hot paths**: FileScore contains `file_id: usize` instead of `path: String`
+6. **Deduplication is O(1)**: HashMap<PathBuf, FileId> for instant dedup checks
+
+### Code Cleanliness
+
+- Eliminated duplicate logic for walkdir vs historical files (single iterator chain)
+- Removed `App.files` and `App.historical_files` (everything in registry)
+- Centralized file information in FileInfo struct
+- FileId newtype provides type safety (can't mix up with other integers)
+
 ## Future Improvements
 
 Potential enhancements (not implemented):

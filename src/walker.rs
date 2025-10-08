@@ -5,7 +5,7 @@ use walkdir::WalkDir;
 const IGNORED_DIRS: &[&str] = &[".git", "node_modules", ".venv", "target"];
 const MAX_FILES: usize = 5000;
 
-pub fn start_file_walker(root: PathBuf, tx: Sender<PathBuf>) {
+pub fn start_file_walker(root: PathBuf, tx: Sender<(PathBuf, Option<i64>)>) {
     std::thread::spawn(move || {
         let mut file_count = 0;
         for entry in WalkDir::new(&root)
@@ -25,7 +25,15 @@ pub fn start_file_walker(root: PathBuf, tx: Sender<PathBuf>) {
                 if file_count >= MAX_FILES {
                     break;
                 }
-                let _ = tx.send(entry.path().to_path_buf());
+
+                // Extract mtime from cached metadata
+                let mtime = entry.metadata()
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64);
+
+                let _ = tx.send((entry.path().to_path_buf(), mtime));
                 file_count += 1;
             }
         }

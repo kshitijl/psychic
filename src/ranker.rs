@@ -14,6 +14,7 @@ use crate::{db, features};
 
 #[derive(Debug, Clone)]
 pub struct FileCandidate {
+    pub file_id: usize, // Index into main.rs file registry
     pub relative_path: String,
     pub full_path: PathBuf,
     pub mtime: Option<i64>,
@@ -21,7 +22,7 @@ pub struct FileCandidate {
 
 #[derive(Debug, Clone)]
 pub struct FileScore {
-    pub path: String,
+    pub file_id: usize, // Index into main.rs file registry
     pub score: f64,
     pub features: Vec<f64>, // Feature vector in registry order
 }
@@ -164,20 +165,14 @@ impl Ranker {
         let mut scored_files = Vec::new();
         for file in files {
             let features = self.compute_features(query, file, current_timestamp, cwd)?;
-
             // Get prediction score
             let score = self
                 .model
-                .predict_with_params(
-                    &features,
-                    features.len() as i32,
-                    true,
-                    "num_threads=1",
-                )
+                .predict_with_params(&features, features.len() as i32, true, "num_threads=1")
                 .context("Failed to predict with model")?[0];
 
             scored_files.push(FileScore {
-                path: file.relative_path.clone(),
+                file_id: file.file_id,
                 score,
                 features,
             });
@@ -445,6 +440,7 @@ mod tests {
 
         // Test with simple data
         let test_files = vec![FileCandidate {
+            file_id: 0,
             relative_path: "test.md".to_string(),
             full_path: PathBuf::from("/tmp/test.md"),
             mtime: Some(1234567890),
@@ -461,8 +457,8 @@ mod tests {
                 println!("✓ Ranking succeeded");
                 for fs in file_scores {
                     println!(
-                        "  {} - score: {:.4}, features: {:?}",
-                        fs.path, fs.score, fs.features
+                        "  file_id {} - score: {:.4}, features: {:?}",
+                        fs.file_id, fs.score, fs.features
                     );
                 }
             }
@@ -488,6 +484,7 @@ mod tests {
 
         // Create file candidate
         let file = FileCandidate {
+            file_id: 0,
             relative_path: "foo/bar.txt".to_string(),
             full_path: PathBuf::from("/tmp/foo/bar.txt"),
             mtime: Some(1700000000i64), // Nov 14, 2023
@@ -499,17 +496,23 @@ mod tests {
         clicks_by_file.insert(
             "/tmp/foo/bar.txt".to_string(),
             vec![
-                ClickEvent { timestamp: 1700000000 },
-                ClickEvent { timestamp: 1700010000 },
-                ClickEvent { timestamp: 1700020000 },
+                ClickEvent {
+                    timestamp: 1700000000,
+                },
+                ClickEvent {
+                    timestamp: 1700010000,
+                },
+                ClickEvent {
+                    timestamp: 1700020000,
+                },
             ],
         );
         // Add some clicks to a different file in the same directory (for parent_dir feature)
         clicks_by_file.insert(
             "/tmp/foo/other.txt".to_string(),
-            vec![
-                ClickEvent { timestamp: 1700000000 },
-            ],
+            vec![ClickEvent {
+                timestamp: 1700000000,
+            }],
         );
 
         // Compute features using the standalone function

@@ -1,3 +1,11 @@
+## notes on performance
+
+On 5000 files, `update_filtered_files` takes 150-200ms. All of that comes from `rank_files`. The majority of THAT is from feature computation, not actually from running the model.
+
+Feature computation can be sped up in a bunch of ways:
+* Divide features into those that depend on the query and those that don't. The ones that don't depend on query don't need to be recomputed on query change.
+* Two of them iterate over clicks_by_file. We can probably move parent dir click aggregation, and last 30 days click counting, into a precomputation that happens once at db load time and computes click counts by iterating over all clicks once. Then the features just do lookups? Idk how to do this elegantly though, where adding each feature doesn't become a big chore at db load time. Ah! Maybe each feature also gets to define its own Agg type that can do stuff at db load time? 
+
 ## now
 
 - make sure that subnet and gateway are being logged properly. generally, look at the db and see what's up, is it missing important data?
