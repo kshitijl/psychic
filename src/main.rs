@@ -241,39 +241,32 @@ impl App {
         let start_time = Instant::now();
         let query_lower = self.query.to_lowercase();
 
-        // First, filter files that match the query from walkdir
+        // Filter files that match the query
         let filter_start = Instant::now();
         let mut file_entries: Vec<FileEntry> = Vec::new();
         let mut matching_files: Vec<(String, PathBuf, Option<i64>)> = Vec::new();
+        let mut seen_paths: HashSet<PathBuf> = HashSet::new();
 
-        for path in &self.files {
-            let entry = FileEntry::from_walkdir(path.clone(), &self.root);
+        // Process walkdir files first, then historical files
+        let all_files = self.files.iter().map(|p| (p, true))
+            .chain(self.historical_files.iter().map(|p| (p, false)));
+
+        for (path, is_walkdir) in all_files {
+            // Skip if already seen (historical duplicates)
+            if !seen_paths.insert(path.clone()) {
+                continue;
+            }
+
+            let entry = if is_walkdir {
+                FileEntry::from_walkdir(path.clone(), &self.root)
+            } else {
+                FileEntry::from_history(path.clone(), &self.root)
+            };
 
             if query_lower.is_empty() || entry.display_name.to_lowercase().contains(&query_lower) {
                 let (mtime, _, _) = get_file_metadata(&entry.full_path);
                 matching_files.push((entry.display_name.clone(), entry.full_path.clone(), mtime));
                 file_entries.push(entry);
-            }
-        }
-
-        // Also include historical files that match the query (and aren't already in results)
-        let existing_paths: HashSet<PathBuf> =
-            file_entries.iter().map(|e| e.full_path.clone()).collect();
-        for path in &self.historical_files {
-            if !existing_paths.contains(path) {
-                let entry = FileEntry::from_history(path.clone(), &self.root);
-
-                if query_lower.is_empty()
-                    || entry.display_name.to_lowercase().contains(&query_lower)
-                {
-                    let (mtime, _, _) = get_file_metadata(&entry.full_path);
-                    matching_files.push((
-                        entry.display_name.clone(),
-                        entry.full_path.clone(),
-                        mtime,
-                    ));
-                    file_entries.push(entry);
-                }
             }
         }
 
