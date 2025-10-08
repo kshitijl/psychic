@@ -86,6 +86,7 @@ struct FileInfo {
     full_path: PathBuf,
     display_name: String,
     mtime: Option<i64>,
+    is_from_walker: bool,
 }
 
 impl FileInfo {
@@ -100,6 +101,7 @@ impl FileInfo {
             full_path,
             display_name,
             mtime,
+            is_from_walker: true,
         }
     }
 
@@ -124,6 +126,7 @@ impl FileInfo {
             full_path,
             display_name,
             mtime,
+            is_from_walker: false,
         }
     }
 }
@@ -198,10 +201,12 @@ impl App {
             .collect();
 
         for path in historical_paths {
-            let (mtime, _, _) = get_file_metadata(&path);
-            let file_info = FileInfo::from_history(path.clone(), mtime, &root);
+            // Canonicalize historical paths once at startup
+            let canonical_path = path.canonicalize().unwrap_or(path);
+            let (mtime, _, _) = get_file_metadata(&canonical_path);
+            let file_info = FileInfo::from_history(canonical_path.clone(), mtime, &root);
             let file_id = FileId(file_registry.len());
-            path_to_id.insert(path, file_id);
+            path_to_id.insert(canonical_path, file_id);
             file_registry.push(file_info);
         }
 
@@ -286,6 +291,7 @@ impl App {
                     relative_path: file_info.display_name.clone(),
                     full_path: file_info.full_path.clone(),
                     mtime: file_info.mtime,
+                    is_from_walker: file_info.is_from_walker,
                 }
             })
             .collect();
@@ -556,8 +562,8 @@ fn main() -> Result<()> {
         }
     }
 
-    // Get current working directory
-    let root = env::current_dir()?;
+    // Get current working directory and canonicalize once
+    let root = env::current_dir()?.canonicalize()?;
 
     // Get data directory for main app
     let data_dir = cli

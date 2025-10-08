@@ -126,16 +126,14 @@ impl Feature for IsUnderCwd {
     }
 
     fn compute(&self, inputs: &FeatureInputs) -> Result<f64> {
-        let full_path_normalized = inputs
-            .full_path
-            .canonicalize()
-            .unwrap_or_else(|_| inputs.full_path.to_path_buf());
-        let cwd_normalized = inputs
-            .cwd
-            .canonicalize()
-            .unwrap_or_else(|_| inputs.cwd.to_path_buf());
+        // Files from walker are guaranteed to be under cwd
+        if inputs.is_from_walker {
+            return Ok(1.0);
+        }
 
-        Ok(if full_path_normalized.starts_with(&cwd_normalized) {
+        // Historical files have already been canonicalized at startup
+        // so we can do a simple prefix check
+        Ok(if inputs.full_path.starts_with(inputs.cwd) {
             1.0
         } else {
             0.0

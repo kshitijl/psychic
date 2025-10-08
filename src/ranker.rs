@@ -18,6 +18,7 @@ pub struct FileCandidate {
     pub relative_path: String,
     pub full_path: PathBuf,
     pub mtime: Option<i64>,
+    pub is_from_walker: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -251,6 +252,7 @@ fn compute_features_with_timing(
         clicks_by_file,
         current_timestamp,
         session: None,
+        is_from_walker: file.is_from_walker,
     };
 
     // Compute all features using the registry, tracking time for each
@@ -468,6 +470,7 @@ mod tests {
             relative_path: "test.md".to_string(),
             full_path: PathBuf::from("/tmp/test.md"),
             mtime: Some(1234567890),
+            is_from_walker: true,
         }];
 
         let result = ranker.rank_files(
@@ -512,6 +515,7 @@ mod tests {
             relative_path: "foo/bar.txt".to_string(),
             full_path: PathBuf::from("/tmp/foo/bar.txt"),
             mtime: Some(1700000000i64), // Nov 14, 2023
+            is_from_walker: true,
         };
 
         // Create synthetic click data
@@ -550,10 +554,10 @@ mod tests {
         // filename_starts_with_query=0 (bar.txt doesn't start with "test")
         // clicks_last_30_days=3 (3 clicks on bar.txt itself)
         // modified_today=0 (mtime is old - Nov 2023, test runs in 2025)
-        // is_under_cwd=0 (file doesn't exist on disk so canonicalize fails, falls back to non-matching path)
+        // is_under_cwd=1 (is_from_walker=true, so guaranteed to be under cwd)
         // is_hidden=0 (no dot-prefixed components)
         // clicks_last_week_parent_dir=4 (3 clicks on bar.txt + 1 click on other.txt in /tmp/foo/)
-        let expected = "[0.0, 3.0, 0.0, 0.0, 0.0, 4.0]";
+        let expected = "[0.0, 3.0, 0.0, 1.0, 0.0, 4.0]";
 
         assert_eq!(actual, expected, "Feature vector mismatch");
     }

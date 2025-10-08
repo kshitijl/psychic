@@ -267,6 +267,7 @@ fn compute_features_from_accumulator(
         clicks_by_file: &acc.clicks_by_file,
         current_timestamp: impression.timestamp,
         session,
+        is_from_walker: false, // Training data doesn't track this
     };
 
     // Compute all features using the registry

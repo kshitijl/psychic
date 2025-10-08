@@ -21,6 +21,7 @@ pub struct FeatureInputs<'a> {
     pub clicks_by_file: &'a HashMap<String, Vec<ClickEvent>>,
     pub current_timestamp: i64,
     pub session: Option<&'a Session>,
+    pub is_from_walker: bool,
 }
 
 /// Trait that all features must implement
