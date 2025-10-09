@@ -8,6 +8,13 @@ Feature computation can be sped up in a bunch of ways:
 
 ## now
 
+- put name of file at top of preview
+- scrolling results is broken after the async refactor
+- monotonicity constraints on certain obvious features
+- maybe add a slight linear term?
+- try fitting a linear or logistic regressor esp on modified time and num clicks and last time clicked
+- hit enter to open Preview or whatever default thing is configured
+- can we preview PDFs and images in the terminal?
 - make sure that subnet and gateway are being logged properly. generally, look at the db and see what's up, is it missing important data?
 - is_in_dotdir would need to be logged at query time i think. can't be done at feature gen time because what if FS changes
 - implement the streaming async plan for updating ui and sorting etc in a different thread
