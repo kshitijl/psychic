@@ -176,7 +176,13 @@ struct WorkerState {
 }
 
 impl WorkerState {
-    fn new(root: PathBuf, ranker: ranker::Ranker, db: &Database, model_path: PathBuf, db_path: PathBuf) -> Result<Self> {
+    fn new(
+        root: PathBuf,
+        ranker: ranker::Ranker,
+        db: &Database,
+        model_path: PathBuf,
+        db_path: PathBuf,
+    ) -> Result<Self> {
         // Load historical files into registry
         let mut file_registry = Vec::new();
         let mut path_to_id: HashMap<PathBuf, FileId> = HashMap::new();
@@ -201,7 +207,10 @@ impl WorkerState {
             file_registry.push(file_info);
         }
 
-        log::debug!("WorkerState loaded {} historical files", file_registry.len());
+        log::debug!(
+            "WorkerState loaded {} historical files",
+            file_registry.len()
+        );
 
         Ok(WorkerState {
             file_registry,
@@ -234,7 +243,8 @@ impl WorkerState {
             .map(FileId)
             .filter(|&file_id| {
                 let file_info = &self.file_registry[file_id.0];
-                query_lower.is_empty() || file_info.display_name.to_lowercase().contains(&query_lower)
+                query_lower.is_empty()
+                    || file_info.display_name.to_lowercase().contains(&query_lower)
             })
             .collect();
 
@@ -255,7 +265,11 @@ impl WorkerState {
 
         // Rank them with the model
         let current_timestamp = jiff::Timestamp::now().as_second();
-        match self.ranker.0.rank_files(query, &file_candidates, current_timestamp, &self.root) {
+        match self
+            .ranker
+            .0
+            .rank_files(query, &file_candidates, current_timestamp, &self.root)
+        {
             Ok(scored) => {
                 self.filtered_files = scored.iter().map(|fs| FileId(fs.file_id)).collect();
                 self.file_scores = scored;
@@ -277,9 +291,7 @@ impl WorkerState {
             .take(count)
             .map(|&file_id| {
                 let file_info = &self.file_registry[file_id.0];
-                let file_score = self.file_scores
-                    .iter()
-                    .find(|fs| fs.file_id == file_id.0);
+                let file_score = self.file_scores.iter().find(|fs| fs.file_id == file_id.0);
 
                 let score = file_score.map(|fs| fs.score).unwrap_or(0.0);
                 let features = file_score.map(|fs| fs.features.clone()).unwrap_or_default();
@@ -440,8 +452,8 @@ fn drain_latest_query(rx: &mpsc::Receiver<WorkerRequest>, initial: String) -> St
 struct App {
     query: String,
     visible_files: Vec<DisplayFileInfo>, // Only what's currently visible
-    total_results: usize, // Total number of filtered files
-    total_files: usize, // Total number of files in index
+    total_results: usize,                // Total number of filtered files
+    total_files: usize,                  // Total number of files in index
     selected_index: usize,
     file_list_scroll: u16, // Scroll offset for file list
     preview_scroll: u16,
@@ -549,18 +561,19 @@ impl App {
 
     fn reload_model(&mut self) -> Result<()> {
         log::info!("Requesting model reload from worker");
-        self.worker_tx.send(WorkerRequest::ReloadModel)
+        self.worker_tx
+            .send(WorkerRequest::ReloadModel)
             .context("Failed to send ReloadModel request to worker")?;
         Ok(())
     }
 
     fn reload_and_rerank(&mut self) -> Result<()> {
         log::info!("Requesting clicks reload from worker");
-        self.worker_tx.send(WorkerRequest::ReloadClicks)
+        self.worker_tx
+            .send(WorkerRequest::ReloadClicks)
             .context("Failed to send ReloadClicks request to worker")?;
         Ok(())
     }
-
 
     fn check_and_log_impressions(&mut self, force: bool) -> Result<()> {
         let subsession = match &mut self.current_subsession {
@@ -819,7 +832,6 @@ fn main() -> Result<()> {
         }
     });
 
-
     // Setup terminal
     enable_raw_mode()?;
     stdout().execute(EnterAlternateScreen)?;
@@ -937,111 +949,132 @@ fn run_app(
                 })
                 .collect();
 
-            let list = List::new(items).block(Block::default().borders(Borders::ALL).title(
-                format!("Files ({}/{})", app.total_results, app.total_files),
-            ));
+            let list = List::new(items).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!("Files ({}/{})", app.total_results, app.total_files)),
+            );
             f.render_widget(list, top_chunks[0]);
+
+            let scroll_offset = app.file_list_scroll as usize;
+            let visible_idx = app.selected_index.saturating_sub(scroll_offset);
+
+            let current_file = if visible_idx < app.visible_files.len() {
+                Some(&app.visible_files[visible_idx])
+            } else {
+                None
+            };
+
+            let current_file_path = current_file.map(|x| x.full_path.to_string_lossy().to_string());
 
             // Preview on the right using bat (with smart caching)
             let preview_height = top_chunks[1].height.saturating_sub(2);
             let preview_text = if !app.visible_files.is_empty() && app.total_results > 0 {
-                let scroll_offset = app.file_list_scroll as usize;
-                let visible_idx = app.selected_index.saturating_sub(scroll_offset);
-
-                let full_path_str = if visible_idx < app.visible_files.len() {
-                    app.visible_files[visible_idx].full_path.to_string_lossy().to_string()
-                } else {
-                    // Selected file not in visible slice yet, show placeholder
-                    String::from("[Loading...]")
-                };
-
-                if full_path_str == "[Loading...]" {
+                if current_file_path == None {
                     Text::from("[Loading preview...]")
                 } else {
-                    let full_path = PathBuf::from(&full_path_str);
+                    let current_file_path = current_file_path.as_ref().unwrap();
+                    let full_path = PathBuf::from(&current_file_path);
 
-                // Check for a full, cached preview
-                if let Some(cached_text) = app.preview_cache.as_ref().and_then(|(path, text)| {
-                    if path == &full_path_str {
-                        Some(text.clone())
-                    } else {
-                        None
-                    }
-                }) {
-                    // FAST PATH: Full preview is cached, just use it.
-                    cached_text
-                } else {
-                    // SLOW PATH: No full preview in cache.
-                    // Decide whether to render a light preview or a full one.
-                    let (text_to_render, should_cache) = if app.preview_scroll == 0 {
-                        // Initial view (unscrolled): render a light preview of N lines.
-                        let line_range = format!(":{}", preview_height);
-                        let bat_output = std::process::Command::new("bat")
-                            .arg("--color=always")
-                            .arg("--style=numbers")
-                            .arg("--line-range")
-                            .arg(&line_range)
-                            .arg(&full_path)
-                            .output();
-
-                        let text = match bat_output {
-                            Ok(output) => match ansi_to_tui::IntoText::into_text(&output.stdout) {
-                                Ok(text) => text,
-                                Err(_) => Text::from("[Unable to parse preview]"),
-                            },
-                            Err(_) => {
-                                // Fallback for light preview
-                                match std::fs::read_to_string(&full_path) {
-                                    Ok(content) => Text::from(
-                                        content
-                                            .lines()
-                                            .take(preview_height as usize)
-                                            .collect::<Vec<_>>()
-                                            .join("\n"),
-                                    ),
-                                    Err(_) => Text::from("[Unable to preview file]"),
-                                }
+                    // Check for a full, cached preview
+                    if let Some(cached_text) =
+                        app.preview_cache.as_ref().and_then(|(path, text)| {
+                            if path == current_file_path {
+                                Some(text.clone())
+                            } else {
+                                None
                             }
-                        };
-                        (text, false) // Don't cache the light preview
+                        })
+                    {
+                        // FAST PATH: Full preview is cached, just use it.
+                        cached_text
                     } else {
-                        // User is scrolling, and we need to generate the full preview.
-                        let bat_output = std::process::Command::new("bat")
-                            .arg("--color=always")
-                            .arg("--style=numbers")
-                            .arg("--paging=never")
-                            .arg(&full_path)
-                            .output();
+                        // SLOW PATH: No full preview in cache.
+                        // Decide whether to render a light preview or a full one.
+                        let (text_to_render, should_cache) = if app.preview_scroll == 0 {
+                            // Initial view (unscrolled): render a light preview of N lines.
+                            let line_range = format!(":{}", preview_height);
+                            let bat_output = std::process::Command::new("bat")
+                                .arg("--color=always")
+                                .arg("--style=numbers")
+                                .arg("--line-range")
+                                .arg(&line_range)
+                                .arg(&full_path)
+                                .output();
 
-                        let text = match bat_output {
-                            Ok(output) => match ansi_to_tui::IntoText::into_text(&output.stdout) {
-                                Ok(text) => text,
-                                Err(_) => Text::from("[Unable to parse preview]"),
-                            },
-                            Err(_) => {
-                                // Fallback for full preview
-                                match std::fs::read_to_string(&full_path) {
-                                    Ok(content) => Text::from(content),
-                                    Err(_) => Text::from("[Unable to preview file]"),
+                            let text = match bat_output {
+                                Ok(output) => {
+                                    match ansi_to_tui::IntoText::into_text(&output.stdout) {
+                                        Ok(text) => text,
+                                        Err(_) => Text::from("[Unable to parse preview]"),
+                                    }
                                 }
-                            }
-                        };
-                        (text, true) // Cache the full preview
-                    };
+                                Err(_) => {
+                                    // Fallback for light preview
+                                    match std::fs::read_to_string(&full_path) {
+                                        Ok(content) => Text::from(
+                                            content
+                                                .lines()
+                                                .take(preview_height as usize)
+                                                .collect::<Vec<_>>()
+                                                .join("\n"),
+                                        ),
+                                        Err(_) => Text::from("[Unable to preview file]"),
+                                    }
+                                }
+                            };
+                            (text, false) // Don't cache the light preview
+                        } else {
+                            // User is scrolling, and we need to generate the full preview.
+                            let bat_output = std::process::Command::new("bat")
+                                .arg("--color=always")
+                                .arg("--style=numbers")
+                                .arg("--paging=never")
+                                .arg(&full_path)
+                                .output();
 
-                    if should_cache {
-                        app.preview_cache = Some((full_path_str, text_to_render.clone()));
+                            let text = match bat_output {
+                                Ok(output) => {
+                                    match ansi_to_tui::IntoText::into_text(&output.stdout) {
+                                        Ok(text) => text,
+                                        Err(_) => Text::from("[Unable to parse preview]"),
+                                    }
+                                }
+                                Err(_) => {
+                                    // Fallback for full preview
+                                    match std::fs::read_to_string(&full_path) {
+                                        Ok(content) => Text::from(content),
+                                        Err(_) => Text::from("[Unable to preview file]"),
+                                    }
+                                }
+                            };
+                            (text, true) // Cache the full preview
+                        };
+
+                        if should_cache {
+                            app.preview_cache =
+                                Some((current_file_path.to_string(), text_to_render.clone()));
+                        }
+                        text_to_render
                     }
-                    text_to_render
-                }
                 }
             } else {
                 Text::from("")
             };
 
+            let preview_pane_title = current_file
+                .and_then(|x| x.full_path.file_name())
+                .map(|x| x.to_string_lossy())
+                .map(|x| x.to_string())
+                .unwrap_or("No file selected".to_string());
+
             let preview = Paragraph::new(preview_text)
                 .scroll((app.preview_scroll, 0))
-                .block(Block::default().borders(Borders::ALL).title("Preview"));
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(preview_pane_title),
+                );
             f.render_widget(preview, top_chunks[1]);
 
             // Debug panel on the right
@@ -1100,7 +1133,10 @@ fn run_app(
                     debug_lines.push(format!("  Trained: {}", stats.trained_at));
                 }
 
-                debug_lines.push(format!("  Duration: {:.2}s", stats.training_duration_seconds));
+                debug_lines.push(format!(
+                    "  Duration: {:.2}s",
+                    stats.training_duration_seconds
+                ));
                 debug_lines.push(format!("  Features: {}", stats.num_features));
                 debug_lines.push(format!(
                     "  Examples: {} ({} pos, {} neg)",
@@ -1187,7 +1223,13 @@ fn run_app(
         // Poll for worker responses (non-blocking)
         while let Ok(response) = app.worker_rx.try_recv() {
             match response {
-                WorkerResponse::QueryUpdated { query, total_results, total_files, visible_slice, model_stats } => {
+                WorkerResponse::QueryUpdated {
+                    query,
+                    total_results,
+                    total_files,
+                    visible_slice,
+                    model_stats,
+                } => {
                     // Only apply if query still matches
                     if query == app.query {
                         app.visible_files = visible_slice;
@@ -1235,14 +1277,18 @@ fn run_app(
                                 let visible_idx = app.selected_index.saturating_sub(scroll_offset);
                                 if visible_idx < app.visible_files.len() {
                                     let display_info = &app.visible_files[visible_idx];
-                                    let full_path_str = display_info.full_path.to_string_lossy().to_string();
+                                    let full_path_str =
+                                        display_info.full_path.to_string_lossy().to_string();
                                     let key = (app.query.clone(), full_path_str.clone());
 
                                     if !app.scrolled_files.contains(&key) {
                                         let (mtime, atime, file_size) =
                                             get_file_metadata(&display_info.full_path);
-                                        let subsession_id =
-                                            app.current_subsession.as_ref().map(|s| s.id).unwrap_or(1);
+                                        let subsession_id = app
+                                            .current_subsession
+                                            .as_ref()
+                                            .map(|s| s.id)
+                                            .unwrap_or(1);
                                         let _ = app.db.log_scroll(EventData {
                                             query: &app.query,
                                             file_path: &display_info.display_name,
@@ -1271,14 +1317,18 @@ fn run_app(
                                 let visible_idx = app.selected_index.saturating_sub(scroll_offset);
                                 if visible_idx < app.visible_files.len() {
                                     let display_info = &app.visible_files[visible_idx];
-                                    let full_path_str = display_info.full_path.to_string_lossy().to_string();
+                                    let full_path_str =
+                                        display_info.full_path.to_string_lossy().to_string();
                                     let key = (app.query.clone(), full_path_str.clone());
 
                                     if !app.scrolled_files.contains(&key) {
                                         let (mtime, atime, file_size) =
                                             get_file_metadata(&display_info.full_path);
-                                        let subsession_id =
-                                            app.current_subsession.as_ref().map(|s| s.id).unwrap_or(1);
+                                        let subsession_id = app
+                                            .current_subsession
+                                            .as_ref()
+                                            .map(|s| s.id)
+                                            .unwrap_or(1);
                                         let _ = app.db.log_scroll(EventData {
                                             query: &app.query,
                                             file_path: &display_info.display_name,
@@ -1310,7 +1360,9 @@ fn run_app(
                         {
                             // Ctrl-U: clear entire search
                             app.query.clear();
-                            let _ = app.worker_tx.send(WorkerRequest::UpdateQuery(app.query.clone()));
+                            let _ = app
+                                .worker_tx
+                                .send(WorkerRequest::UpdateQuery(app.query.clone()));
                         }
                         KeyCode::Char('o')
                             if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
@@ -1323,11 +1375,15 @@ fn run_app(
                         }
                         KeyCode::Char(c) => {
                             app.query.push(c);
-                            let _ = app.worker_tx.send(WorkerRequest::UpdateQuery(app.query.clone()));
+                            let _ = app
+                                .worker_tx
+                                .send(WorkerRequest::UpdateQuery(app.query.clone()));
                         }
                         KeyCode::Backspace => {
                             app.query.pop();
-                            let _ = app.worker_tx.send(WorkerRequest::UpdateQuery(app.query.clone()));
+                            let _ = app
+                                .worker_tx
+                                .send(WorkerRequest::UpdateQuery(app.query.clone()));
                         }
                         KeyCode::Up => {
                             app.move_selection(-1);

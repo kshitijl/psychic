@@ -8,7 +8,6 @@ Feature computation can be sped up in a bunch of ways:
 
 ## now
 
-- put name of file at top of preview
 - scrolling results is broken after the async refactor
 - monotonicity constraints on certain obvious features
 - maybe add a slight linear term?
