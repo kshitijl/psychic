@@ -10,7 +10,7 @@
 # ]
 # ///
 """
-Train LightGBM ranking model on psychic feature data and generate evaluation visualizations.
+Train LightGBM ranking model on features generated from events.db, and generate evaluation visualizations.
 
 Usage:
     python train.py features.csv output_prefix [--data-dir DIR]
@@ -49,7 +49,7 @@ def load_schema(data_dir):
         sys.exit(1)
 
     # Hash the schema file to verify it's the same across runs
-    with open(schema_path, 'rb') as f:
+    with open(schema_path, "rb") as f:
         schema_hash = hashlib.md5(f.read()).hexdigest()[:8]
 
     with open(schema_path) as f:
@@ -69,33 +69,37 @@ def load_data(csv_path):
     import hashlib
 
     # Hash the CSV file to verify it's the same across runs
-    with open(csv_path, 'rb') as f:
+    with open(csv_path, "rb") as f:
         csv_hash = hashlib.md5(f.read()).hexdigest()[:8]
 
     df = pd.read_csv(csv_path)
     print(f"Loaded {len(df)} samples from {csv_path}")
     print(f"  CSV file hash: {csv_hash}")
     print(f"Label distribution:\n{df['label'].value_counts()}")
-    print(f"\nFeatures: {[c for c in df.columns if c not in ['label', 'group_id', 'subsession_id', 'session_id']]}")
+    print(
+        f"\nFeatures: {[c for c in df.columns if c not in ['label', 'group_id', 'subsession_id', 'session_id']]}"
+    )
 
     # Use group_id as query groups (each group spans from one click/scroll to the next)
-    df['query_group'] = df['group_id'].astype(int)
+    df["query_group"] = df["group_id"].astype(int)
 
     # Filter out query groups with no positive labels (no clicks/scrolls)
     # LambdaRank needs at least one positive example per query group
-    groups_with_positives = df.groupby('query_group')['label'].sum()
+    groups_with_positives = df.groupby("query_group")["label"].sum()
     valid_groups = groups_with_positives[groups_with_positives > 0].index
 
     original_samples = len(df)
-    original_groups = df['query_group'].nunique()
+    original_groups = df["query_group"].nunique()
 
-    df = df[df['query_group'].isin(valid_groups)].reset_index(drop=True)
+    df = df[df["query_group"].isin(valid_groups)].reset_index(drop=True)
 
     filtered_samples = original_samples - len(df)
-    filtered_groups = original_groups - df['query_group'].nunique()
+    filtered_groups = original_groups - df["query_group"].nunique()
 
     print(f"Loaded {df['query_group'].nunique()} query groups (click/scroll sequences)")
-    print(f"  Filtered out {filtered_groups} groups ({filtered_samples} samples) with no positive labels")
+    print(
+        f"  Filtered out {filtered_groups} groups ({filtered_samples} samples) with no positive labels"
+    )
     return df
 
 
@@ -107,7 +111,17 @@ def prepare_features(df, feature_names, binary_features):
 
     # Drop categorical features (query, file_path) since Rust lightgbm3 doesn't support them
     # Also drop metadata columns (including group_id since it's used as query_group)
-    X = df.drop(columns=["label", "query_group", "group_id", "subsession_id", "session_id", "query", "file_path"])
+    X = df.drop(
+        columns=[
+            "label",
+            "query_group",
+            "group_id",
+            "subsession_id",
+            "session_id",
+            "query",
+            "file_path",
+        ]
+    )
 
     # Ensure numeric features are correct type using schema
     for col in X.columns:
@@ -128,25 +142,23 @@ def prepare_features(df, feature_names, binary_features):
     return X, y, query_groups, []  # No categorical features
 
 
-def train_model(X_train, y_train, groups_train, X_val, y_val, groups_val, categorical_features):
+def train_model(
+    X_train, y_train, groups_train, X_val, y_val, groups_val, categorical_features
+):
     """Train LightGBM regression model."""
     print("\nTraining LightGBM regression model...")
 
     # Create LightGBM datasets (no group info needed for regression)
     train_data = lgb.Dataset(
-        X_train,
-        label=y_train,
-        categorical_feature=categorical_features
+        X_train, label=y_train, categorical_feature=categorical_features
     )
     val_data = lgb.Dataset(
         X_val,
         label=y_val,
         categorical_feature=categorical_features,
-        reference=train_data
+        reference=train_data,
     )
 
-    # LightGBM regression parameters
-    # Seeds are critical for deterministic behavior with small sample sizes
     params = {
         "objective": "regression",
         "metric": "rmse",
@@ -185,7 +197,17 @@ def train_model(X_train, y_train, groups_train, X_val, y_val, groups_val, catego
     return model, evals_result
 
 
-def create_visualizations(model, X_train, y_train, groups_train, X_test, y_test, groups_test, evals_result, output_pdf):
+def create_visualizations(
+    model,
+    X_train,
+    y_train,
+    groups_train,
+    X_test,
+    y_test,
+    groups_test,
+    evals_result,
+    output_pdf,
+):
     """Generate all visualizations and save to PDF."""
     print(f"\nGenerating visualizations to {output_pdf}...")
 
@@ -211,7 +233,9 @@ def create_visualizations(model, X_train, y_train, groups_train, X_test, y_test,
             {"feature": feature_names, "importance": importance}
         ).sort_values("importance", ascending=True)
 
-        axes[1].barh(feature_importance_df["feature"], feature_importance_df["importance"])
+        axes[1].barh(
+            feature_importance_df["feature"], feature_importance_df["importance"]
+        )
         axes[1].set_xlabel("Importance (Gain)")
         axes[1].set_title("Feature Importance: Gain")
         axes[1].grid(True, axis="x")
@@ -234,7 +258,9 @@ def create_visualizations(model, X_train, y_train, groups_train, X_test, y_test,
         axes[0, 0].grid(True, axis="x")
 
         # Gain importance (repeated for comparison)
-        axes[0, 1].barh(feature_importance_df["feature"], feature_importance_df["importance"])
+        axes[0, 1].barh(
+            feature_importance_df["feature"], feature_importance_df["importance"]
+        )
         axes[0, 1].set_xlabel("Total Gain")
         axes[0, 1].set_title("Feature Importance: Gain")
         axes[0, 1].grid(True, axis="x")
@@ -242,17 +268,16 @@ def create_visualizations(model, X_train, y_train, groups_train, X_test, y_test,
         # Permutation importance - correlation with target
         correlations = []
         for col in X_test.columns:
-            if X_test[col].dtype in ['int64', 'float64']:
+            if X_test[col].dtype in ["int64", "float64"]:
                 corr = X_test[col].corr(y_test)
             else:
                 # For categorical, use point-biserial (convert to numeric codes)
                 corr = pd.Series(X_test[col].cat.codes).corr(y_test)
             correlations.append(abs(corr))
 
-        corr_df = pd.DataFrame({
-            "feature": X_test.columns,
-            "abs_correlation": correlations
-        }).sort_values("abs_correlation", ascending=True)
+        corr_df = pd.DataFrame(
+            {"feature": X_test.columns, "abs_correlation": correlations}
+        ).sort_values("abs_correlation", ascending=True)
 
         axes[1, 0].barh(corr_df["feature"], corr_df["abs_correlation"])
         axes[1, 0].set_xlabel("Absolute Correlation with Label")
@@ -260,15 +285,21 @@ def create_visualizations(model, X_train, y_train, groups_train, X_test, y_test,
         axes[1, 0].grid(True, axis="x")
 
         # Normalized comparison of all three
-        norm_gain = feature_importance_df.set_index("feature")["importance"] / feature_importance_df["importance"].max()
-        norm_split = split_df.set_index("feature")["importance"] / split_df["importance"].max()
-        norm_corr = corr_df.set_index("feature")["abs_correlation"] / corr_df["abs_correlation"].max()
+        norm_gain = (
+            feature_importance_df.set_index("feature")["importance"]
+            / feature_importance_df["importance"].max()
+        )
+        norm_split = (
+            split_df.set_index("feature")["importance"] / split_df["importance"].max()
+        )
+        norm_corr = (
+            corr_df.set_index("feature")["abs_correlation"]
+            / corr_df["abs_correlation"].max()
+        )
 
-        comparison_df = pd.DataFrame({
-            "Gain": norm_gain,
-            "Split": norm_split,
-            "Correlation": norm_corr
-        })
+        comparison_df = pd.DataFrame(
+            {"Gain": norm_gain, "Split": norm_split, "Correlation": norm_corr}
+        )
 
         comparison_df.plot(kind="barh", ax=axes[1, 1], width=0.8)
         axes[1, 1].set_xlabel("Normalized Importance (0-1)")
@@ -297,14 +328,16 @@ def create_visualizations(model, X_train, y_train, groups_train, X_test, y_test,
         # Convert categorical to numeric ONLY for visualization
         X_test_sample_numeric = X_test_sample.copy()
         for col in X_test_sample_numeric.columns:
-            if X_test_sample_numeric[col].dtype.name == 'category':
+            if X_test_sample_numeric[col].dtype.name == "category":
                 X_test_sample_numeric[col] = X_test_sample_numeric[col].cat.codes
 
         fig, axes = plt.subplots(2, 1, figsize=(14, 12))
 
         # SHAP summary plot (bar)
         plt.sca(axes[0])
-        shap.summary_plot(shap_values, X_test_sample_numeric, plot_type="bar", show=False)
+        shap.summary_plot(
+            shap_values, X_test_sample_numeric, plot_type="bar", show=False
+        )
         axes[0].set_title("SHAP Feature Importance (Mean |SHAP value|)")
 
         # SHAP summary plot (beeswarm)
@@ -328,11 +361,7 @@ def create_visualizations(model, X_train, y_train, groups_train, X_test, y_test,
 
             # Use numeric data for SHAP dependence plot
             shap.dependence_plot(
-                feat_idx,
-                shap_values,
-                X_test_sample_numeric,
-                show=False,
-                ax=axes[i]
+                feat_idx, shap_values, X_test_sample_numeric, show=False, ax=axes[i]
             )
             axes[i].set_title(f"SHAP Dependence: {feat_name}")
 
@@ -354,12 +383,19 @@ def create_visualizations(model, X_train, y_train, groups_train, X_test, y_test,
 
         # Metrics summary
         metrics_text = f"RMSE: {rmse:.4f}\nMAE: {mae:.4f}\nR²: {r2:.4f}"
-        axes[0, 0].text(0.5, 0.5, metrics_text, ha='center', va='center',
-                       fontsize=16, bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+        axes[0, 0].text(
+            0.5,
+            0.5,
+            metrics_text,
+            ha="center",
+            va="center",
+            fontsize=16,
+            bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
+        )
         axes[0, 0].set_xlim([0, 1])
         axes[0, 0].set_ylim([0, 1])
         axes[0, 0].set_title("Regression Metrics (Test Set)")
-        axes[0, 0].axis('off')
+        axes[0, 0].axis("off")
 
         # Score distribution for clicked vs not clicked
         axes[0, 1].hist(
@@ -385,7 +421,7 @@ def create_visualizations(model, X_train, y_train, groups_train, X_test, y_test,
         # Residuals plot
         residuals = y_test - y_pred_scores
         axes[1, 0].scatter(y_pred_scores, residuals, alpha=0.5, s=20)
-        axes[1, 0].axhline(y=0, color='r', linestyle='--', linewidth=2)
+        axes[1, 0].axhline(y=0, color="r", linestyle="--", linewidth=2)
         axes[1, 0].set_xlabel("Predicted Score")
         axes[1, 0].set_ylabel("Residuals (Actual - Predicted)")
         axes[1, 0].set_title("Residual Plot")
@@ -398,7 +434,7 @@ def create_visualizations(model, X_train, y_train, groups_train, X_test, y_test,
             alpha=0.3,
             s=20,
             label="Not Clicked",
-            color="blue"
+            color="blue",
         )
         axes[1, 1].scatter(
             y_pred_scores[y_test == 1],
@@ -406,7 +442,7 @@ def create_visualizations(model, X_train, y_train, groups_train, X_test, y_test,
             alpha=0.8,
             s=40,
             label="Clicked",
-            color="red"
+            color="red",
         )
         axes[1, 1].set_xlabel("Predicted Score")
         axes[1, 1].set_ylabel("Label (jittered)")
@@ -447,16 +483,22 @@ def save_model(model, output_prefix):
 
 def main():
     import time
+
     training_start = time.time()
 
     parser = argparse.ArgumentParser(
         description="Train LightGBM ranking model on psychic feature data"
     )
     parser.add_argument("csv_path", help="Path to features CSV file")
-    parser.add_argument("output_prefix", help="Output prefix for model and visualizations")
-    parser.add_argument("--data-dir", type=str,
-                       default=os.path.expanduser("~/.local/share/psychic"),
-                       help="Data directory for schema and outputs (default: ~/.local/share/psychic)")
+    parser.add_argument(
+        "output_prefix", help="Output prefix for model and visualizations"
+    )
+    parser.add_argument(
+        "--data-dir",
+        type=str,
+        default=os.path.expanduser("~/.local/share/psychic"),
+        help="Data directory for schema and outputs (default: ~/.local/share/psychic)",
+    )
 
     args = parser.parse_args()
 
@@ -471,7 +513,9 @@ def main():
     df = load_data(csv_path)
 
     # Prepare features
-    X, y, query_groups, categorical_features = prepare_features(df, feature_names, binary_features)
+    X, y, query_groups, categorical_features = prepare_features(
+        df, feature_names, binary_features
+    )
 
     # Split data by query groups (so each query stays together)
     splitter = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
@@ -486,6 +530,7 @@ def main():
 
     # Compute hashes to verify deterministic splits
     import hashlib
+
     train_hash = hashlib.md5(str(sorted(train_idx)).encode()).hexdigest()[:8]
     test_hash = hashlib.md5(str(sorted(test_idx)).encode()).hexdigest()[:8]
 
@@ -500,7 +545,9 @@ def main():
 
     # Further split train into train/val for early stopping
     splitter_val = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
-    train_idx2, val_idx = next(splitter_val.split(X_train, y_train, groups=groups_train))
+    train_idx2, val_idx = next(
+        splitter_val.split(X_train, y_train, groups=groups_train)
+    )
 
     X_val = X_train.iloc[val_idx].reset_index(drop=True)
     y_val = y_train.iloc[val_idx].reset_index(drop=True)
@@ -512,17 +559,31 @@ def main():
 
     # Print validation split hash
     val_hash = hashlib.md5(str(sorted(val_idx)).encode()).hexdigest()[:8]
-    print(f"Validation set: {len(X_val)} samples, {groups_val.nunique()} query groups ({y_val.sum()} positive)")
+    print(
+        f"Validation set: {len(X_val)} samples, {groups_val.nunique()} query groups ({y_val.sum()} positive)"
+    )
     print(f"  Validation split hash: {val_hash}")
 
     # Train model
-    model, evals_result = train_model(X_train, y_train, groups_train, X_val, y_val, groups_val, categorical_features)
+    model, evals_result = train_model(
+        X_train, y_train, groups_train, X_val, y_val, groups_val, categorical_features
+    )
 
     # Save model
     save_model(model, output_prefix)
 
     # Generate visualizations
-    create_visualizations(model, X_train, y_train, groups_train, X_test, y_test, groups_test, evals_result, output_pdf)
+    create_visualizations(
+        model,
+        X_train,
+        y_train,
+        groups_train,
+        X_test,
+        y_test,
+        groups_test,
+        evals_result,
+        output_pdf,
+    )
 
     # Calculate training duration
     training_duration = time.time() - training_start
@@ -533,10 +594,13 @@ def main():
     feature_importance_df = pd.DataFrame(
         {"feature": feature_names_list, "importance": importance}
     ).sort_values("importance", ascending=False)
-    top_3_features = feature_importance_df.head(3)[["feature", "importance"]].to_dict('records')
+    top_3_features = feature_importance_df.head(3)[["feature", "importance"]].to_dict(
+        "records"
+    )
 
     # Write model stats to JSON
     import datetime
+
     stats = {
         "trained_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "training_duration_seconds": round(training_duration, 2),
@@ -544,11 +608,11 @@ def main():
         "num_total_examples": len(df),
         "num_positive_examples": int(y.sum()),
         "num_negative_examples": int(len(y) - y.sum()),
-        "top_3_features": top_3_features
+        "top_3_features": top_3_features,
     }
 
     stats_path = Path(args.data_dir) / "model_stats.json"
-    with open(stats_path, 'w') as f:
+    with open(stats_path, "w") as f:
         json.dump(stats, f, indent=2)
     print(f"  - Stats: {stats_path}")
 
