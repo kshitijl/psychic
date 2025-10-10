@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 
-// These next three are worker thread communication types
+// These next three are types for communicating with the UI thread.
 #[derive(Debug, Clone)]
 pub struct DisplayFileInfo {
     pub display_name: String,

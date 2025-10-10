@@ -12,6 +12,10 @@ Helix file picker is a lot faster. Maybe implement a mode that doesn't sort or r
 
 ## now
 
+- get rid of calls to get_file_metadata in main.rs
+- deduplicate code in up-down scrolling in main.rs
+- file walker should probably just send mtime as given by walkdir API. and make the type it sends not a tuple. include file size and atime in there.
+- get_file_metadata should return a struct, not a tuple
 - implement Ctrl-p and Ctrl-n for up and down
 - watch the cwd. if new files added then add them.
 - scrolling results is broken after the async refactor

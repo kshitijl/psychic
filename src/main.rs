@@ -428,9 +428,7 @@ fn run_app(
     retrain_rx: Receiver<bool>,
 ) -> Result<()> {
     loop {
-        // Walker files are now handled by the worker thread
-
-        // Check and log impressions if >200ms old
+        // Log impressions for this subsession if >200ms old
         let _ = app.check_and_log_impressions(false);
 
         // Draw UI
