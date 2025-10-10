@@ -29,7 +29,6 @@ pub struct FileScore {
     pub features: Vec<f64>, // Feature vector in registry order
 }
 
-
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct ModelStats {
     pub trained_at: String,
@@ -59,7 +58,7 @@ pub struct Ranker {
 }
 
 impl Ranker {
-    pub fn new(model_path: &Path, db_path: PathBuf) -> Result<Self> {
+    pub fn new(model_path: &Path, db_path: &Path) -> Result<Self> {
         let model = Booster::from_file(model_path.to_str().unwrap())
             .context("Failed to load LightGBM model")?;
 
@@ -100,7 +99,7 @@ impl Ranker {
     }
 
     /// Load click events from last 30 days from database
-    pub fn load_clicks(db_path: &PathBuf) -> Result<ClickData> {
+    pub fn load_clicks(db_path: &Path) -> Result<ClickData> {
         let now = Timestamp::now();
         let session_tz = jiff::tz::TimeZone::system();
         let now_zoned = now.to_zoned(session_tz);
@@ -146,10 +145,7 @@ impl Ranker {
             "Loaded {} files with click history from last 30 days",
             clicks_by_file.len()
         );
-        log::debug!(
-            "Indexed {} parent directories",
-            clicks_by_parent_dir.len()
-        );
+        log::debug!("Indexed {} parent directories", clicks_by_parent_dir.len());
 
         Ok(ClickData {
             clicks_by_file,
@@ -184,26 +180,43 @@ impl Ranker {
                     current_timestamp,
                     cwd,
                     clicks_by_file,
-                    clicks_by_parent_dir
-                ).expect("Feature computation failed")
+                    clicks_by_parent_dir,
+                )
+                .expect("Feature computation failed")
             })
             .collect();
 
-        log::debug!("Parallel feature computation for {} files took {:?}", files.len(), compute_start.elapsed());
+        log::debug!(
+            "Parallel feature computation for {} files took {:?}",
+            files.len(),
+            compute_start.elapsed()
+        );
 
         // Batch predict all files at once
         // Flatten features into a single vector for batch prediction
         let flatten_start = Instant::now();
-        let num_features = if all_features.is_empty() { 0 } else { all_features[0].len() };
+        let num_features = if all_features.is_empty() {
+            0
+        } else {
+            all_features[0].len()
+        };
         let flat_features: Vec<f64> = all_features.iter().flatten().copied().collect();
-        log::debug!("Flattening features for {} files took {:?}", files.len(), flatten_start.elapsed());
+        log::debug!(
+            "Flattening features for {} files took {:?}",
+            files.len(),
+            flatten_start.elapsed()
+        );
 
         let predict_start = Instant::now();
         let prediction_results = self
             .model
             .predict_with_params(&flat_features, num_features as i32, true, "num_threads=8")
             .context("Failed to batch predict with model")?;
-        log::debug!("Batch model prediction for {} files took {:?}", files.len(), predict_start.elapsed());
+        log::debug!(
+            "Batch model prediction for {} files took {:?}",
+            files.len(),
+            predict_start.elapsed()
+        );
 
         // Build scored files
         let mut scored_files = Vec::with_capacity(files.len());
@@ -222,11 +235,14 @@ impl Ranker {
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        log::debug!("Sorting {} scored files took {:?}", scored_files.len(), sort_start.elapsed());
+        log::debug!(
+            "Sorting {} scored files took {:?}",
+            scored_files.len(),
+            sort_start.elapsed()
+        );
 
         Ok(scored_files)
     }
-
 }
 
 /// Convert feature vector to HashMap (for display purposes)
@@ -247,7 +263,14 @@ fn compute_features(
     clicks_by_file: &HashMap<String, Vec<ClickEvent>>,
     clicks_by_parent_dir: &HashMap<PathBuf, Vec<ClickEvent>>,
 ) -> Result<Vec<f64>> {
-    let (features, _timings) = compute_features_with_timing(query, file, current_timestamp, cwd, clicks_by_file, clicks_by_parent_dir)?;
+    let (features, _timings) = compute_features_with_timing(
+        query,
+        file,
+        current_timestamp,
+        cwd,
+        clicks_by_file,
+        clicks_by_parent_dir,
+    )?;
     Ok(features)
 }
 
@@ -341,7 +364,7 @@ pub fn retrain_model(data_dir: &Path, training_log_path: Option<PathBuf>) -> Res
         // Step 1: Generate features
         log::info!("Generating features...");
         let feature_start = Instant::now();
-        let db_path = db::Database::get_db_path(&data_dir)?;
+        let db_path = db::Database::get_db_path(&data_dir);
         let features_csv = data_dir.join("features.csv");
         let schema_json = data_dir.join("feature_schema.json");
 
@@ -470,9 +493,9 @@ mod tests {
             .join(".local")
             .join("share")
             .join("psychic");
-        let db_path = Database::get_db_path(&data_dir).expect("Failed to get db path");
+        let db_path = Database::get_db_path(&data_dir);
 
-        let ranker = Ranker::new(&model_path, db_path);
+        let ranker = Ranker::new(&model_path, &db_path);
         match &ranker {
             Ok(_) => println!("✓ Ranker loaded successfully"),
             Err(e) => {
@@ -574,8 +597,15 @@ mod tests {
         }
 
         // Compute features using the standalone function
-        let features = compute_features(query, &file, current_timestamp, &cwd, &clicks_by_file, &clicks_by_parent_dir)
-            .expect("Failed to compute features");
+        let features = compute_features(
+            query,
+            &file,
+            current_timestamp,
+            &cwd,
+            &clicks_by_file,
+            &clicks_by_parent_dir,
+        )
+        .expect("Failed to compute features");
 
         // Format as string for expect-test style comparison
         let actual = format!("{:?}", features);

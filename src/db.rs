@@ -2,8 +2,13 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 use std::path::{Path, PathBuf};
 
-// Type alias for file metadata tuples
-pub type FileMetadata = (String, String, Option<i64>, Option<i64>, Option<i64>); // (relative, full, mtime, atime, file_size)
+pub struct FileMetadata {
+    pub relative_path: String,
+    pub full_path: String,
+    pub mtime: Option<i64>,
+    pub atime: Option<i64>,
+    pub size: Option<i64>,
+}
 
 #[derive(Debug, Clone)]
 pub struct ContextData {
@@ -16,6 +21,13 @@ pub struct ContextData {
     pub timezone: String,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum UserInteraction {
+    Click,
+    Scroll,
+    Impression,
+}
+
 pub struct EventData<'a> {
     pub query: &'a str,
     pub file_path: &'a str,
@@ -24,24 +36,16 @@ pub struct EventData<'a> {
     pub atime: Option<i64>,
     pub file_size: Option<i64>,
     pub subsession_id: u64,
-    pub action: &'a str,
+    pub action: UserInteraction,
     pub session_id: &'a str,
 }
 
 pub struct Database {
     conn: Connection,
-    db_path: PathBuf,
 }
 
 impl Database {
-    pub fn new(data_dir: &Path) -> Result<Self> {
-        let db_path = Self::get_db_path(data_dir)?;
-
-        // Create parent directory if it doesn't exist
-        if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
+    pub fn new(db_path: &Path) -> Result<Self> {
         let conn = Connection::open(&db_path).context("Failed to open database")?;
 
         // Create tables if they don't exist
@@ -77,23 +81,20 @@ impl Database {
             [],
         )?;
 
-        // Create index for efficient click count queries
-        // Covers: WHERE action = 'click' AND timestamp >= ? GROUP BY full_path
+        // This index is for click count queries. We might want to do those in Rust
+        // code at some point, but this is convenient for now.
+        // The clause: WHERE action = 'click' AND timestamp >= ? GROUP BY full_path
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_events_click_lookup
              ON events(action, timestamp, full_path)",
             [],
         )?;
 
-        Ok(Database { conn, db_path })
+        Ok(Database { conn })
     }
 
-    pub fn get_db_path(data_dir: &Path) -> Result<PathBuf> {
-        Ok(data_dir.join("events.db"))
-    }
-
-    pub fn db_path(&self) -> PathBuf {
-        self.db_path.clone()
+    pub fn get_db_path(data_dir: &Path) -> PathBuf {
+        data_dir.join("events.db")
     }
 
     pub fn log_session(&self, session_id: &str, context: &ContextData) -> Result<()> {
@@ -121,6 +122,12 @@ impl Database {
     pub fn log_event(&self, event: EventData) -> Result<()> {
         let timestamp = jiff::Timestamp::now().as_second();
 
+        let action = match event.action {
+            UserInteraction::Click => "click",
+            UserInteraction::Scroll => "scroll",
+            UserInteraction::Impression => "impression",
+        };
+
         self.conn.execute(
             "INSERT INTO events (timestamp, query, file_path, full_path, mtime, atime, file_size, subsession_id, action, session_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
@@ -133,7 +140,7 @@ impl Database {
                 event.atime,
                 event.file_size,
                 event.subsession_id,
-                event.action,
+                action,
                 event.session_id
             ],
         )?;
@@ -148,29 +155,28 @@ impl Database {
         subsession_id: u64,
         session_id: &str,
     ) -> Result<()> {
-        for (file_path, full_path, mtime, atime, file_size) in file_paths {
+        for FileMetadata {
+            relative_path,
+            full_path,
+            mtime,
+            atime,
+            size,
+        } in file_paths
+        {
             self.log_event(EventData {
                 query,
-                file_path,
+                file_path: relative_path,
                 full_path,
                 mtime: *mtime,
                 atime: *atime,
-                file_size: *file_size,
+                file_size: *size,
                 subsession_id,
-                action: "impression",
+                action: UserInteraction::Impression,
                 session_id,
             })?;
         }
 
         Ok(())
-    }
-
-    pub fn log_click(&self, event: EventData) -> Result<()> {
-        self.log_event(event)
-    }
-
-    pub fn log_scroll(&self, event: EventData) -> Result<()> {
-        self.log_event(event)
     }
 
     pub fn get_previously_interacted_files(&self) -> Result<Vec<String>> {

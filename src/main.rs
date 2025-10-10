@@ -3,6 +3,7 @@ mod db;
 mod feature_defs;
 mod features;
 mod ranker;
+mod search_worker;
 mod walker;
 
 use anyhow::{Context, Result};
@@ -21,17 +22,19 @@ use ratatui::{
     text::Text,
     widgets::{Block, Borders, List, ListItem, Paragraph},
 };
+use search_worker::{
+    DisplayFileInfo, WorkerRequest, WorkerResponse, get_file_metadata, get_time_ago,
+};
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashSet, VecDeque},
     env,
     io::{self, stdout},
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver},
     time::{Duration, Instant},
 };
-use walker::start_file_walker;
 
-/// Output format for feature generation
+/// For feature generation
 #[derive(Debug, Clone, ValueEnum)]
 enum OutputFormat {
     Csv,
@@ -40,17 +43,18 @@ enum OutputFormat {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Generate features for machine learning from collected events
+    /// Generate features for training from collected events
     GenerateFeatures {
-        /// Output format (csv or json)
+        /// Output format
         #[arg(short, long, value_enum, default_value = "csv")]
         format: OutputFormat,
     },
-    /// Retrain the ranking model using collected events
+    /// Retrain the ranking model using collected events. This does everything,
+    /// including feature gen.
     Retrain,
 }
 
-/// A terminal-based file browser with fuzzy search and analytics
+/// A terminal-based file browser that learns which files you want to see.
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
@@ -71,382 +75,13 @@ fn get_default_data_dir() -> Result<PathBuf> {
         .join("psychic"))
 }
 
+// Every time the query changes, as the user types, corresponds to a new
+// subsession. Subsession id is logged to the db.
 struct Subsession {
     id: u64,
     query: String,
-    created_at: jiff::Timestamp, // When subsession was created
-    impressions_logged: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct FileId(usize);
-
-#[derive(Debug, Clone)]
-struct FileInfo {
-    full_path: PathBuf,
-    display_name: String,
-    mtime: Option<i64>,
-    is_from_walker: bool,
-}
-
-impl FileInfo {
-    fn from_walkdir(full_path: PathBuf, mtime: Option<i64>, root: &PathBuf) -> Self {
-        let display_name = full_path
-            .strip_prefix(root)
-            .unwrap_or(&full_path)
-            .to_string_lossy()
-            .to_string();
-
-        FileInfo {
-            full_path,
-            display_name,
-            mtime,
-            is_from_walker: true,
-        }
-    }
-
-    fn from_history(full_path: PathBuf, mtime: Option<i64>, root: &PathBuf) -> Self {
-        let display_name = if full_path.strip_prefix(root).is_ok() {
-            // File is in current tree - show relative path normally
-            full_path
-                .strip_prefix(root)
-                .unwrap()
-                .to_string_lossy()
-                .to_string()
-        } else {
-            // File is from elsewhere - show .../{filename}
-            let filename = full_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("unknown");
-            format!(".../{}", filename)
-        };
-
-        FileInfo {
-            full_path,
-            display_name,
-            mtime,
-            is_from_walker: false,
-        }
-    }
-}
-
-// Worker thread communication types
-#[derive(Debug, Clone)]
-struct DisplayFileInfo {
-    display_name: String,
-    full_path: PathBuf,
-    score: f64,
-    features: Vec<f64>,
-}
-
-enum WorkerRequest {
-    UpdateQuery(String),
-    GetVisibleSlice { start: usize, count: usize },
-    ReloadModel,
-    ReloadClicks,
-}
-
-enum WorkerResponse {
-    QueryUpdated {
-        query: String,
-        total_results: usize,
-        total_files: usize,
-        visible_slice: Vec<DisplayFileInfo>,
-        model_stats: Option<ranker::ModelStats>,
-    },
-    VisibleSlice(Vec<DisplayFileInfo>),
-}
-
-// Unsafe Send wrapper for Ranker (LightGBM is thread-safe for read-only ops)
-struct SendRanker(ranker::Ranker);
-unsafe impl Send for SendRanker {}
-
-// Worker thread state - owns all file data
-struct WorkerState {
-    file_registry: Vec<FileInfo>,
-    path_to_id: HashMap<PathBuf, FileId>,
-    filtered_files: Vec<FileId>,
-    file_scores: Vec<ranker::FileScore>,
-    current_query: String,
-    root: PathBuf,
-    ranker: SendRanker,
-    model_path: PathBuf,
-    db_path: PathBuf,
-}
-
-impl WorkerState {
-    fn new(
-        root: PathBuf,
-        ranker: ranker::Ranker,
-        db: &Database,
-        model_path: PathBuf,
-        db_path: PathBuf,
-    ) -> Result<Self> {
-        // Load historical files into registry
-        let mut file_registry = Vec::new();
-        let mut path_to_id: HashMap<PathBuf, FileId> = HashMap::new();
-
-        let historical_paths: Vec<PathBuf> = db
-            .get_previously_interacted_files()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|p| {
-                let path = PathBuf::from(&p);
-                if path.exists() { Some(path) } else { None }
-            })
-            .collect();
-
-        for path in historical_paths {
-            // Canonicalize historical paths once at startup
-            let canonical_path = path.canonicalize().unwrap_or(path);
-            let (mtime, _, _) = get_file_metadata(&canonical_path);
-            let file_info = FileInfo::from_history(canonical_path.clone(), mtime, &root);
-            let file_id = FileId(file_registry.len());
-            path_to_id.insert(canonical_path, file_id);
-            file_registry.push(file_info);
-        }
-
-        log::debug!(
-            "WorkerState loaded {} historical files",
-            file_registry.len()
-        );
-
-        Ok(WorkerState {
-            file_registry,
-            path_to_id,
-            filtered_files: Vec::new(),
-            file_scores: Vec::new(),
-            current_query: String::new(),
-            root,
-            ranker: SendRanker(ranker),
-            model_path,
-            db_path,
-        })
-    }
-
-    fn add_file(&mut self, path: PathBuf, mtime: Option<i64>) {
-        if !self.path_to_id.contains_key(&path) {
-            let file_info = FileInfo::from_walkdir(path.clone(), mtime, &self.root);
-            let file_id = FileId(self.file_registry.len());
-            self.path_to_id.insert(path, file_id);
-            self.file_registry.push(file_info);
-        }
-    }
-
-    fn filter_and_rank(&mut self, query: &str) -> Result<()> {
-        self.current_query = query.to_string();
-        let query_lower = query.to_lowercase();
-
-        // Filter files that match the query
-        let matching_file_ids: Vec<FileId> = (0..self.file_registry.len())
-            .map(FileId)
-            .filter(|&file_id| {
-                let file_info = &self.file_registry[file_id.0];
-                query_lower.is_empty()
-                    || file_info.display_name.to_lowercase().contains(&query_lower)
-            })
-            .collect();
-
-        // Convert to FileCandidate structs
-        let file_candidates: Vec<ranker::FileCandidate> = matching_file_ids
-            .iter()
-            .map(|&file_id| {
-                let file_info = &self.file_registry[file_id.0];
-                ranker::FileCandidate {
-                    file_id: file_id.0,
-                    relative_path: file_info.display_name.clone(),
-                    full_path: file_info.full_path.clone(),
-                    mtime: file_info.mtime,
-                    is_from_walker: file_info.is_from_walker,
-                }
-            })
-            .collect();
-
-        // Rank them with the model
-        let current_timestamp = jiff::Timestamp::now().as_second();
-        match self
-            .ranker
-            .0
-            .rank_files(query, &file_candidates, current_timestamp, &self.root)
-        {
-            Ok(scored) => {
-                self.filtered_files = scored.iter().map(|fs| FileId(fs.file_id)).collect();
-                self.file_scores = scored;
-            }
-            Err(e) => {
-                log::warn!("Ranking failed: {}, falling back to simple filtering", e);
-                self.file_scores.clear();
-                self.filtered_files = matching_file_ids;
-            }
-        }
-
-        Ok(())
-    }
-
-    fn get_slice(&self, start: usize, count: usize) -> Vec<DisplayFileInfo> {
-        self.filtered_files
-            .iter()
-            .skip(start)
-            .take(count)
-            .map(|&file_id| {
-                let file_info = &self.file_registry[file_id.0];
-                let file_score = self.file_scores.iter().find(|fs| fs.file_id == file_id.0);
-
-                let score = file_score.map(|fs| fs.score).unwrap_or(0.0);
-                let features = file_score.map(|fs| fs.features.clone()).unwrap_or_default();
-
-                DisplayFileInfo {
-                    display_name: file_info.display_name.clone(),
-                    full_path: file_info.full_path.clone(),
-                    score,
-                    features,
-                }
-            })
-            .collect()
-    }
-
-    fn reload_model(&mut self) -> Result<()> {
-        log::info!("Worker: Reloading model from disk");
-        self.ranker.0 = ranker::Ranker::new(&self.model_path, self.db_path.clone())?;
-        log::info!("Worker: Model reloaded successfully");
-        Ok(())
-    }
-
-    fn reload_clicks(&mut self) -> Result<()> {
-        log::info!("Worker: Reloading click data");
-        self.ranker.0.clicks = ranker::Ranker::load_clicks(&self.db_path)?;
-        log::info!("Worker: Click data reloaded successfully");
-        Ok(())
-    }
-}
-
-// Worker thread main loop
-fn worker_thread_loop(
-    task_rx: mpsc::Receiver<WorkerRequest>,
-    result_tx: mpsc::Sender<WorkerResponse>,
-    walker_rx: mpsc::Receiver<(PathBuf, Option<i64>)>,
-    mut state: WorkerState,
-) {
-    use std::sync::mpsc::RecvTimeoutError;
-    use std::time::Instant;
-
-    let mut last_update = Instant::now();
-    let mut files_changed = false;
-
-    loop {
-        // Process walker updates (non-blocking)
-        while let Ok((path, mtime)) = walker_rx.try_recv() {
-            state.add_file(path, mtime);
-            files_changed = true;
-        }
-
-        // If files changed and enough time passed, send update
-        if files_changed && last_update.elapsed() > Duration::from_millis(100) {
-            if let Err(e) = state.filter_and_rank(&state.current_query.clone()) {
-                log::error!("Auto-refresh filter/rank failed: {}", e);
-            } else {
-                let visible_slice = state.get_slice(0, 60);
-                let _ = result_tx.send(WorkerResponse::QueryUpdated {
-                    query: state.current_query.clone(),
-                    total_results: state.filtered_files.len(),
-                    total_files: state.file_registry.len(),
-                    visible_slice,
-                    model_stats: state.ranker.0.stats.clone(),
-                });
-                last_update = Instant::now();
-                files_changed = false;
-            }
-        }
-
-        // Wait for worker requests with timeout
-        match task_rx.recv_timeout(Duration::from_millis(5)) {
-            Ok(WorkerRequest::UpdateQuery(query)) => {
-                // Debounce: drain all pending queries and keep the latest
-                let query = drain_latest_query(&task_rx, query);
-                state.current_query = query.clone();
-
-                // Filter and rank
-                if let Err(e) = state.filter_and_rank(&query) {
-                    log::error!("Filter/rank failed: {}", e);
-                    continue;
-                }
-
-                // Send back results with enough items to fill screen (assume ~50 lines)
-                let visible_slice = state.get_slice(0, 60);
-                let _ = result_tx.send(WorkerResponse::QueryUpdated {
-                    query,
-                    total_results: state.filtered_files.len(),
-                    total_files: state.file_registry.len(),
-                    visible_slice,
-                    model_stats: state.ranker.0.stats.clone(),
-                });
-                last_update = Instant::now();
-                files_changed = false;
-            }
-            Ok(WorkerRequest::GetVisibleSlice { start, count }) => {
-                let slice = state.get_slice(start, count);
-                let _ = result_tx.send(WorkerResponse::VisibleSlice(slice));
-            }
-            Ok(WorkerRequest::ReloadModel) => {
-                if let Err(e) = state.reload_model() {
-                    log::error!("Failed to reload model: {}", e);
-                } else {
-                    // Re-filter and rank with new model
-                    let query = state.current_query.clone();
-                    if let Err(e) = state.filter_and_rank(&query) {
-                        log::error!("Filter/rank failed after model reload: {}", e);
-                    } else {
-                        let visible_slice = state.get_slice(0, 60);
-                        let _ = result_tx.send(WorkerResponse::QueryUpdated {
-                            query,
-                            total_results: state.filtered_files.len(),
-                            total_files: state.file_registry.len(),
-                            visible_slice,
-                            model_stats: state.ranker.0.stats.clone(),
-                        });
-                    }
-                }
-            }
-            Ok(WorkerRequest::ReloadClicks) => {
-                if let Err(e) = state.reload_clicks() {
-                    log::error!("Failed to reload clicks: {}", e);
-                } else {
-                    // Re-filter and rank with new clicks
-                    let query = state.current_query.clone();
-                    if let Err(e) = state.filter_and_rank(&query) {
-                        log::error!("Filter/rank failed after clicks reload: {}", e);
-                    } else {
-                        let visible_slice = state.get_slice(0, 60);
-                        let _ = result_tx.send(WorkerResponse::QueryUpdated {
-                            query,
-                            total_results: state.filtered_files.len(),
-                            total_files: state.file_registry.len(),
-                            visible_slice,
-                            model_stats: state.ranker.0.stats.clone(),
-                        });
-                    }
-                }
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                // No work to do, loop again
-                continue;
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-                log::debug!("Worker thread channel disconnected");
-                break;
-            }
-        }
-    }
-}
-
-// Helper to drain all pending queries and return the latest one
-fn drain_latest_query(rx: &mpsc::Receiver<WorkerRequest>, initial: String) -> String {
-    let mut latest = initial;
-    while let Ok(WorkerRequest::UpdateQuery(query)) = rx.try_recv() {
-        latest = query;
-    }
-    latest
+    created_at: jiff::Timestamp,
+    events_have_been_logged: bool,
 }
 
 struct App {
@@ -463,12 +98,17 @@ struct App {
     current_subsession: Option<Subsession>,
     next_subsession_id: u64,
     db: Database,
+
+    num_results_to_log_as_impressions: usize,
+
+    // For debug pane
     model_stats_cache: Option<ranker::ModelStats>, // Cached from worker, refreshed periodically
-    retraining: bool,
+    currently_retraining: bool,
     log_receiver: Receiver<String>,
     recent_logs: VecDeque<String>,
-    debug_maximized: bool,
-    // Worker thread communication
+    debug_pane_maximized: bool,
+
+    // Search worker thread communication
     worker_tx: mpsc::Sender<WorkerRequest>,
     worker_rx: mpsc::Receiver<WorkerResponse>,
 }
@@ -488,45 +128,11 @@ impl App {
         let session_id = hasher.finish().to_string();
 
         let db_start = Instant::now();
-        let db = Database::new(data_dir)?;
-        let db_path = db.db_path();
+        let db_path = Database::get_db_path(data_dir);
+        let db = Database::new(&db_path)?;
         log::debug!("Database initialization took {:?}", db_start.elapsed());
 
-        // Try to load the ranker model if it exists (stored next to db file)
-        let ranker_start = Instant::now();
-        let model_path = db_path
-            .parent()
-            .map(|p| p.join("model.txt"))
-            .unwrap_or_else(|| PathBuf::from("model.txt"));
-
-        let ranker = ranker::Ranker::new(&model_path, db_path.clone())?;
-        log::info!("Loaded ranking model from {:?}", model_path);
-        log::debug!("Ranker initialization took {:?}", ranker_start.elapsed());
-
-        // Create channels for worker thread
-        let (worker_tx, worker_task_rx) = mpsc::channel::<WorkerRequest>();
-        let (worker_result_tx, worker_rx) = mpsc::channel::<WorkerResponse>();
-        let (walker_tx, walker_rx) = mpsc::channel::<(PathBuf, Option<i64>)>();
-
-        // Initialize worker state
-        let worker_state = WorkerState::new(
-            root.clone(),
-            ranker,
-            &db,
-            model_path.clone(),
-            db_path.clone(),
-        )?;
-
-        // Spawn worker thread
-        std::thread::spawn(move || {
-            worker_thread_loop(worker_task_rx, worker_result_tx, walker_rx, worker_state);
-        });
-
-        // Spawn walker thread
-        let root_clone = root.clone();
-        std::thread::spawn(move || {
-            start_file_walker(root_clone, walker_tx);
-        });
+        let (worker_tx, worker_rx) = search_worker::spawn(root.clone(), data_dir)?;
 
         log::debug!("App::new() total time: {:?}", start_time.elapsed());
 
@@ -543,12 +149,13 @@ impl App {
             session_id,
             current_subsession: None,
             next_subsession_id: 1,
+            num_results_to_log_as_impressions: 25,
             db,
             model_stats_cache: None,
-            retraining: false,
+            currently_retraining: false,
             log_receiver,
             recent_logs: VecDeque::with_capacity(50),
-            debug_maximized: false,
+            debug_pane_maximized: false,
             worker_tx: worker_tx.clone(),
             worker_rx,
         };
@@ -582,7 +189,7 @@ impl App {
         };
 
         // Skip if already logged
-        if subsession.impressions_logged {
+        if subsession.events_have_been_logged {
             return Ok(());
         }
 
@@ -594,27 +201,28 @@ impl App {
             return Ok(());
         }
 
-        // Log top 10 visible files with metadata
-        let top_10: Vec<FileMetadata> = self
+        // Log top N visible files with metadata
+        let top_n: Vec<FileMetadata> = self
             .visible_files
             .iter()
-            .take(10)
+            .take(self.num_results_to_log_as_impressions)
             .map(|display_info| {
                 let (mtime, atime, file_size) = get_file_metadata(&display_info.full_path);
-                (
-                    display_info.display_name.clone(),
-                    display_info.full_path.to_string_lossy().to_string(),
+
+                FileMetadata {
+                    relative_path: display_info.display_name.clone(),
+                    full_path: display_info.full_path.to_string_lossy().to_string(),
                     mtime,
                     atime,
-                    file_size,
-                )
+                    size: file_size,
+                }
             })
             .collect();
 
-        if !top_10.is_empty() {
+        if !top_n.is_empty() {
             self.db
-                .log_impressions(&subsession.query, &top_10, subsession.id, &self.session_id)?;
-            subsession.impressions_logged = true;
+                .log_impressions(&subsession.query, &top_n, subsession.id, &self.session_id)?;
+            subsession.events_have_been_logged = true;
         }
 
         Ok(())
@@ -668,42 +276,6 @@ impl App {
     }
 }
 
-fn get_file_metadata(path: &PathBuf) -> (Option<i64>, Option<i64>, Option<i64>) {
-    if let Ok(metadata) = std::fs::metadata(path) {
-        let mtime = metadata
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs() as i64);
-
-        let atime = metadata
-            .accessed()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs() as i64);
-
-        let file_size = Some(metadata.len() as i64);
-
-        (mtime, atime, file_size)
-    } else {
-        (None, None, None)
-    }
-}
-
-fn get_time_ago(path: &PathBuf) -> String {
-    if let Ok(metadata) = std::fs::metadata(path)
-        && let Ok(modified) = metadata.modified()
-    {
-        let duration = std::time::SystemTime::now()
-            .duration_since(modified)
-            .unwrap_or(Duration::from_secs(0));
-
-        let formatter = timeago::Formatter::new();
-        return formatter.convert(duration);
-    }
-    String::from("unknown")
-}
-
 fn main() -> Result<()> {
     // Initialize logger with fern to write to both file and memory
     let (log_tx, log_rx) = mpsc::channel();
@@ -754,7 +326,7 @@ fn main() -> Result<()> {
                 };
                 let output_path = data_dir.join(default_filename);
                 let schema_path = data_dir.join("feature_schema.json");
-                let db_path = db::Database::get_db_path(&data_dir)?;
+                let db_path = db::Database::get_db_path(&data_dir);
 
                 // Convert CLI format to features format
                 let features_format = match format {
@@ -873,7 +445,7 @@ fn run_app(
                 .split(f.area());
 
             // Split top area horizontally: left for file list, middle for preview, right for debug
-            let top_chunks = if app.debug_maximized {
+            let top_chunks = if app.debug_pane_maximized {
                 // When debug is maximized, give it most of the space
                 Layout::default()
                     .direction(Direction::Horizontal)
@@ -1112,7 +684,7 @@ fn run_app(
             debug_lines.push(String::from("")); // Separator
 
             // Add retraining status
-            if app.retraining {
+            if app.currently_retraining {
                 debug_lines.push(String::from("Retraining model..."));
                 debug_lines.push(String::from("")); // Separator
             }
@@ -1176,11 +748,11 @@ fn run_app(
             // Add recent logs
             debug_lines.push(String::from("Recent Logs:"));
             // Show more log lines when debug is maximized
-            let log_count = if app.debug_maximized { 30 } else { 10 };
+            let log_count = if app.debug_pane_maximized { 30 } else { 10 };
             let log_start = app.recent_logs.len().saturating_sub(log_count);
             for log_line in app.recent_logs.iter().skip(log_start) {
                 // Truncate long lines to fit
-                let max_len = if app.debug_maximized { 120 } else { 60 };
+                let max_len = if app.debug_pane_maximized { 120 } else { 60 };
                 if log_line.len() > max_len {
                     debug_lines.push(format!("  {}...", &log_line[..(max_len - 3)]));
                 } else {
@@ -1190,7 +762,7 @@ fn run_app(
 
             let debug_text = debug_lines.join("\n");
 
-            let debug_title = if app.debug_maximized {
+            let debug_title = if app.debug_pane_maximized {
                 "Debug (Ctrl-O to minimize)"
             } else {
                 "Debug (Ctrl-O to maximize)"
@@ -1207,7 +779,7 @@ fn run_app(
 
         // Check for retraining status updates
         if let Ok(retraining_status) = retrain_rx.try_recv() {
-            app.retraining = retraining_status;
+            app.currently_retraining = retraining_status;
         }
 
         // Collect new log messages (non-blocking)
@@ -1247,7 +819,7 @@ fn run_app(
                             id: app.next_subsession_id,
                             query: query.clone(),
                             created_at: jiff::Timestamp::now(),
-                            impressions_logged: false,
+                            events_have_been_logged: false,
                         });
                         app.next_subsession_id += 1;
                     }
@@ -1289,7 +861,7 @@ fn run_app(
                                             .as_ref()
                                             .map(|s| s.id)
                                             .unwrap_or(1);
-                                        let _ = app.db.log_scroll(EventData {
+                                        let _ = app.db.log_event(EventData {
                                             query: &app.query,
                                             file_path: &display_info.display_name,
                                             full_path: &full_path_str,
@@ -1297,7 +869,7 @@ fn run_app(
                                             atime,
                                             file_size,
                                             subsession_id,
-                                            action: "scroll",
+                                            action: db::UserInteraction::Scroll,
                                             session_id: &app.session_id,
                                         });
                                         app.scrolled_files.insert(key);
@@ -1329,7 +901,7 @@ fn run_app(
                                             .as_ref()
                                             .map(|s| s.id)
                                             .unwrap_or(1);
-                                        let _ = app.db.log_scroll(EventData {
+                                        let _ = app.db.log_event(EventData {
                                             query: &app.query,
                                             file_path: &display_info.display_name,
                                             full_path: &full_path_str,
@@ -1337,7 +909,7 @@ fn run_app(
                                             atime,
                                             file_size,
                                             subsession_id,
-                                            action: "scroll",
+                                            action: db::UserInteraction::Scroll,
                                             session_id: &app.session_id,
                                         });
                                         app.scrolled_files.insert(key);
@@ -1368,7 +940,7 @@ fn run_app(
                             if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
                         {
                             // Ctrl-O: toggle debug pane maximization
-                            app.debug_maximized = !app.debug_maximized;
+                            app.debug_pane_maximized = !app.debug_pane_maximized;
                         }
                         KeyCode::Esc => {
                             return Ok(());
@@ -1406,7 +978,7 @@ fn run_app(
                                     // Log the click
                                     let subsession_id =
                                         app.current_subsession.as_ref().map(|s| s.id).unwrap_or(1);
-                                    app.db.log_click(EventData {
+                                    app.db.log_event(EventData {
                                         query: &app.query,
                                         file_path: &display_info.display_name,
                                         full_path: &display_info.full_path.to_string_lossy(),
@@ -1414,7 +986,7 @@ fn run_app(
                                         atime,
                                         file_size,
                                         subsession_id,
-                                        action: "click",
+                                        action: db::UserInteraction::Click,
                                         session_id: &app.session_id,
                                     })?;
 
