@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use crossterm::{
     ExecutableCommand,
+    cursor::Show,
     event::{self, Event, KeyCode, KeyEventKind},
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -657,6 +658,7 @@ fn main() -> Result<()> {
     disable_raw_mode()?;
     stdout().execute(crossterm::event::DisableMouseCapture)?;
     stdout().execute(LeaveAlternateScreen)?;
+    stdout().execute(Show)?;
 
     result
 }
@@ -1109,6 +1111,12 @@ fn run_app(
             let input = Paragraph::new(app.query.as_str())
                 .block(Block::default().borders(Borders::ALL).title("Search"));
             f.render_widget(input, main_chunks[2]);
+
+            // Position cursor in the search input at the end of the query text
+            // Account for border (1 char) + query length
+            let cursor_x = main_chunks[2].x + 1 + app.query.len() as u16;
+            let cursor_y = main_chunks[2].y + 1; // 1 for top border
+            f.set_cursor_position((cursor_x, cursor_y));
         })?;
 
         // Check for retraining status updates
@@ -1303,6 +1311,7 @@ fn run_app(
                                         .backend_mut()
                                         .execute(crossterm::event::DisableMouseCapture)?;
                                     terminal.backend_mut().execute(LeaveAlternateScreen)?;
+                                    terminal.backend_mut().execute(Show)?;
 
                                     let status = if display_info.is_dir {
                                         // If directory, cd and spawn shell
