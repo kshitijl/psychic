@@ -21,6 +21,13 @@ pub struct WalkerFileMetadata {
     pub is_dir: bool,
 }
 
+// Messages from walker to worker
+#[derive(Debug, Clone)]
+pub enum WalkerMessage {
+    FileMetadata(WalkerFileMetadata),
+    AllDone,
+}
+
 // These next three are types for communicating with the UI thread.
 #[derive(Debug, Clone)]
 pub struct DisplayFileInfo {
@@ -160,7 +167,7 @@ pub fn spawn(
 ) -> Result<(Sender<WorkerRequest>, Receiver<WorkerResponse>, JoinHandle<()>)> {
     let (worker_tx, worker_task_rx) = mpsc::channel::<WorkerRequest>();
     let (worker_result_tx, worker_rx) = mpsc::channel::<WorkerResponse>();
-    let (walker_tx, walker_rx) = mpsc::channel::<WalkerFileMetadata>();
+    let (walker_tx, walker_rx) = mpsc::channel::<WalkerMessage>();
 
     let data_dir = data_dir.to_path_buf();
     let cwd_clone = cwd.clone();
@@ -407,7 +414,7 @@ impl WorkerState {
 fn worker_thread_loop(
     task_rx: mpsc::Receiver<WorkerRequest>,
     result_tx: mpsc::Sender<WorkerResponse>,
-    walker_rx: mpsc::Receiver<WalkerFileMetadata>,
+    walker_rx: mpsc::Receiver<WalkerMessage>,
     mut state: WorkerState,
 ) {
     use std::sync::mpsc::RecvTimeoutError;
@@ -418,14 +425,23 @@ fn worker_thread_loop(
     loop {
         // Process walker updates (non-blocking)
         let mut files_changed = false;
-        while let Ok(metadata) = walker_rx.try_recv() {
-            state.add_file(metadata.path, metadata.mtime, metadata.atime, metadata.file_size, metadata.is_dir);
-            files_changed = true;
+        let mut walker_done = false;
+        while let Ok(message) = walker_rx.try_recv() {
+            match message {
+                WalkerMessage::FileMetadata(metadata) => {
+                    state.add_file(metadata.path, metadata.mtime, metadata.atime, metadata.file_size, metadata.is_dir);
+                    files_changed = true;
+                }
+                WalkerMessage::AllDone => {
+                    walker_done = true;
+                    files_changed = true;
+                }
+            }
         }
 
         // If files changed, notify the UI so it can decide to trigger a refresh.
-        // We debounce this to avoid spamming the UI thread.
-        if files_changed && last_files_changed_notification.elapsed() > Duration::from_millis(200) {
+        // We debounce this to avoid spamming the UI thread, UNLESS the walker is done.
+        if files_changed && (walker_done || last_files_changed_notification.elapsed() > Duration::from_millis(200)) {
             let _ = result_tx.send(WorkerResponse::FilesChanged);
             last_files_changed_notification = Instant::now();
         }

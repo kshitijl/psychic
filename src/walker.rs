@@ -1,4 +1,4 @@
-use crate::search_worker::WalkerFileMetadata;
+use crate::search_worker::{WalkerFileMetadata, WalkerMessage};
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use walkdir::WalkDir;
@@ -7,7 +7,7 @@ const IGNORED_DIRS: &[&str] = &[".git", "node_modules", ".venv", "target"];
 const MAX_FILES: usize = 250_000;
 const SHALLOW_MODE_THRESHOLD: usize = 8_000;
 
-pub fn start_file_walker(root: PathBuf, tx: Sender<WalkerFileMetadata>) {
+pub fn start_file_walker(root: PathBuf, tx: Sender<WalkerMessage>) {
     std::thread::spawn(move || {
         // First pass: try full-depth exploration
         let mut item_count = 0;
@@ -73,16 +73,18 @@ pub fn start_file_walker(root: PathBuf, tx: Sender<WalkerFileMetadata>) {
 
                         let file_size = metadata.as_ref().map(|m| m.len() as i64);
 
-                        let _ = tx.send(WalkerFileMetadata {
+                        let _ = tx.send(WalkerMessage::FileMetadata(WalkerFileMetadata {
                             path: entry.path().to_path_buf(),
                             mtime,
                             atime,
                             file_size,
                             is_dir,
-                        });
+                        }));
                         item_count += 1;
                     }
                 }
+                // Send AllDone message after shallow mode walk completes
+                let _ = tx.send(WalkerMessage::AllDone);
                 return; // Exit after shallow mode pass
             }
 
@@ -116,7 +118,9 @@ pub fn start_file_walker(root: PathBuf, tx: Sender<WalkerFileMetadata>) {
 
         // If we finished without hitting the threshold, send all collected items
         for item in items {
-            let _ = tx.send(item);
+            let _ = tx.send(WalkerMessage::FileMetadata(item));
         }
+        // Send AllDone message after full-depth walk completes
+        let _ = tx.send(WalkerMessage::AllDone);
     });
 }
