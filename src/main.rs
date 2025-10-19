@@ -35,6 +35,56 @@ use std::{
     time::{Duration, Instant},
 };
 
+
+
+/// Truncates a path string in the middle if it's too long, keeping the first
+/// component and the end of the path.
+/// e.g., "a/b/c/d/e.txt" -> "a/.../d/e.txt"
+fn truncate_path(path_str: &str, max_len: usize) -> String {
+    if path_str.len() <= max_len {
+        return path_str.to_string();
+    }
+
+    let path = Path::new(path_str);
+    let components: Vec<&str> = path
+        .components()
+        .map(|c| c.as_os_str().to_str().unwrap_or(""))
+        .collect();
+
+    // Don't truncate simple paths
+    if components.len() <= 2 {
+        return path_str.to_string();
+    }
+
+    let head = components.first().unwrap_or(&"");
+    let mut tail_parts: Vec<&str> = Vec::new();
+
+    // Start with filename
+    let filename = components.last().unwrap_or(&"");
+    tail_parts.push(filename);
+
+    // head + "/.../" + filename
+    let mut len_so_far = head.len() + 5 + filename.len();
+
+    // Add parts to tail from the end until we run out of space
+    // Iterate over parent components in reverse (skipping filename)
+    for part in components.iter().rev().skip(1) {
+        // Stop if we are about to collide with the head component
+        if part == head {
+            break;
+        }
+
+        if len_so_far + part.len() + 1 > max_len {
+            break;
+        }
+
+        tail_parts.insert(0, part);
+        len_so_far += part.len() + 1;
+    }
+
+    format!("{}/.../{}", head, tail_parts.join("/"))
+}
+
 // Page-based caching constants
 const PAGE_SIZE: usize = 128;
 const PREFETCH_MARGIN: usize = 32;
@@ -119,8 +169,8 @@ struct App {
     total_results: usize,             // Total number of filtered files
     total_files: usize,               // Total number of files in index
     selected_index: usize,
-    file_list_scroll: u16, // Scroll offset for file list
-    preview_scroll: u16,
+    file_list_scroll: usize, // Scroll offset for file list
+    preview_scroll: usize,
     preview_cache: Option<(String, Text<'static>)>, // (file_path, rendered_text)
     scrolled_files: HashSet<(String, String)>, // (query, full_path) - track what we've logged scroll for
     session_id: String,
@@ -129,6 +179,11 @@ struct App {
     db: Database,
 
     num_results_to_log_as_impressions: usize,
+
+    // For marquee path bar
+    path_bar_scroll: u16,
+    path_bar_scroll_direction: i8,
+    last_path_bar_update: Instant,
 
     // For debug pane
     model_stats_cache: Option<ranker::ModelStats>, // Cached from worker, refreshed periodically
@@ -181,6 +236,9 @@ impl App {
             next_subsession_id: 1, // Start with 1, 0 is for initial query
             num_results_to_log_as_impressions: 25,
             db,
+            path_bar_scroll: 0,
+            path_bar_scroll_direction: 1,
+            last_path_bar_update: Instant::now(),
             model_stats_cache: None,
             currently_retraining: false,
             log_receiver,
@@ -315,6 +373,11 @@ impl App {
         // Reset preview scroll and clear cache when changing selection
         self.preview_scroll = 0;
         self.preview_cache = None;
+
+        // Reset marquee scroll
+        self.path_bar_scroll = 0;
+        self.path_bar_scroll_direction = 1;
+        self.last_path_bar_update = Instant::now();
     }
 
     fn log_preview_scroll(&mut self) -> Result<()> {
@@ -354,16 +417,17 @@ impl App {
     }
 
     fn update_scroll(&mut self, visible_height: u16) {
+        let visible_height = visible_height as usize;
         if self.total_results == 0 {
             return;
         }
 
         // If all results fit on screen, don't scroll at all
-        if self.total_results <= visible_height as usize {
+        if self.total_results <= visible_height {
             self.file_list_scroll = 0;
         } else {
             // Auto-scroll the file list when selection is near top or bottom
-            let selected = self.selected_index as u16;
+            let selected = self.selected_index;
             let scroll = self.file_list_scroll;
 
             // If selected item is above visible area, scroll up
@@ -374,7 +438,7 @@ impl App {
             else if selected >= scroll + visible_height {
                 // Smart positioning: leave some space from bottom (5 lines)
                 // This makes wrap-around more comfortable
-                let margin = 5u16;
+                let margin = 5usize;
                 self.file_list_scroll = selected.saturating_sub(visible_height.saturating_sub(margin).min(visible_height - 1));
             }
             // If we're in the bottom 5 items and there's more to see, keep scrolling
@@ -602,6 +666,9 @@ fn run_app(
     app: &mut App,
     retrain_rx: Receiver<bool>,
 ) -> Result<()> {
+    let marquee_delay = Duration::from_millis(500); // 0.5s pause at ends
+    let marquee_speed = Duration::from_millis(80); // scroll every 80ms
+
     loop {
         // Log impressions for this subsession if >200ms old
         let _ = app.check_and_log_impressions(false);
@@ -613,6 +680,7 @@ fn run_app(
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Min(0),    // Results + Preview
+                    Constraint::Length(1), // Path bar
                     Constraint::Length(3), // Search input at bottom
                 ])
                 .split(f.area());
@@ -645,56 +713,52 @@ fn run_app(
 
             // File list on the left
             let list_width = top_chunks[0].width.saturating_sub(2) as usize; // subtract borders
-            let scroll_offset = app.file_list_scroll as usize;
+            let scroll_offset = app.file_list_scroll;
 
             // Build list items from page cache
             let items: Vec<ListItem> = (0..visible_height as usize)
-                .filter_map(|display_idx| {
+                .map(|display_idx| {
                     let i = scroll_offset + display_idx;
                     if i >= app.total_results {
-                        return None;
+                        return ListItem::new("");
                     }
 
-                    let display_info = app.get_file_at_index(i)?;
-                    let time_ago = get_time_ago(display_info.mtime);
-                    let rank = i + 1;
+                    if let Some(display_info) = app.get_file_at_index(i) {
+                        let time_ago = get_time_ago(display_info.mtime);
+                        let rank = i + 1;
 
-                    // Calculate space: "N. " takes 4 chars, time_ago length, we need padding between
-                    let rank_prefix = format!("{:2}. ", rank);
-                    let prefix_len = rank_prefix.len();
-                    let time_len = time_ago.len();
+                        // Calculate space: "N. " takes 4 chars, time_ago length, we need padding between
+                        let rank_prefix = format!("{:2}. ", rank);
+                        let prefix_len = rank_prefix.len();
+                        let time_len = time_ago.len();
 
-                    // Available space for filename and padding
-                    let available = list_width.saturating_sub(prefix_len + time_len);
-                    let file_width = available.saturating_sub(2); // leave at least 2 spaces padding
+                        // Available space for filename and padding
+                        let available = list_width.saturating_sub(prefix_len + time_len);
+                        let file_width = available.saturating_sub(2); // leave at least 2 spaces padding
 
-                    // Right-justify time by padding filename to fill available space
-                    let line = if display_info.display_name.len() > file_width {
-                        format!(
+                        let truncated_path = truncate_path(&display_info.display_name, file_width);
+
+                        // Right-justify time by padding filename to fill available space
+                        let line = format!(
                             "{}{:<width$}  {}",
                             rank_prefix,
-                            &display_info.display_name[..file_width],
+                            truncated_path,
                             time_ago,
                             width = file_width
-                        )
-                    } else {
-                        format!(
-                            "{}{:<width$}  {}",
-                            rank_prefix,
-                            &display_info.display_name,
-                            time_ago,
-                            width = file_width
-                        )
-                    };
+                        );
 
-                    let style = if i == app.selected_index {
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD)
+                        let style = if i == app.selected_index {
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default()
+                        };
+                        ListItem::new(line).style(style)
                     } else {
-                        Style::default()
-                    };
-                    Some(ListItem::new(line).style(style))
+                        // Page is not cached, show a loading indicator
+                        ListItem::new("[Loading...]").style(Style::default().fg(Color::DarkGray))
+                    }
                 })
                 .collect();
 
@@ -813,7 +877,7 @@ fn run_app(
                 .unwrap_or("No file selected".to_string());
 
             let preview = Paragraph::new(preview_text)
-                .scroll((app.preview_scroll, 0))
+                .scroll((app.preview_scroll as u16, 0))
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
@@ -951,10 +1015,57 @@ fn run_app(
                 .block(Block::default().borders(Borders::ALL).title(debug_title));
             f.render_widget(debug_pane, top_chunks[2]);
 
+            // Get path of currently selected file for marquee
+            let selected_path_str = app
+                .get_file_at_index(app.selected_index)
+                .map(|f| f.full_path.to_string_lossy().to_string())
+                .unwrap_or_default();
+
+            // Pad the string to make the marquee scroll past the end
+            let padded_path = format!("{}    ", selected_path_str);
+
+            let path_bar_width = main_chunks[1].width as usize;
+
+            // Marquee animation logic
+            if padded_path.len() > path_bar_width {
+                let now = Instant::now();
+                let time_since_update = now.duration_since(app.last_path_bar_update);
+
+                let max_scroll = padded_path.len().saturating_sub(path_bar_width) as u16;
+
+                // Pause at the ends of the scroll
+                let should_scroll = if app.path_bar_scroll == 0 || app.path_bar_scroll >= max_scroll {
+                    time_since_update > marquee_delay
+                } else {
+                    time_since_update > marquee_speed
+                };
+
+                if should_scroll {
+                    if app.path_bar_scroll_direction == 1 {
+                        if app.path_bar_scroll < max_scroll {
+                            app.path_bar_scroll += 1;
+                        } else {
+                            app.path_bar_scroll_direction = -1; // Change direction
+                        }
+                    } else if app.path_bar_scroll > 0 {
+                        app.path_bar_scroll -= 1;
+                    } else {
+                        app.path_bar_scroll_direction = 1; // Change direction
+                    }
+                    app.last_path_bar_update = now;
+                }
+            }
+
+            // Path bar
+            let path_bar = Paragraph::new(padded_path)
+                .style(Style::default().fg(Color::DarkGray))
+                .scroll((0, app.path_bar_scroll));
+            f.render_widget(path_bar, main_chunks[1]);
+
             // Search input at the bottom
             let input = Paragraph::new(app.query.as_str())
                 .block(Block::default().borders(Borders::ALL).title("Search"));
-            f.render_widget(input, main_chunks[1]);
+            f.render_widget(input, main_chunks[2]);
         })?;
 
         // Check for retraining status updates
