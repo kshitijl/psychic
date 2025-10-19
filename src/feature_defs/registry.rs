@@ -2,7 +2,7 @@ use super::schema::{Feature, FeatureType};
 use super::implementations::{
     ClicksLast30Days, ClicksLast7Days, ClicksLastHour, ClicksLastWeekParentDir, ClicksToday,
     FilenameStartsWithQuery, IsHidden, IsUnderCwd, ModifiedAge, ModifiedToday,
-    ClicksForThisQuery,
+    ClicksForThisQuery, IsDir,
 };
 use once_cell::sync::Lazy;
 use serde_json::json;
@@ -22,6 +22,7 @@ pub static FEATURE_REGISTRY: Lazy<Vec<Box<dyn Feature>>> = Lazy::new(|| {
         Box::new(ClicksLast7Days),
         Box::new(ModifiedAge),
         Box::new(ClicksForThisQuery),
+        Box::new(IsDir),
     ]
 });
 

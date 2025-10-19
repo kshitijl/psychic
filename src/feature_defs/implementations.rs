@@ -429,3 +429,23 @@ impl Feature for ClicksForThisQuery {
         Ok(clicks as f64)
     }
 }
+
+// ============================================================================
+// Feature: is_dir
+// ============================================================================
+
+pub struct IsDir;
+
+impl Feature for IsDir {
+    fn name(&self) -> &'static str {
+        "is_dir"
+    }
+
+    fn feature_type(&self) -> FeatureType {
+        FeatureType::Binary
+    }
+
+    fn compute(&self, inputs: &FeatureInputs) -> Result<f64> {
+        Ok(if inputs.is_dir { 1.0 } else { 0.0 })
+    }
+}

@@ -280,6 +280,9 @@ fn compute_features_from_accumulator(
     let full_path = Path::new(&impression.full_path);
     let is_from_walker = full_path.starts_with(cwd);
 
+    // Check if this is a directory (best effort - check if path exists and is dir)
+    let is_dir = full_path.is_dir();
+
     let inputs = FeatureInputs {
         query: &impression.query,
         file_path: &impression.file_path,
@@ -292,6 +295,7 @@ fn compute_features_from_accumulator(
         current_timestamp: impression.timestamp,
         session,
         is_from_walker,
+        is_dir,
     };
 
     // Compute all features using the registry

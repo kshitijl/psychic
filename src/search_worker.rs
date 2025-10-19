@@ -18,6 +18,7 @@ pub struct WalkerFileMetadata {
     pub mtime: Option<i64>,
     pub atime: Option<i64>,
     pub file_size: Option<i64>,
+    pub is_dir: bool,
 }
 
 // These next three are types for communicating with the UI thread.
@@ -30,6 +31,7 @@ pub struct DisplayFileInfo {
     pub mtime: Option<i64>,
     pub atime: Option<i64>,
     pub file_size: Option<i64>,
+    pub is_dir: bool,
 }
 
 pub struct UpdateQueryRequest {
@@ -87,6 +89,7 @@ struct FileInfo {
     atime: Option<i64>,
     file_size: Option<i64>,
     origin: FileOrigin,
+    is_dir: bool,
 }
 
 impl FileInfo {
@@ -95,6 +98,7 @@ impl FileInfo {
         mtime: Option<i64>,
         atime: Option<i64>,
         file_size: Option<i64>,
+        is_dir: bool,
         root: &PathBuf,
     ) -> Self {
         let display_name = full_path
@@ -110,6 +114,7 @@ impl FileInfo {
             atime,
             file_size,
             origin: FileOrigin::CwdWalker,
+            is_dir,
         }
     }
 
@@ -118,6 +123,7 @@ impl FileInfo {
         mtime: Option<i64>,
         atime: Option<i64>,
         file_size: Option<i64>,
+        is_dir: bool,
         root: &PathBuf,
     ) -> Self {
         let display_name = match full_path.strip_prefix(root) {
@@ -143,6 +149,7 @@ impl FileInfo {
             atime,
             file_size,
             origin: FileOrigin::UserClickedInEventsDb,
+            is_dir,
         }
     }
 }
@@ -227,6 +234,7 @@ impl WorkerState {
                 metadata.mtime,
                 metadata.atime,
                 metadata.file_size,
+                metadata.is_dir,
                 &root,
             );
             let file_id = FileId(file_registry.len());
@@ -253,9 +261,9 @@ impl WorkerState {
         })
     }
 
-    fn add_file(&mut self, path: PathBuf, mtime: Option<i64>, atime: Option<i64>, file_size: Option<i64>) {
+    fn add_file(&mut self, path: PathBuf, mtime: Option<i64>, atime: Option<i64>, file_size: Option<i64>, is_dir: bool) {
         if !self.path_to_id.contains_key(&path) {
-            let file_info = FileInfo::from_walkdir(path.clone(), mtime, atime, file_size, &self.root);
+            let file_info = FileInfo::from_walkdir(path.clone(), mtime, atime, file_size, is_dir, &self.root);
             let file_id = FileId(self.file_registry.len());
             self.path_to_id.insert(path, file_id);
             self.file_registry.push(file_info);
@@ -287,6 +295,7 @@ impl WorkerState {
                     full_path: file_info.full_path.clone(),
                     mtime: file_info.mtime,
                     is_from_walker: file_info.origin == FileOrigin::CwdWalker,
+                    is_dir: file_info.is_dir,
                 }
             })
             .collect();
@@ -347,6 +356,7 @@ impl WorkerState {
                     mtime: file_info.mtime,
                     atime: file_info.atime,
                     file_size: file_info.file_size,
+                    is_dir: file_info.is_dir,
                 }
             })
             .collect()
@@ -409,7 +419,7 @@ fn worker_thread_loop(
         // Process walker updates (non-blocking)
         let mut files_changed = false;
         while let Ok(metadata) = walker_rx.try_recv() {
-            state.add_file(metadata.path, metadata.mtime, metadata.atime, metadata.file_size);
+            state.add_file(metadata.path, metadata.mtime, metadata.atime, metadata.file_size, metadata.is_dir);
             files_changed = true;
         }
 
@@ -532,6 +542,7 @@ struct FileMetadata {
     mtime: Option<i64>,
     atime: Option<i64>,
     file_size: Option<i64>,
+    is_dir: bool,
 }
 
 fn get_file_metadata(path: &PathBuf) -> FileMetadata {
@@ -549,17 +560,20 @@ fn get_file_metadata(path: &PathBuf) -> FileMetadata {
             .map(|d| d.as_secs() as i64);
 
         let file_size = Some(metadata.len() as i64);
+        let is_dir = metadata.is_dir();
 
         FileMetadata {
             mtime,
             atime,
             file_size,
+            is_dir,
         }
     } else {
         FileMetadata {
             mtime: None,
             atime: None,
             file_size: None,
+            is_dir: false,
         }
     }
 }

@@ -20,6 +20,7 @@ pub struct FileCandidate {
     pub full_path: PathBuf,
     pub mtime: Option<i64>,
     pub is_from_walker: bool,
+    pub is_dir: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -321,6 +322,7 @@ fn compute_features_with_timing(
         current_timestamp,
         session: None,
         is_from_walker: file.is_from_walker,
+        is_dir: file.is_dir,
     };
 
     // Compute all features using the registry, tracking time for each

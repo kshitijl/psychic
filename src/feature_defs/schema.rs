@@ -31,6 +31,7 @@ pub struct FeatureInputs<'a> {
     pub current_timestamp: i64,
     pub session: Option<&'a Session>,
     pub is_from_walker: bool,
+    pub is_dir: bool,
 }
 
 /// Trait that all features must implement

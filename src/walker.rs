@@ -8,8 +8,9 @@ const MAX_FILES: usize = 250_000;
 
 pub fn start_file_walker(root: PathBuf, tx: Sender<WalkerFileMetadata>) {
     std::thread::spawn(move || {
-        let mut file_count = 0;
+        let mut item_count = 0;
         for entry in WalkDir::new(&root)
+            .follow_links(true)
             .into_iter()
             .filter_entry(|e| {
                 // Skip ignored directories
@@ -22,11 +23,14 @@ pub fn start_file_walker(root: PathBuf, tx: Sender<WalkerFileMetadata>) {
             })
             .filter_map(|e| e.ok())
         {
-            // Only send files, not directories
-            if entry.file_type().is_file() {
-                if file_count >= MAX_FILES {
+            // Send both files AND directories (but not the root itself)
+            let is_root = entry.path() == root;
+            if !is_root {
+                if item_count >= MAX_FILES {
                     break;
                 }
+
+                let is_dir = entry.file_type().is_dir();
 
                 // Extract metadata from cached walkdir metadata
                 let metadata = entry.metadata().ok();
@@ -49,8 +53,9 @@ pub fn start_file_walker(root: PathBuf, tx: Sender<WalkerFileMetadata>) {
                     mtime,
                     atime,
                     file_size,
+                    is_dir,
                 });
-                file_count += 1;
+                item_count += 1;
             }
         }
     });
