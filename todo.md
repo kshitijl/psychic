@@ -12,16 +12,14 @@ Helix file picker is a lot faster. Maybe implement a mode that doesn't sort or r
 
 ## now
 
-- display broken if we scroll past a binary file and it gets previewed
-- clicks_last_hour, clicks_today, clicks_last_7_days. all monotonic.
-- modified_age
+- do something with directory prioritization. i hit p in ~ right now and what i want is for it to highly prioritize opening ~/notes which btw is a symlink, not even a full dir. and also ~/Dropbox which is also a symlink. because those are often directories that I'm in and I click files in there all the time and they are often the cwd's for when i open psychic. so they should be prioritized. the trouble is that the filewalker explores other dirs first and we don't end up exploring dirs that we should know are actually important.
+- display is broken if we scroll past a binary file and it gets previewed
 - if we hit up while file walker is still walking then it shows loading and we end up in some strange middle of the results. instead we should remember our scroll position as -1 and reevaluate that when results are updated.
 - implement Ctrl-p and Ctrl-n for up and down
 - pick some good keybindings for going to top, and paging up and down the results
 - watch the cwd + all historical files; if mtime changes then update. more generally, our internal file data structure must be kept up-to-date with the filesystem. Right now this works because the file list view polls the filesytem for file metadata every frame or something awful like that. But the fixes below will break that.
-- file walker should probably just send mtime as given by walkdir API. and make the type it sends not a tuple. include file size and atime in there.
+- until filewalker is done, don't bother sorting and calculating features? idk. or really, make sure we don't recalculate features? hmm. maybe we want to divide features into query-dependent and query independent?
 - watch the cwd. if new files added then add them.
-- monotonicity constraints on certain obvious features
 - maybe add a slight linear term?
 - try fitting a linear or logistic regressor esp on modified time and num clicks and last time clicked
 - hit enter to open Preview or whatever default thing is configured

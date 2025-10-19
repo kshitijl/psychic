@@ -211,6 +211,9 @@ Why: Adding a new feature only requires: (1) implement trait, (2) add to registr
 **Schema export:** `generate-features` command outputs `feature_schema.json` with feature names and types.
 Why: Python training script reads schema to know feature order and types. No manual duplication.
 
+**Query-specific features:** The `clicks_for_this_query` feature tracks clicks for specific (query, file) pairs. This distinguishes between files clicked for different search contexts - e.g., a file clicked 10 times for query "config" vs 0 times for query "test" is more relevant for "config" searches.
+Why: General click counts don't capture query-specific relevance. A frequently clicked file for one query may be irrelevant for another.
+
 ### Module: `features.rs`
 
 Generates training data from events database.
@@ -241,10 +244,11 @@ Why single-pass: O(n) instead of O(n²). No future data leakage (features only s
 Why: LambdaRank needs groups. Each group = impressions leading to an action. More meaningful than subsession-based grouping.
 
 **Features computed:** See `feature_defs/implementations.rs` for full list. Examples:
-- Query matching: filename_starts_with_query, filename_contains_query
-- Click history: clicks_last_30_days, ever_clicked
-- File properties: is_hidden, is_under_cwd, path_depth
-- Temporal: modified_today, seconds_since_mod
+- Query matching: filename_starts_with_query
+- Click history: clicks_last_30_days, clicks_last_7_days, clicks_last_hour, clicks_today, clicks_for_this_query
+- File properties: is_hidden, is_under_cwd
+- Temporal: modified_today, modified_age
+- Directory features: clicks_last_week_parent_dir
 
 ### Module: `ranker.rs`
 
@@ -253,13 +257,23 @@ LightGBM model inference for scoring files.
 ```rust
 pub struct Ranker {
     model: Booster,
-    clicks: HashMap<String, usize>,  // Preloaded click counts
+    clicks: ClickData,
     stats: Option<ModelStats>,
+}
+
+pub struct ClickData {
+    clicks_by_file: HashMap<String, Vec<ClickEvent>>,
+    clicks_by_parent_dir: HashMap<PathBuf, Vec<ClickEvent>>,
+    clicks_by_query_and_file: HashMap<(String, String), Vec<ClickEvent>>,
 }
 ```
 
-**Preloading clicks:** All click counts from last 30 days loaded at startup into HashMap.
-Why: O(1) lookup per file vs O(n) query per file. Database query runs once with composite index.
+**Preloading clicks:** All click events from last 30 days loaded at startup into multiple HashMaps:
+- `clicks_by_file`: Indexed by full file path
+- `clicks_by_parent_dir`: Indexed by parent directory path
+- `clicks_by_query_and_file`: Indexed by (query, full_path) tuple for query-specific click tracking
+
+Why: O(1) lookup per file vs O(n) query per file. Database query runs once with composite index. Multiple indices enable different features without re-querying the database.
 
 **Ranking:**
 ```rust

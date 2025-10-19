@@ -396,3 +396,36 @@ impl Feature for ModifiedAge {
         }
     }
 }
+
+// ============================================================================
+// Feature: clicks_for_this_query
+// ============================================================================
+
+pub struct ClicksForThisQuery;
+
+impl Feature for ClicksForThisQuery {
+    fn name(&self) -> &'static str {
+        "clicks_for_this_query"
+    }
+
+    fn feature_type(&self) -> FeatureType {
+        FeatureType::Numeric
+    }
+
+    fn monotonicity(&self) -> Option<Monotonicity> {
+        Some(Monotonicity::Increasing)
+    }
+
+    fn compute(&self, inputs: &FeatureInputs) -> Result<f64> {
+        let full_path_str = inputs.full_path.to_string_lossy().to_string();
+        let key = (inputs.query.to_string(), full_path_str);
+
+        let clicks = inputs
+            .clicks_by_query_and_file
+            .get(&key)
+            .map(|clicks| clicks.len())
+            .unwrap_or(0);
+
+        Ok(clicks as f64)
+    }
+}

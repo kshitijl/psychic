@@ -36,6 +36,7 @@ pub enum OutputFormat {
 struct Accumulator {
     clicks_by_file: HashMap<String, Vec<ClickEvent>>,
     clicks_by_parent_dir: HashMap<std::path::PathBuf, Vec<ClickEvent>>,
+    clicks_by_query_and_file: HashMap<(String, String), Vec<ClickEvent>>,
     // Key: (session_id, subsession_id, full_path)
     pending_impressions: HashMap<(String, u64, String), PendingImpression>,
     output_rows: Vec<HashMap<String, String>>,
@@ -56,6 +57,7 @@ impl Accumulator {
         Self {
             clicks_by_file: HashMap::new(),
             clicks_by_parent_dir: HashMap::new(),
+            clicks_by_query_and_file: HashMap::new(),
             pending_impressions: HashMap::new(),
             output_rows: Vec::new(),
             current_group_id: 0,
@@ -79,6 +81,12 @@ impl Accumulator {
                 .or_default()
                 .push(click);
         }
+
+        // Also index by (query, file_path)
+        self.clicks_by_query_and_file
+            .entry((event.query.clone(), event.full_path.clone()))
+            .or_default()
+            .push(click);
     }
 
     fn add_impression(&mut self, event: &Event, mut features: HashMap<String, String>) {
@@ -280,6 +288,7 @@ fn compute_features_from_accumulator(
         cwd,
         clicks_by_file: &acc.clicks_by_file,
         clicks_by_parent_dir: &acc.clicks_by_parent_dir,
+        clicks_by_query_and_file: &acc.clicks_by_query_and_file,
         current_timestamp: impression.timestamp,
         session,
         is_from_walker,

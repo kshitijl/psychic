@@ -27,6 +27,7 @@ pub struct FeatureInputs<'a> {
     pub cwd: &'a Path,
     pub clicks_by_file: &'a HashMap<String, Vec<ClickEvent>>,
     pub clicks_by_parent_dir: &'a HashMap<PathBuf, Vec<ClickEvent>>,
+    pub clicks_by_query_and_file: &'a HashMap<(String, String), Vec<ClickEvent>>,
     pub current_timestamp: i64,
     pub session: Option<&'a Session>,
     pub is_from_walker: bool,

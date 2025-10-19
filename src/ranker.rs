@@ -49,6 +49,7 @@ pub struct FeatureImportance {
 pub struct ClickData {
     pub clicks_by_file: HashMap<String, Vec<ClickEvent>>,
     pub clicks_by_parent_dir: HashMap<PathBuf, Vec<ClickEvent>>,
+    pub clicks_by_query_and_file: HashMap<(String, String), Vec<ClickEvent>>,
 }
 
 pub struct Ranker {
@@ -107,27 +108,41 @@ impl Ranker {
         let thirty_days_ago_ts = thirty_days_ago.as_second();
 
         let mut clicks_by_file: HashMap<String, Vec<ClickEvent>> = HashMap::new();
+        let mut clicks_by_query_and_file: HashMap<(String, String), Vec<ClickEvent>> = HashMap::new();
 
         let conn =
             Connection::open(db_path).context("Failed to open database for preloading clicks")?;
 
         let mut stmt = conn.prepare(
-            "SELECT full_path, timestamp
+            "SELECT full_path, timestamp, query
              FROM events
              WHERE action = 'click'
              AND timestamp >= ?1",
         )?;
 
         let rows = stmt.query_map([thirty_days_ago_ts], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
         })?;
 
         for row in rows {
-            let (path, timestamp) = row?;
+            let (path, timestamp, query) = row?;
+            let click_event = ClickEvent { timestamp };
+
+            // Index by file path only
             clicks_by_file
-                .entry(path)
+                .entry(path.clone())
                 .or_default()
-                .push(ClickEvent { timestamp });
+                .push(click_event);
+
+            // Index by (query, file_path)
+            clicks_by_query_and_file
+                .entry((query, path))
+                .or_default()
+                .push(click_event);
         }
 
         // Build parent directory index
@@ -146,10 +161,15 @@ impl Ranker {
             clicks_by_file.len()
         );
         log::debug!("Indexed {} parent directories", clicks_by_parent_dir.len());
+        log::debug!(
+            "Indexed {} (query, file) pairs",
+            clicks_by_query_and_file.len()
+        );
 
         Ok(ClickData {
             clicks_by_file,
             clicks_by_parent_dir,
+            clicks_by_query_and_file,
         })
     }
 
@@ -170,6 +190,7 @@ impl Ranker {
         // Capture what we need for parallel computation
         let clicks_by_file = &self.clicks.clicks_by_file;
         let clicks_by_parent_dir = &self.clicks.clicks_by_parent_dir;
+        let clicks_by_query_and_file = &self.clicks.clicks_by_query_and_file;
 
         let all_features: Vec<Vec<f64>> = files
             .par_iter()
@@ -181,6 +202,7 @@ impl Ranker {
                     cwd,
                     clicks_by_file,
                     clicks_by_parent_dir,
+                    clicks_by_query_and_file,
                 )
                 .expect("Feature computation failed")
             })
@@ -262,6 +284,7 @@ fn compute_features(
     cwd: &Path,
     clicks_by_file: &HashMap<String, Vec<ClickEvent>>,
     clicks_by_parent_dir: &HashMap<PathBuf, Vec<ClickEvent>>,
+    clicks_by_query_and_file: &HashMap<(String, String), Vec<ClickEvent>>,
 ) -> Result<Vec<f64>> {
     let (features, _timings) = compute_features_with_timing(
         query,
@@ -270,6 +293,7 @@ fn compute_features(
         cwd,
         clicks_by_file,
         clicks_by_parent_dir,
+        clicks_by_query_and_file,
     )?;
     Ok(features)
 }
@@ -282,6 +306,7 @@ fn compute_features_with_timing(
     cwd: &Path,
     clicks_by_file: &HashMap<String, Vec<ClickEvent>>,
     clicks_by_parent_dir: &HashMap<PathBuf, Vec<ClickEvent>>,
+    clicks_by_query_and_file: &HashMap<(String, String), Vec<ClickEvent>>,
 ) -> Result<(Vec<f64>, HashMap<String, Duration>)> {
     // Create FeatureInputs for inference
     let inputs = FeatureInputs {
@@ -292,6 +317,7 @@ fn compute_features_with_timing(
         cwd,
         clicks_by_file,
         clicks_by_parent_dir,
+        clicks_by_query_and_file,
         current_timestamp,
         session: None,
         is_from_walker: file.is_from_walker,
@@ -596,6 +622,20 @@ mod tests {
             }
         }
 
+        // Build (query, file) index - add 2 query-specific clicks
+        let mut clicks_by_query_and_file = HashMap::new();
+        clicks_by_query_and_file.insert(
+            (query.to_string(), "/tmp/foo/bar.txt".to_string()),
+            vec![
+                ClickEvent {
+                    timestamp: 1700000000,
+                },
+                ClickEvent {
+                    timestamp: 1700010000,
+                },
+            ],
+        );
+
         // Compute features using the standalone function
         let features = compute_features(
             query,
@@ -604,13 +644,14 @@ mod tests {
             &cwd,
             &clicks_by_file,
             &clicks_by_parent_dir,
+            &clicks_by_query_and_file,
         )
         .expect("Failed to compute features");
 
         // Format as string for expect-test style comparison
         let actual = format!("{:?}", features);
 
-        // Expected output: [filename_starts_with_query, clicks_last_30_days, modified_today, is_under_cwd, is_hidden, clicks_last_week_parent_dir, clicks_last_hour, clicks_today, clicks_last_7_days, modified_age]
+        // Expected output: [filename_starts_with_query, clicks_last_30_days, modified_today, is_under_cwd, is_hidden, clicks_last_week_parent_dir, clicks_last_hour, clicks_today, clicks_last_7_days, modified_age, clicks_for_this_query]
         // filename_starts_with_query=0 (bar.txt doesn't start with "test")
         // clicks_last_30_days=3 (3 clicks on bar.txt itself)
         // modified_today=0 (mtime is old - Nov 2023, test runs in 2025)
@@ -621,7 +662,8 @@ mod tests {
         // clicks_today=0 (clicks are old)
         // clicks_last_7_days=3 (all 3 clicks are within the last 7 days of the test timestamp)
         // modified_age=86400 (1 day in seconds)
-        let expected = "[0.0, 3.0, 0.0, 1.0, 0.0, 4.0, 0.0, 0.0, 3.0, 86400.0]";
+        // clicks_for_this_query=2 (2 query-specific clicks for "test" + bar.txt)
+        let expected = "[0.0, 3.0, 0.0, 1.0, 0.0, 4.0, 0.0, 0.0, 3.0, 86400.0, 2.0]";
 
         assert_eq!(actual, expected, "Feature vector mismatch");
     }
