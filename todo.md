@@ -17,7 +17,6 @@ Helix file picker is a lot faster. Maybe implement a mode that doesn't sort or r
 - implement Ctrl-p and Ctrl-n for up and down
 - pick some good keybindings for going to top, and paging up and down the results
 - watch the cwd + all historical files; if mtime changes then update. more generally, our internal file data structure must be kept up-to-date with the filesystem. Right now this works because the file list view polls the filesytem for file metadata every frame or something awful like that. But the fixes below will break that.
-- deduplicate code in up-down scrolling in main.rs
 - file walker should probably just send mtime as given by walkdir API. and make the type it sends not a tuple. include file size and atime in there.
 - watch the cwd. if new files added then add them.
 - monotonicity constraints on certain obvious features

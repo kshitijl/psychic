@@ -299,6 +299,42 @@ impl App {
         self.preview_cache = None;
     }
 
+    fn log_preview_scroll(&mut self) -> Result<()> {
+        if self.total_results == 0 {
+            return Ok(());
+        }
+
+        // Force log impressions before scroll
+        self.check_and_log_impressions(true)?;
+
+        if let Some(display_info) = self.get_file_at_index(self.selected_index) {
+            let full_path_str = display_info.full_path.to_string_lossy().to_string();
+            let key = (self.query.clone(), full_path_str.clone());
+
+            if !self.scrolled_files.contains(&key) {
+                let subsession_id = self
+                    .current_subsession
+                    .as_ref()
+                    .map(|s| s.id)
+                    .unwrap_or(1);
+                self.db.log_event(EventData {
+                    query: &self.query,
+                    file_path: &display_info.display_name,
+                    full_path: &full_path_str,
+                    mtime: display_info.mtime,
+                    atime: display_info.atime,
+                    file_size: display_info.file_size,
+                    subsession_id,
+                    action: db::UserInteraction::Scroll,
+                    session_id: &self.session_id,
+                })?;
+                self.scrolled_files.insert(key);
+            }
+        }
+
+        Ok(())
+    }
+
     fn update_scroll(&mut self, visible_height: u16) {
         if self.total_results == 0 {
             return;
@@ -970,73 +1006,11 @@ fn run_app(
                     match mouse_event.kind {
                         MouseEventKind::ScrollDown => {
                             app.preview_scroll = app.preview_scroll.saturating_add(3);
-
-                            // Log scroll event (deduplicated by query + full_path)
-                            if app.total_results > 0 {
-                                // Force log impressions before scroll
-                                let _ = app.check_and_log_impressions(true);
-
-                                if let Some(display_info) = app.get_file_at_index(app.selected_index) {
-                                    let full_path_str =
-                                        display_info.full_path.to_string_lossy().to_string();
-                                    let key = (app.query.clone(), full_path_str.clone());
-
-                                    if !app.scrolled_files.contains(&key) {
-                                        let subsession_id = app
-                                            .current_subsession
-                                            .as_ref()
-                                            .map(|s| s.id)
-                                            .unwrap_or(1);
-                                        let _ = app.db.log_event(EventData {
-                                            query: &app.query,
-                                            file_path: &display_info.display_name,
-                                            full_path: &full_path_str,
-                                            mtime: display_info.mtime,
-                                            atime: display_info.atime,
-                                            file_size: display_info.file_size,
-                                            subsession_id,
-                                            action: db::UserInteraction::Scroll,
-                                            session_id: &app.session_id,
-                                        });
-                                        app.scrolled_files.insert(key);
-                                    }
-                                }
-                            }
+                            let _ = app.log_preview_scroll();
                         }
                         MouseEventKind::ScrollUp => {
                             app.preview_scroll = app.preview_scroll.saturating_sub(3);
-
-                            // Log scroll event (deduplicated by query + full_path)
-                            if app.total_results > 0 {
-                                // Force log impressions before scroll
-                                let _ = app.check_and_log_impressions(true);
-
-                                if let Some(display_info) = app.get_file_at_index(app.selected_index) {
-                                    let full_path_str =
-                                        display_info.full_path.to_string_lossy().to_string();
-                                    let key = (app.query.clone(), full_path_str.clone());
-
-                                    if !app.scrolled_files.contains(&key) {
-                                        let subsession_id = app
-                                            .current_subsession
-                                            .as_ref()
-                                            .map(|s| s.id)
-                                            .unwrap_or(1);
-                                        let _ = app.db.log_event(EventData {
-                                            query: &app.query,
-                                            file_path: &display_info.display_name,
-                                            full_path: &full_path_str,
-                                            mtime: display_info.mtime,
-                                            atime: display_info.atime,
-                                            file_size: display_info.file_size,
-                                            subsession_id,
-                                            action: db::UserInteraction::Scroll,
-                                            session_id: &app.session_id,
-                                        });
-                                        app.scrolled_files.insert(key);
-                                    }
-                                }
-                            }
+                            let _ = app.log_preview_scroll();
                         }
                         _ => {}
                     }

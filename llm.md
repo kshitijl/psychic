@@ -4,6 +4,8 @@ Use asserts liberally throughout the code. For any function, consider documentin
 
 If a function returns a tuple, strongly consider defining and returning a struct instead. This way we give a name to each field.
 
+Separation of concerns: think hard about the API between different components. A minimal API should be exposed. The work of each component should be defined, and functions for that should live in the code for that component. They should not be public.
+
 Read src/main.rs to understand the entrypoint. Read train.py to understand how the model is made.
 
 It should reflect the current state of the world, and also be a dev log. It should have caveats, gotchas, decisions, and bugs fixed.
