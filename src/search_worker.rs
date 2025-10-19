@@ -11,6 +11,15 @@ use std::{
     time::Duration,
 };
 
+// Metadata sent from walker to worker
+#[derive(Debug, Clone)]
+pub struct WalkerFileMetadata {
+    pub path: PathBuf,
+    pub mtime: Option<i64>,
+    pub atime: Option<i64>,
+    pub file_size: Option<i64>,
+}
+
 // These next three are types for communicating with the UI thread.
 #[derive(Debug, Clone)]
 pub struct DisplayFileInfo {
@@ -18,6 +27,9 @@ pub struct DisplayFileInfo {
     pub full_path: PathBuf,
     pub score: f64,
     pub features: Vec<f64>,
+    pub mtime: Option<i64>,
+    pub atime: Option<i64>,
+    pub file_size: Option<i64>,
 }
 
 pub enum WorkerRequest {
@@ -60,11 +72,19 @@ struct FileInfo {
     full_path: PathBuf,
     display_name: String,
     mtime: Option<i64>,
+    atime: Option<i64>,
+    file_size: Option<i64>,
     origin: FileOrigin,
 }
 
 impl FileInfo {
-    fn from_walkdir(full_path: PathBuf, mtime: Option<i64>, root: &PathBuf) -> Self {
+    fn from_walkdir(
+        full_path: PathBuf,
+        mtime: Option<i64>,
+        atime: Option<i64>,
+        file_size: Option<i64>,
+        root: &PathBuf,
+    ) -> Self {
         let display_name = full_path
             .strip_prefix(root)
             .unwrap_or(&full_path)
@@ -75,11 +95,19 @@ impl FileInfo {
             full_path,
             display_name,
             mtime,
+            atime,
+            file_size,
             origin: FileOrigin::CwdWalker,
         }
     }
 
-    fn from_history(full_path: PathBuf, mtime: Option<i64>, root: &PathBuf) -> Self {
+    fn from_history(
+        full_path: PathBuf,
+        mtime: Option<i64>,
+        atime: Option<i64>,
+        file_size: Option<i64>,
+        root: &PathBuf,
+    ) -> Self {
         let display_name = match full_path.strip_prefix(root) {
             Ok(postfix) => {
                 // File is in current tree - show relative path
@@ -100,6 +128,8 @@ impl FileInfo {
             full_path,
             display_name,
             mtime,
+            atime,
+            file_size,
             origin: FileOrigin::UserClickedInEventsDb,
         }
     }
@@ -111,7 +141,7 @@ pub fn spawn(
 ) -> Result<(Sender<WorkerRequest>, Receiver<WorkerResponse>, JoinHandle<()>)> {
     let (worker_tx, worker_task_rx) = mpsc::channel::<WorkerRequest>();
     let (worker_result_tx, worker_rx) = mpsc::channel::<WorkerResponse>();
-    let (walker_tx, walker_rx) = mpsc::channel::<(PathBuf, Option<i64>)>();
+    let (walker_tx, walker_rx) = mpsc::channel::<WalkerFileMetadata>();
 
     let data_dir = data_dir.to_path_buf();
     let cwd_clone = cwd.clone();
@@ -178,8 +208,14 @@ impl WorkerState {
             // Canonicalize historical paths and get their metadata once, at
             // startup, to minimize syscalls later during searches.
             let canonical_path = path.canonicalize().unwrap_or(path);
-            let (mtime, _, _) = get_file_metadata(&canonical_path);
-            let file_info = FileInfo::from_history(canonical_path.clone(), mtime, &root);
+            let metadata = get_file_metadata(&canonical_path);
+            let file_info = FileInfo::from_history(
+                canonical_path.clone(),
+                metadata.mtime,
+                metadata.atime,
+                metadata.file_size,
+                &root,
+            );
             let file_id = FileId(file_registry.len());
             path_to_id.insert(canonical_path, file_id);
             file_registry.push(file_info);
@@ -203,9 +239,9 @@ impl WorkerState {
         })
     }
 
-    fn add_file(&mut self, path: PathBuf, mtime: Option<i64>) {
+    fn add_file(&mut self, path: PathBuf, mtime: Option<i64>, atime: Option<i64>, file_size: Option<i64>) {
         if !self.path_to_id.contains_key(&path) {
-            let file_info = FileInfo::from_walkdir(path.clone(), mtime, &self.root);
+            let file_info = FileInfo::from_walkdir(path.clone(), mtime, atime, file_size, &self.root);
             let file_id = FileId(self.file_registry.len());
             self.path_to_id.insert(path, file_id);
             self.file_registry.push(file_info);
@@ -278,6 +314,9 @@ impl WorkerState {
                     full_path: file_info.full_path.clone(),
                     score,
                     features,
+                    mtime: file_info.mtime,
+                    atime: file_info.atime,
+                    file_size: file_info.file_size,
                 }
             })
             .collect()
@@ -316,7 +355,7 @@ impl WorkerState {
 fn worker_thread_loop(
     task_rx: mpsc::Receiver<WorkerRequest>,
     result_tx: mpsc::Sender<WorkerResponse>,
-    walker_rx: mpsc::Receiver<(PathBuf, Option<i64>)>,
+    walker_rx: mpsc::Receiver<WalkerFileMetadata>,
     mut state: WorkerState,
 ) {
     use std::sync::mpsc::RecvTimeoutError;
@@ -327,8 +366,8 @@ fn worker_thread_loop(
 
     loop {
         // Process walker updates (non-blocking)
-        while let Ok((path, mtime)) = walker_rx.try_recv() {
-            state.add_file(path, mtime);
+        while let Ok(metadata) = walker_rx.try_recv() {
+            state.add_file(metadata.path, metadata.mtime, metadata.atime, metadata.file_size);
             files_changed = true;
         }
 
@@ -440,7 +479,14 @@ fn drain_latest_query(rx: &mpsc::Receiver<WorkerRequest>, initial: String) -> St
     latest
 }
 
-pub fn get_file_metadata(path: &PathBuf) -> (Option<i64>, Option<i64>, Option<i64>) {
+// Internal struct for file metadata (not exported)
+struct FileMetadata {
+    mtime: Option<i64>,
+    atime: Option<i64>,
+    file_size: Option<i64>,
+}
+
+fn get_file_metadata(path: &PathBuf) -> FileMetadata {
     if let Ok(metadata) = std::fs::metadata(path) {
         let mtime = metadata
             .modified()
@@ -456,22 +502,17 @@ pub fn get_file_metadata(path: &PathBuf) -> (Option<i64>, Option<i64>, Option<i6
 
         let file_size = Some(metadata.len() as i64);
 
-        (mtime, atime, file_size)
+        FileMetadata {
+            mtime,
+            atime,
+            file_size,
+        }
     } else {
-        (None, None, None)
+        FileMetadata {
+            mtime: None,
+            atime: None,
+            file_size: None,
+        }
     }
 }
 
-pub fn get_time_ago(path: &PathBuf) -> String {
-    if let Ok(metadata) = std::fs::metadata(path)
-        && let Ok(modified) = metadata.modified()
-    {
-        let duration = std::time::SystemTime::now()
-            .duration_since(modified)
-            .unwrap_or(Duration::from_secs(0));
-
-        let formatter = timeago::Formatter::new();
-        return formatter.convert(duration);
-    }
-    String::from("unknown")
-}

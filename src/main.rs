@@ -23,7 +23,7 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, Paragraph},
 };
 use search_worker::{
-    DisplayFileInfo, WorkerRequest, WorkerResponse, get_file_metadata, get_time_ago,
+    DisplayFileInfo, WorkerRequest, WorkerResponse,
 };
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -38,6 +38,22 @@ use std::{
 // Page-based caching constants
 const PAGE_SIZE: usize = 128;
 const PREFETCH_MARGIN: usize = 32;
+
+/// Convert Unix timestamp to human-readable "time ago" string
+fn get_time_ago(mtime: Option<i64>) -> String {
+    if let Some(mtime_secs) = mtime {
+        // Convert Unix timestamp to SystemTime
+        let mtime_systime = std::time::UNIX_EPOCH + Duration::from_secs(mtime_secs as u64);
+
+        let duration = std::time::SystemTime::now()
+            .duration_since(mtime_systime)
+            .unwrap_or(Duration::from_secs(0));
+
+        let formatter = timeago::Formatter::new();
+        return formatter.convert(duration);
+    }
+    String::from("unknown")
+}
 
 /// A page of DisplayFileInfo for caching
 #[derive(Debug, Clone)]
@@ -246,13 +262,12 @@ impl App {
         let mut top_n = Vec::new();
         for i in 0..self.num_results_to_log_as_impressions.min(self.total_results) {
             if let Some(display_info) = self.get_file_at_index(i) {
-                let (mtime, atime, file_size) = get_file_metadata(&display_info.full_path);
                 top_n.push(FileMetadata {
                     relative_path: display_info.display_name.clone(),
                     full_path: display_info.full_path.to_string_lossy().to_string(),
-                    mtime,
-                    atime,
-                    size: file_size,
+                    mtime: display_info.mtime,
+                    atime: display_info.atime,
+                    size: display_info.file_size,
                 });
             }
         }
@@ -576,7 +591,7 @@ fn run_app(
                     }
 
                     let display_info = app.get_file_at_index(i)?;
-                    let time_ago = get_time_ago(&display_info.full_path);
+                    let time_ago = get_time_ago(display_info.mtime);
                     let rank = i + 1;
 
                     // Calculate space: "N. " takes 4 chars, time_ago length, we need padding between
@@ -967,8 +982,6 @@ fn run_app(
                                     let key = (app.query.clone(), full_path_str.clone());
 
                                     if !app.scrolled_files.contains(&key) {
-                                        let (mtime, atime, file_size) =
-                                            get_file_metadata(&display_info.full_path);
                                         let subsession_id = app
                                             .current_subsession
                                             .as_ref()
@@ -978,9 +991,9 @@ fn run_app(
                                             query: &app.query,
                                             file_path: &display_info.display_name,
                                             full_path: &full_path_str,
-                                            mtime,
-                                            atime,
-                                            file_size,
+                                            mtime: display_info.mtime,
+                                            atime: display_info.atime,
+                                            file_size: display_info.file_size,
                                             subsession_id,
                                             action: db::UserInteraction::Scroll,
                                             session_id: &app.session_id,
@@ -1004,8 +1017,6 @@ fn run_app(
                                     let key = (app.query.clone(), full_path_str.clone());
 
                                     if !app.scrolled_files.contains(&key) {
-                                        let (mtime, atime, file_size) =
-                                            get_file_metadata(&display_info.full_path);
                                         let subsession_id = app
                                             .current_subsession
                                             .as_ref()
@@ -1015,9 +1026,9 @@ fn run_app(
                                             query: &app.query,
                                             file_path: &display_info.display_name,
                                             full_path: &full_path_str,
-                                            mtime,
-                                            atime,
-                                            file_size,
+                                            mtime: display_info.mtime,
+                                            atime: display_info.atime,
+                                            file_size: display_info.file_size,
                                             subsession_id,
                                             action: db::UserInteraction::Scroll,
                                             session_id: &app.session_id,
@@ -1079,9 +1090,6 @@ fn run_app(
                                 app.check_and_log_impressions(true)?;
 
                                 if let Some(display_info) = app.get_file_at_index(app.selected_index) {
-                                    let (mtime, atime, file_size) =
-                                        get_file_metadata(&display_info.full_path);
-
                                     // Log the click
                                     let subsession_id =
                                         app.current_subsession.as_ref().map(|s| s.id).unwrap_or(1);
@@ -1089,9 +1097,9 @@ fn run_app(
                                         query: &app.query,
                                         file_path: &display_info.display_name,
                                         full_path: &display_info.full_path.to_string_lossy(),
-                                        mtime,
-                                        atime,
-                                        file_size,
+                                        mtime: display_info.mtime,
+                                        atime: display_info.atime,
+                                        file_size: display_info.file_size,
                                         subsession_id,
                                         action: db::UserInteraction::Click,
                                         session_id: &app.session_id,

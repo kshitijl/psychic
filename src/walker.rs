@@ -1,3 +1,4 @@
+use crate::search_worker::WalkerFileMetadata;
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use walkdir::WalkDir;
@@ -5,7 +6,7 @@ use walkdir::WalkDir;
 const IGNORED_DIRS: &[&str] = &[".git", "node_modules", ".venv", "target"];
 const MAX_FILES: usize = 250_000;
 
-pub fn start_file_walker(root: PathBuf, tx: Sender<(PathBuf, Option<i64>)>) {
+pub fn start_file_walker(root: PathBuf, tx: Sender<WalkerFileMetadata>) {
     std::thread::spawn(move || {
         let mut file_count = 0;
         for entry in WalkDir::new(&root)
@@ -27,15 +28,28 @@ pub fn start_file_walker(root: PathBuf, tx: Sender<(PathBuf, Option<i64>)>) {
                     break;
                 }
 
-                // Extract mtime from cached metadata
-                let mtime = entry
-                    .metadata()
-                    .ok()
+                // Extract metadata from cached walkdir metadata
+                let metadata = entry.metadata().ok();
+                let mtime = metadata
+                    .as_ref()
                     .and_then(|m| m.modified().ok())
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                     .map(|d| d.as_secs() as i64);
 
-                let _ = tx.send((entry.path().to_path_buf(), mtime));
+                let atime = metadata
+                    .as_ref()
+                    .and_then(|m| m.accessed().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64);
+
+                let file_size = metadata.as_ref().map(|m| m.len() as i64);
+
+                let _ = tx.send(WalkerFileMetadata {
+                    path: entry.path().to_path_buf(),
+                    mtime,
+                    atime,
+                    file_size,
+                });
                 file_count += 1;
             }
         }
