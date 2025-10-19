@@ -610,14 +610,18 @@ mod tests {
         // Format as string for expect-test style comparison
         let actual = format!("{:?}", features);
 
-        // Expected output: [filename_starts_with_query, clicks_last_30_days, modified_today, is_under_cwd, is_hidden, clicks_last_week_parent_dir]
+        // Expected output: [filename_starts_with_query, clicks_last_30_days, modified_today, is_under_cwd, is_hidden, clicks_last_week_parent_dir, clicks_last_hour, clicks_today, clicks_last_7_days, modified_age]
         // filename_starts_with_query=0 (bar.txt doesn't start with "test")
         // clicks_last_30_days=3 (3 clicks on bar.txt itself)
         // modified_today=0 (mtime is old - Nov 2023, test runs in 2025)
         // is_under_cwd=1 (is_from_walker=true, so guaranteed to be under cwd)
         // is_hidden=0 (no dot-prefixed components)
         // clicks_last_week_parent_dir=4 (3 clicks on bar.txt + 1 click on other.txt in /tmp/foo/)
-        let expected = "[0.0, 3.0, 0.0, 1.0, 0.0, 4.0]";
+        // clicks_last_hour=0 (clicks are old)
+        // clicks_today=0 (clicks are old)
+        // clicks_last_7_days=3 (all 3 clicks are within the last 7 days of the test timestamp)
+        // modified_age=86400 (1 day in seconds)
+        let expected = "[0.0, 3.0, 0.0, 1.0, 0.0, 4.0, 0.0, 0.0, 3.0, 86400.0]";
 
         assert_eq!(actual, expected, "Feature vector mismatch");
     }

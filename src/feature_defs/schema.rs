@@ -1,14 +1,21 @@
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 // Re-export from parent features module
 use crate::features::{ClickEvent, Session};
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
 pub enum FeatureType {
     Binary,
     Numeric,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+pub enum Monotonicity {
+    Increasing = 1,
+    Decreasing = -1,
 }
 
 /// All inputs a feature might need to compute its value
@@ -32,6 +39,11 @@ pub trait Feature: Send + Sync {
 
     /// Feature type (binary or numeric)
     fn feature_type(&self) -> FeatureType;
+
+    /// Monotonicity constraint for the model
+    fn monotonicity(&self) -> Option<Monotonicity> {
+        None // Default to no constraint
+    }
 
     /// Compute feature value from inputs
     /// Used for both training and inference

@@ -1,7 +1,7 @@
 use super::schema::{Feature, FeatureType};
 use super::implementations::{
-    ClicksLast30Days, ClicksLastWeekParentDir, FilenameStartsWithQuery, IsHidden, IsUnderCwd,
-    ModifiedToday,
+    ClicksLast30Days, ClicksLast7Days, ClicksLastHour, ClicksLastWeekParentDir, ClicksToday,
+    FilenameStartsWithQuery, IsHidden, IsUnderCwd, ModifiedAge, ModifiedToday,
 };
 use once_cell::sync::Lazy;
 use serde_json::json;
@@ -16,6 +16,10 @@ pub static FEATURE_REGISTRY: Lazy<Vec<Box<dyn Feature>>> = Lazy::new(|| {
         Box::new(IsUnderCwd),
         Box::new(IsHidden),
         Box::new(ClicksLastWeekParentDir),
+        Box::new(ClicksLastHour),
+        Box::new(ClicksToday),
+        Box::new(ClicksLast7Days),
+        Box::new(ModifiedAge),
     ]
 });
 
@@ -43,16 +47,54 @@ pub fn export_json() -> String {
     let features: Vec<_> = FEATURE_REGISTRY
         .iter()
         .map(|f| {
+            let mono_val = f.monotonicity().map(|m| match m {
+                super::schema::Monotonicity::Increasing => 1,
+                super::schema::Monotonicity::Decreasing => -1,
+            });
+
             json!({
                 "name": f.name(),
                 "type": match f.feature_type() {
                     FeatureType::Binary => "binary",
                     FeatureType::Numeric => "numeric",
-                }
+                },
+                "monotonicity": mono_val,
             })
         })
         .collect();
 
     let schema = json!({ "features": features });
     serde_json::to_string_pretty(&schema).unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+
+    #[test]
+    fn test_export_json_monotonicity() {
+        let json_str = export_json();
+        let schema: Value = serde_json::from_str(&json_str).unwrap();
+
+        let features = schema["features"].as_array().unwrap();
+
+        let clicks_feature = features
+            .iter()
+            .find(|f| f["name"] == "clicks_last_hour")
+            .unwrap();
+        assert_eq!(clicks_feature["monotonicity"], 1);
+
+        let modified_age_feature = features
+            .iter()
+            .find(|f| f["name"] == "modified_age")
+            .unwrap();
+        assert_eq!(modified_age_feature["monotonicity"], -1);
+
+        let no_mono_feature = features
+            .iter()
+            .find(|f| f["name"] == "filename_starts_with_query")
+            .unwrap();
+        assert!(no_mono_feature["monotonicity"].is_null());
+    }
 }

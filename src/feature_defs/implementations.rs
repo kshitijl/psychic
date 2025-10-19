@@ -1,4 +1,4 @@
-use super::schema::{Feature, FeatureInputs, FeatureType};
+use super::schema::{Feature, FeatureInputs, FeatureType, Monotonicity};
 use anyhow::Result;
 use jiff::{Span, Timestamp};
 use std::path::Path;
@@ -185,6 +185,10 @@ impl Feature for ClicksLastWeekParentDir {
         FeatureType::Numeric
     }
 
+    fn monotonicity(&self) -> Option<Monotonicity> {
+        Some(Monotonicity::Increasing)
+    }
+
     fn compute(&self, inputs: &FeatureInputs) -> Result<f64> {
         // Calculate 7 days ago timestamp
         let now_ts = Timestamp::from_second(inputs.current_timestamp)?;
@@ -220,5 +224,175 @@ impl Feature for ClicksLastWeekParentDir {
             .unwrap_or(0);
 
         Ok(clicks as f64)
+    }
+}
+
+// ============================================================================
+// Feature: clicks_last_hour
+// ============================================================================
+
+pub struct ClicksLastHour;
+
+impl Feature for ClicksLastHour {
+    fn name(&self) -> &'static str {
+        "clicks_last_hour"
+    }
+
+    fn feature_type(&self) -> FeatureType {
+        FeatureType::Numeric
+    }
+
+    fn monotonicity(&self) -> Option<Monotonicity> {
+        Some(Monotonicity::Increasing)
+    }
+
+    fn compute(&self, inputs: &FeatureInputs) -> Result<f64> {
+        let now_ts = Timestamp::from_second(inputs.current_timestamp)?;
+        let session_tz = if let Some(session) = inputs.session {
+            jiff::tz::TimeZone::get(&session.timezone).unwrap_or(jiff::tz::TimeZone::system())
+        } else {
+            jiff::tz::TimeZone::system()
+        };
+        let now_zoned = now_ts.to_zoned(session_tz);
+        let one_hour_ago = now_zoned.checked_sub(Span::new().hours(1))?.timestamp();
+
+        let full_path_str = inputs.full_path.to_string_lossy().to_string();
+        let clicks = inputs
+            .clicks_by_file
+            .get(&full_path_str)
+            .map(|clicks| {
+                clicks
+                    .iter()
+                    .filter(|c| {
+                        c.timestamp >= one_hour_ago.as_second()
+                            && c.timestamp <= inputs.current_timestamp
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        Ok(clicks as f64)
+    }
+}
+
+// ============================================================================
+// Feature: clicks_today
+// ============================================================================
+
+pub struct ClicksToday;
+
+impl Feature for ClicksToday {
+    fn name(&self) -> &'static str {
+        "clicks_today"
+    }
+
+    fn feature_type(&self) -> FeatureType {
+        FeatureType::Numeric
+    }
+
+    fn monotonicity(&self) -> Option<Monotonicity> {
+        Some(Monotonicity::Increasing)
+    }
+
+    fn compute(&self, inputs: &FeatureInputs) -> Result<f64> {
+        let now_ts = Timestamp::from_second(inputs.current_timestamp)?;
+        let session_tz = if let Some(session) = inputs.session {
+            jiff::tz::TimeZone::get(&session.timezone).unwrap_or(jiff::tz::TimeZone::system())
+        } else {
+            jiff::tz::TimeZone::system()
+        };
+        let start_of_day = now_ts.to_zoned(session_tz).start_of_day()?.timestamp();
+
+        let full_path_str = inputs.full_path.to_string_lossy().to_string();
+        let clicks = inputs
+            .clicks_by_file
+            .get(&full_path_str)
+            .map(|clicks| {
+                clicks
+                    .iter()
+                    .filter(|c| {
+                        c.timestamp >= start_of_day.as_second()
+                            && c.timestamp <= inputs.current_timestamp
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        Ok(clicks as f64)
+    }
+}
+
+// ============================================================================
+// Feature: clicks_last_7_days
+// ============================================================================
+
+pub struct ClicksLast7Days;
+
+impl Feature for ClicksLast7Days {
+    fn name(&self) -> &'static str {
+        "clicks_last_7_days"
+    }
+
+    fn feature_type(&self) -> FeatureType {
+        FeatureType::Numeric
+    }
+
+    fn monotonicity(&self) -> Option<Monotonicity> {
+        Some(Monotonicity::Increasing)
+    }
+
+    fn compute(&self, inputs: &FeatureInputs) -> Result<f64> {
+        let now_ts = Timestamp::from_second(inputs.current_timestamp)?;
+        let session_tz = if let Some(session) = inputs.session {
+            jiff::tz::TimeZone::get(&session.timezone).unwrap_or(jiff::tz::TimeZone::system())
+        } else {
+            jiff::tz::TimeZone::system()
+        };
+        let now_zoned = now_ts.to_zoned(session_tz);
+        let seven_days_ago = now_zoned.checked_sub(Span::new().days(7))?.timestamp();
+
+        let full_path_str = inputs.full_path.to_string_lossy().to_string();
+        let clicks = inputs
+            .clicks_by_file
+            .get(&full_path_str)
+            .map(|clicks| {
+                clicks
+                    .iter()
+                    .filter(|c| {
+                        c.timestamp >= seven_days_ago.as_second()
+                            && c.timestamp <= inputs.current_timestamp
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        Ok(clicks as f64)
+    }
+}
+
+// ============================================================================
+// Feature: modified_age
+// ============================================================================
+
+pub struct ModifiedAge;
+
+impl Feature for ModifiedAge {
+    fn name(&self) -> &'static str {
+        "modified_age"
+    }
+
+    fn feature_type(&self) -> FeatureType {
+        FeatureType::Numeric
+    }
+
+    fn monotonicity(&self) -> Option<Monotonicity> {
+        Some(Monotonicity::Decreasing)
+    }
+
+    fn compute(&self, inputs: &FeatureInputs) -> Result<f64> {
+        if let Some(mtime) = inputs.mtime {
+            let seconds_since_mod = inputs.current_timestamp - mtime;
+            Ok(seconds_since_mod as f64)
+        } else {
+            // If mtime is not available, return a large age
+            Ok(Span::new().days(365).get_seconds() as f64)
+        }
     }
 }

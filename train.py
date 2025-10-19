@@ -51,13 +51,15 @@ def load_schema(data_dir):
     with open(schema_path) as f:
         schema = json.load(f)
 
-    # Extract feature names and types from schema
+    # Extract feature names, types, and monotonicity from schema
     feature_names = [f["name"] for f in schema["features"]]
     binary_features = [f["name"] for f in schema["features"] if f["type"] == "binary"]
+    monotonicity_map = {f["name"]: f.get("monotonicity") for f in schema["features"]}
+
     print(f"Loaded feature schema: {len(feature_names)} features")
     print(f"  Schema file hash: {schema_hash}")
 
-    return feature_names, binary_features
+    return feature_names, binary_features, monotonicity_map
 
 
 def load_data(csv_path):
@@ -99,7 +101,7 @@ def load_data(csv_path):
     return df
 
 
-def prepare_features(df, feature_names, binary_features):
+def prepare_features(df, feature_names, binary_features, monotonicity_map):
     """Convert features to numeric and prepare X, y, query_groups."""
     # Separate label and query_group from features
     y = df["label"].astype(int)
@@ -135,11 +137,14 @@ def prepare_features(df, feature_names, binary_features):
     if missing_features:
         raise ValueError(f"Missing features from schema: {missing_features}")
 
-    return X, y, query_groups, []  # No categorical features
+    # Create the monotonicity constraints list from the map
+    constraints = [monotonicity_map.get(f, 0) or 0 for f in X.columns]
+
+    return X, y, query_groups, [], constraints  # No categorical features
 
 
 def train_model(
-    X_train, y_train, groups_train, X_val, y_val, groups_val, categorical_features
+    X_train, y_train, groups_train, X_val, y_val, groups_val, categorical_features, monotone_constraints
 ):
     """Train LightGBM binary classification model with class weights and constraints."""
     # This function assumes X_train is a pandas DataFrame to get column names
@@ -147,13 +152,7 @@ def train_model(
 
     # --- NEW: Create the monotonicity constraints list ---
     # 1 for positive, -1 for negative, 0 for no constraint
-    constraints = [0] * len(feature_names)
-    feature_to_constrain = "clicks_last_30_days"
-
-    if feature_to_constrain in feature_names:
-        feature_index = feature_names.index(feature_to_constrain)
-        constraints[feature_index] = 1  # Force positive relationship
-        print(f"Applying positive monotonic constraint to '{feature_to_constrain}'")
+    print(f"Applying monotonicity constraints: {monotone_constraints}")
 
     train_data = lgb.Dataset(
         X_train, label=y_train, categorical_feature=categorical_features
@@ -170,7 +169,7 @@ def train_model(
         "objective": "binary",  # Changed from 'regression'
         "metric": "auc",  # Changed from 'rmse'
         "class_weight": "balanced",  # Added class weight
-        "monotone_constraints": constraints,  # Added monotonicity
+        "monotone_constraints": monotone_constraints,  # Added monotonicity
         "boosting_type": "gbdt",
         "num_leaves": 31,
         "learning_rate": 0.05,
@@ -513,14 +512,14 @@ def main():
     output_pdf = f"{output_prefix}_viz.pdf"
 
     # Load schema
-    feature_names, binary_features = load_schema(args.data_dir)
+    feature_names, binary_features, monotonicity_map = load_schema(args.data_dir)
 
     # Load data
     df = load_data(csv_path)
 
     # Prepare features
-    X, y, query_groups, categorical_features = prepare_features(
-        df, feature_names, binary_features
+    X, y, query_groups, categorical_features, monotone_constraints = prepare_features(
+        df, feature_names, binary_features, monotonicity_map
     )
 
     # Split data by query groups (so each query stays together)
@@ -572,7 +571,7 @@ def main():
 
     # Train model
     model, evals_result = train_model(
-        X_train, y_train, groups_train, X_val, y_val, groups_val, categorical_features
+        X_train, y_train, groups_train, X_val, y_val, groups_val, categorical_features, monotone_constraints
     )
 
     # Save model
