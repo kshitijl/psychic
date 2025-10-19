@@ -1,6 +1,6 @@
 Read how-it-works.md to understand the code and decisions.
 
-Use asserts liberally throughout the code. For any function, consider documenting its preconditions in the form of asserts. Put these at the top of the function.
+Use asserts liberally throughout the code. For any function, consider documenting its preconditions in the form of asserts. Put these at the top of the function. They should be asserts, not debug_asserts, so they're run in prod and we can find bugs.
 
 If a function returns a tuple, strongly consider defining and returning a struct instead. This way we give a name to each field.
 

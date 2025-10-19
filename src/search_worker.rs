@@ -298,11 +298,27 @@ impl WorkerState {
     }
 
     fn get_slice(&self, start: usize, count: usize) -> Vec<DisplayFileInfo> {
+        // Precondition: start must be within bounds
+        assert!(
+            start <= self.filtered_files.len(),
+            "get_slice: start {} exceeds filtered_files length {}",
+            start,
+            self.filtered_files.len()
+        );
+
         self.filtered_files
             .iter()
             .skip(start)
             .take(count)
             .map(|&file_id| {
+                // Precondition: file_id must be valid index into registry
+                assert!(
+                    file_id.0 < self.file_registry.len(),
+                    "Invalid file_id {} (registry size: {})",
+                    file_id.0,
+                    self.file_registry.len()
+                );
+
                 let file_info = &self.file_registry[file_id.0];
                 let file_score = self.file_scores.iter().find(|fs| fs.file_id == file_id.0);
 
@@ -323,11 +339,23 @@ impl WorkerState {
     }
 
     fn get_page(&self, page_num: usize, page_size: usize) -> PageData {
+        // Precondition: page_size must be reasonable (non-zero)
+        assert!(page_size > 0, "page_size must be positive, got {}", page_size);
+
         let start_index = page_num * page_size;
         let end_index = (start_index + page_size).min(self.filtered_files.len());
         let count = end_index.saturating_sub(start_index);
 
         let files = self.get_slice(start_index, count);
+
+        // Postcondition: returned page must be consistent
+        assert_eq!(
+            files.len(),
+            count,
+            "get_page: returned {} files but expected {}",
+            files.len(),
+            count
+        );
 
         PageData {
             page_num,

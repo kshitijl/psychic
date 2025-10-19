@@ -223,6 +223,21 @@ impl App {
         let page_num = index / PAGE_SIZE;
         let page = self.page_cache.get(&page_num)?;
 
+        // Preconditions: page must be properly constructed
+        assert!(
+            page.start_index < page.end_index,
+            "Page has invalid range: [{}, {})",
+            page.start_index,
+            page.end_index
+        );
+        assert_eq!(
+            page.end_index - page.start_index,
+            page.files.len(),
+            "Page size mismatch: range length {} != files count {}",
+            page.end_index - page.start_index,
+            page.files.len()
+        );
+
         // Assert that the index is actually within this page's range
         assert!(
             index >= page.start_index && index < page.end_index,
