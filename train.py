@@ -21,10 +21,6 @@ import pandas as pd
 import numpy as np
 import lightgbm as lgb
 from sklearn.model_selection import GroupShuffleSplit
-from sklearn.metrics import (
-    ndcg_score,
-    label_ranking_average_precision_score,
-)
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 import seaborn as sns
@@ -145,10 +141,20 @@ def prepare_features(df, feature_names, binary_features):
 def train_model(
     X_train, y_train, groups_train, X_val, y_val, groups_val, categorical_features
 ):
-    """Train LightGBM regression model."""
-    print("\nTraining LightGBM regression model...")
+    """Train LightGBM binary classification model with class weights and constraints."""
+    # This function assumes X_train is a pandas DataFrame to get column names
+    feature_names = list(X_train.columns)
 
-    # Create LightGBM datasets (no group info needed for regression)
+    # --- NEW: Create the monotonicity constraints list ---
+    # 1 for positive, -1 for negative, 0 for no constraint
+    constraints = [0] * len(feature_names)
+    feature_to_constrain = "clicks_last_30_days"
+
+    if feature_to_constrain in feature_names:
+        feature_index = feature_names.index(feature_to_constrain)
+        constraints[feature_index] = 1  # Force positive relationship
+        print(f"Applying positive monotonic constraint to '{feature_to_constrain}'")
+
     train_data = lgb.Dataset(
         X_train, label=y_train, categorical_feature=categorical_features
     )
@@ -159,9 +165,12 @@ def train_model(
         reference=train_data,
     )
 
+    # --- MODIFIED: Updated params dictionary ---
     params = {
-        "objective": "regression",
-        "metric": "rmse",
+        "objective": "binary",  # Changed from 'regression'
+        "metric": "auc",  # Changed from 'rmse'
+        "class_weight": "balanced",  # Added class weight
+        "monotone_constraints": constraints,  # Added monotonicity
         "boosting_type": "gbdt",
         "num_leaves": 31,
         "learning_rate": 0.05,
@@ -169,14 +178,12 @@ def train_model(
         "bagging_fraction": 0.8,
         "bagging_freq": 5,
         "verbose": -1,
-        # Deterministic seeds
         "seed": 42,
         "bagging_seed": 42,
         "feature_fraction_seed": 42,
         "data_random_seed": 42,
     }
 
-    # Train with early stopping
     evals_result = {}
     model = lgb.train(
         params,
@@ -215,13 +222,12 @@ def create_visualizations(
         # Page 1: Training curves
         fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
-        # RMSE curves - plot RMSE as primary metric for regression
-        train_rmse = evals_result["train"]["rmse"]
-        val_rmse = evals_result["val"]["rmse"]
-        axes[0].plot(train_rmse, label="Train RMSE", linewidth=2)
-        axes[0].plot(val_rmse, label="Validation RMSE", linewidth=2)
+        train_auc = evals_result["train"]["auc"]
+        val_auc = evals_result["val"]["auc"]
+        axes[0].plot(train_auc, label="Train auc", linewidth=2)
+        axes[0].plot(val_auc, label="Validation auc", linewidth=2)
         axes[0].set_xlabel("Iteration")
-        axes[0].set_ylabel("RMSE")
+        axes[0].set_ylabel("auc")
         axes[0].set_title("Training Progress (Regression Error)")
         axes[0].legend()
         axes[0].grid(True)
@@ -457,7 +463,7 @@ def create_visualizations(
         plt.close()
 
         # Print regression metrics
-        print(f"\nRegression Metrics (Test Set):")
+        print("\nRegression Metrics (Test Set):")
         print(f"  RMSE: {rmse:.4f}")
         print(f"  MAE:  {mae:.4f}")
         print(f"  R²:   {r2:.4f}")
@@ -616,7 +622,7 @@ def main():
         json.dump(stats, f, indent=2)
     print(f"  - Stats: {stats_path}")
 
-    print(f"\n✓ Training complete!")
+    print("\n✓ Training complete!")
     print(f"  - Model: {output_prefix}.txt")
     print(f"  - Visualizations: {output_pdf}")
 
