@@ -1,0 +1,1 @@
+Read llm.md and how-it-works.md to understand the project architecture, development guidelines, and implementation details. After reading both files, confirm you understand the key points and are ready to work on the project.
