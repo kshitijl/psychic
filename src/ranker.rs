@@ -62,7 +62,7 @@ impl Ranker {
         let model = Booster::from_file(model_path.to_str().unwrap())
             .context("Failed to load LightGBM model")?;
 
-        let clicks = Self::load_clicks(&db_path)?;
+        let clicks = Self::load_clicks(db_path)?;
 
         // Load model stats from same directory as model
         let stats_path = model_path

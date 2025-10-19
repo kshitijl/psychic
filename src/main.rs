@@ -87,6 +87,7 @@ struct Subsession {
 struct App {
     query: String,
     visible_files: Vec<DisplayFileInfo>, // Only what's currently visible
+    visible_files_offset: usize,         // What index the visible_files array starts at
     total_results: usize,                // Total number of filtered files
     total_files: usize,                  // Total number of files in index
     selected_index: usize,
@@ -139,6 +140,7 @@ impl App {
         let app = App {
             query: String::new(),
             visible_files: Vec::new(),
+            visible_files_offset: 0,
             total_results: 0,
             total_files: 0,
             selected_index: 0,
@@ -262,12 +264,19 @@ impl App {
 
         // Request more visible items if we're getting close to the edge
         let scroll_offset = self.file_list_scroll as usize;
-        let current_visible_end = scroll_offset + self.visible_files.len();
+        let visible_end = self.visible_files_offset + self.visible_files.len();
         let needed_end = scroll_offset + visible_height as usize + 10; // 10 item buffer
 
-        if needed_end > current_visible_end && current_visible_end < self.total_results {
+        // Check if we need to request a new slice
+        // We need new data if: scroll_offset is outside our current window OR we're near the end
+        let need_new_slice = scroll_offset < self.visible_files_offset
+            || scroll_offset >= visible_end
+            || (needed_end > visible_end && visible_end < self.total_results);
+
+        if need_new_slice {
             // Request more items
             let count = (visible_height as usize * 2).max(60); // At least 60 or 2x screen height
+            self.visible_files_offset = scroll_offset; // Update offset optimistically
             let _ = self.worker_tx.send(WorkerRequest::GetVisibleSlice {
                 start: scroll_offset,
                 count,
@@ -471,12 +480,18 @@ fn run_app(
             // File list on the left
             let list_width = top_chunks[0].width.saturating_sub(2) as usize; // subtract borders
             let scroll_offset = app.file_list_scroll as usize;
+
+            // Calculate which items from visible_files to display
+            // visible_files starts at visible_files_offset, we want to show from scroll_offset
+            let skip_count = scroll_offset.saturating_sub(app.visible_files_offset);
+
             let items: Vec<ListItem> = app
                 .visible_files
                 .iter()
+                .skip(skip_count)
                 .enumerate()
-                .map(|(visible_idx, display_info)| {
-                    let i = scroll_offset + visible_idx;
+                .map(|(display_idx, display_info)| {
+                    let i = scroll_offset + display_idx;
                     let time_ago = get_time_ago(&display_info.full_path);
                     let rank = i + 1;
 
@@ -526,8 +541,9 @@ fn run_app(
             );
             f.render_widget(list, top_chunks[0]);
 
-            let scroll_offset = app.file_list_scroll as usize;
-            let visible_idx = app.selected_index.saturating_sub(scroll_offset);
+            // Calculate index into visible_files array
+            // selected_index is global, visible_files_offset is where the array starts
+            let visible_idx = app.selected_index.saturating_sub(app.visible_files_offset);
 
             let current_file = if visible_idx < app.visible_files.len() {
                 Some(&app.visible_files[visible_idx])
@@ -540,11 +556,8 @@ fn run_app(
             // Preview on the right using bat (with smart caching)
             let preview_height = top_chunks[1].height.saturating_sub(2);
             let preview_text = if !app.visible_files.is_empty() && app.total_results > 0 {
-                if current_file_path == None {
-                    Text::from("[Loading preview...]")
-                } else {
-                    let current_file_path = current_file_path.as_ref().unwrap();
-                    let full_path = PathBuf::from(&current_file_path);
+                if let Some(current_file_path) = &current_file_path {
+                    let full_path = PathBuf::from(current_file_path);
 
                     // Check for a full, cached preview
                     if let Some(cached_text) =
@@ -627,6 +640,8 @@ fn run_app(
                         }
                         text_to_render
                     }
+                } else {
+                    Text::from("[Loading preview...]")
                 }
             } else {
                 Text::from("")
@@ -652,8 +667,7 @@ fn run_app(
 
             // Show current selection info
             if !app.visible_files.is_empty() && app.total_results > 0 {
-                let scroll_offset = app.file_list_scroll as usize;
-                let visible_idx = app.selected_index.saturating_sub(scroll_offset);
+                let visible_idx = app.selected_index.saturating_sub(app.visible_files_offset);
                 if visible_idx < app.visible_files.len() {
                     let display_info = &app.visible_files[visible_idx];
                     debug_lines.push(format!("Score: {:.4}", display_info.score));
@@ -723,8 +737,7 @@ fn run_app(
 
             // Add preview cache status
             if !app.visible_files.is_empty() && app.total_results > 0 {
-                let scroll_offset = app.file_list_scroll as usize;
-                let visible_idx = app.selected_index.saturating_sub(scroll_offset);
+                let visible_idx = app.selected_index.saturating_sub(app.visible_files_offset);
                 if visible_idx < app.visible_files.len() {
                     let display_info = &app.visible_files[visible_idx];
                     let full_path_str = display_info.full_path.to_string_lossy().to_string();
@@ -803,6 +816,7 @@ fn run_app(
                     // Only apply if query still matches
                     if query == app.query {
                         app.visible_files = visible_slice;
+                        app.visible_files_offset = 0; // Query results always start at 0
                         app.total_results = total_results;
                         app.total_files = total_files;
                         app.model_stats_cache = model_stats;
@@ -823,6 +837,7 @@ fn run_app(
                     }
                 }
                 WorkerResponse::VisibleSlice(slice) => {
+                    // Note: offset is set when we request the slice in update_scroll()
                     app.visible_files = slice;
                 }
             }
@@ -843,8 +858,7 @@ fn run_app(
                                 // Force log impressions before scroll
                                 let _ = app.check_and_log_impressions(true);
 
-                                let scroll_offset = app.file_list_scroll as usize;
-                                let visible_idx = app.selected_index.saturating_sub(scroll_offset);
+                                let visible_idx = app.selected_index.saturating_sub(app.visible_files_offset);
                                 if visible_idx < app.visible_files.len() {
                                     let display_info = &app.visible_files[visible_idx];
                                     let full_path_str =
@@ -883,8 +897,7 @@ fn run_app(
                                 // Force log impressions before scroll
                                 let _ = app.check_and_log_impressions(true);
 
-                                let scroll_offset = app.file_list_scroll as usize;
-                                let visible_idx = app.selected_index.saturating_sub(scroll_offset);
+                                let visible_idx = app.selected_index.saturating_sub(app.visible_files_offset);
                                 if visible_idx < app.visible_files.len() {
                                     let display_info = &app.visible_files[visible_idx];
                                     let full_path_str =
@@ -966,8 +979,7 @@ fn run_app(
                                 // Force log impressions before click
                                 app.check_and_log_impressions(true)?;
 
-                                let scroll_offset = app.file_list_scroll as usize;
-                                let visible_idx = app.selected_index.saturating_sub(scroll_offset);
+                                let visible_idx = app.selected_index.saturating_sub(app.visible_files_offset);
                                 if visible_idx < app.visible_files.len() {
                                     let display_info = &app.visible_files[visible_idx];
                                     let (mtime, atime, file_size) =

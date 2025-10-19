@@ -46,7 +46,7 @@ pub struct Database {
 
 impl Database {
     pub fn new(db_path: &Path) -> Result<Self> {
-        let conn = Connection::open(&db_path).context("Failed to open database")?;
+        let conn = Connection::open(db_path).context("Failed to open database")?;
 
         // Create tables if they don't exist
         conn.execute(
