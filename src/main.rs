@@ -809,6 +809,26 @@ fn run_app(
 
             debug_lines.push(String::from("")); // Separator
 
+            // Add page cache status
+            if app.total_results > 0 {
+                let current_page = app.selected_index / PAGE_SIZE;
+                debug_lines.push(format!("Current page: {}", current_page));
+
+                let mut cached_pages: Vec<usize> = app.page_cache.keys().copied().collect();
+                cached_pages.sort_unstable();
+                let pages_str = cached_pages
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                debug_lines.push(format!("Cached pages: [{}]", pages_str));
+            } else {
+                debug_lines.push(String::from("Current page: N/A"));
+                debug_lines.push(String::from("Cached pages: []"));
+            }
+
+            debug_lines.push(String::from("")); // Separator
+
             // Add recent logs
             debug_lines.push(String::from("Recent Logs:"));
             // Show more log lines when debug is maximized
