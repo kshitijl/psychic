@@ -736,7 +736,14 @@ fn run_app(
                         let available = list_width.saturating_sub(prefix_len + time_len);
                         let file_width = available.saturating_sub(2); // leave at least 2 spaces padding
 
-                        let truncated_path = truncate_path(&display_info.display_name, file_width);
+                        // Add "/" suffix for directories
+                        let display_name = if display_info.is_dir {
+                            format!("{}/", display_info.display_name)
+                        } else {
+                            display_info.display_name.clone()
+                        };
+
+                        let truncated_path = truncate_path(&display_name, file_width);
 
                         // Right-justify time by padding filename to fill available space
                         let line = format!(
@@ -751,6 +758,9 @@ fn run_app(
                             Style::default()
                                 .fg(Color::Yellow)
                                 .add_modifier(Modifier::BOLD)
+                        } else if display_info.is_dir {
+                            // Color directories cyan when not selected
+                            Style::default().fg(Color::Cyan)
                         } else {
                             Style::default()
                         };
@@ -1254,17 +1264,25 @@ fn run_app(
                                         session_id: &app.session_id,
                                     })?;
 
-                                    // Suspend TUI and launch editor
+                                    // Suspend TUI
                                     disable_raw_mode()?;
                                     terminal
                                         .backend_mut()
                                         .execute(crossterm::event::DisableMouseCapture)?;
                                     terminal.backend_mut().execute(LeaveAlternateScreen)?;
 
-                                    // Launch hx editor
-                                    let status = std::process::Command::new("hx")
-                                        .arg(&display_info.full_path)
-                                        .status();
+                                    let status = if display_info.is_dir {
+                                        // If directory, cd and spawn shell
+                                        let shell = std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
+                                        std::process::Command::new(&shell)
+                                            .current_dir(&display_info.full_path)
+                                            .status()
+                                    } else {
+                                        // If file, launch editor
+                                        std::process::Command::new("hx")
+                                            .arg(&display_info.full_path)
+                                            .status()
+                                    };
 
                                     // Resume TUI
                                     enable_raw_mode()?;
@@ -1275,7 +1293,7 @@ fn run_app(
                                     terminal.clear()?;
 
                                     if let Err(e) = status {
-                                        log::error!("Failed to launch editor: {}", e);
+                                        log::error!("Failed to launch {}: {}", if display_info.is_dir { "shell" } else { "editor" }, e);
                                     }
 
                                     // Reload model (may have been retrained in background)

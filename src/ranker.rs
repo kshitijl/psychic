@@ -541,6 +541,7 @@ mod tests {
             full_path: PathBuf::from("/tmp/test.md"),
             mtime: Some(1234567890),
             is_from_walker: true,
+            is_dir: false,
         }];
 
         let result = ranker.rank_files(
@@ -586,6 +587,7 @@ mod tests {
             full_path: PathBuf::from("/tmp/foo/bar.txt"),
             mtime: Some(1700000000i64), // Nov 14, 2023
             is_from_walker: true,
+            is_dir: false,
         };
 
         // Create synthetic click data
@@ -653,7 +655,7 @@ mod tests {
         // Format as string for expect-test style comparison
         let actual = format!("{:?}", features);
 
-        // Expected output: [filename_starts_with_query, clicks_last_30_days, modified_today, is_under_cwd, is_hidden, clicks_last_week_parent_dir, clicks_last_hour, clicks_today, clicks_last_7_days, modified_age, clicks_for_this_query]
+        // Expected output: [filename_starts_with_query, clicks_last_30_days, modified_today, is_under_cwd, is_hidden, clicks_last_week_parent_dir, clicks_last_hour, clicks_today, clicks_last_7_days, modified_age, clicks_for_this_query, is_dir]
         // filename_starts_with_query=0 (bar.txt doesn't start with "test")
         // clicks_last_30_days=3 (3 clicks on bar.txt itself)
         // modified_today=0 (mtime is old - Nov 2023, test runs in 2025)
@@ -665,7 +667,8 @@ mod tests {
         // clicks_last_7_days=3 (all 3 clicks are within the last 7 days of the test timestamp)
         // modified_age=86400 (1 day in seconds)
         // clicks_for_this_query=2 (2 query-specific clicks for "test" + bar.txt)
-        let expected = "[0.0, 3.0, 0.0, 1.0, 0.0, 4.0, 0.0, 0.0, 3.0, 86400.0, 2.0]";
+        // is_dir=0 (this is a file, not a directory)
+        let expected = "[0.0, 3.0, 0.0, 1.0, 0.0, 4.0, 0.0, 0.0, 3.0, 86400.0, 2.0, 0.0]";
 
         assert_eq!(actual, expected, "Feature vector mismatch");
     }

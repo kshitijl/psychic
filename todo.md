@@ -12,6 +12,8 @@ Helix file picker is a lot faster. Maybe implement a mode that doesn't sort or r
 
 ## now
 
+- for dirs, in preview show a little tree or something?
+- keyword or something to filter to just dirs. at that point it becomes a zoxide replacement.
 - do something with directory prioritization. i hit p in ~ right now and what i want is for it to highly prioritize opening ~/notes which btw is a symlink, not even a full dir. and also ~/Dropbox which is also a symlink. because those are often directories that I'm in and I click files in there all the time and they are often the cwd's for when i open psychic. so they should be prioritized. the trouble is that the filewalker explores other dirs first and we don't end up exploring dirs that we should know are actually important.
 - display is broken if we scroll past a binary file and it gets previewed
 - if we hit up while file walker is still walking then it shows loading and we end up in some strange middle of the results. instead we should remember our scroll position as -1 and reevaluate that when results are updated.
