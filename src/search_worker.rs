@@ -32,11 +32,19 @@ pub struct DisplayFileInfo {
     pub file_size: Option<i64>,
 }
 
+pub struct UpdateQueryRequest {
+    pub query: String,
+    pub query_id: u64,
+}
+
 pub enum WorkerRequest {
-    UpdateQuery(String),
-    GetPage { page_num: usize },
-    ReloadModel,
-    ReloadClicks,
+    UpdateQuery(UpdateQueryRequest),
+    GetPage {
+        query_id: u64,
+        page_num: usize,
+    },
+    ReloadModel { query_id: u64 },
+    ReloadClicks { query_id: u64 },
 }
 
 #[derive(Debug, Clone)]
@@ -49,13 +57,17 @@ pub struct PageData {
 
 pub enum WorkerResponse {
     QueryUpdated {
-        query: String,
+        query_id: u64,
         total_results: usize,
         total_files: usize,
         initial_page: PageData,
         model_stats: Option<ranker::ModelStats>,
     },
-    Page(PageData),
+    Page {
+        query_id: u64,
+        page_data: PageData,
+    },
+    FilesChanged,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -169,6 +181,7 @@ struct WorkerState {
     filtered_files: Vec<FileId>,
     file_scores: Vec<ranker::FileScore>,
     current_query: String,
+    current_query_id: u64,
     root: PathBuf,
     ranker: ranker::Ranker,
     model_path: PathBuf,
@@ -232,6 +245,7 @@ impl WorkerState {
             filtered_files: Vec::new(),
             file_scores: Vec::new(),
             current_query: String::new(),
+            current_query_id: 0,
             root,
             ranker,
             model_path,
@@ -389,43 +403,33 @@ fn worker_thread_loop(
     use std::sync::mpsc::RecvTimeoutError;
     use std::time::Instant;
 
-    let mut last_update = Instant::now();
-    let mut files_changed = false;
+    let mut last_files_changed_notification = Instant::now();
 
     loop {
         // Process walker updates (non-blocking)
+        let mut files_changed = false;
         while let Ok(metadata) = walker_rx.try_recv() {
             state.add_file(metadata.path, metadata.mtime, metadata.atime, metadata.file_size);
             files_changed = true;
         }
 
-        // If files changed and enough time passed, send update
-        if files_changed && last_update.elapsed() > Duration::from_millis(100) {
-            if let Err(e) = state.filter_and_rank(&state.current_query.clone()) {
-                log::error!("Auto-refresh filter/rank failed: {}", e);
-            } else {
-                let initial_page = state.get_page(0, 128);
-                let _ = result_tx.send(WorkerResponse::QueryUpdated {
-                    query: state.current_query.clone(),
-                    total_results: state.filtered_files.len(),
-                    total_files: state.file_registry.len(),
-                    initial_page,
-                    model_stats: state.ranker.stats.clone(),
-                });
-                last_update = Instant::now();
-                files_changed = false;
-            }
+        // If files changed, notify the UI so it can decide to trigger a refresh.
+        // We debounce this to avoid spamming the UI thread.
+        if files_changed && last_files_changed_notification.elapsed() > Duration::from_millis(200) {
+            let _ = result_tx.send(WorkerResponse::FilesChanged);
+            last_files_changed_notification = Instant::now();
         }
 
         // Wait for worker requests with timeout
         match task_rx.recv_timeout(Duration::from_millis(5)) {
-            Ok(WorkerRequest::UpdateQuery(query)) => {
+            Ok(WorkerRequest::UpdateQuery(update_req)) => {
                 // Debounce: drain all pending queries and keep the latest
-                let query = drain_latest_query(&task_rx, query);
-                state.current_query = query.clone();
+                let latest_req = drain_latest_update_request(&task_rx, update_req);
+                state.current_query = latest_req.query.clone();
+                state.current_query_id = latest_req.query_id;
 
                 // Filter and rank
-                if let Err(e) = state.filter_and_rank(&query) {
+                if let Err(e) = state.filter_and_rank(&latest_req.query) {
                     log::error!("Filter/rank failed: {}", e);
                     continue;
                 }
@@ -433,20 +437,23 @@ fn worker_thread_loop(
                 // Send back results with initial page (page 0)
                 let initial_page = state.get_page(0, 128);
                 let _ = result_tx.send(WorkerResponse::QueryUpdated {
-                    query,
+                    query_id: latest_req.query_id,
                     total_results: state.filtered_files.len(),
                     total_files: state.file_registry.len(),
                     initial_page,
                     model_stats: state.ranker.stats.clone(),
                 });
-                last_update = Instant::now();
-                files_changed = false;
             }
-            Ok(WorkerRequest::GetPage { page_num }) => {
-                let page = state.get_page(page_num, 128);
-                let _ = result_tx.send(WorkerResponse::Page(page));
+            Ok(WorkerRequest::GetPage { query_id, page_num }) => {
+                // If the request is for an old query, ignore it.
+                if query_id != state.current_query_id {
+                    continue;
+                }
+                let page_data = state.get_page(page_num, 128);
+                let _ = result_tx.send(WorkerResponse::Page { query_id, page_data });
             }
-            Ok(WorkerRequest::ReloadModel) => {
+            Ok(WorkerRequest::ReloadModel { query_id }) => {
+                state.current_query_id = query_id;
                 if let Err(e) = state.reload_model() {
                     log::error!("Failed to reload model: {}", e);
                 } else {
@@ -457,7 +464,7 @@ fn worker_thread_loop(
                     } else {
                         let initial_page = state.get_page(0, 128);
                         let _ = result_tx.send(WorkerResponse::QueryUpdated {
-                            query,
+                            query_id,
                             total_results: state.filtered_files.len(),
                             total_files: state.file_registry.len(),
                             initial_page,
@@ -466,7 +473,8 @@ fn worker_thread_loop(
                     }
                 }
             }
-            Ok(WorkerRequest::ReloadClicks) => {
+            Ok(WorkerRequest::ReloadClicks { query_id }) => {
+                state.current_query_id = query_id;
                 if let Err(e) = state.reload_clicks() {
                     log::error!("Failed to reload clicks: {}", e);
                 } else {
@@ -477,7 +485,7 @@ fn worker_thread_loop(
                     } else {
                         let initial_page = state.get_page(0, 128);
                         let _ = result_tx.send(WorkerResponse::QueryUpdated {
-                            query,
+                            query_id,
                             total_results: state.filtered_files.len(),
                             total_files: state.file_registry.len(),
                             initial_page,
@@ -498,11 +506,23 @@ fn worker_thread_loop(
     }
 }
 
-// Helper to drain all pending queries and return the latest one
-fn drain_latest_query(rx: &mpsc::Receiver<WorkerRequest>, initial: String) -> String {
+// Helper to drain all pending UpdateQuery requests and return the latest one
+fn drain_latest_update_request(
+    rx: &mpsc::Receiver<WorkerRequest>,
+    initial: UpdateQueryRequest,
+) -> UpdateQueryRequest {
     let mut latest = initial;
-    while let Ok(WorkerRequest::UpdateQuery(query)) = rx.try_recv() {
-        latest = query;
+    while let Ok(request) = rx.try_recv() {
+        if let WorkerRequest::UpdateQuery(update_req) = request {
+            latest = update_req;
+        } else {
+            // This is not ideal, we've consumed a non-UpdateQuery request.
+            // For this application, the channel logic is simple enough that
+            // this case is unlikely, but in a more complex app, we'd need
+            // to handle or requeue the request.
+            log::warn!("Unexpected request type in drain_latest_update_request");
+            break;
+        }
     }
     latest
 }

@@ -178,7 +178,7 @@ impl App {
             scrolled_files: HashSet::new(),
             session_id,
             current_subsession: None,
-            next_subsession_id: 1,
+            next_subsession_id: 1, // Start with 1, 0 is for initial query
             num_results_to_log_as_impressions: 25,
             db,
             model_stats_cache: None,
@@ -191,24 +191,27 @@ impl App {
             worker_handle: Some(worker_handle),
         };
 
-        // Send initial query to worker
-        let _ = worker_tx.send(WorkerRequest::UpdateQuery(String::new()));
+        // Send initial query to worker with ID 0
+        let _ = worker_tx.send(WorkerRequest::UpdateQuery(search_worker::UpdateQueryRequest {
+            query: String::new(),
+            query_id: 0,
+        }));
 
         Ok(app)
     }
 
-    fn reload_model(&mut self) -> Result<()> {
+    fn reload_model(&mut self, query_id: u64) -> Result<()> {
         log::info!("Requesting model reload from worker");
         self.worker_tx
-            .send(WorkerRequest::ReloadModel)
+            .send(WorkerRequest::ReloadModel { query_id })
             .context("Failed to send ReloadModel request to worker")?;
         Ok(())
     }
 
-    fn reload_and_rerank(&mut self) -> Result<()> {
+    fn reload_and_rerank(&mut self, query_id: u64) -> Result<()> {
         log::info!("Requesting clicks reload from worker");
         self.worker_tx
-            .send(WorkerRequest::ReloadClicks)
+            .send(WorkerRequest::ReloadClicks { query_id })
             .context("Failed to send ReloadClicks request to worker")?;
         Ok(())
     }
@@ -380,12 +383,17 @@ impl App {
             }
         }
 
+        let active_query_id = self.current_subsession.as_ref().map(|s| s.id).unwrap_or(0);
+
         // Page-based prefetching
         let current_page = self.selected_index / PAGE_SIZE;
 
         // Ensure current page is loaded
         if !self.page_cache.contains_key(&current_page) {
-            let _ = self.worker_tx.send(WorkerRequest::GetPage { page_num: current_page });
+            let _ = self.worker_tx.send(WorkerRequest::GetPage {
+                query_id: active_query_id,
+                page_num: current_page,
+            });
         }
 
         // Check if we're close to the top of the current page - prefetch previous page
@@ -401,7 +409,10 @@ impl App {
 
             // Only request if we have that many pages and it's not cached
             if total_pages > 0 && !self.page_cache.contains_key(&prev_page) {
-                let _ = self.worker_tx.send(WorkerRequest::GetPage { page_num: prev_page });
+                let _ = self.worker_tx.send(WorkerRequest::GetPage {
+                    query_id: active_query_id,
+                    page_num: prev_page,
+                });
             }
         }
 
@@ -418,7 +429,10 @@ impl App {
 
             // Only request if it's not cached
             if !self.page_cache.contains_key(&next_page) {
-                let _ = self.worker_tx.send(WorkerRequest::GetPage { page_num: next_page });
+                let _ = self.worker_tx.send(WorkerRequest::GetPage {
+                    query_id: active_query_id,
+                    page_num: next_page,
+                });
             }
         }
     }
@@ -962,14 +976,17 @@ fn run_app(
         while let Ok(response) = app.worker_rx.try_recv() {
             match response {
                 WorkerResponse::QueryUpdated {
-                    query,
+                    query_id,
                     total_results,
                     total_files,
                     initial_page,
                     model_stats,
                 } => {
-                    // Only apply if query still matches
-                    if query == app.query {
+                    let active_query_id = app.current_subsession.as_ref().map(|s| s.id).unwrap_or(0);
+
+                    // Only accept updates for queries that are newer than what we currently have.
+                    // This handles out-of-order responses.
+                    if query_id >= active_query_id {
                         // Clear page cache on query change
                         app.page_cache.clear();
 
@@ -990,24 +1007,41 @@ fn run_app(
                             app.selected_index = 0;
                         }
 
-                        // Create subsession
+                        // Create subsession, using the query text from the app state
                         app.current_subsession = Some(Subsession {
-                            id: app.next_subsession_id,
-                            query: query.clone(),
+                            id: query_id,
+                            query: app.query.clone(),
                             created_at: jiff::Timestamp::now(),
                             events_have_been_logged: false,
                         });
-                        app.next_subsession_id += 1;
                     }
                 }
-                WorkerResponse::Page(page_data) => {
-                    // Insert page into cache
-                    let page = Page {
-                        start_index: page_data.start_index,
-                        end_index: page_data.end_index,
-                        files: page_data.files,
-                    };
-                    app.page_cache.insert(page_data.page_num, page);
+                WorkerResponse::Page { query_id, page_data } => {
+                    let active_query_id = app.current_subsession.as_ref().map(|s| s.id).unwrap_or(0);
+
+                    // Only accept page data for the currently active query
+                    if query_id == active_query_id {
+                        // Insert page into cache
+                        let page = Page {
+                            start_index: page_data.start_index,
+                            end_index: page_data.end_index,
+                            files: page_data.files,
+                        };
+                        app.page_cache.insert(page_data.page_num, page);
+                    }
+                }
+                WorkerResponse::FilesChanged => {
+                    // The worker detected file changes, so we trigger a refresh
+                    // of the current query to get fresh results.
+                    log::info!("Auto-refreshing query due to file changes.");
+                    let query_id = app.next_subsession_id;
+                    app.next_subsession_id += 1;
+                    let _ = app.worker_tx.send(WorkerRequest::UpdateQuery(
+                        search_worker::UpdateQueryRequest {
+                            query: app.query.clone(),
+                            query_id,
+                        },
+                    ));
                 }
             }
         }
@@ -1042,9 +1076,14 @@ fn run_app(
                         {
                             // Ctrl-U: clear entire search
                             app.query.clear();
-                            let _ = app
-                                .worker_tx
-                                .send(WorkerRequest::UpdateQuery(app.query.clone()));
+                            let query_id = app.next_subsession_id;
+                            app.next_subsession_id += 1;
+                            let _ = app.worker_tx.send(WorkerRequest::UpdateQuery(
+                                search_worker::UpdateQueryRequest {
+                                    query: app.query.clone(),
+                                    query_id,
+                                },
+                            ));
                         }
                         KeyCode::Char('o')
                             if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
@@ -1057,15 +1096,25 @@ fn run_app(
                         }
                         KeyCode::Char(c) => {
                             app.query.push(c);
-                            let _ = app
-                                .worker_tx
-                                .send(WorkerRequest::UpdateQuery(app.query.clone()));
+                            let query_id = app.next_subsession_id;
+                            app.next_subsession_id += 1;
+                            let _ = app.worker_tx.send(WorkerRequest::UpdateQuery(
+                                search_worker::UpdateQueryRequest {
+                                    query: app.query.clone(),
+                                    query_id,
+                                },
+                            ));
                         }
                         KeyCode::Backspace => {
                             app.query.pop();
-                            let _ = app
-                                .worker_tx
-                                .send(WorkerRequest::UpdateQuery(app.query.clone()));
+                            let query_id = app.next_subsession_id;
+                            app.next_subsession_id += 1;
+                            let _ = app.worker_tx.send(WorkerRequest::UpdateQuery(
+                                search_worker::UpdateQueryRequest {
+                                    query: app.query.clone(),
+                                    query_id,
+                                },
+                            ));
                         }
                         KeyCode::Up => {
                             app.move_selection(-1);
@@ -1119,12 +1168,16 @@ fn run_app(
                                     }
 
                                     // Reload model (may have been retrained in background)
-                                    if let Err(e) = app.reload_model() {
+                                    let query_id_model = app.next_subsession_id;
+                                    app.next_subsession_id += 1;
+                                    if let Err(e) = app.reload_model(query_id_model) {
                                         log::error!("Failed to reload model: {}", e);
                                     }
 
                                     // Reload click data and rerank files after editing
-                                    if let Err(e) = app.reload_and_rerank() {
+                                    let query_id_clicks = app.next_subsession_id;
+                                    app.next_subsession_id += 1;
+                                    if let Err(e) = app.reload_and_rerank(query_id_clicks) {
                                         log::error!("Failed to reload and rerank: {}", e);
                                     }
                                 }

@@ -1,5 +1,9 @@
 # How It Works
 
+## About this document
+
+This document describes the current state of the code, with a brief description of why certain things are done the way they are. It's not meant to be an exhaustive list of all previous iterations of the code. It shouldn't describe how things used to work. Anything learned from previous designs should only show up in the brie "why" statements.
+
 ## Overview
 
 `psychic` is a terminal-based file browser with fuzzy search, ML-powered ranking, and click tracking analytics. Built in Rust using ratatui for the TUI.
@@ -29,11 +33,31 @@ Why: Worker thread architecture prevents UI lag during expensive filtering/ranki
 **Communication:**
 ```
 Walker → (path, mtime) → Worker
-Main → UpdateQuery("foo") → Worker
-Worker → QueryUpdated{visible_slice, total, stats} → Main
+
+// UI generates a unique ID for every request
+Main → UpdateQuery{query: "foo", query_id: 1} → Worker
+Worker → QueryUpdated{query_id: 1, ...} → Main
+
+Main → GetPage{query_id: 1, page_num: 2} → Worker
+Worker → Page{query_id: 1, ...} → Main
 ```
 
 Why: Worker owns file data to avoid blocking UI. Main thread only keeps what's visible (20-40 files), not all files (thousands).
+
+### Robust Communication with Query IDs
+
+A `query_id` represents a query string plus the immutable set of search results generated for it at a specific moment in time. By assigning a unique ID to every new result set, we can treat them as distinct, versioned objects.
+
+This is critical for correctness in an asynchronous environment. For example, without it, a `GetPage` request for an old result set could be processed against a new result set (e.g., from an auto-refresh), which might have a different number of total items, leading to panics or data corruption in the UI's page cache.
+
+To solve this, a robust request-response protocol was implemented:
+
+1.  **UI as Client:** The UI thread acts as the client, and is the sole source of truth for request identity.
+2.  **UI-Generated IDs:** For any action that will result in a new set of filtered files (typing, reloading the model, or an auto-refresh from file changes), the UI generates a new, unique `query_id`. This ID is reused from the existing `subsession_id` mechanism.
+3.  **ID'd Requests:** Every request from the UI to the worker (`UpdateQuery`, `GetPage`, `ReloadModel`) carries the relevant `query_id`.
+4.  **ID'd Responses:** Every response from the worker back to the UI (`QueryUpdated`, `Page`) also carries the `query_id` of the request it is responding to.
+
+This ensures that both the UI and the worker can safely discard stale messages, preventing state corruption and crashes.
 
 ### Module: `db.rs`
 
@@ -127,8 +151,7 @@ Worker thread owns all file data and processes queries asynchronously.
 **Debouncing:** If user types "hello" quickly, only process final query (not 5 intermediate queries).
 Why: Avoids wasted computation and improves responsiveness.
 
-**Auto-refresh:** When new files arrive from walker, worker re-ranks current query and sends update to main thread.
-Why: User sees new files automatically without re-typing query.
+**Auto-refresh:** When new files arrive from the walker, the worker sends a `FilesChanged` notification to the UI thread. The UI is then responsible for triggering a new query with a new `query_id` to get fresh results. This preserves the "UI generates IDs" architecture and ensures the page cache is handled correctly.
 
 **File Registry Design:**
 
@@ -321,9 +344,11 @@ struct Subsession {
 }
 ```
 
-New subsession created on query change. Impressions logged after 200ms (debounced) or immediately before click/scroll.
-Why debounce: Prevents database spam on every keystroke.
-Why force logging before engagement: Ensures temporal consistency (impressions exist before their labels).
+New subsession metadata is created when the UI receives a valid `QueryUpdated` response from the worker. The `id` is generated from a counter in the UI thread (`App.next_subsession_id`) and serves a dual purpose:
+1.  It links analytics events (`impression`, `click`) together for a given search.
+2.  It acts as the `query_id` for the robust communication protocol with the search worker.
+
+Impressions are logged to the database after a 200ms debounce period (to avoid logging on every keystroke) or immediately before a click/scroll event (to ensure temporal correctness).
 
 **Event loop:**
 1. Poll worker responses (non-blocking `try_recv`)
