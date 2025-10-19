@@ -7,6 +7,7 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::mpsc::{self},
+    thread::JoinHandle,
     time::Duration,
 };
 
@@ -107,14 +108,14 @@ impl FileInfo {
 pub fn spawn(
     cwd: PathBuf,
     data_dir: &Path,
-) -> Result<(Sender<WorkerRequest>, Receiver<WorkerResponse>)> {
+) -> Result<(Sender<WorkerRequest>, Receiver<WorkerResponse>, JoinHandle<()>)> {
     let (worker_tx, worker_task_rx) = mpsc::channel::<WorkerRequest>();
     let (worker_result_tx, worker_rx) = mpsc::channel::<WorkerResponse>();
     let (walker_tx, walker_rx) = mpsc::channel::<(PathBuf, Option<i64>)>();
 
     let data_dir = data_dir.to_path_buf();
     let cwd_clone = cwd.clone();
-    std::thread::spawn(move || {
+    let worker_handle = std::thread::spawn(move || {
         // WorkerState is constructed in this thread so the ranker never moves
         // between thread. It's technically thread-safe to move for read-only
         // operations, but doing it this way means we don't have to do an unsafe
@@ -128,7 +129,7 @@ pub fn spawn(
         start_file_walker(root_clone, walker_tx);
     });
 
-    Ok((worker_tx, worker_rx))
+    Ok((worker_tx, worker_rx, worker_handle))
 }
 
 // Worker thread state - owns all file data

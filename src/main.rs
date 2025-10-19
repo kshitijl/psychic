@@ -31,6 +31,7 @@ use std::{
     io::{self, stdout},
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver},
+    thread::JoinHandle,
     time::{Duration, Instant},
 };
 
@@ -123,6 +124,7 @@ struct App {
     // Search worker thread communication
     worker_tx: mpsc::Sender<WorkerRequest>,
     worker_rx: mpsc::Receiver<WorkerResponse>,
+    worker_handle: Option<JoinHandle<()>>,
 }
 
 impl App {
@@ -144,7 +146,7 @@ impl App {
         let db = Database::new(&db_path)?;
         log::debug!("Database initialization took {:?}", db_start.elapsed());
 
-        let (worker_tx, worker_rx) = search_worker::spawn(root.clone(), data_dir)?;
+        let (worker_tx, worker_rx, worker_handle) = search_worker::spawn(root.clone(), data_dir)?;
 
         log::debug!("App::new() total time: {:?}", start_time.elapsed());
 
@@ -170,6 +172,7 @@ impl App {
             debug_pane_maximized: false,
             worker_tx: worker_tx.clone(),
             worker_rx,
+            worker_handle: Some(worker_handle),
         };
 
         // Send initial query to worker
@@ -493,7 +496,20 @@ fn main() -> Result<()> {
     // Run the app
     let result = run_app(&mut terminal, &mut app, retrain_rx);
 
-    // Cleanup
+    // Shutdown sequence: extract and drop worker_tx to signal the worker to stop,
+    // then wait for the worker thread to finish, THEN drop app (which drops log_rx).
+    // This ensures the worker can log its shutdown message before the logging channel closes.
+    let worker_tx = std::mem::replace(&mut app.worker_tx, mpsc::channel().0);
+    drop(worker_tx);
+
+    if let Some(handle) = app.worker_handle.take() {
+        let _ = handle.join();
+    }
+
+    // Now it's safe to drop app, which will close the logging channel
+    drop(app);
+
+    // Terminal cleanup
     disable_raw_mode()?;
     stdout().execute(crossterm::event::DisableMouseCapture)?;
     stdout().execute(LeaveAlternateScreen)?;
