@@ -14,6 +14,7 @@ Helix file picker is a lot faster. Maybe implement a mode that doesn't sort or r
 
 - for dirs, in preview show a little tree or output of eza -al
 - maybe specifically when it's run in ~/, it should just show all first level dirs and any historical dirs for selection? or limit walkdir depth to 1?
+- actually maybe it's not ~ specifically, but when the number of files is large, then stop and switch to limited depth traversal. then it be cool to have shift-enter be "enter this directory" and that makes it the new cwd.
 - keyword or something to filter to just dirs. at that point it becomes a zoxide replacement.
 - do something with directory prioritization. i hit p in ~ right now and what i want is for it to highly prioritize opening ~/notes which btw is a symlink, not even a full dir. and also ~/Dropbox which is also a symlink. because those are often directories that I'm in and I click files in there all the time and they are often the cwd's for when i open psychic. so they should be prioritized. the trouble is that the filewalker explores other dirs first and we don't end up exploring dirs that we should know are actually important.
 - display is broken if we scroll past a binary file and it gets previewed

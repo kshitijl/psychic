@@ -9,8 +9,15 @@ const MAX_FILES: usize = 250_000;
 pub fn start_file_walker(root: PathBuf, tx: Sender<WalkerFileMetadata>) {
     std::thread::spawn(move || {
         let mut item_count = 0;
+
+        // If in home directory, limit depth to 1 to only show first-level directories
+        let home_dir = std::env::var("HOME").ok().map(PathBuf::from);
+        let is_home = home_dir.as_ref().map(|h| &root == h).unwrap_or(false);
+        let max_depth = if is_home { 1 } else { usize::MAX };
+
         for entry in WalkDir::new(&root)
             .follow_links(true)
+            .max_depth(max_depth)
             .into_iter()
             .filter_entry(|e| {
                 // Skip ignored directories

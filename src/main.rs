@@ -780,16 +780,48 @@ fn run_app(
             f.render_widget(list, top_chunks[0]);
 
             // Get current file from page cache - clone the info we need to avoid borrow issues
-            let current_file_info: Option<(PathBuf, String)> = app
+            let current_file_info: Option<(PathBuf, String, bool)> = app
                 .get_file_at_index(app.selected_index)
-                .map(|f| (f.full_path.clone(), f.display_name.clone()));
-            let current_file_path = current_file_info.as_ref().map(|(p, _)| p.to_string_lossy().to_string());
+                .map(|f| (f.full_path.clone(), f.display_name.clone(), f.is_dir));
+            let current_file_path = current_file_info.as_ref().map(|(p, _, _)| p.to_string_lossy().to_string());
+            let is_dir = current_file_info.as_ref().map(|(_, _, d)| *d).unwrap_or(false);
 
             // Preview on the right using bat (with smart caching)
             let preview_height = top_chunks[1].height.saturating_sub(2);
             let preview_text = if current_file_info.is_some() && app.total_results > 0 {
                 if let Some(current_file_path) = &current_file_path {
                     let full_path = PathBuf::from(current_file_path);
+
+                    // For directories, show eza -al output
+                    if is_dir {
+                        let eza_output = std::process::Command::new("eza")
+                            .arg("-al")
+                            .arg("--color=always")
+                            .arg(&full_path)
+                            .output();
+
+                        match eza_output {
+                            Ok(output) => {
+                                match ansi_to_tui::IntoText::into_text(&output.stdout) {
+                                    Ok(text) => text,
+                                    Err(_) => Text::from("[Unable to parse directory listing]"),
+                                }
+                            }
+                            Err(_) => {
+                                // Fallback to ls if eza not available
+                                let ls_output = std::process::Command::new("ls")
+                                    .arg("-lah")
+                                    .arg(&full_path)
+                                    .output();
+                                match ls_output {
+                                    Ok(output) => Text::from(String::from_utf8_lossy(&output.stdout).to_string()),
+                                    Err(_) => Text::from("[Unable to list directory]"),
+                                }
+                            }
+                        }
+                    } else {
+                        // For files, use bat as before
+                        let full_path = PathBuf::from(current_file_path);
 
                     // Check for a full, cached preview
                     if let Some(cached_text) =
@@ -872,6 +904,7 @@ fn run_app(
                         }
                         text_to_render
                     }
+                    } // End of else block for files
                 } else {
                     Text::from("[Loading preview...]")
                 }
@@ -881,7 +914,7 @@ fn run_app(
 
             let preview_pane_title = current_file_info
                 .as_ref()
-                .and_then(|(path, _)| path.file_name())
+                .and_then(|(path, _, _)| path.file_name())
                 .map(|x| x.to_string_lossy())
                 .map(|x| x.to_string())
                 .unwrap_or("No file selected".to_string());
@@ -965,7 +998,7 @@ fn run_app(
             }
 
             // Add preview cache status
-            if let Some((file_path, _)) = &current_file_info {
+            if let Some((file_path, _, _)) = &current_file_info {
                 let full_path_str = file_path.to_string_lossy().to_string();
                 let is_cached = app
                     .preview_cache
