@@ -245,6 +245,24 @@ impl App {
     }
 
     fn update_scroll(&mut self, visible_height: u16) {
+        // If all results fit on screen, don't scroll at all
+        if self.total_results <= visible_height as usize {
+            self.file_list_scroll = 0;
+            // Still need to request visible slice if needed
+            let visible_end = self.visible_files_offset + self.visible_files.len();
+            let needed_end = visible_height as usize + 10;
+
+            if needed_end > visible_end && visible_end < self.total_results {
+                let count = (visible_height as usize * 2).max(60);
+                self.visible_files_offset = 0;
+                let _ = self.worker_tx.send(WorkerRequest::GetVisibleSlice {
+                    start: 0,
+                    count,
+                });
+            }
+            return;
+        }
+
         // Auto-scroll the file list when selection is near top or bottom
         let selected = self.selected_index as u16;
         let scroll = self.file_list_scroll;
@@ -255,7 +273,10 @@ impl App {
         }
         // If selected item is below visible area, scroll down
         else if selected >= scroll + visible_height {
-            self.file_list_scroll = selected.saturating_sub(visible_height - 1);
+            // Smart positioning: leave some space from bottom (5 lines)
+            // This makes wrap-around more comfortable
+            let margin = 5u16;
+            self.file_list_scroll = selected.saturating_sub(visible_height.saturating_sub(margin).min(visible_height - 1));
         }
         // If we're in the bottom 5 items and there's more to see, keep scrolling
         else if selected >= scroll + visible_height.saturating_sub(5) {
