@@ -1,5 +1,7 @@
 Read how-it-works.md to understand the code and decisions.
 
+Use asserts liberally throughout the code. For any function, consider documenting its preconditions in the form of asserts. Put these at the top of the function.
+
 Read src/main.rs to understand the entrypoint. Read train.py to understand how the model is made.
 
 It should reflect the current state of the world, and also be a dev log. It should have caveats, gotchas, decisions, and bugs fixed.

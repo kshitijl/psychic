@@ -26,13 +26,25 @@ use search_worker::{
     DisplayFileInfo, WorkerRequest, WorkerResponse, get_file_metadata, get_time_ago,
 };
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     env,
     io::{self, stdout},
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver},
     time::{Duration, Instant},
 };
+
+// Page-based caching constants
+const PAGE_SIZE: usize = 128;
+const PREFETCH_MARGIN: usize = 32;
+
+/// A page of DisplayFileInfo for caching
+#[derive(Debug, Clone)]
+struct Page {
+    start_index: usize,
+    end_index: usize,
+    files: Vec<DisplayFileInfo>,
+}
 
 /// For feature generation
 #[derive(Debug, Clone, ValueEnum)]
@@ -86,10 +98,9 @@ struct Subsession {
 
 struct App {
     query: String,
-    visible_files: Vec<DisplayFileInfo>, // Only what's currently visible
-    visible_files_offset: usize,         // What index the visible_files array starts at
-    total_results: usize,                // Total number of filtered files
-    total_files: usize,                  // Total number of files in index
+    page_cache: HashMap<usize, Page>, // Page-based cache
+    total_results: usize,             // Total number of filtered files
+    total_files: usize,               // Total number of files in index
     selected_index: usize,
     file_list_scroll: u16, // Scroll offset for file list
     preview_scroll: u16,
@@ -139,8 +150,7 @@ impl App {
 
         let app = App {
             query: String::new(),
-            visible_files: Vec::new(),
-            visible_files_offset: 0,
+            page_cache: HashMap::new(),
             total_results: 0,
             total_files: 0,
             selected_index: 0,
@@ -184,19 +194,44 @@ impl App {
         Ok(())
     }
 
+    /// Get file from page cache at a given global index
+    /// Returns None if the page isn't loaded or index is out of range
+    fn get_file_at_index(&self, index: usize) -> Option<&DisplayFileInfo> {
+        if index >= self.total_results {
+            return None;
+        }
+
+        let page_num = index / PAGE_SIZE;
+        let page = self.page_cache.get(&page_num)?;
+
+        // Assert that the index is actually within this page's range
+        assert!(
+            index >= page.start_index && index < page.end_index,
+            "Index {} outside page {} range [{}, {})",
+            index,
+            page_num,
+            page.start_index,
+            page.end_index
+        );
+
+        let offset_in_page = index - page.start_index;
+        page.files.get(offset_in_page)
+    }
+
     fn check_and_log_impressions(&mut self, force: bool) -> Result<()> {
-        let subsession = match &mut self.current_subsession {
-            Some(s) => s,
+        // Extract values we need before borrowing subsession mutably
+        let (subsession_id, subsession_query, created_at, already_logged) = match &self.current_subsession {
+            Some(s) => (s.id, s.query.clone(), s.created_at, s.events_have_been_logged),
             None => return Ok(()),
         };
 
         // Skip if already logged
-        if subsession.events_have_been_logged {
+        if already_logged {
             return Ok(());
         }
 
         // Check if we should log: either forced or >200ms old
-        let elapsed = jiff::Timestamp::now().duration_since(subsession.created_at);
+        let elapsed = jiff::Timestamp::now().duration_since(created_at);
         let threshold = jiff::SignedDuration::from_millis(200);
         let should_log = force || elapsed >= threshold;
         if !should_log {
@@ -204,27 +239,29 @@ impl App {
         }
 
         // Log top N visible files with metadata
-        let top_n: Vec<FileMetadata> = self
-            .visible_files
-            .iter()
-            .take(self.num_results_to_log_as_impressions)
-            .map(|display_info| {
+        // Collect from page cache starting at index 0
+        let mut top_n = Vec::new();
+        for i in 0..self.num_results_to_log_as_impressions.min(self.total_results) {
+            if let Some(display_info) = self.get_file_at_index(i) {
                 let (mtime, atime, file_size) = get_file_metadata(&display_info.full_path);
-
-                FileMetadata {
+                top_n.push(FileMetadata {
                     relative_path: display_info.display_name.clone(),
                     full_path: display_info.full_path.to_string_lossy().to_string(),
                     mtime,
                     atime,
                     size: file_size,
-                }
-            })
-            .collect();
+                });
+            }
+        }
 
         if !top_n.is_empty() {
             self.db
-                .log_impressions(&subsession.query, &top_n, subsession.id, &self.session_id)?;
-            subsession.events_have_been_logged = true;
+                .log_impressions(&subsession_query, &top_n, subsession_id, &self.session_id)?;
+
+            // Mark as logged
+            if let Some(ref mut s) = self.current_subsession {
+                s.events_have_been_logged = true;
+            }
         }
 
         Ok(())
@@ -245,63 +282,75 @@ impl App {
     }
 
     fn update_scroll(&mut self, visible_height: u16) {
-        // If all results fit on screen, don't scroll at all
-        if self.total_results <= visible_height as usize {
-            self.file_list_scroll = 0;
-            // Still need to request visible slice if needed
-            let visible_end = self.visible_files_offset + self.visible_files.len();
-            let needed_end = visible_height as usize + 10;
-
-            if needed_end > visible_end && visible_end < self.total_results {
-                let count = (visible_height as usize * 2).max(60);
-                self.visible_files_offset = 0;
-                let _ = self.worker_tx.send(WorkerRequest::GetVisibleSlice {
-                    start: 0,
-                    count,
-                });
-            }
+        if self.total_results == 0 {
             return;
         }
 
-        // Auto-scroll the file list when selection is near top or bottom
-        let selected = self.selected_index as u16;
-        let scroll = self.file_list_scroll;
+        // If all results fit on screen, don't scroll at all
+        if self.total_results <= visible_height as usize {
+            self.file_list_scroll = 0;
+        } else {
+            // Auto-scroll the file list when selection is near top or bottom
+            let selected = self.selected_index as u16;
+            let scroll = self.file_list_scroll;
 
-        // If selected item is above visible area, scroll up
-        if selected < scroll {
-            self.file_list_scroll = selected;
+            // If selected item is above visible area, scroll up
+            if selected < scroll {
+                self.file_list_scroll = selected;
+            }
+            // If selected item is below visible area, scroll down
+            else if selected >= scroll + visible_height {
+                // Smart positioning: leave some space from bottom (5 lines)
+                // This makes wrap-around more comfortable
+                let margin = 5u16;
+                self.file_list_scroll = selected.saturating_sub(visible_height.saturating_sub(margin).min(visible_height - 1));
+            }
+            // If we're in the bottom 5 items and there's more to see, keep scrolling
+            else if selected >= scroll + visible_height.saturating_sub(5) {
+                self.file_list_scroll = selected.saturating_sub(visible_height.saturating_sub(5));
+            }
         }
-        // If selected item is below visible area, scroll down
-        else if selected >= scroll + visible_height {
-            // Smart positioning: leave some space from bottom (5 lines)
-            // This makes wrap-around more comfortable
-            let margin = 5u16;
-            self.file_list_scroll = selected.saturating_sub(visible_height.saturating_sub(margin).min(visible_height - 1));
-        }
-        // If we're in the bottom 5 items and there's more to see, keep scrolling
-        else if selected >= scroll + visible_height.saturating_sub(5) {
-            self.file_list_scroll = selected.saturating_sub(visible_height.saturating_sub(5));
+
+        // Page-based prefetching
+        let current_page = self.selected_index / PAGE_SIZE;
+
+        // Ensure current page is loaded
+        if !self.page_cache.contains_key(&current_page) {
+            let _ = self.worker_tx.send(WorkerRequest::GetPage { page_num: current_page });
         }
 
-        // Request more visible items if we're getting close to the edge
-        let scroll_offset = self.file_list_scroll as usize;
-        let visible_end = self.visible_files_offset + self.visible_files.len();
-        let needed_end = scroll_offset + visible_height as usize + 10; // 10 item buffer
+        // Check if we're close to the top of the current page - prefetch previous page
+        let offset_in_page = self.selected_index % PAGE_SIZE;
+        if offset_in_page < PREFETCH_MARGIN {
+            // Calculate previous page with wrap-around
+            let total_pages = self.total_results.div_ceil(PAGE_SIZE);
+            let prev_page = if current_page == 0 {
+                total_pages.saturating_sub(1)
+            } else {
+                current_page - 1
+            };
 
-        // Check if we need to request a new slice
-        // We need new data if: scroll_offset is outside our current window OR we're near the end
-        let need_new_slice = scroll_offset < self.visible_files_offset
-            || scroll_offset >= visible_end
-            || (needed_end > visible_end && visible_end < self.total_results);
+            // Only request if we have that many pages and it's not cached
+            if total_pages > 0 && !self.page_cache.contains_key(&prev_page) {
+                let _ = self.worker_tx.send(WorkerRequest::GetPage { page_num: prev_page });
+            }
+        }
 
-        if need_new_slice {
-            // Request more items
-            let count = (visible_height as usize * 2).max(60); // At least 60 or 2x screen height
-            self.visible_files_offset = scroll_offset; // Update offset optimistically
-            let _ = self.worker_tx.send(WorkerRequest::GetVisibleSlice {
-                start: scroll_offset,
-                count,
-            });
+        // Check if we're close to the bottom of the current page - prefetch next page
+        let page_size_for_current = PAGE_SIZE.min(self.total_results - current_page * PAGE_SIZE);
+        if offset_in_page >= page_size_for_current.saturating_sub(PREFETCH_MARGIN) {
+            // Calculate next page with wrap-around
+            let total_pages = self.total_results.div_ceil(PAGE_SIZE);
+            let next_page = if current_page + 1 >= total_pages {
+                0
+            } else {
+                current_page + 1
+            };
+
+            // Only request if it's not cached
+            if !self.page_cache.contains_key(&next_page) {
+                let _ = self.worker_tx.send(WorkerRequest::GetPage { page_num: next_page });
+            }
         }
     }
 }
@@ -502,17 +551,15 @@ fn run_app(
             let list_width = top_chunks[0].width.saturating_sub(2) as usize; // subtract borders
             let scroll_offset = app.file_list_scroll as usize;
 
-            // Calculate which items from visible_files to display
-            // visible_files starts at visible_files_offset, we want to show from scroll_offset
-            let skip_count = scroll_offset.saturating_sub(app.visible_files_offset);
-
-            let items: Vec<ListItem> = app
-                .visible_files
-                .iter()
-                .skip(skip_count)
-                .enumerate()
-                .map(|(display_idx, display_info)| {
+            // Build list items from page cache
+            let items: Vec<ListItem> = (0..visible_height as usize)
+                .filter_map(|display_idx| {
                     let i = scroll_offset + display_idx;
+                    if i >= app.total_results {
+                        return None;
+                    }
+
+                    let display_info = app.get_file_at_index(i)?;
                     let time_ago = get_time_ago(&display_info.full_path);
                     let rank = i + 1;
 
@@ -551,7 +598,7 @@ fn run_app(
                     } else {
                         Style::default()
                     };
-                    ListItem::new(line).style(style)
+                    Some(ListItem::new(line).style(style))
                 })
                 .collect();
 
@@ -562,21 +609,15 @@ fn run_app(
             );
             f.render_widget(list, top_chunks[0]);
 
-            // Calculate index into visible_files array
-            // selected_index is global, visible_files_offset is where the array starts
-            let visible_idx = app.selected_index.saturating_sub(app.visible_files_offset);
-
-            let current_file = if visible_idx < app.visible_files.len() {
-                Some(&app.visible_files[visible_idx])
-            } else {
-                None
-            };
-
-            let current_file_path = current_file.map(|x| x.full_path.to_string_lossy().to_string());
+            // Get current file from page cache - clone the info we need to avoid borrow issues
+            let current_file_info: Option<(PathBuf, String)> = app
+                .get_file_at_index(app.selected_index)
+                .map(|f| (f.full_path.clone(), f.display_name.clone()));
+            let current_file_path = current_file_info.as_ref().map(|(p, _)| p.to_string_lossy().to_string());
 
             // Preview on the right using bat (with smart caching)
             let preview_height = top_chunks[1].height.saturating_sub(2);
-            let preview_text = if !app.visible_files.is_empty() && app.total_results > 0 {
+            let preview_text = if current_file_info.is_some() && app.total_results > 0 {
                 if let Some(current_file_path) = &current_file_path {
                     let full_path = PathBuf::from(current_file_path);
 
@@ -668,8 +709,9 @@ fn run_app(
                 Text::from("")
             };
 
-            let preview_pane_title = current_file
-                .and_then(|x| x.full_path.file_name())
+            let preview_pane_title = current_file_info
+                .as_ref()
+                .and_then(|(path, _)| path.file_name())
                 .map(|x| x.to_string_lossy())
                 .map(|x| x.to_string())
                 .unwrap_or("No file selected".to_string());
@@ -686,30 +728,26 @@ fn run_app(
             // Debug panel on the right
             let mut debug_lines = Vec::new();
 
-            // Show current selection info
-            if !app.visible_files.is_empty() && app.total_results > 0 {
-                let visible_idx = app.selected_index.saturating_sub(app.visible_files_offset);
-                if visible_idx < app.visible_files.len() {
-                    let display_info = &app.visible_files[visible_idx];
-                    debug_lines.push(format!("Score: {:.4}", display_info.score));
-                    debug_lines.push(String::from(""));
-                    debug_lines.push(String::from("Features:"));
-                    debug_lines.push(String::from(""));
+            // Show current selection info - need another lookup to get score/features
+            if let Some(display_info) = app.get_file_at_index(app.selected_index) {
+                debug_lines.push(format!("Score: {:.4}", display_info.score));
+                debug_lines.push(String::from(""));
+                debug_lines.push(String::from("Features:"));
+                debug_lines.push(String::from(""));
 
-                    // Show all features from registry
-                    if !display_info.features.is_empty() {
-                        let features_map = ranker::features_to_map(&display_info.features);
-                        for feature in feature_defs::FEATURE_REGISTRY.iter() {
-                            if let Some(value) = features_map.get(feature.name()) {
-                                debug_lines.push(format!("  {}: {}", feature.name(), value));
-                            }
+                // Show all features from registry
+                if !display_info.features.is_empty() {
+                    let features_map = ranker::features_to_map(&display_info.features);
+                    for feature in feature_defs::FEATURE_REGISTRY.iter() {
+                        if let Some(value) = features_map.get(feature.name()) {
+                            debug_lines.push(format!("  {}: {}", feature.name(), value));
                         }
-                    } else {
-                        debug_lines.push(String::from("  (no features)"));
                     }
                 } else {
-                    debug_lines.push(String::from("(loading...)"));
+                    debug_lines.push(String::from("  (no features)"));
                 }
+            } else if app.total_results > 0 {
+                debug_lines.push(String::from("(loading...)"));
             } else {
                 debug_lines.push(String::from("No results"));
             }
@@ -757,20 +795,14 @@ fn run_app(
             }
 
             // Add preview cache status
-            if !app.visible_files.is_empty() && app.total_results > 0 {
-                let visible_idx = app.selected_index.saturating_sub(app.visible_files_offset);
-                if visible_idx < app.visible_files.len() {
-                    let display_info = &app.visible_files[visible_idx];
-                    let full_path_str = display_info.full_path.to_string_lossy().to_string();
-                    let is_cached = app
-                        .preview_cache
-                        .as_ref()
-                        .is_some_and(|(p, _)| p == &full_path_str);
-                    let cache_status = if is_cached { "Cached" } else { "Live" };
-                    debug_lines.push(format!("Preview: {}", cache_status));
-                } else {
-                    debug_lines.push(String::from("Preview: N/A"));
-                }
+            if let Some((file_path, _)) = &current_file_info {
+                let full_path_str = file_path.to_string_lossy().to_string();
+                let is_cached = app
+                    .preview_cache
+                    .as_ref()
+                    .is_some_and(|(p, _)| p == &full_path_str);
+                let cache_status = if is_cached { "Cached" } else { "Live" };
+                debug_lines.push(format!("Preview: {}", cache_status));
             } else {
                 debug_lines.push(String::from("Preview: N/A"));
             }
@@ -831,13 +863,22 @@ fn run_app(
                     query,
                     total_results,
                     total_files,
-                    visible_slice,
+                    initial_page,
                     model_stats,
                 } => {
                     // Only apply if query still matches
                     if query == app.query {
-                        app.visible_files = visible_slice;
-                        app.visible_files_offset = 0; // Query results always start at 0
+                        // Clear page cache on query change
+                        app.page_cache.clear();
+
+                        // Insert initial page
+                        let page = Page {
+                            start_index: initial_page.start_index,
+                            end_index: initial_page.end_index,
+                            files: initial_page.files,
+                        };
+                        app.page_cache.insert(initial_page.page_num, page);
+
                         app.total_results = total_results;
                         app.total_files = total_files;
                         app.model_stats_cache = model_stats;
@@ -857,9 +898,14 @@ fn run_app(
                         app.next_subsession_id += 1;
                     }
                 }
-                WorkerResponse::VisibleSlice(slice) => {
-                    // Note: offset is set when we request the slice in update_scroll()
-                    app.visible_files = slice;
+                WorkerResponse::Page(page_data) => {
+                    // Insert page into cache
+                    let page = Page {
+                        start_index: page_data.start_index,
+                        end_index: page_data.end_index,
+                        files: page_data.files,
+                    };
+                    app.page_cache.insert(page_data.page_num, page);
                 }
             }
         }
@@ -875,13 +921,11 @@ fn run_app(
                             app.preview_scroll = app.preview_scroll.saturating_add(3);
 
                             // Log scroll event (deduplicated by query + full_path)
-                            if !app.visible_files.is_empty() && app.total_results > 0 {
+                            if app.total_results > 0 {
                                 // Force log impressions before scroll
                                 let _ = app.check_and_log_impressions(true);
 
-                                let visible_idx = app.selected_index.saturating_sub(app.visible_files_offset);
-                                if visible_idx < app.visible_files.len() {
-                                    let display_info = &app.visible_files[visible_idx];
+                                if let Some(display_info) = app.get_file_at_index(app.selected_index) {
                                     let full_path_str =
                                         display_info.full_path.to_string_lossy().to_string();
                                     let key = (app.query.clone(), full_path_str.clone());
@@ -914,13 +958,11 @@ fn run_app(
                             app.preview_scroll = app.preview_scroll.saturating_sub(3);
 
                             // Log scroll event (deduplicated by query + full_path)
-                            if !app.visible_files.is_empty() && app.total_results > 0 {
+                            if app.total_results > 0 {
                                 // Force log impressions before scroll
                                 let _ = app.check_and_log_impressions(true);
 
-                                let visible_idx = app.selected_index.saturating_sub(app.visible_files_offset);
-                                if visible_idx < app.visible_files.len() {
-                                    let display_info = &app.visible_files[visible_idx];
+                                if let Some(display_info) = app.get_file_at_index(app.selected_index) {
                                     let full_path_str =
                                         display_info.full_path.to_string_lossy().to_string();
                                     let key = (app.query.clone(), full_path_str.clone());
@@ -996,13 +1038,11 @@ fn run_app(
                             app.move_selection(1);
                         }
                         KeyCode::Enter => {
-                            if !app.visible_files.is_empty() && app.total_results > 0 {
+                            if app.total_results > 0 {
                                 // Force log impressions before click
                                 app.check_and_log_impressions(true)?;
 
-                                let visible_idx = app.selected_index.saturating_sub(app.visible_files_offset);
-                                if visible_idx < app.visible_files.len() {
-                                    let display_info = &app.visible_files[visible_idx];
+                                if let Some(display_info) = app.get_file_at_index(app.selected_index) {
                                     let (mtime, atime, file_size) =
                                         get_file_metadata(&display_info.full_path);
 

@@ -21,9 +21,17 @@ pub struct DisplayFileInfo {
 
 pub enum WorkerRequest {
     UpdateQuery(String),
-    GetVisibleSlice { start: usize, count: usize },
+    GetPage { page_num: usize },
     ReloadModel,
     ReloadClicks,
+}
+
+#[derive(Debug, Clone)]
+pub struct PageData {
+    pub page_num: usize,
+    pub start_index: usize,
+    pub end_index: usize,
+    pub files: Vec<DisplayFileInfo>,
 }
 
 pub enum WorkerResponse {
@@ -31,10 +39,10 @@ pub enum WorkerResponse {
         query: String,
         total_results: usize,
         total_files: usize,
-        visible_slice: Vec<DisplayFileInfo>,
+        initial_page: PageData,
         model_stats: Option<ranker::ModelStats>,
     },
-    VisibleSlice(Vec<DisplayFileInfo>),
+    Page(PageData),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -274,6 +282,21 @@ impl WorkerState {
             .collect()
     }
 
+    fn get_page(&self, page_num: usize, page_size: usize) -> PageData {
+        let start_index = page_num * page_size;
+        let end_index = (start_index + page_size).min(self.filtered_files.len());
+        let count = end_index.saturating_sub(start_index);
+
+        let files = self.get_slice(start_index, count);
+
+        PageData {
+            page_num,
+            start_index,
+            end_index,
+            files,
+        }
+    }
+
     fn reload_model(&mut self) -> Result<()> {
         log::info!("Worker: Reloading model from disk");
         self.ranker = ranker::Ranker::new(&self.model_path, &self.db_path)?;
@@ -313,12 +336,12 @@ fn worker_thread_loop(
             if let Err(e) = state.filter_and_rank(&state.current_query.clone()) {
                 log::error!("Auto-refresh filter/rank failed: {}", e);
             } else {
-                let visible_slice = state.get_slice(0, 60);
+                let initial_page = state.get_page(0, 128);
                 let _ = result_tx.send(WorkerResponse::QueryUpdated {
                     query: state.current_query.clone(),
                     total_results: state.filtered_files.len(),
                     total_files: state.file_registry.len(),
-                    visible_slice,
+                    initial_page,
                     model_stats: state.ranker.stats.clone(),
                 });
                 last_update = Instant::now();
@@ -339,21 +362,21 @@ fn worker_thread_loop(
                     continue;
                 }
 
-                // Send back results with enough items to fill screen (assume ~50 lines)
-                let visible_slice = state.get_slice(0, 60);
+                // Send back results with initial page (page 0)
+                let initial_page = state.get_page(0, 128);
                 let _ = result_tx.send(WorkerResponse::QueryUpdated {
                     query,
                     total_results: state.filtered_files.len(),
                     total_files: state.file_registry.len(),
-                    visible_slice,
+                    initial_page,
                     model_stats: state.ranker.stats.clone(),
                 });
                 last_update = Instant::now();
                 files_changed = false;
             }
-            Ok(WorkerRequest::GetVisibleSlice { start, count }) => {
-                let slice = state.get_slice(start, count);
-                let _ = result_tx.send(WorkerResponse::VisibleSlice(slice));
+            Ok(WorkerRequest::GetPage { page_num }) => {
+                let page = state.get_page(page_num, 128);
+                let _ = result_tx.send(WorkerResponse::Page(page));
             }
             Ok(WorkerRequest::ReloadModel) => {
                 if let Err(e) = state.reload_model() {
@@ -364,12 +387,12 @@ fn worker_thread_loop(
                     if let Err(e) = state.filter_and_rank(&query) {
                         log::error!("Filter/rank failed after model reload: {}", e);
                     } else {
-                        let visible_slice = state.get_slice(0, 60);
+                        let initial_page = state.get_page(0, 128);
                         let _ = result_tx.send(WorkerResponse::QueryUpdated {
                             query,
                             total_results: state.filtered_files.len(),
                             total_files: state.file_registry.len(),
-                            visible_slice,
+                            initial_page,
                             model_stats: state.ranker.stats.clone(),
                         });
                     }
@@ -384,12 +407,12 @@ fn worker_thread_loop(
                     if let Err(e) = state.filter_and_rank(&query) {
                         log::error!("Filter/rank failed after clicks reload: {}", e);
                     } else {
-                        let visible_slice = state.get_slice(0, 60);
+                        let initial_page = state.get_page(0, 128);
                         let _ = result_tx.send(WorkerResponse::QueryUpdated {
                             query,
                             total_results: state.filtered_files.len(),
                             total_files: state.file_registry.len(),
-                            visible_slice,
+                            initial_page,
                             model_stats: state.ranker.stats.clone(),
                         });
                     }
