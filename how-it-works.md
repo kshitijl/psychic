@@ -2,1014 +2,168 @@
 
 ## Overview
 
-`psychic` is a terminal-based file browser with fuzzy search, file preview, and click tracking analytics. It's built in Rust using a TUI (Terminal User Interface) framework and logs user interactions to a SQLite database for analysis.
+`psychic` is a terminal-based file browser with fuzzy search, ML-powered ranking, and click tracking analytics. Built in Rust using ratatui for the TUI.
 
 ## Architecture
 
 ### Core Components
 
-The application is split into five modules:
-
-1. **`db.rs`** - Database layer for event logging
+1. **`db.rs`** - SQLite event logging
 2. **`walker.rs`** - Background file discovery
 3. **`context.rs`** - System context gathering
-4. **`features.rs`** - Feature generation for machine learning
-5. **`main.rs`** - TUI event loop and rendering
+4. **`features.rs`** - ML feature generation for training
+5. **`feature_defs/`** - Trait-based feature registry
+6. **`ranker.rs`** - LightGBM model inference
+7. **`search_worker.rs`** - Async worker thread for filtering/ranking
+8. **`main.rs`** - TUI event loop and rendering
+
+Why: Worker thread architecture prevents UI lag during expensive filtering/ranking operations.
+
+### Thread Architecture
+
+**3 threads:**
+- **Main (UI)**: Renders UI, handles keyboard/mouse, owns visible file slice only
+- **Worker**: Owns all file data, does filtering/ranking, sends results to main
+- **Walker**: Discovers files via walkdir, sends to worker
+
+**Communication:**
+```
+Walker → (path, mtime) → Worker
+Main → UpdateQuery("foo") → Worker
+Worker → QueryUpdated{visible_slice, total, stats} → Main
+```
+
+Why: Worker owns file data to avoid blocking UI. Main thread only keeps what's visible (20-40 files), not all files (thousands).
 
 ### Module: `db.rs`
 
-Manages SQLite database at `~/.local/share/psychic/events.db` with two tables:
+Database at `~/.local/share/psychic/events.db` with two tables:
 
 ```sql
 CREATE TABLE events (
-    id INTEGER PRIMARY KEY,
-    timestamp INTEGER NOT NULL,
-    query TEXT NOT NULL,
-    file_path TEXT NOT NULL,           -- relative path from cwd
-    full_path TEXT NOT NULL,           -- absolute path
-    mtime INTEGER,                     -- file modification time (unix epoch)
-    atime INTEGER,                     -- file access time (unix epoch)
-    action TEXT NOT NULL,              -- 'impression' or 'click'
-    session_id TEXT NOT NULL
+    timestamp INTEGER,
+    query TEXT,
+    file_path TEXT,      -- relative path
+    full_path TEXT,      -- absolute path
+    mtime INTEGER,
+    atime INTEGER,
+    file_size INTEGER,
+    subsession_id INTEGER,
+    action TEXT,         -- 'impression', 'scroll', or 'click'
+    session_id TEXT
 );
 
 CREATE TABLE sessions (
     session_id TEXT PRIMARY KEY,
-    cwd TEXT NOT NULL,
-    gateway TEXT NOT NULL,
-    subnet TEXT NOT NULL,
-    dns TEXT NOT NULL,
-    shell_history TEXT NOT NULL,
-    running_processes TEXT NOT NULL,
-    created_at INTEGER NOT NULL
+    cwd TEXT,
+    gateway TEXT,
+    subnet TEXT,
+    dns TEXT,
+    shell_history TEXT,
+    running_processes TEXT,
+    timezone TEXT,
+    created_at INTEGER
 );
 ```
 
-**Key decisions:**
-- Session ID is a random 64-bit integer (not UUID - UUIDs were too long for analysis)
-- Timestamps use `jiff::Timestamp::now().as_second()` for Unix epoch seconds
-- Store both relative paths (for display) and full paths (for analysis)
-- File metadata (mtime/atime) captured at event time, not file discovery time
-- Context data gathered once per session in separate table
+**Index:**
+```sql
+CREATE INDEX idx_events_click_lookup ON events(action, timestamp, full_path);
+```
 
-**API:**
-- `log_session()` - Log session context data at startup
-- `log_impressions()` - Batch log top 10 visible results with metadata
-- `log_click()` - Log when user opens a file with metadata
+Why: Composite index speeds up 30-day click count aggregation (O(log n) vs O(n)).
+
+**Session ID:** Random 64-bit integer (not UUID).
+Why: UUIDs are 36 chars. 64-bit int gives 18 quintillion IDs, more compact.
+
+**File metadata:** Captured at event time, not discovery time.
+Why: Files can be modified between discovery and impression. Event-time metadata reflects what user actually saw.
 
 ### Module: `walker.rs`
 
-Spawns a background thread that recursively walks the current directory using `walkdir`.
+Background thread that recursively walks current directory using `walkdir`.
 
-**Key decisions:**
-- Streams results via `mpsc::channel` as files are discovered (don't wait for scan to complete)
-- Filters out common ignored directories: `.git`, `node_modules`, `.venv`, `target`
-- Only sends files, not directories
+**Key points:**
+- Streams results via mpsc channel as discovered
+- Filters: `.git`, `node_modules`, `.venv`, `target`
+- Sends files only (not directories)
+- Extracts mtime from walkdir's cached metadata
 
-**Why background thread:**
-- Large directories (like monorepos) can take seconds to scan
-- UI remains responsive while discovery happens
-- Results populate incrementally
+Why background thread: Large directories take seconds to scan. Streaming keeps UI responsive.
+Why send mtime: Avoids re-fetching metadata later (performance).
 
 ### Module: `context.rs`
 
-Gathers system/environment context at startup in a background thread. Captures:
+Gathers system context at startup in background thread:
+- `cwd` - Current working directory
+- `gateway` - Default gateway from `netstat -nr`
+- `subnet` - First two octets of local IP
+- `dns` - First DNS nameserver from `scutil --dns`
+- `shell_history` - Last 10 commands from ~/.zsh_history or ~/.bash_history
+- `running_processes` - Output of `ps -u $USER -o pid,comm`
+- `timezone` - From `date +%Z`
 
-- **`cwd`** - Current working directory
-- **`gateway`** - Default gateway IP from `netstat -nr`
-- **`subnet`** - First two octets of local IP (e.g., "192.168")
-- **`dns`** - First DNS nameserver from `scutil --dns`
-- **`shell_history`** - Last 10 shell commands (tries `~/.bash_history` then `~/.zsh_history`)
-- **`running_processes`** - Output of `ps -u $USER -o pid,comm`
+Why gather this: Network context (home/office/cafe), shell history (user intent), and running processes help analyze search patterns and could become ML features.
 
-**Key decisions:**
-- Runs in separate thread to avoid blocking file walker or UI startup
-- All commands wrapped in shell scripts via `sh -c` for robustness
-- Falls back to `"unknown"` on any error (don't crash on missing tools)
-- Shell history tries both bash and zsh (zsh history needs `cut -d';' -f2-` to strip timestamps)
+**Error handling:** All fields fallback to "unknown" on error. Never crash due to missing tools.
 
-**Why gather this data:**
-- Network context helps understand if user is at home/office/coffee shop
-- Shell history provides clues about what user was doing before launching `psychic`
-- Running processes show what else user is working on
-- All useful features for analyzing search patterns and file access
+### Module: `search_worker.rs`
 
-### Module: `features.rs`
+Worker thread owns all file data and processes queries asynchronously.
 
-This module is responsible for reading the `events` and `sessions` tables from the database, computing a wide range of features for each impression event, and exporting the results to a CSV file suitable for training a machine learning model (e.g., with LightGBM in Python).
+**WorkerState owns:**
+- `file_registry: Vec<FileInfo>` - All files with metadata
+- `path_to_id: HashMap<PathBuf, FileId>` - Deduplication
+- `filtered_files: Vec<FileId>` - Ranked result IDs
+- `file_scores: Vec<FileScore>` - Scores and features
+- `ranker: Ranker` - ML model
 
-**Key Features Generated:**
-- **Static File Features:** `path_depth`, `filename_len`, `extension`, `is_hidden`, `file_size`, `in_src`, `has_uuid`, `filename_entropy`, `path_entropy`, `digit_ratio`, `special_char_ratio`, `uppercase_ratio`, `num_underscores_in_filename`, `num_hyphens_in_filename`, etc.
-- **Temporal Features:** `seconds_since_mod`, `modified_today`, `seconds_since_access`, `session_duration_seconds`.
-- **Query-based Features:** `query_len`, `query_exact_match`, `filename_contains_query`, `path_contains_query`.
-- **Historical Features:** `prev_session_clicks`, `prev_session_scrolls`, `ever_clicked`, `current_session_clicks`.
-- **Ranking Features:** `rank`, `rank_most_recently_modified`, `rank_most_recently_clicked` of the file in the search results for a given query.
-- **Label:** `1` if the file was clicked or scrolled in the same subsession, `0` otherwise.
+**Worker loop:**
+1. Process walker updates (non-blocking `try_recv`)
+2. Auto-refresh every 100ms if files changed
+3. Process work requests with 5ms timeout
+4. Debounce queries (drain channel, keep latest)
 
-### Module: `main.rs`
+**Debouncing:** If user types "hello" quickly, only process final query (not 5 intermediate queries).
+Why: Avoids wasted computation and improves responsiveness.
 
-Main event loop using `ratatui` + `crossterm` for TUI rendering. Also handles command-line argument parsing to switch between TUI mode and feature generation mode.
+**Auto-refresh:** When new files arrive from walker, worker re-ranks current query and sends update to main thread.
+Why: User sees new files automatically without re-typing query.
 
-**Layout (fzf-style):**
-```
-┌─────────────────┬─────────────────┐
-│                 │                 │
-│   File List     │    Preview      │
-│   (left 50%)    │    (right 50%)  │
-│                 │                 │
-└─────────────────┴─────────────────┘
-┌───────────────────────────────────┐
-│   Search Input (bottom)           │
-└───────────────────────────────────┘
-```
-
-**Key decisions:**
-- Input box at bottom (like fzf, not at top)
-- Split top area 50/50 for results and preview
-- Preview uses `bat` for syntax highlighting
-
-## Feature Generation Mode
-
-To support machine learning experiments, `psychic` can be run in a non-interactive mode to generate a feature dataset from the existing event logs.
-
-**Usage:**
-```bash
-# Generate features and save to features.csv (default)
-psychic generate-features
-
-# Specify a custom output path
-psychic generate-features --output my_features.csv
-```
-
-This is implemented using the `clap` crate for command-line argument parsing. When the `--generate-features` flag is provided, the application calls the `features::generate_features` function and exits, skipping the TUI entirely.
-
-## Refactoring for Testability and Performance
-
-The `features.rs` module was initially written to query the database for each feature, for each impression. This resulted in a large number of database queries, making feature generation slow and difficult to test.
-
-To address this, the module is being refactored to:
-
-1.  **Fetch all data upfront:** All `events` and `sessions` are read from the database into in-memory data structures at the beginning of the feature generation process.
-2.  **Compute features from in-memory data:** All feature computation functions now operate on these in-memory data structures, eliminating the need for repeated database queries.
-
-This change has several benefits:
-- **Performance:** Feature generation is significantly faster as it avoids thousands of small database queries.
-- **Testability:** Unit tests can be written for the feature computation logic without needing to interact with a database. This makes the tests faster, more reliable, and easier to write.
-
-## Key Technical Decisions
-
-### 1. Session ID: 64-bit Random Integer
-
-**Original plan:** Use UUID v4
-**Changed to:** Random 64-bit integer as string
-
-**Reason:** UUIDs are too long (36 characters) for a session identifier. A 64-bit int gives us 18 quintillion possible IDs, more than enough to avoid collisions, and it's much more compact in logs and queries.
-
-**Implementation:**
-```rust
-use std::collections::hash_map::RandomState;
-use std::hash::{BuildHasher, Hash, Hasher};
-
-let mut hasher = RandomState::new().build_hasher();
-Instant::now().hash(&mut hasher);
-std::process::id().hash(&mut hasher);
-let session_id = hasher.finish().to_string();
-```
-
-### 2. Subsession Tracking and Impression Logging
-
-**Problem:** Every keystroke changes query → changes results → would spam database with impressions. Also need to ensure clicks/scrolls are associated with the correct query and impressions.
-
-**Solution:** Subsession-based tracking with debounced impression logging
+**File Registry Design:**
 
 ```rust
-struct Subsession {
-    id: u64,
-    query: String,
-    created_at: Instant,
-    impressions_logged: bool,
+struct FileId(usize);  // Newtype for type safety
+
+struct FileInfo {
+    full_path: PathBuf,
+    display_name: String,  // Computed once (relative path or ".../filename")
+    mtime: Option<i64>,    // From walker or historical load
+    origin: FileOrigin,    // CwdWalker or UserClickedInEventsDb
 }
 ```
 
-**How it works:**
-1. When query changes, a new `Subsession` is created with incremented ID
-2. Every frame, `check_and_log_impressions(false)` is called - logs impressions if subsession is >200ms old and not yet logged
-3. When user clicks or scrolls, `check_and_log_impressions(true)` is called first - forces immediate impression logging if not already done
-4. Subsession is marked as logged to prevent duplicate logging
+Why FileId: O(1) lookups. No string cloning in hot paths. Type-safe (can't mix with other usize).
+Why display_name computed once: Filtering checks display_name repeatedly. Computing it once at registration avoids repeated allocations.
+Why origin tracking: Historical files (from other directories) show as ".../filename" to indicate they're not local.
 
-**Key guarantees:**
-- All clicks/scrolls have their impressions logged first (temporal consistency)
-- Same query always maps to same subsession_id
-- Impressions are debounced by 200ms for normal typing
-- Engagement events force immediate logging to ensure data completeness
+**Historical files:** Loads previously clicked/scrolled files from events.db at startup.
+Why: User can find files from other projects they've accessed before.
 
-**Why this matters for ML:**
-- Label=1 means "user clicked/scrolled this file in this subsession"
-- Features are computed from the impressions shown in that subsession
-- Prevents query/subsession mismatches that would create incorrect training data
+### Module: `feature_defs/`
 
-### 3. Feature Generation with Fold-Based Architecture
+Trait-based feature registry - single source of truth for all features.
 
-**Problem:** Initial implementation had O(n²) complexity - for each impression, it scanned all events to compute features. Also had future data leakage - features could see clicks that happened AFTER the impression.
-
-**Solution:** Single-pass fold with Accumulator struct
-
+**Architecture:**
 ```rust
-struct Accumulator {
-    clicks_by_file: HashMap<String, Vec<ClickEvent>>,
-    scrolls_by_file: HashMap<String, Vec<ScrollEvent>>,
-    pending_impressions: HashMap<(String, u64, String), PendingImpression>,
-    output_rows: Vec<HashMap<String, String>>,
-}
-```
-
-**How it works:**
-1. Load all events and sessions from database into memory
-2. Sort events by timestamp (critical for temporal correctness)
-3. Single forward pass through events:
-   - **Impression**: Compute features using only data in accumulator (past events), add to pending_impressions
-   - **Click/Scroll**: Record in accumulator, mark matching pending impressions as label=1
-4. After pass completes, output all pending impressions as feature rows
-
-**Temporal correctness:**
-- Features like `clicks_last_30_days` filter with `c.timestamp <= impression.timestamp`
-- Only past events contribute to features
-- Labels CAN use future events (click happens after impression in same subsession)
-- This matches production: at inference time, model only sees past data
-
-**Performance:** O(n) instead of O(n²) - single pass through events
-
-### 4. Editor Launch and TUI Suspend/Resume
-
-**Challenge:** Need to suspend TUI, launch `hx` editor, then resume TUI when editor closes.
-
-**Gotcha #1:** Terminal state wasn't properly restored after editor closed - blank screen on resume.
-
-**Solution:**
-```rust
-// Suspend
-disable_raw_mode()?;
-terminal.backend_mut().execute(LeaveAlternateScreen)?;
-
-// Launch editor
-std::process::Command::new("hx").arg(&full_path).status();
-
-// Resume
-enable_raw_mode()?;
-terminal.backend_mut().execute(EnterAlternateScreen)?;
-terminal.clear()?;  // CRITICAL: must clear terminal
-```
-
-**Key insight:** Must use `terminal.backend_mut().execute()` (not `stdout().execute()`) to ensure we're using the same terminal instance. The `terminal.clear()` call is essential to wipe any leftover state.
-
-### 4. File Preview with Bat
-
-**Goal:** Show syntax-highlighted preview of selected file
-
-**First attempt:** Just read file contents and display as plain text
-```rust
-std::fs::read_to_string(&path)
-```
-
-**Problem:** No syntax highlighting, looks bland
-
-**Second attempt:** Use `bat --color=always` and display output
-```rust
-Command::new("bat")
-    .arg("--color=always")
-    .arg("--style=plain")
-    .arg("--line-range").arg(":100")
-    .output()
-```
-
-**Gotcha #2:** Terminal rendering was completely broken - saw raw ANSI escape codes like `^[[38;5;123m` mixed with colored text. Also saw "weird remnants of previous previews" when scrolling.
-
-**Root cause:** `bat` outputs ANSI escape codes for colors (e.g., `\x1b[31m` for red), but `ratatui`'s `Paragraph` widget doesn't parse these - it renders them literally. Need to convert ANSI codes to `ratatui::text::Text` with proper styling.
-
-**Solution:** Use `ansi-to-tui` crate
-```rust
-use ratatui::text::Text;
-
-match Command::new("bat")...output() {
-    Ok(output) => {
-        match ansi_to_tui::IntoText::into_text(&output.stdout) {
-            Ok(text) => text,
-            Err(_) => Text::from("[Unable to parse preview]"),
-        }
-    }
-}
-```
-
-**Key insight:** `ansi-to-tui::IntoText` expects `&[u8]` (byte slice), which is exactly what `output.stdout` is. The library handles UTF-8 conversion internally, so we don't need `from_utf8_lossy`. Just pass the raw bytes directly.
-
-**Why this works:**
-- `bat` outputs ANSI escape codes to `stdout`
-- `ansi-to-tui` parses these codes and converts them to `ratatui::text::Text` with proper `Style` applied to each span
-- `ratatui` renders the `Text` with colors intact
-- Terminal clears properly on each redraw, no remnants
-
-**Fallback:** If `bat` isn't installed, falls back to plain `std::fs::read_to_string`.
-
-## Event Loop
-
-Main loop does three things:
-
-1. **Receive files from walker** (non-blocking)
-   ```rust
-   while let Ok(path) = rx.try_recv() {
-       app.files.push(path);
-       app.update_filtered_files();
-   }
-   ```
-
-2. **Draw UI** using `ratatui`
-   - File list (left)
-   - Preview (right)
-   - Search input (bottom)
-
-3. **Handle keyboard input**
-   - Type characters → update query → filter files → log impressions
-   - Up/Down → move selection → updates preview
-   - Enter → log click, launch editor, resume TUI
-   - Ctrl-C or Esc → quit
-
-## Search and Filtering
-
-**Algorithm:** Case-insensitive substring match
-
-```rust
-let query_lower = self.query.to_lowercase();
-self.files.iter().filter(|path| {
-    relative_path.to_lowercase().contains(&query_lower)
-})
-```
-
-**No fuzzy matching yet** - just plain substring. Could add fuzzy matching later (e.g., using `fuzzy-matcher` crate) but kept it simple for MVP.
-
-## Dependencies
-
-- `ratatui` - TUI framework
-- `crossterm` - Terminal backend (handles raw mode, key events)
-- `walkdir` - Recursive directory traversal
-- `rusqlite` - SQLite database (with `bundled` feature for static linking)
-- `anyhow` - Error handling
-- `jiff` - Timestamps
-- `ansi-to-tui` - Convert ANSI escape codes to ratatui Text
-- `clap` - Command-line argument parsing
-- External: `bat` - Syntax highlighting (optional, has fallback)
-
-## Gotchas and Lessons Learned
-
-### 1. TUI Suspend/Resume is Tricky
-Must properly cleanup terminal state before launching child process, then restore. The `terminal.clear()` call is non-obvious but critical.
-
-### 2. ANSI Escape Codes Aren't Automatically Parsed
-`ratatui` doesn't magically handle ANSI codes - need explicit parsing with `ansi-to-tui`. Raw escape codes will render as literal text otherwise.
-
-### 3. Don't Double-Convert Bytes
-`ansi-to-tui` works on `&[u8]` and handles UTF-8 internally. Don't call `from_utf8_lossy` first - you'll lose information and create unnecessary allocations.
-
-### 4. Background File Walker Needs Channel
-Can't just block and wait for file scan to complete - large directories would freeze UI. Use `mpsc::channel` to stream results as they're discovered.
-
-### 5. Debounce Impression Logging
-Without debouncing, every keystroke would write to database. 200ms debounce batches impressions sensibly.
-
-### 6. Cargo Edition "2024" Doesn't Exist
-Initial `Cargo.toml` had `edition = "2024"` (probably from spec) but latest stable is `edition = "2021"`. Build would fail otherwise.
-
-### 7. Preview Scroll Lag and Blank Lines
-
-**Problem:** When scrolling preview, text below scroll position showed as blank. Also scrolling felt laggy/slow.
-
-**Root causes:**
-1. `bat --line-range :100` only fetched first 100 lines. Scrolling past line 100 showed blank because no data existed.
-2. Running `bat` on every frame (60+ times per second) was extremely slow. Each scroll triggered full re-render with new `bat` call.
-
-**Solution:** Preview caching
-- Fetch entire file once with `bat --paging=never` (no line limit)
-- Cache rendered `Text<'static>` in `App` state keyed by file path
-- On scroll, just adjust `Paragraph::scroll()` offset - no re-rendering needed
-- Invalidate cache when selection changes to different file
-
-**Result:** Smooth 60fps scrolling through arbitrarily long files. No more blank lines, no more lag.
-
-## Enhanced Context Tracking (Added)
-
-### What Changed
-
-Added comprehensive context tracking to understand the environment in which searches happen:
-
-1. **New `sessions` table** - Stores per-session context data
-2. **New `context.rs` module** - Gathers system/network/shell data
-3. **Enhanced `events` table** - Now includes full paths and file timestamps
-4. **Background context gathering** - Runs in separate thread at startup
-
-### Data Collected
-
-**Session-level (once per run):**
-- Working directory
-- Network gateway/subnet/DNS (helps identify location)
-- Last 10 shell commands (what user was doing before)
-- Running processes (what else is open)
-
-**Event-level (per impression/click):**
-- Both relative and absolute file paths
-- File modification time (mtime)
-- File access time (atime)
-
-### Implementation Details
-
-**File metadata timing:** Metadata (mtime/atime) is captured at event time, not discovery time. This is important because:
-- File could be modified between discovery and impression/click
-- Capturing at event time gives accurate "file state when user saw it"
-- Slight performance cost but more accurate data
-
-**Context gathering is asynchronous:**
-```rust
-std::thread::spawn(move || {
-    let context = context::gather_context();
-    if let Ok(db) = db::Database::new() {
-        let _ = db.log_session(&session_id_clone, &context);
-    }
-});
-```
-
-Spawns immediately at startup but doesn't block file walker or UI. Context commands can take 100-500ms combined (especially `ps` and network commands), so doing this async keeps startup snappy.
-
-**Shell script wrapping:** All system commands run via `sh -c` rather than direct `Command::new()`. This handles:
-- Piping (e.g., `netstat | grep | awk`)
-- Shell globbing
-- Command chaining
-
-**Error handling:** Every context field falls back to `"unknown"` on error. Never crash the app because of missing/unavailable system tools.
-
-### Why This Data?
-
-**Network context** (gateway/subnet/DNS) helps answer:
-- Is user at home, office, or coffee shop?
-- Different networks might correlate with different file access patterns
-- Could reveal patterns like "always searches for config files when on public WiFi"
-
-**Shell history** reveals:
-- What commands user ran before launching `psychic`
-- Possible intent (e.g., ran `git log` → likely searching for commit-related files)
-- Workflow patterns
-
-**Running processes** shows:
-- What applications are open (IDEs, browsers, terminals)
-- Multi-tasking behavior
-- Could correlate with file types accessed
-
-**File timestamps** enable:
-- "User tends to click recently modified files"
-- "Files accessed recently are clicked more"
-- Time-based relevance signals
-
-All of this enables richer analysis and potentially ML-based ranking in the future.
-
-## UI Enhancements (Added)
-
-### What Changed
-
-Added several UX improvements to make the TUI more informative and interactive:
-
-1. **Rank numbers** - Each file in results list shows its position (1., 2., 3., etc.)
-2. **Time ago column** - Shows how long ago each file was modified (e.g., "2 hours ago", "3 days ago")
-3. **Preview scrolling** - Mouse wheel scrolls the preview pane instead of results list
-4. **Scroll event tracking** - Logs "scroll" action when user scrolls preview
-
-### Implementation Details
-
-**Rank numbers:** Simple enumeration in the file list rendering:
-```rust
-let rank = i + 1;
-let line = format!("{:2}. {:<50} {}", rank, file, time_ago);
-```
-
-**Time ago formatting:** Uses `timeago` crate for human-readable relative timestamps:
-```rust
-let formatter = timeago::Formatter::new();
-formatter.convert(duration)
-```
-
-Produces output like "just now", "5 minutes ago", "2 days ago", "3 weeks ago", etc. Much more readable than unix timestamps or ISO dates.
-
-Used in multiple places:
-- Historical files list (showing when files were last accessed)
-- Debug pane: Model trained timestamp
-- Debug pane: Model load time ("Model load: 2 minutes ago")
-- Debug pane: Clicks reload time ("Clicks reload: 5 seconds ago")
-
-**In-memory logging for debug pane:** Uses `fern` crate to dispatch logs to multiple outputs:
-```rust
-let (log_tx, log_rx) = mpsc::channel();
-
-fern::Dispatch::new()
-    .format(|out, message, record| {
-        out.finish(format_args!(
-            "[{} {} {}] {}",
-            timestamp, record.level(), record.target(), message
-        ))
-    })
-    .level(log::LevelFilter::Debug)
-    .chain(fern::log_file(log_file)?)  // File output
-    .chain(log_tx)  // Memory output via channel
-    .apply()?;
-```
-
-Recent logs are collected in a `VecDeque<String>` with max 50 entries (circular buffer):
-- Event loop drains `log_rx` channel (non-blocking)
-- Pushes messages to `app.recent_logs`
-- Pops oldest when over limit
-- Debug pane shows last 10 lines (30 when maximized), truncated to 60 chars (120 when maximized)
-
-**Debug pane maximization:** Press `Ctrl-O` to toggle:
-- Normal view: 35% file list, 45% preview, 20% debug
-- Maximized view: 25% file list, 0% preview (hidden), 75% debug
-- Shows more logs and longer lines when maximized
-- Title updates to show current state and keybinding
-
-**Preview scrolling:**
-- Added `preview_scroll: u16` to `App` state
-- `Paragraph::scroll((app.preview_scroll, 0))` controls vertical offset
-- Mouse events (ScrollUp/ScrollDown) adjust scroll position by 3 lines
-- Scroll position resets to 0 when selection changes (different file = start at top)
-
-**Preview caching (performance fix):**
-- Added `preview_cache: Option<(String, Text<'static>)>` to cache rendered preview
-- Fetch entire file once with `bat --color=always --style=numbers --paging=never`
-- `--style=numbers` shows line numbers in preview
-- Cache keyed by full file path
-- Cache invalidated when selection changes
-- Eliminates lag - `bat` only runs once per file, not on every frame
-- Fixes blank text issue - entire file is cached, not just first 100 lines
-
-**Mouse capture:**
-```rust
-stdout().execute(crossterm::event::EnableMouseCapture)?;
-```
-
-Must enable at startup and disable on cleanup. Also disable/enable when launching editor to avoid interfering with editor's mouse handling.
-
-**Scroll event logging:** New "scroll" action type in events table. Indicates user interest without full click commitment. Useful for distinguishing:
-- **Impression** - File appeared in top 10
-- **Scroll** - User scrolled preview (definitely looked at it)
-- **Click** - User opened file in editor (highest intent)
-
-This creates a hierarchy of engagement levels for later analysis.
-
-**Scroll event deduplication:**
-- Track scrolled files in `HashSet<(String, String)>` - key is `(query, full_path)`
-- Only log scroll once per session for each unique (query, file) combination
-- Prevents spam: user might scroll up/down many times on same file
-- Check `scrolled_files.contains(&key)` before logging
-- Per-session deduplication (not global) - resets each time app starts
-
-### Why Mouse Scroll for Preview?
-
-Original behavior: mouse scroll moved selection up/down in results list.
-
-**Problem:** Most users navigate results with keyboard (up/down arrows are faster). Mouse scroll on results list is redundant and not commonly used.
-
-**Better use:** Scroll the preview pane. Users want to see more of the file before deciding to open it. Preview was limited to first ~100 lines with no way to see more. Now mouse wheel scrolls through the file content.
-
-**Result:** Much more useful interaction. Keyboard for navigation (fast), mouse for exploration (natural).
-
-### Clippy and Release Builds
-
-**Added policy:** Always run `cargo clippy --release -- -D warnings` before considering a build done. Treats all warnings as errors for code quality.
-
-**Clippy fixes made:**
-1. Removed unused imports (`Scrollbar`, `ScrollbarOrientation`, `ScrollbarState`) that were added but not used
-2. Fixed "too many arguments" warning by introducing `EventData` struct to bundle event parameters
-
-**Release mode:** All builds now `--release` for production-ready performance. Debug builds are slow, especially for TUI rendering.
-
-## ML-Powered Ranking with LightGBM (Added)
-
-### Overview
-
-Integrated a **LightGBM LambdaRank** model for learning-to-rank file search results based on user interactions. The ranker scores files using features like query matching, click history, and modification time, then re-orders results to show most relevant files first.
-
-### Architecture
-
-**New components:**
-1. **`ranker.rs`** - LightGBM model inference and feature computation
-2. **`train.py`** - Python script for training ranking model
-3. **Model storage** - `~/.local/share/psychic/model.txt` (next to events.db)
-4. **3-column TUI layout** - Added ML features display panel
-
-### Model: `ranker.rs`
-
-**Purpose:** Load trained LightGBM model and score files in real-time.
-
-```rust
-pub struct Ranker {
-    model: Booster,
-    click_counts: HashMap<String, usize>, // Preloaded click data
-}
-```
-
-**Key features computed:**
-- `filename_starts_with_query` (binary 0/1)
-- `clicks_last_30_days` (integer count)
-- `modified_today` (binary 0/1)
-
-**Performance optimization:**
-- Preloads ALL click data from last 30 days at startup into HashMap
-- O(1) lookup per file vs O(n) database query per file
-- Database query runs once: `SELECT full_path, COUNT(*) FROM events WHERE action='click' AND timestamp >= ?1 GROUP BY full_path`
-- Composite index on `(action, timestamp, full_path)` speeds up query
-
-**Initialization:**
-```rust
-let ranker = Ranker::new(&model_path, db_path)?;
-// Loads model from ~/.local/share/psychic/model.txt
-// Preloads all click counts into memory
-```
-
-**Ranking process:**
-```rust
-let scored = ranker.rank_files(&query, &matching_files, &session_id)?;
-// Returns Vec<FileScore> sorted by predicted relevance (descending)
-```
-
-**FileScore struct:**
-```rust
-pub struct FileScore {
-    pub path: String,
-    pub score: f64,
-    pub features: HashMap<String, f64>,
-}
-```
-
-### Training Script: `train.py`
-
-**Purpose:** Train LightGBM ranking model from feature CSV exported by `psychic generate-features`.
-
-**Key characteristics:**
-- **Objective:** `lambdarank` (learning-to-rank)
-- **Metric:** NDCG (Normalized Discounted Cumulative Gain)
-- **Grouping:** By subsession_id (each search query = one ranking problem)
-- **Features:** Only numeric features (Rust lightgbm3 doesn't support categorical)
-
-**Usage:**
-```bash
-psychic generate-features  # Export features.csv
-python train.py features.csv output  # Train model
-# Outputs:
-#   - output.txt (model for current directory)
-#   - ~/.local/share/psychic/model.txt (model for TUI)
-#   - output_viz.pdf (feature importance, SHAP analysis, NDCG metrics)
-```
-
-**Model saves to two locations:**
-1. `output.txt` in current directory (for version control/inspection)
-2. `~/.local/share/psychic/model.txt` (where TUI looks for it)
-
-**Visualizations generated:**
-- Training curves (NDCG@5 over iterations)
-- Feature importance (gain, split count, correlation)
-- SHAP summary plots (mean |SHAP value| and impact distribution)
-- SHAP dependence plots for top 4 features
-- Score distributions (clicked vs not clicked)
-- Rank position analysis (where do clicked items appear?)
-
-**Categorical features removed:**
-- Original features included `query` and `file_path` as categorical
-- Rust `lightgbm3` crate only supports numeric features
-- Removed from training data: `df.drop(columns=["query", "file_path", ...])`
-- Can add back later with manual mapping to numeric codes
-
-### UI Changes: 3-Column Layout
-
-**New layout:**
-```
-┌────────────────┬──────────────────┬─────────────────┐
-│  File List     │   Preview        │  ML Features    │
-│  (35%)         │   (45%)          │  (20%)          │
-│                │                  │                 │
-│ 1. file.rs     │  [bat output]    │ Score: 0.7234   │
-│ 2. main.rs     │                  │                 │
-│ ...            │                  │ Features:       │
-│                │                  │  Query Match: 1 │
-│                │                  │  Clicks (30d): 3│
-│                │                  │  Modified Today:│
-└────────────────┴──────────────────┴─────────────────┘
-┌───────────────────────────────────────────────────────┐
-│   Search Input (bottom)                               │
-└───────────────────────────────────────────────────────┘
-```
-
-**Features panel shows:**
-- **Score** - LightGBM predicted relevance score
-- **Features** - All computed features with readable labels
-- Shows "No features (ranking enabled)" when model loaded but no file selected
-- Shows "No features (ranking disabled)" when no model found
-
-**Fallback behavior:**
-- If `~/.local/share/psychic/model.txt` doesn't exist → simple substring filtering
-- Logs: `"No ranking model found at {:?} - using simple filtering"`
-- If model load fails → logs warning and falls back to filtering
-- Application always works, ranking is optional enhancement
-
-### Performance Improvements
-
-**Problem:** Startup was slow with many files due to calling `update_filtered_files()` for every single file received from walker.
-
-**Root cause:**
-```rust
-// BAD: Called 816 times, 817 times, 818 times...
-while let Ok(path) = rx.try_recv() {
-    app.files.push(path);
-    app.update_filtered_files();  // ← Re-filters and re-ranks ALL files!
-}
-```
-
-Each call:
-1. Filters all files (with mtime lookup for each)
-2. Ranks all matching files with ML model
-3. Sorts results
-
-With 800 files, this is 800 filter+rank+sort operations instead of 1.
-
-**Solution:** Batch file updates
-```rust
-let mut received_files = false;
-while let Ok(path) = rx.try_recv() {
-    app.files.push(path);
-    received_files = true;
-}
-
-// Only update once after receiving all available files
-if received_files {
-    app.update_filtered_files();
-}
-```
-
-**Result:** Dramatic startup speedup. Instead of hundreds of rank operations, only 1 per event loop iteration.
-
-**Timing instrumentation added:**
-- App::new() timing (database init, ranker init)
-- update_filtered_files() timing (filtering, ranking)
-- All logs go to `~/.local/share/psychic/app.log` (not stderr, which disrupts TUI)
-
-### Logging Infrastructure
-
-**Problem:** Using `eprintln!` for debugging made terminal display "all weird" because it interferes with TUI rendering.
-
-**Solution:** File-based logging with `log` + `env_logger` crates
-
-**Setup:**
-```rust
-// Initialize at start of main()
-let log_file = PathBuf::from(home)
-    .join(".local/share/sg/app.log");
-
-env_logger::Builder::new()
-    .target(env_logger::Target::Pipe(Box::new(file)))
-    .filter_level(log::LevelFilter::Debug)
-    .init();
-```
-
-**All eprintln! replaced with log macros:**
-- `log::info!()` - Model loading, startup messages
-- `log::warn!()` - Ranking failures, fallbacks
-- `log::error!()` - Editor launch failures
-- `log::debug!()` - Timing data, performance metrics
-
-**Logs written to:** `~/.local/share/psychic/app.log`
-
-**Example log output:**
-```
-[2025-10-07T02:08:35Z INFO  psychic] Started sg in directory /path/to/project, session 12345
-[2025-10-07T02:08:35Z DEBUG psychic] Database initialization took 2.3ms
-[2025-10-07T02:08:35Z DEBUG psychic] Loaded 143 click counts from last 30 days
-[2025-10-07T02:08:35Z DEBUG psychic] Ranker initialization took 45.2ms
-[2025-10-07T02:08:35Z DEBUG psychic] Filtering 820 files (with metadata) took 1.4ms
-[2025-10-07T02:08:35Z DEBUG psychic] Ranking took 2.2ms
-```
-
-### Database Enhancements
-
-**New method:**
-```rust
-pub fn get_previously_interacted_files(&self) -> Result<Vec<String>> {
-    // Get all unique full_paths that have been clicked or scrolled
-    let mut stmt = self.conn.prepare(
-        "SELECT DISTINCT full_path
-         FROM events
-         WHERE action IN ('click', 'scroll')
-         ORDER BY timestamp DESC"
-    )?;
-    // ...
-}
-```
-
-**Purpose:** Include historical files in search results even if not found by current directory walker.
-
-**Use case:**
-- User previously clicked `config/database.yml` in different project
-- Current project doesn't have that file
-- But similar file path might exist and should be surfaced
-- Useful for cross-project patterns
-
-**Implementation:**
-- Load historical files at startup
-- Store in `App.historical_files: Vec<PathBuf>`
-- Filter out files that don't exist (check `path.exists()`)
-- Include in search results if they match query and aren't already in results
-- Merge with walkdir results before ranking
-
-### UI/UX Improvements
-
-**1. Keyboard shortcut: Clear search**
-- **Key:** Ctrl-U
-- **Action:** Clears entire search query
-- **Standard:** Follows readline convention (Ctrl-U = kill line backward)
-
-**2. Auto-scroll for file list**
-- **Problem:** When navigating down, selected item would go off-screen
-- **Solution:** Automatic scrolling when selection near bottom
-- **Implementation:**
-  - Track `file_list_scroll: u16` offset
-  - `update_scroll(visible_height)` adjusts scroll position
-  - When selected item in bottom 5 rows → scroll to keep it visible
-  - Skip/take on file list rendering based on scroll offset
-
-**3. Right-justified modification time**
-- **Problem:** Fixed-width formatting caused misaligned time column
-- **Solution:** Dynamic width calculation based on actual terminal size
-```rust
-let list_width = top_chunks[0].width.saturating_sub(2); // subtract borders
-let available = list_width.saturating_sub(prefix_len + time_len);
-let file_width = available.saturating_sub(2); // padding
-format!("{}{:<width$}  {}", rank_prefix, file, time_ago, width = file_width)
-```
-- **Result:** Time column always right-aligned regardless of filename length
-
-**4. Historical files in results**
-- Previously clicked/scrolled files included in search
-- Expands search beyond current directory
-- Useful for finding files you accessed before but aren't in current tree
-
-### Performance: Zero-Copy Optimizations
-
-**Problem:** Unnecessary clones in hot path
-
-**Ranker signature change:**
-```rust
-// BEFORE: Takes owned Vec (requires clone at call site)
-pub fn rank_files(&self, files: Vec<(String, PathBuf, Option<i64>)>) -> Result<Vec<FileScore>>
-
-// AFTER: Takes slice reference (zero-copy)
-pub fn rank_files(&self, files: &[(String, PathBuf, Option<i64>)]) -> Result<Vec<FileScore>>
-```
-
-**Call site improvement:**
-```rust
-// BEFORE: Clone matching_files just to pass to ranker
-ranker.rank_files(&self.query, matching_files.clone(), &self.session_id)
-
-// AFTER: Pass reference, no clone
-ranker.rank_files(&self.query, &matching_files, &self.session_id)
-```
-
-**Also removed:**
-- Clone of features HashMap when creating FileScore (move instead)
-- Clone of scored results when updating filtered_files
-
-**Result:** Reduced memory allocations in ranking hot path.
-
-### Database Indexes
-
-**Added index for click count queries:**
-```sql
-CREATE INDEX IF NOT EXISTS idx_events_click_lookup
-ON events(action, timestamp, full_path)
-```
-
-**Covers query:**
-```sql
-SELECT full_path, COUNT(*) as count
-FROM events
-WHERE action = 'click' AND timestamp >= ?1
-GROUP BY full_path
-```
-
-**Performance:** O(log n) index lookup vs O(n) table scan for 30-day click aggregation.
-
-## LambdaMART Group-Based Ranking (Added)
-
-### What Changed
-
-Modified the grouping strategy for LambdaMART training from subsession-based to engagement-based sequences:
-
-**Previous behavior:**
-- Groups were based on `subsession_id` (one group per query/search)
-- Each unique query within a session created a new group
-- All impressions for that query belonged to the same group
-
-**New behavior:**
-- Groups span from one engagement event (click/scroll) to the next
-- `group_id` starts at 0 and increments on:
-  - Each click or scroll event
-  - Each new session boundary
-- Creates more meaningful ranking tasks where each group represents impressions leading to an action
-
-### Implementation Details
-
-**features.rs changes:**
-1. Added `current_group_id: u64` to `Accumulator` struct
-2. Added `last_session_id: Option<String>` to track session boundaries
-3. `group_id` field added to CSV output
-4. In `add_impression()`: checks for session changes and assigns current `group_id`
-5. In `mark_impressions_as_engaged()`: increments `group_id` after marking labels
-6. New feature: `is_under_cwd` - binary feature indicating if file is under the session's working directory
-
-**train.py changes:**
-- Changed from `subsession_id` to `group_id` for grouping
-- Updated to exclude `group_id` from features (used only for grouping)
-- Added `is_under_cwd` to binary features list
-
-**Why this approach:**
-- More granular ranking tasks - each group represents a coherent search-to-action sequence
-- Better aligns with user behavior - impressions before an action vs after
-- Reduces group size variance - subsessions could have very different lengths
-- Session boundaries create natural breaks in the data
-
-**Example:**
-```
-Session 1:
-  Impression A, B, C → Click on B  [group_id: 0]
-  Impression D, E → Scroll on E    [group_id: 1]
-  Impression F, G, H              [group_id: 2]
-Session 2:
-  Impression I, J → Click on J     [group_id: 3]
-```
-
-Each group becomes a learning-to-rank problem where the model learns which files should be ranked higher.
-
-## Summary of Session Work
-
-This session added significant ML and performance enhancements:
-
-**ML Infrastructure:**
-1. LightGBM ranking model integration (`ranker.rs`)
-2. Model training pipeline (`train.py` improvements)
-3. 3-column TUI layout with ML features display
-4. Preloaded click data for O(1) feature computation
-5. Database index for efficient click aggregation
-
-**Performance:**
-1. Batched file updates (800x speedup during startup)
-2. Zero-copy ranker API (slice references)
-3. File-based logging (no TUI disruption)
-4. Timing instrumentation for bottleneck analysis
-
-**UX:**
-1. Ctrl-U to clear search
-2. Auto-scroll in file list
-3. Right-justified time column
-4. Historical files in search results
-
-**Infrastructure:**
-1. Model storage in `~/.local/share/psychic/`
-2. Log output to `app.log`
-3. Startup logging with session/directory info
-4. Comprehensive debug timing
-
-All improvements maintain backward compatibility - app works without model (falls back to simple filtering).
-
-## Trait-Based Feature System Refactor (Added)
-
-### Problem
-
-Adding new features required updating 7+ places manually:
-- Feature computation in features.rs
-- Feature computation in ranker.rs
-- Feature name ordering in multiple places
-- CSV column order
-- Python feature lists
-- Binary vs numeric type tracking
-
-This was brittle and error-prone.
-
-### Solution: Single Source of Truth
-
-Created a trait-based feature registry system where **all features are defined once** in `src/feature_defs/`:
-
-**Core architecture:**
-```rust
-// schema.rs - trait definition
+// schema.rs
 pub trait Feature: Send + Sync {
     fn name(&self) -> &'static str;
     fn feature_type(&self) -> FeatureType;
     fn compute(&self, inputs: &FeatureInputs) -> Result<f64>;
 }
 
-// implementations.rs - all features in one file
+// implementations.rs - all features implement trait
 pub struct FilenameStartsWithQuery;
 impl Feature for FilenameStartsWithQuery {
     fn name(&self) -> &'static str { "filename_starts_with_query" }
@@ -1029,382 +183,308 @@ pub static FEATURE_REGISTRY: Lazy<Vec<Box<dyn Feature>>> = Lazy::new(|| {
 });
 ```
 
-**Key benefits:**
-- **Single implementation** - Each feature has one `compute()` method used everywhere
-- **Automatic ordering** - Registry order determines feature vector order (no manual synchronization)
-- **Type safety** - Features export their type (binary/numeric) automatically
-- **Schema export** - JSON schema generated directly from registry
-- **Easy to add features** - Implement trait, add to registry, done
+Why: Adding a new feature only requires: (1) implement trait, (2) add to registry. No manual synchronization across files. Feature vector order comes from registry order automatically.
 
-**Cross-language integration:**
+**Schema export:** `generate-features` command outputs `feature_schema.json` with feature names and types.
+Why: Python training script reads schema to know feature order and types. No manual duplication.
+
+### Module: `features.rs`
+
+Generates training data from events database.
+
+**Approach:** Single-pass fold with temporal correctness.
+
+```rust
+struct Accumulator {
+    clicks_by_file: HashMap<String, Vec<ClickEvent>>,
+    scrolls_by_file: HashMap<String, Vec<ScrollEvent>>,
+    pending_impressions: HashMap<(String, u64, String), PendingImpression>,
+    output_rows: Vec<HashMap<String, String>>,
+    current_group_id: u64,
+}
+```
+
+**Process:**
+1. Load all events and sessions from database
+2. Sort by timestamp (critical for temporal correctness)
+3. Single forward pass:
+   - Impression: Compute features from accumulator (only past data), store as pending
+   - Click/Scroll: Record in accumulator, mark matching pending impressions as label=1, increment group_id
+4. Output all pending impressions as CSV rows
+
+Why single-pass: O(n) instead of O(n²). No future data leakage (features only see past events).
+
+**Group-based ranking:** Each group spans from one engagement event to the next.
+Why: LambdaRank needs groups. Each group = impressions leading to an action. More meaningful than subsession-based grouping.
+
+**Features computed:** See `feature_defs/implementations.rs` for full list. Examples:
+- Query matching: filename_starts_with_query, filename_contains_query
+- Click history: clicks_last_30_days, ever_clicked
+- File properties: is_hidden, is_under_cwd, path_depth
+- Temporal: modified_today, seconds_since_mod
+
+### Module: `ranker.rs`
+
+LightGBM model inference for scoring files.
+
+```rust
+pub struct Ranker {
+    model: Booster,
+    clicks: HashMap<String, usize>,  // Preloaded click counts
+    stats: Option<ModelStats>,
+}
+```
+
+**Preloading clicks:** All click counts from last 30 days loaded at startup into HashMap.
+Why: O(1) lookup per file vs O(n) query per file. Database query runs once with composite index.
+
+**Ranking:**
+```rust
+pub fn rank_files(
+    &self,
+    query: &str,
+    file_candidates: &[FileCandidate],
+    current_timestamp: i64,
+    cwd: &PathBuf,
+) -> Result<Vec<FileScore>>
+```
+
+Returns `Vec<FileScore>` sorted by predicted relevance (descending).
+
+**FileScore:**
+```rust
+pub struct FileScore {
+    pub file_id: usize,  // Index into file registry
+    pub score: f64,
+    pub features: Vec<f64>,  // For debug display
+}
+```
+
+Why file_id instead of path string: No string cloning in hot path. Direct O(1) mapping back to file registry.
+
+**Thread safety:** Ranker wrapped in `SendRanker` with `unsafe impl Send`.
+Why: LightGBM Booster contains raw pointers (not Send by default). Safe because model is read-only.
+
+### Training: `train.py`
+
+Trains LightGBM LambdaRank model from features CSV.
+
+**Key parameters:**
+- Objective: `lambdarank`
+- Metric: NDCG (Normalized Discounted Cumulative Gain)
+- Grouping: `group_id` (engagement-based sequences)
+
+**Usage:**
 ```bash
-# Rust exports schema
-cargo run --release -- generate-features
-# Outputs: features.csv + feature_schema.json
-
-# Python reads schema
+psychic generate-features  # Outputs features.csv + feature_schema.json
 python train.py features.csv output
-# Reads feature_schema.json to get feature names and types
+# Outputs:
+#   - output.txt (model file)
+#   - ~/.local/share/psychic/model.txt (copy for TUI)
+#   - output_viz.pdf (feature importance, SHAP, metrics)
 ```
 
-**Schema format (simplified):**
-```json
-{
-  "features": [
-    {"name": "filename_starts_with_query", "type": "binary"},
-    {"name": "clicks_last_30_days", "type": "numeric"},
-    {"name": "is_hidden", "type": "binary"}
-  ]
-}
+**Schema integration:** Reads `feature_schema.json` to get feature names and types. Errors if missing.
+Why: Ensures Rust and Python agree on feature order.
+
+**Visualizations:** Training curves, feature importance, SHAP analysis, score distributions, rank position analysis.
+
+### Module: `main.rs`
+
+TUI event loop using ratatui + crossterm.
+
+**Layout:**
+```
+┌─────────────┬─────────────┬──────────────┐
+│  File List  │   Preview   │ Debug/Stats  │
+│   (35%)     │    (45%)    │    (20%)     │
+│             │             │              │
+│ 1. file.rs  │ [bat output]│ Score: 0.72  │
+│ 2. main.rs  │             │ Features:    │
+│ ...         │             │  Clicks: 3   │
+└─────────────┴─────────────┴──────────────┘
+┌──────────────────────────────────────────┐
+│   Search Input (bottom)                  │
+└──────────────────────────────────────────┘
 ```
 
-**Files changed:**
-- `src/feature_defs/` - New module with schema, implementations, registry
-- `src/features.rs` - Now uses registry for computation
-- `src/ranker.rs` - Now uses registry for inference
-- `src/main.rs` - CLI changed to `generate-features` subcommand, auto-generates schema
-- `train.py` - Reads feature_schema.json (errors if missing)
-- `Cargo.toml` - Added once_cell dependency
+**Debug pane maximization:** Ctrl-O toggles 75% debug / 25% file list (hides preview).
+Why: More space for logs and longer lines when debugging.
 
-**New features added using this system:**
-- `is_under_cwd` - File is under current working directory (binary)
-- `is_hidden` - Path contains hidden directory component (binary)
-
-### Renaming: sg → psychic
-
-Changed binary and directory names:
-- Binary: `sg` → `psychic` (in Cargo.toml)
-- Data directory: `~/.local/share/sg/` → `~/.local/share/psychic/`
-- Updated: db.rs, main.rs, train.py, how-it-works.md
-- Log file: `~/.local/share/psychic/app.log`
-- Database: `~/.local/share/psychic/events.db`
-- Model: `~/.local/share/psychic/model.txt`
-
-### Performance Limit
-
-Added MAX_FILES = 5000 limit in walker.rs to cap file discovery for now. Will optimize later.
-
-## Async Worker Thread Architecture (Added)
-
-### Problem
-
-The synchronous filtering/ranking implementation caused UI lag:
-
-1. **Blocking on every keystroke**: Each character typed would block for 30-80ms while filtering/ranking
-2. **Cumulative lag**: Typing "hello" = 5 × 50ms = 250ms of UI freezing
-3. **Poor responsiveness**: No ability to type ahead or cancel outdated queries
-4. **Wasted computation**: If user types quickly, intermediate queries are computed but never used
-
-### Solution: Worker Thread with Async Communication
-
-Moved all file data and ranking logic to a dedicated worker thread that processes queries asynchronously:
-
-**Thread architecture:**
+**Subsession tracking:**
 ```rust
-// Main UI Thread: Renders UI, handles events, polls for updates
-// Worker Thread: Owns all file data, does filtering/ranking
-// Walker Thread: Discovers files, sends to worker (not main)
+struct Subsession {
+    id: u64,
+    query: String,
+    created_at: Instant,
+    impressions_logged: bool,
+}
 ```
 
-**Data flow:**
-```
-[Walker] → (path, mtime) → [Worker]
-[Main] → UpdateQuery("foo") → [Worker]
-[Worker] → QueryUpdated{visible_slice, total} → [Main]
-```
+New subsession created on query change. Impressions logged after 200ms (debounced) or immediately before click/scroll.
+Why debounce: Prevents database spam on every keystroke.
+Why force logging before engagement: Ensures temporal consistency (impressions exist before their labels).
 
-**Worker thread owns:**
-- `file_registry: Vec<FileInfo>` - All file metadata
-- `path_to_id: HashMap<PathBuf, FileId>` - Deduplication map
-- `filtered_files: Vec<FileId>` - Ranked results
-- `file_scores: Vec<FileScore>` - Scores and features
-- `ranker: Ranker` - ML model (wrapped in SendRanker for thread safety)
+**Event loop:**
+1. Poll worker responses (non-blocking `try_recv`)
+2. Drain logging channel (non-blocking)
+3. Poll keyboard/mouse events (50ms timeout)
+4. Check and log impressions if >200ms elapsed
+5. Draw UI
 
-**Main thread only keeps:**
-- `visible_files: Vec<DisplayFileInfo>` - Only what's visible (20-40 items)
-- `total_results: usize` - Count of filtered files
-- `query: String` - Current search query
-- Channels for worker communication
+**Keyboard:**
+- Type → send UpdateQuery to worker
+- Up/Down → move selection, request new visible slice if needed
+- Enter → log click, launch editor, resume TUI
+- Ctrl-U → clear query
+- Ctrl-O → toggle debug pane
+- Ctrl-C/Esc → quit
 
-**Communication types:**
+**Mouse:**
+- ScrollUp/ScrollDown → scroll preview pane
+
+Why mouse scrolls preview: Keyboard for navigation (fast), mouse for exploration (natural). Most users don't use mouse for results list.
+
+**Preview:**
+- Uses `bat --color=always --style=numbers --paging=never`
+- `ansi-to-tui` crate converts ANSI codes to ratatui Text
+- Cached by file path (invalidated on selection change)
+- Scrollable with mouse wheel
+
+Why cache: Running bat on every frame is slow. Cache entire file once, scroll offset is instant.
+Why ansi-to-tui: ratatui doesn't parse ANSI codes natively. Without it, raw escape codes appear as literal text.
+
+**Editor launch:**
 ```rust
-enum WorkerRequest {
-    UpdateQuery(String),
-    GetVisibleSlice { start: usize, count: usize },
-    ReloadModel,
-    ReloadClicks,
-}
-
-enum WorkerResponse {
-    QueryUpdated {
-        query: String,
-        total_results: usize,
-        total_files: usize,
-        visible_slice: Vec<DisplayFileInfo>,
-        model_stats: Option<ModelStats>,
-    },
-    VisibleSlice(Vec<DisplayFileInfo>),
-}
-
-struct DisplayFileInfo {
-    display_name: String,
-    full_path: PathBuf,
-    score: f64,
-    features: Vec<f64>,  // For debug display
-}
+disable_raw_mode()?;
+terminal.backend_mut().execute(LeaveAlternateScreen)?;
+Command::new("hx").arg(&full_path).status()?;
+enable_raw_mode()?;
+terminal.backend_mut().execute(EnterAlternateScreen)?;
+terminal.clear()?;  // CRITICAL
 ```
 
-**Worker loop:**
+Why `terminal.backend_mut().execute()`: Must use same terminal instance (not stdout()).
+Why `terminal.clear()`: Wipes leftover state from editor. Without it, blank screen on resume.
+
+**Logging:** Uses `fern` crate with dual dispatch:
+- File output: `~/.local/share/psychic/app.log`
+- Memory output: mpsc channel → VecDeque (circular buffer, 50 lines max)
+
+Why dual dispatch: File for persistence, memory for debug pane. Never use eprintln (disrupts TUI).
+
+**Scroll event deduplication:** HashSet<(query, full_path)> tracks scrolled files per session.
+Why: User might scroll up/down many times. Only log once per (query, file) combination.
+
+## Page-Based Caching
+
+**Problem:** Scrolling results list had noticeable lag when file list was large.
+
+**Solution:** Page-based caching with prefetch.
+
 ```rust
-fn worker_thread_loop(
-    rx: Receiver<WorkerRequest>,
-    result_tx: Sender<WorkerResponse>,
-    walker_rx: Receiver<(PathBuf, Option<i64>)>,
-    mut state: WorkerState,
-) {
-    let mut last_update = Instant::now();
-    let mut files_changed = false;
-
-    loop {
-        // Process walker updates (non-blocking)
-        while let Ok((path, mtime)) = walker_rx.try_recv() {
-            state.add_file(path, mtime);
-            files_changed = true;
-        }
-
-        // Auto-refresh if files changed and >100ms elapsed
-        if files_changed && last_update.elapsed() > Duration::from_millis(100) {
-            state.filter_and_rank(&state.current_query)?;
-            let visible_slice = state.get_slice(0, 20);
-            let _ = result_tx.send(WorkerResponse::QueryUpdated {
-                query: state.current_query.clone(),
-                total_results: state.filtered_files.len(),
-                total_files: state.file_registry.len(),
-                visible_slice,
-                model_stats: state.ranker.0.stats.clone(),
-            });
-            files_changed = false;
-            last_update = Instant::now();
-        }
-
-        // Process work requests with 5ms timeout (for debouncing)
-        match rx.recv_timeout(Duration::from_millis(5)) {
-            Ok(WorkerRequest::UpdateQuery(query)) => {
-                // Drain all pending queries, process only latest
-                let query = drain_latest_query(&rx, query);
-                state.filter_and_rank(&query)?;
-                // Send results...
-            }
-            Ok(WorkerRequest::ReloadModel) => {
-                state.reload_model()?;
-                state.filter_and_rank(&state.current_query)?;
-                // Send results...
-            }
-            // ... other requests
-        }
-    }
-}
-```
-
-**Debouncing:**
-```rust
-// Helper to drain all pending queries and return latest
-fn drain_latest_query(rx: &Receiver<WorkerRequest>, initial: String) -> String {
-    let mut latest = initial;
-    while let Ok(WorkerRequest::UpdateQuery(query)) = rx.try_recv() {
-        latest = query;
-    }
-    latest
-}
-```
-
-**Main thread integration:**
-```rust
-// On keystroke
-KeyCode::Char(c) => {
-    app.query.push(c);
-    let _ = app.worker_tx.send(WorkerRequest::UpdateQuery(app.query.clone()));
-    // Continue immediately, UI renders with old visible_files
-}
-
-// Poll for results (non-blocking)
-while let Ok(response) = app.worker_rx.try_recv() {
-    match response {
-        WorkerResponse::QueryUpdated { query, visible_slice, total_results, model_stats, .. } => {
-            if query == app.query {  // Only apply if still current
-                app.visible_files = visible_slice;
-                app.total_results = total_results;
-                app.model_stats_cache = model_stats;
-                // ... create subsession
-            }
-        }
-        WorkerResponse::VisibleSlice(slice) => {
-            app.visible_files = slice;
-        }
-    }
-}
-```
-
-**Auto-refresh on file discovery:**
-- Worker receives files from walker via `walker_rx`
-- Sets `files_changed = true` flag
-- Every 100ms, re-filters/ranks current query and sends updated results to main thread
-- Main thread automatically sees new files without user interaction
-
-**Thread safety for LightGBM:**
-```rust
-// Ranker contains raw pointers (not Send by default)
-struct SendRanker(ranker::Ranker);
-unsafe impl Send for SendRanker {}
-// Safe because: model only used for read-only inference
-```
-
-### Performance Gains
-
-1. **Non-blocking input**: Keystrokes take <1ms (just channel send)
-2. **Debounced processing**: Typing "hello" quickly = 1 query processed (not 5)
-3. **Responsive UI**: Can type ahead while worker processes previous query
-4. **Auto-updating results**: New files appear automatically as walker discovers them
-5. **Stale results OK**: User sees old results briefly while new ones compute (acceptable trade-off)
-
-### File Registry Refactor (Added)
-
-**Note:** File registry is now owned by WorkerState, not App. Main thread only has visible slice.
-
-The previous implementation had major performance issues:
-
-1. **Metadata fetched on every filter**: `get_file_metadata()` called repeatedly for same files whenever query changed
-2. **Display paths recomputed on every filter**: `FileEntry::from_walkdir()` / `from_history()` called repeatedly
-3. **String-based lookups were O(n²)**: After ranking, linear search through file_entries for each scored file
-4. **Excessive string cloning**: FileScore contained `path: String`, then cloned into Vec, then searched by it
-5. **Walker metadata thrown away**: walkdir caches metadata from syscall, but we only sent PathBuf then re-fetched metadata later
-
-Created a central file registry where all files are stored once with their metadata (now in WorkerState):
-
-**Core architecture:**
-```rust
-// Newtype for type safety
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct FileId(usize);
-
-#[derive(Debug, Clone)]
-struct FileInfo {
-    full_path: PathBuf,
-    display_name: String,
-    mtime: Option<i64>,
+struct Page {
+    start_index: usize,
+    end_index: usize,
+    files: Vec<DisplayFileInfo>,
 }
 
 struct App {
-    file_registry: Vec<FileInfo>,           // All known files
-    path_to_id: HashMap<PathBuf, FileId>,   // Deduplication
-    filtered_files: Vec<FileId>,            // Just IDs, not full structs
-    // ... removed: files, historical_files
+    page_cache: HashMap<usize, Page>,
+    current_page: usize,
 }
 ```
 
-**Walker sends metadata:**
-```rust
-// walker.rs - extract mtime from cached metadata
-let mtime = entry.metadata()
-    .ok()
-    .and_then(|m| m.modified().ok())
-    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-    .map(|d| d.as_secs() as i64);
+**Parameters:**
+- PAGE_SIZE = 128
+- PREFETCH_MARGIN = 32
 
-tx.send((entry.path().to_path_buf(), mtime))
+**Behavior:**
+- When selection enters bottom 32 items of current page, prefetch next page
+- When selection enters top 32 items, prefetch previous page
+- Prefetch wraps around (last page → first page)
+
+Why: Smooth scrolling through large result sets. Prefetch prevents stuttering at page boundaries.
+
+**Integration with worker:**
+- Worker sends initial page (page 0) with QueryUpdated response
+- Main thread requests additional pages via GetPage request
+- Worker returns Page response with slice
+
+Why worker sends page 0: Avoids extra round-trip. Main thread has immediate results.
+
+## Performance Optimizations
+
+1. **Batched file updates:** Don't call update_filtered_files() for every file from walker. Batch with flag.
+   Why: 800x speedup during startup (1 rank operation vs 800).
+
+2. **Zero-copy ranker API:** Takes `&[FileCandidate]` instead of `Vec<FileCandidate>`.
+   Why: No clone at call site.
+
+3. **File registry:** Metadata fetched once, display names computed once.
+   Why: Filtering is O(n) with no syscalls or allocations.
+
+4. **Preloaded click counts:** HashMap loaded at startup from database query with index.
+   Why: O(1) lookup vs O(n) query per file.
+
+5. **Worker thread:** All expensive operations off main thread.
+   Why: UI never blocks. Can type ahead while worker processes.
+
+6. **Debouncing:** Drain query channel, process only latest.
+   Why: Fast typing = 1 query processed, not many intermediate queries.
+
+7. **Page caching:** Request visible slice only, cache with prefetch.
+   Why: Large result sets don't slow down rendering.
+
+8. **Preview caching:** Bat runs once per file, cached as Text<'static>.
+   Why: Scrolling is 60fps (no re-rendering).
+
+## Shutdown Sequence
+
+**Order:**
+1. Drop worker_tx (signals worker to stop)
+2. Join worker thread (wait for completion)
+3. Drop app (closes logging channel)
+4. Disable raw mode
+5. Leave alternate screen
+6. Disable mouse capture
+
+Why this order: Worker can log its shutdown message before logging channel closes. Prevents "Error performing logging" messages.
+
+## Dependencies
+
+- `ratatui` - TUI framework
+- `crossterm` - Terminal backend
+- `walkdir` - Recursive directory traversal
+- `rusqlite` - SQLite (bundled feature for static linking)
+- `lightgbm3` - LightGBM inference
+- `anyhow` - Error handling
+- `jiff` - Timestamps
+- `ansi-to-tui` - ANSI to ratatui Text conversion
+- `clap` - CLI argument parsing
+- `fern` - Logging dispatch
+- `log` - Logging facade
+- `once_cell` - Lazy static for feature registry
+- `timeago` - Human-readable relative timestamps
+- External: `bat` - Syntax highlighting (optional, has fallback)
+
+## CLI Commands
+
+```bash
+# Run TUI
+psychic
+
+# Generate training data
+psychic generate-features
+# Outputs: features.csv + feature_schema.json
+
+# Train model
+python train.py features.csv output
+# Outputs: output.txt + ~/.local/share/psychic/model.txt + output_viz.pdf
 ```
 
-**Receiver populates registry:**
-```rust
-// main.rs - walker receiver
-while let Ok((path, mtime)) = rx.try_recv() {
-    if !app.path_to_id.contains_key(&path) {
-        let file_info = FileInfo::from_walkdir(path.clone(), mtime, &app.root);
-        let file_id = FileId(app.file_registry.len());
-        app.path_to_id.insert(path, file_id);
-        app.file_registry.push(file_info);
-    }
-}
-```
+## Data Files
 
-**Filtering becomes trivial:**
-```rust
-// Just iterate FileIds, check display_name (no syscalls, no allocations)
-let matching_file_ids: Vec<FileId> = (0..self.file_registry.len())
-    .map(FileId)
-    .filter(|&file_id| {
-        let file_info = &self.file_registry[file_id.0];
-        query_lower.is_empty() || file_info.display_name.to_lowercase().contains(&query_lower)
-    })
-    .collect();
-```
-
-**Ranking uses FileIds:**
-```rust
-// ranker.rs
-pub struct FileCandidate {
-    pub file_id: usize,  // Index into registry
-    pub relative_path: String,
-    pub full_path: PathBuf,
-    pub mtime: Option<i64>,
-}
-
-pub struct FileScore {
-    pub file_id: usize,  // Index into registry (not String path!)
-    pub score: f64,
-    pub features: Vec<f64>,
-}
-```
-
-**Ranking reorder is now O(n):**
-```rust
-// BEFORE: O(n²) string-based linear search
-let score_order: Vec<String> = scored.iter().map(|fs| fs.path.clone()).collect();
-for score_path in &score_order {
-    if let Some(entry) = file_entries.iter().find(|e| &e.display_name == score_path) {
-        reordered_entries.push(entry.clone());
-    }
-}
-
-// AFTER: O(n) direct mapping
-self.filtered_files = scored.iter().map(|fs| FileId(fs.file_id)).collect();
-```
-
-**UI rendering looks up from registry:**
-```rust
-// Iterate FileIds, look up FileInfo
-for (i, &file_id) in app.filtered_files.iter().enumerate() {
-    let file_info = &app.file_registry[file_id.0];
-    // Use file_info.display_name, file_info.full_path, etc.
-}
-```
-
-### Performance Gains
-
-1. **Metadata fetched once**: Walker extracts from cached walkdir metadata (no extra syscalls), historical files call get_file_metadata once at startup
-2. **Display paths computed once**: Each file's display_name computed when added to registry
-3. **Filtering is O(n)**: Just iterate FileIds and check display_name (no allocations)
-4. **Ranking reorder is O(n)**: Changed from string-based linear search to direct FileId mapping
-5. **No string cloning in hot paths**: FileScore contains `file_id: usize` instead of `path: String`
-6. **Deduplication is O(1)**: HashMap<PathBuf, FileId> for instant dedup checks
-
-### Code Cleanliness
-
-- Eliminated duplicate logic for walkdir vs historical files (single iterator chain)
-- Removed `App.files` and `App.historical_files` (everything in registry)
-- Centralized file information in FileInfo struct
-- FileId newtype provides type safety (can't mix up with other integers)
-
-## Future Improvements
-
-Potential enhancements (not implemented):
-
-- Fuzzy matching (not just substring)
-- Configurable ignored directories
-- Custom editor (currently hardcoded to `hx`)
-- Better binary file handling (currently tries to preview everything)
-- More ranking features (file size, directory depth, extension patterns)
-- Online learning (update model from user interactions)
-- Categorical features in ranking model (need manual encoding for Rust lightgbm3)
-- Cross-session feature aggregation (global click patterns, not just session-local)
-- A/B testing framework for ranking experiments
+- `~/.local/share/psychic/events.db` - SQLite database
+- `~/.local/share/psychic/model.txt` - LightGBM model (optional)
+- `~/.local/share/psychic/app.log` - Application logs

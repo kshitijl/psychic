@@ -12,8 +12,8 @@ Helix file picker is a lot faster. Maybe implement a mode that doesn't sort or r
 
 ## now
 
-- scrolling results is broken after the async refactor
-- buggy log messages printed to console when exiting
+- clicks_last_hour, clicks_today, clicks_last_7_days. all monotonic.
+- modified_age
 - get rid of calls to get_file_metadata in main.rs
 - get_file_metadata should return a struct, not a tuple
 - implement Ctrl-p and Ctrl-n for up and down
