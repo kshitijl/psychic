@@ -55,6 +55,7 @@ pub struct DisplayFileInfo {
     pub file_size: Option<i64>,
     pub is_dir: bool,
     pub is_cwd: bool,
+    pub is_historical: bool, // From UserClickedInEventsDb, not current CwdWalker
 }
 
 pub struct UpdateQueryRequest {
@@ -142,13 +143,9 @@ impl FileInfo {
                     postfix.to_string_lossy().to_string()
                 }
                 Err(_) => {
-                    // File is from elsewhere - show .../{filename} as a shorthand
-                    // for "it's not from this dir"
-                    let filename = full_path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("unknown");
-                    format!(".../{}", filename)
+                    // File is from elsewhere - show full absolute path
+                    // Will be colored differently in UI to indicate it's historical
+                    full_path.to_string_lossy().to_string()
                 }
             }
         };
@@ -439,6 +436,7 @@ impl WorkerState {
 
                 // Check if this is the current working directory
                 let is_cwd = file_info.full_path == self.root;
+                let is_historical = file_info.origin == FileOrigin::UserClickedInEventsDb;
 
                 DisplayFileInfo {
                     display_name: file_info.display_name.clone(),
@@ -450,6 +448,7 @@ impl WorkerState {
                     file_size: file_info.file_size,
                     is_dir: file_info.is_dir,
                     is_cwd,
+                    is_historical,
                 }
             })
             .collect()
@@ -513,11 +512,9 @@ impl WorkerState {
                     postfix.to_string_lossy().to_string()
                 }
                 Err(_) => {
-                    // File is from elsewhere - show .../{filename} as a shorthand
-                    let filename = file.full_path.file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("unknown");
-                    format!(".../{}", filename)
+                    // File is from elsewhere - show full absolute path
+                    // Will be colored differently in UI to indicate it's historical
+                    file.full_path.to_string_lossy().to_string()
                 }
             };
         }

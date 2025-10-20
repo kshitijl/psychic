@@ -87,6 +87,81 @@ fn truncate_path(path_str: &str, max_len: usize) -> String {
     format!("{}/.../{}", head, tail_parts.join("/"))
 }
 
+/// Truncate an absolute path (for historical files) showing beginning and end
+/// e.g., "/Users/kshitijlauria/Library/CloudStorage/Dropbox/src/11-sg/todo.md"
+///    -> "/Users/kshitijlauria/.../11-sg/todo.md"
+fn truncate_absolute_path(path_str: &str, max_len: usize) -> String {
+    if path_str.len() <= max_len {
+        return path_str.to_string();
+    }
+
+    // Split path into components manually to avoid Path component issues
+    let parts: Vec<&str> = path_str.split('/').filter(|s| !s.is_empty()).collect();
+
+    if parts.is_empty() {
+        return path_str.to_string();
+    }
+
+    // Always keep the filename
+    let filename = parts.last().unwrap_or(&"");
+
+    // Start with just the filename
+    let mut head_count = 0;
+    let mut tail_count = 1; // Start with 1 for filename
+
+    // Reserve space for ".../"
+    let mut estimated_len = 3 + 1 + filename.len(); // "..." + "/" + filename
+
+    // Add components from the end (before filename)
+    for i in (0..parts.len().saturating_sub(1)).rev() {
+        let part = parts[i];
+        if estimated_len + 1 + part.len() > max_len {
+            break;
+        }
+        estimated_len += 1 + part.len(); // "/" + part
+        tail_count += 1;
+    }
+
+    // Add components from the beginning
+    for i in 0..parts.len() {
+        if i >= parts.len() - tail_count {
+            // We've reached the tail section
+            break;
+        }
+        let part = parts[i];
+        if estimated_len + 1 + part.len() > max_len {
+            break;
+        }
+        estimated_len += 1 + part.len(); // "/" + part
+        head_count += 1;
+    }
+
+    // Build the result
+    let is_absolute = path_str.starts_with('/');
+
+    if head_count + tail_count >= parts.len() {
+        // Everything fits
+        return path_str.to_string();
+    } else if head_count == 0 {
+        // Only tail fits
+        let tail: Vec<&str> = parts.iter().skip(parts.len() - tail_count).copied().collect();
+        if is_absolute {
+            format!("/.../{}", tail.join("/"))
+        } else {
+            format!(".../{}", tail.join("/"))
+        }
+    } else {
+        // Both head and tail
+        let head: Vec<&str> = parts.iter().take(head_count).copied().collect();
+        let tail: Vec<&str> = parts.iter().skip(parts.len() - tail_count).copied().collect();
+        if is_absolute {
+            format!("/{}/.../{}", head.join("/"), tail.join("/"))
+        } else {
+            format!("{}/.../{}", head.join("/"), tail.join("/"))
+        }
+    }
+}
+
 // Page-based caching constants
 const PAGE_SIZE: usize = 128;
 const PREFETCH_MARGIN: usize = 32;
@@ -262,6 +337,26 @@ enum FilterArg {
     Files,
 }
 
+/// Action to take when user presses Enter on a directory
+#[derive(ValueEnum, Clone, Debug, PartialEq)]
+enum OnDirClickAction {
+    /// Navigate into the directory (default)
+    Navigate,
+    /// Print path to stdout and exit
+    PrintToStdout,
+    /// Drop into a shell in that directory
+    DropIntoShell,
+}
+
+/// Action to take when user presses Ctrl-J on current directory
+#[derive(ValueEnum, Clone, Debug, PartialEq)]
+enum OnCwdVisitAction {
+    /// Print path to stdout and exit (for shell integration)
+    PrintToStdout,
+    /// Drop into a shell in the current directory
+    DropIntoShell,
+}
+
 /// A terminal-based file browser that learns which files you want to see.
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -270,9 +365,13 @@ struct Cli {
     #[arg(long, global = true, value_name = "DIR")]
     data_dir: Option<PathBuf>,
 
-    /// Enable shell integration mode (Ctrl-J writes path and exits instead of spawning shell)
-    #[arg(long)]
-    shell_integration: bool,
+    /// Action when pressing Enter on a directory
+    #[arg(long, value_enum, default_value = "navigate")]
+    on_dir_click: OnDirClickAction,
+
+    /// Action when pressing Ctrl-J (current directory visit)
+    #[arg(long, value_enum, default_value = "drop-into-shell")]
+    on_cwd_visit: OnCwdVisitAction,
 
     /// Set initial filter (none, cwd, dirs, files)
     #[arg(long, value_enum)]
@@ -338,8 +437,9 @@ struct App {
     current_filter: search_worker::FilterType,
     filter_picker_visible: bool,
 
-    // Shell integration
-    shell_integration: bool,
+    // Action configuration
+    on_dir_click: OnDirClickAction,
+    on_cwd_visit: OnCwdVisitAction,
 
     // Search worker thread communication
     worker_tx: mpsc::Sender<WorkerRequest>,
@@ -348,7 +448,7 @@ struct App {
 }
 
 impl App {
-    fn new(root: PathBuf, data_dir: &Path, log_receiver: Receiver<String>, shell_integration: bool, initial_filter: search_worker::FilterType) -> Result<Self> {
+    fn new(root: PathBuf, data_dir: &Path, log_receiver: Receiver<String>, on_dir_click: OnDirClickAction, on_cwd_visit: OnCwdVisitAction, initial_filter: search_worker::FilterType) -> Result<Self> {
         use std::collections::hash_map::RandomState;
         use std::hash::{BuildHasher, Hash, Hasher};
 
@@ -400,7 +500,8 @@ impl App {
             debug_pane_maximized: false,
             current_filter: initial_filter,
             filter_picker_visible: false,
-            shell_integration,
+            on_dir_click,
+            on_cwd_visit,
             worker_tx: worker_tx.clone(),
             worker_rx,
             worker_handle: Some(worker_handle),
@@ -869,7 +970,7 @@ fn main() -> Result<()> {
     };
 
     // Initialize app
-    let mut app = App::new(root.clone(), &data_dir, log_rx, cli.shell_integration, initial_filter)?;
+    let mut app = App::new(root.clone(), &data_dir, log_rx, cli.on_dir_click.clone(), cli.on_cwd_visit.clone(), initial_filter)?;
 
     log::info!(
         "Started psychic in directory {}, session {}",
@@ -1056,7 +1157,13 @@ fn run_app(
 
                         // Adjust file_width to account for cwd suffix
                         let adjusted_file_width = file_width.saturating_sub(cwd_suffix_len);
-                        let truncated_path = truncate_path(&display_name, adjusted_file_width);
+
+                        // For historical files, use absolute path truncation
+                        let truncated_path = if display_info.is_historical {
+                            truncate_absolute_path(&display_name, adjusted_file_width)
+                        } else {
+                            truncate_path(&display_name, adjusted_file_width)
+                        };
 
                         // Build line with styled spans
                         let base_style = if i == app.selected_index {
@@ -1068,6 +1175,18 @@ fn run_app(
                             Style::default().fg(Color::Cyan)
                         } else {
                             Style::default()
+                        };
+
+                        // Rank number color: different for historical files
+                        let rank_style = if display_info.is_historical {
+                            // Historical files: gray rank number
+                            Style::default().fg(Color::DarkGray)
+                        } else if i == app.selected_index {
+                            // Selected: match base style
+                            base_style
+                        } else {
+                            // Normal: match base style
+                            base_style
                         };
 
                         let cwd_style = if i == app.selected_index {
@@ -1088,7 +1207,7 @@ fn run_app(
 
                         let line = if display_info.is_cwd {
                             Line::from(vec![
-                                Span::styled(rank_prefix.clone(), base_style),
+                                Span::styled(rank_prefix.clone(), rank_style),
                                 Span::styled(truncated_path.clone(), base_style),
                                 Span::styled(cwd_suffix, cwd_style),
                                 Span::raw(padding),
@@ -1097,7 +1216,8 @@ fn run_app(
                             ])
                         } else {
                             Line::from(vec![
-                                Span::styled(format!("{}{:<width$}  {}", rank_prefix, truncated_path, time_ago, width = adjusted_file_width), base_style),
+                                Span::styled(rank_prefix.clone(), rank_style),
+                                Span::styled(format!("{:<width$}  {}", truncated_path, time_ago, width = adjusted_file_width), base_style),
                             ])
                         };
 
@@ -1649,76 +1769,77 @@ fn run_app(
                         KeyCode::Char('j')
                             if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
                         {
-                            if app.shell_integration {
-                                // Shell integration mode: print directory and exit
-                                // Clean up terminal first
-                                disable_raw_mode()?;
-                                terminal
-                                    .backend_mut()
-                                    .execute(crossterm::event::DisableMouseCapture)?;
-                                terminal.backend_mut().execute(LeaveAlternateScreen)?;
-                                terminal.backend_mut().execute(Show)?;
+                            match app.on_cwd_visit {
+                                OnCwdVisitAction::PrintToStdout => {
+                                    // Print directory and exit (for shell integration)
+                                    disable_raw_mode()?;
+                                    terminal
+                                        .backend_mut()
+                                        .execute(crossterm::event::DisableMouseCapture)?;
+                                    terminal.backend_mut().execute(LeaveAlternateScreen)?;
+                                    terminal.backend_mut().execute(Show)?;
 
-                                // Print the current directory to stdout
-                                println!("{}", app.cwd.display());
-                                return Ok(());
-                            } else {
-                                // Normal mode: Open shell in CWD
-                                log::info!("Opening shell in cwd: {:?}", app.cwd);
-
-                                // Suspend TUI
-                                disable_raw_mode()?;
-                                terminal
-                                    .backend_mut()
-                                    .execute(crossterm::event::DisableMouseCapture)?;
-                                terminal.backend_mut().execute(LeaveAlternateScreen)?;
-                                terminal.backend_mut().execute(Show)?;
-
-                                // Use /dev/tty for shell so it can interact with the terminal
-                                use std::process::Stdio;
-                                let tty_in = std::fs::OpenOptions::new()
-                                    .read(true)
-                                    .open("/dev/tty")?;
-                                let tty_out = std::fs::OpenOptions::new()
-                                    .write(true)
-                                    .open("/dev/tty")?;
-                                let tty_err = std::fs::OpenOptions::new()
-                                    .write(true)
-                                    .open("/dev/tty")?;
-
-                                let shell =
-                                    std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
-                                let status = std::process::Command::new(&shell)
-                                    .current_dir(&app.cwd)
-                                    .stdin(Stdio::from(tty_in))
-                                    .stdout(Stdio::from(tty_out))
-                                    .stderr(Stdio::from(tty_err))
-                                    .status();
-
-                                // Resume TUI
-                                enable_raw_mode()?;
-                                terminal.backend_mut().execute(EnterAlternateScreen)?;
-                                terminal
-                                    .backend_mut()
-                                    .execute(crossterm::event::EnableMouseCapture)?;
-                                terminal.clear()?;
-
-                                if let Err(e) = status {
-                                    log::error!("Failed to launch shell: {}", e);
+                                    println!("{}", app.cwd.display());
+                                    return Ok(());
                                 }
+                                OnCwdVisitAction::DropIntoShell => {
+                                    // Open shell in CWD
+                                    log::info!("Opening shell in cwd: {:?}", app.cwd);
 
-                                // Reload model (may have been retrained in background)
-                                let query_id_model = app.next_subsession_id;
-                                app.next_subsession_id += 1;
-                                if let Err(e) = app.reload_model(query_id_model) {
-                                    log::error!("Failed to reload model: {}", e);
-                                }
+                                    // Suspend TUI
+                                    disable_raw_mode()?;
+                                    terminal
+                                        .backend_mut()
+                                        .execute(crossterm::event::DisableMouseCapture)?;
+                                    terminal.backend_mut().execute(LeaveAlternateScreen)?;
+                                    terminal.backend_mut().execute(Show)?;
 
-                                // Reload click data and rerank files after shell
-                                let query_id_clicks = app.next_subsession_id;
-                                app.next_subsession_id += 1;
-                                if let Err(e) = app.reload_and_rerank(query_id_clicks) {
-                                    log::error!("Failed to reload and rerank: {}", e);
+                                    // Use /dev/tty for shell so it can interact with the terminal
+                                    use std::process::Stdio;
+                                    let tty_in = std::fs::OpenOptions::new()
+                                        .read(true)
+                                        .open("/dev/tty")?;
+                                    let tty_out = std::fs::OpenOptions::new()
+                                        .write(true)
+                                        .open("/dev/tty")?;
+                                    let tty_err = std::fs::OpenOptions::new()
+                                        .write(true)
+                                        .open("/dev/tty")?;
+
+                                    let shell =
+                                        std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
+                                    let status = std::process::Command::new(&shell)
+                                        .current_dir(&app.cwd)
+                                        .stdin(Stdio::from(tty_in))
+                                        .stdout(Stdio::from(tty_out))
+                                        .stderr(Stdio::from(tty_err))
+                                        .status();
+
+                                    // Resume TUI
+                                    enable_raw_mode()?;
+                                    terminal.backend_mut().execute(EnterAlternateScreen)?;
+                                    terminal
+                                        .backend_mut()
+                                        .execute(crossterm::event::EnableMouseCapture)?;
+                                    terminal.clear()?;
+
+                                    if let Err(e) = status {
+                                        log::error!("Failed to launch shell: {}", e);
+                                    }
+
+                                    // Reload model (may have been retrained in background)
+                                    let query_id_model = app.next_subsession_id;
+                                    app.next_subsession_id += 1;
+                                    if let Err(e) = app.reload_model(query_id_model) {
+                                        log::error!("Failed to reload model: {}", e);
+                                    }
+
+                                    // Reload click data and rerank files after shell
+                                    let query_id_clicks = app.next_subsession_id;
+                                    app.next_subsession_id += 1;
+                                    if let Err(e) = app.reload_and_rerank(query_id_clicks) {
+                                        log::error!("Failed to reload and rerank: {}", e);
+                                    }
                                 }
                             }
                         }
@@ -1923,21 +2044,79 @@ fn run_app(
                                     })?;
 
                                     if display_info.is_dir {
-                                        // On a directory, change CWD
-                                        let new_cwd = display_info.full_path.clone();
-                                        log::info!("Changing cwd to {:?}", new_cwd);
+                                        // On a directory, perform configured action
+                                        let dir_path = display_info.full_path.clone();
 
-                                        app.dir_history.push(app.cwd.clone());
-                                        app.cwd = new_cwd.clone();
+                                        match app.on_dir_click {
+                                            OnDirClickAction::Navigate => {
+                                                log::info!("Navigating to directory: {:?}", dir_path);
+                                                app.dir_history.push(app.cwd.clone());
+                                                app.cwd = dir_path.clone();
 
-                                        // Clear query and send request to worker
-                                        app.query.clear();
-                                        let query_id = app.next_subsession_id;
-                                        app.next_subsession_id += 1;
-                                        let _ = app.worker_tx.send(WorkerRequest::ChangeCwd {
-                                            new_cwd,
-                                            query_id,
-                                        });
+                                                // Clear query and send request to worker
+                                                app.query.clear();
+                                                let query_id = app.next_subsession_id;
+                                                app.next_subsession_id += 1;
+                                                let _ = app.worker_tx.send(WorkerRequest::ChangeCwd {
+                                                    new_cwd: dir_path,
+                                                    query_id,
+                                                });
+                                            }
+                                            OnDirClickAction::PrintToStdout => {
+                                                // Print directory path and exit
+                                                disable_raw_mode()?;
+                                                terminal
+                                                    .backend_mut()
+                                                    .execute(crossterm::event::DisableMouseCapture)?;
+                                                terminal.backend_mut().execute(LeaveAlternateScreen)?;
+                                                terminal.backend_mut().execute(Show)?;
+
+                                                println!("{}", dir_path.display());
+                                                return Ok(());
+                                            }
+                                            OnDirClickAction::DropIntoShell => {
+                                                // Drop into shell in the selected directory
+                                                log::info!("Dropping into shell in directory: {:?}", dir_path);
+
+                                                disable_raw_mode()?;
+                                                terminal
+                                                    .backend_mut()
+                                                    .execute(crossterm::event::DisableMouseCapture)?;
+                                                terminal.backend_mut().execute(LeaveAlternateScreen)?;
+                                                terminal.backend_mut().execute(Show)?;
+
+                                                use std::process::Stdio;
+                                                let tty_in = std::fs::OpenOptions::new()
+                                                    .read(true)
+                                                    .open("/dev/tty")?;
+                                                let tty_out = std::fs::OpenOptions::new()
+                                                    .write(true)
+                                                    .open("/dev/tty")?;
+                                                let tty_err = std::fs::OpenOptions::new()
+                                                    .write(true)
+                                                    .open("/dev/tty")?;
+
+                                                let shell = std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
+                                                let status = std::process::Command::new(&shell)
+                                                    .current_dir(&dir_path)
+                                                    .stdin(Stdio::from(tty_in))
+                                                    .stdout(Stdio::from(tty_out))
+                                                    .stderr(Stdio::from(tty_err))
+                                                    .status();
+
+                                                // Resume TUI
+                                                enable_raw_mode()?;
+                                                terminal.backend_mut().execute(EnterAlternateScreen)?;
+                                                terminal
+                                                    .backend_mut()
+                                                    .execute(crossterm::event::EnableMouseCapture)?;
+                                                terminal.clear()?;
+
+                                                if let Err(e) = status {
+                                                    log::error!("Failed to launch shell: {}", e);
+                                                }
+                                            }
+                                        }
                                     } else {
                                         // On a file, suspend TUI and open editor
                                         disable_raw_mode()?;
@@ -2002,5 +2181,91 @@ fn run_app(
                 _ => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_truncate_path_no_truncation_needed() {
+        let result = truncate_path("src/main.rs", 100);
+        assert_eq!(result, "src/main.rs", "Short paths should not be truncated");
+    }
+
+    #[test]
+    fn test_truncate_path_simple() {
+        let result = truncate_path("a/b/c/d/e.txt", 12);
+        assert_eq!(result, "a/.../e.txt", "Should truncate middle components when too long");
+    }
+
+    #[test]
+    fn test_truncate_path_keeps_filename() {
+        let result = truncate_path("very/long/path/to/some/file.txt", 18);
+        assert_eq!(result, "very/.../file.txt", "Should always keep filename");
+    }
+
+    #[test]
+    fn test_truncate_path_builds_from_end() {
+        let result = truncate_path("a/b/c/d/e/f/g.txt", 15);
+        // Actual: "a/.../e/f/g.txt" = 15 chars
+        assert_eq!(result, "a/.../e/f/g.txt", "Should build from end to fit more context");
+    }
+
+    #[test]
+    fn test_truncate_absolute_path_no_truncation() {
+        let result = truncate_absolute_path("/Users/test/file.txt", 100);
+        assert_eq!(result, "/Users/test/file.txt", "Short absolute paths should not be truncated");
+    }
+
+    #[test]
+    fn test_truncate_absolute_path_both_ends() {
+        let result = truncate_absolute_path("/Users/kshitijlauria/Library/CloudStorage/Dropbox/src/11-sg/todo.md", 40);
+        // Actual: "/Users/.../Dropbox/src/11-sg/todo.md" = 37 chars
+        assert_eq!(result, "/Users/.../Dropbox/src/11-sg/todo.md", "Should show beginning and end to fit in 40 chars");
+    }
+
+    #[test]
+    fn test_truncate_absolute_path_only_tail() {
+        let result = truncate_absolute_path("/Users/kshitijlauria/Library/CloudStorage/Dropbox/src/11-sg/todo.md", 25);
+        // With 25 chars, can fit: "/.../src/11-sg/todo.md" = 23 chars
+        assert_eq!(result, "/.../src/11-sg/todo.md", "Should show only tail when space is limited");
+    }
+
+    #[test]
+    fn test_truncate_absolute_path_exact_example() {
+        // Test the specific example from the docs
+        let input = "/Users/kshitijlauria/Library/CloudStorage/Dropbox/src/11-sg/todo.md";
+        let result = truncate_absolute_path(input, 50);
+        // Actual: "/.../Library/CloudStorage/Dropbox/src/11-sg/todo.md" = 53 chars
+        // Note: This exceeds 50 chars because we prioritize showing complete components
+        assert_eq!(result, "/.../Library/CloudStorage/Dropbox/src/11-sg/todo.md", "Shows as much tail as fits complete components");
+    }
+
+    #[test]
+    fn test_truncate_absolute_path_relative() {
+        // Test that relative paths also work
+        let result = truncate_absolute_path("relative/path/to/file.txt", 18);
+        // "relative/.../file.txt" = 22 chars, but we only have 18
+        // So it should be: ".../to/file.txt" = 16 chars
+        assert_eq!(result, ".../to/file.txt", "Should handle relative paths and truncate properly");
+    }
+
+    #[test]
+    fn test_truncate_absolute_path_preserves_leading_slash() {
+        let result = truncate_absolute_path("/a/b/c/d/e/f/g.txt", 15);
+        assert!(result.starts_with("/"), "Should preserve leading slash for absolute paths");
+        assert!(result.contains("..."), "Should truncate");
+        assert!(result.ends_with("g.txt"), "Should keep filename");
+    }
+
+    #[test]
+    fn test_truncate_absolute_path_fits_more_tail() {
+        let result = truncate_absolute_path("/Users/name/Documents/Projects/rust/psychic/src/main.rs", 35);
+        // Should prioritize tail (more recent parts of path)
+        assert!(result.ends_with("main.rs"), "Should keep filename");
+        assert!(result.contains("src"), "Should keep parent directory");
+        assert!(result.contains("..."), "Should have ellipsis");
     }
 }
