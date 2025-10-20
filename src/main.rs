@@ -233,6 +233,9 @@ fn render_history_mode(f: &mut Frame, app: &App) {
     // Get filtered history (sorted chronologically as stored)
     let filtered_history = app.get_filtered_history();
 
+    // Calculate list width (accounting for borders)
+    let list_width = top_chunks[0].width.saturating_sub(2) as usize;
+
     // Build list items for directory history
     let items: Vec<ListItem> = filtered_history
         .iter()
@@ -240,7 +243,15 @@ fn render_history_mode(f: &mut Frame, app: &App) {
         .map(|(idx, path)| {
             let rank = idx + 1;
             let rank_prefix = format!("{:2}. ", rank);
-            let display_text = path.to_string_lossy().to_string();
+            let prefix_len = rank_prefix.len();
+            let path_str = path.to_string_lossy();
+
+            // Calculate available width for path (widget width - rank prefix - 1 for safety margin)
+            let available_width = list_width.saturating_sub(prefix_len).saturating_sub(1);
+
+            // Use truncate_absolute_path for good abbreviation
+            let display_text = truncate_absolute_path(&path_str, available_width);
+
             let style = if idx == app.history_selected {
                 Style::default()
                     .fg(Color::Yellow)
