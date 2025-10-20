@@ -5,6 +5,7 @@ mod features;
 mod history;
 mod ranker;
 mod search_worker;
+mod ui_state;
 mod walker;
 
 use anyhow::{Context, Result};
@@ -281,11 +282,21 @@ fn render_history_mode(f: &mut Frame, app: &App) {
     let preview_text = if !filtered_history.is_empty() && app.history_selected < filtered_history.len() {
         let selected_dir = &filtered_history[app.history_selected];
 
-        let eza_output = std::process::Command::new("eza")
-            .arg("-al")
-            .arg("--color=always")
-            .arg(selected_dir)
-            .output();
+        let preview_width = top_chunks[1].width;
+        let extra_flags = app.ui_state.get_eza_flags(preview_width);
+
+        let mut eza_cmd = std::process::Command::new("eza");
+        eza_cmd.arg("-al").arg("--color=always");
+
+        // Add extra flags if preview is narrow
+        for flag in extra_flags.split_whitespace() {
+            if !flag.is_empty() {
+                eza_cmd.arg(flag);
+            }
+        }
+
+        eza_cmd.arg(selected_dir);
+        let eza_output = eza_cmd.output();
 
         match eza_output {
             Ok(output) => {
@@ -453,7 +464,6 @@ struct App {
     db: Database,
     cwd: PathBuf, // Current working directory
     history: history::History,
-    history_mode: bool,      // Are we in history navigation mode?
     history_selected: usize, // Selected item in history mode UI
 
     num_results_to_log_as_impressions: usize,
@@ -468,11 +478,12 @@ struct App {
     currently_retraining: bool,
     log_receiver: Receiver<String>,
     recent_logs: VecDeque<String>,
-    debug_pane_maximized: bool,
 
     // Filter state
     current_filter: search_worker::FilterType,
-    filter_picker_visible: bool,
+
+    // UI state machine
+    ui_state: ui_state::UiState,
 
     // Action configuration
     on_dir_click: OnDirClickAction,
@@ -524,7 +535,6 @@ impl App {
             db,
             cwd: root.clone(),
             history: history::History::new(root),
-            history_mode: false,
             history_selected: 0,
             path_bar_scroll: 0,
             path_bar_scroll_direction: 1,
@@ -533,9 +543,8 @@ impl App {
             currently_retraining: false,
             log_receiver,
             recent_logs: VecDeque::with_capacity(50),
-            debug_pane_maximized: false,
             current_filter: initial_filter,
-            filter_picker_visible: false,
+            ui_state: ui_state::UiState::new(),
             on_dir_click,
             on_cwd_visit,
             worker_tx: worker_tx.clone(),
@@ -730,7 +739,7 @@ impl App {
             self.cwd = new_dir.clone();
 
             // Exit history mode
-            self.history_mode = false;
+            self.ui_state.history_mode = false;
             self.query.clear();
 
             // Send ChangeCwd request to worker
@@ -743,7 +752,7 @@ impl App {
         } else {
             // Directory is same as current, just exit history mode
             log::info!("Already in selected directory, not navigating");
-            self.history_mode = false;
+            self.ui_state.history_mode = false;
             self.query.clear();
         }
 
@@ -1104,7 +1113,7 @@ fn run_app(
         // Draw UI
         terminal.draw(|f| {
             // If in history mode, render history-specific UI
-            if app.history_mode {
+            if app.ui_state.history_mode {
                 render_history_mode(f, app);
                 return;
             }
@@ -1120,25 +1129,40 @@ fn run_app(
                 .split(f.area());
 
             // Split top area horizontally: left for file list, middle for preview, right for debug
-            let top_chunks = if app.debug_pane_maximized {
-                // When debug is maximized, give it most of the space
-                Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([
-                        Constraint::Percentage(25), // File list (smaller)
-                        Constraint::Percentage(0),  // Preview (hidden)
-                        Constraint::Percentage(75), // Debug (maximized)
-                    ])
-                    .split(main_chunks[0])
-            } else {
-                Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([
-                        Constraint::Percentage(35), // File list
-                        Constraint::Percentage(45), // Preview
-                        Constraint::Percentage(20), // Debug
-                    ])
-                    .split(main_chunks[0])
+            let top_chunks = match app.ui_state.debug_pane_mode {
+                ui_state::DebugPaneMode::Expanded => {
+                    // Debug expanded: give it most of the space
+                    Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([
+                            Constraint::Percentage(25), // File list (smaller)
+                            Constraint::Percentage(0),  // Preview (hidden)
+                            Constraint::Percentage(75), // Debug (expanded)
+                        ])
+                        .split(main_chunks[0])
+                }
+                ui_state::DebugPaneMode::Small => {
+                    // Debug small: normal layout
+                    Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([
+                            Constraint::Percentage(35), // File list
+                            Constraint::Percentage(45), // Preview
+                            Constraint::Percentage(20), // Debug (small)
+                        ])
+                        .split(main_chunks[0])
+                }
+                ui_state::DebugPaneMode::Hidden => {
+                    // Debug hidden: no space for debug pane
+                    Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([
+                            Constraint::Percentage(40), // File list (more space)
+                            Constraint::Percentage(60), // Preview (more space)
+                            Constraint::Percentage(0),  // Debug (hidden)
+                        ])
+                        .split(main_chunks[0])
+                }
             };
 
             // Update scroll position based on selection and visible height
@@ -1300,11 +1324,21 @@ fn run_app(
 
                     // For directories, show eza -al output
                     if is_dir {
-                        let eza_output = std::process::Command::new("eza")
-                            .arg("-al")
-                            .arg("--color=always")
-                            .arg(&full_path)
-                            .output();
+                        let preview_width = top_chunks[1].width;
+                        let extra_flags = app.ui_state.get_eza_flags(preview_width);
+
+                        let mut eza_cmd = std::process::Command::new("eza");
+                        eza_cmd.arg("-al").arg("--color=always");
+
+                        // Add extra flags if preview is narrow
+                        for flag in extra_flags.split_whitespace() {
+                            if !flag.is_empty() {
+                                eza_cmd.arg(flag);
+                            }
+                        }
+
+                        eza_cmd.arg(&full_path);
+                        let eza_output = eza_cmd.output();
 
                         match eza_output {
                             Ok(output) => {
@@ -1541,11 +1575,11 @@ fn run_app(
             // Add recent logs
             debug_lines.push(String::from("Recent Logs:"));
             // Show more log lines when debug is maximized
-            let log_count = if app.debug_pane_maximized { 30 } else { 10 };
+            let log_count = if app.ui_state.is_debug_pane_expanded() { 30 } else { 10 };
             let log_start = app.recent_logs.len().saturating_sub(log_count);
             for log_line in app.recent_logs.iter().skip(log_start) {
                 // Truncate long lines to fit
-                let max_len = if app.debug_pane_maximized { 120 } else { 60 };
+                let max_len = if app.ui_state.is_debug_pane_expanded() { 120 } else { 60 };
                 if log_line.len() > max_len {
                     debug_lines.push(format!("  {}...", &log_line[..(max_len - 3)]));
                 } else {
@@ -1555,10 +1589,10 @@ fn run_app(
 
             let debug_text = debug_lines.join("\n");
 
-            let debug_title = if app.debug_pane_maximized {
-                "Debug (Ctrl-O to minimize)"
-            } else {
-                "Debug (Ctrl-O to maximize)"
+            let debug_title = match app.ui_state.debug_pane_mode {
+                ui_state::DebugPaneMode::Small => "Debug (Ctrl-O: expand)",
+                ui_state::DebugPaneMode::Expanded => "Debug (Ctrl-O: hide)",
+                ui_state::DebugPaneMode::Hidden => "Debug (Ctrl-O: show)",
             };
             let debug_pane = Paragraph::new(debug_text)
                 .block(Block::default().borders(Borders::ALL).title(debug_title));
@@ -1625,7 +1659,7 @@ fn run_app(
             f.render_widget(input, main_chunks[2]);
 
             // Filter picker overlay (rendered on top if visible)
-            if app.filter_picker_visible {
+            if app.ui_state.filter_picker_visible {
                 use ratatui::layout::Rect;
 
                 // Create a popup in the bottom-right
@@ -1872,13 +1906,13 @@ fn run_app(
                             if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
                         {
                             // Ctrl-H: Toggle history navigation mode
-                            if app.history_mode {
+                            if app.ui_state.history_mode {
                                 // Exit history mode
-                                app.history_mode = false;
+                                app.ui_state.history_mode = false;
                                 app.query.clear();
                             } else {
                                 // Enter history mode (always allow, even with empty history)
-                                app.history_mode = true;
+                                app.ui_state.history_mode = true;
                                 // Set cursor to current position in history
                                 app.history_selected = app.history.current_display_index();
                                 app.query.clear();
@@ -1913,19 +1947,19 @@ fn run_app(
                         KeyCode::Char('o')
                             if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
                         {
-                            // Ctrl-O: toggle debug pane maximization
-                            app.debug_pane_maximized = !app.debug_pane_maximized;
+                            // Ctrl-O: cycle debug pane mode (Small -> Expanded -> Hidden -> Small)
+                            app.ui_state.cycle_debug_pane_mode();
                         }
                         KeyCode::Char('f')
                             if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
                         {
                             // Ctrl-F: toggle filter picker
-                            app.filter_picker_visible = !app.filter_picker_visible;
+                            app.ui_state.filter_picker_visible = !app.ui_state.filter_picker_visible;
                         }
-                        KeyCode::Char('0') if app.filter_picker_visible => {
+                        KeyCode::Char('0') if app.ui_state.filter_picker_visible => {
                             // Filter 0: None
                             app.current_filter = search_worker::FilterType::None;
-                            app.filter_picker_visible = false;
+                            app.ui_state.filter_picker_visible = false;
                             let query_id = app.next_subsession_id;
                             app.next_subsession_id += 1;
                             let _ = app.worker_tx.send(WorkerRequest::UpdateQuery(
@@ -1936,10 +1970,10 @@ fn run_app(
                                 },
                             ));
                         }
-                        KeyCode::Char('c') if app.filter_picker_visible => {
+                        KeyCode::Char('c') if app.ui_state.filter_picker_visible => {
                             // Filter c: Only CWD
                             app.current_filter = search_worker::FilterType::OnlyCwd;
-                            app.filter_picker_visible = false;
+                            app.ui_state.filter_picker_visible = false;
                             let query_id = app.next_subsession_id;
                             app.next_subsession_id += 1;
                             let _ = app.worker_tx.send(WorkerRequest::UpdateQuery(
@@ -1950,10 +1984,10 @@ fn run_app(
                                 },
                             ));
                         }
-                        KeyCode::Char('d') if app.filter_picker_visible => {
+                        KeyCode::Char('d') if app.ui_state.filter_picker_visible => {
                             // Filter d: Only Dirs
                             app.current_filter = search_worker::FilterType::OnlyDirs;
-                            app.filter_picker_visible = false;
+                            app.ui_state.filter_picker_visible = false;
                             let query_id = app.next_subsession_id;
                             app.next_subsession_id += 1;
                             let _ = app.worker_tx.send(WorkerRequest::UpdateQuery(
@@ -1964,10 +1998,10 @@ fn run_app(
                                 },
                             ));
                         }
-                        KeyCode::Char('f') if app.filter_picker_visible => {
+                        KeyCode::Char('f') if app.ui_state.filter_picker_visible => {
                             // Filter f: Only Files
                             app.current_filter = search_worker::FilterType::OnlyFiles;
-                            app.filter_picker_visible = false;
+                            app.ui_state.filter_picker_visible = false;
                             let query_id = app.next_subsession_id;
                             app.next_subsession_id += 1;
                             let _ = app.worker_tx.send(WorkerRequest::UpdateQuery(
@@ -1979,19 +2013,19 @@ fn run_app(
                             ));
                         }
                         KeyCode::Esc => {
-                            if app.filter_picker_visible {
+                            if app.ui_state.filter_picker_visible {
                                 // Close filter picker without changing filter
-                                app.filter_picker_visible = false;
-                            } else if app.history_mode {
+                                app.ui_state.filter_picker_visible = false;
+                            } else if app.ui_state.history_mode {
                                 // Exit history mode
-                                app.history_mode = false;
+                                app.ui_state.history_mode = false;
                                 app.query.clear();
                             } else {
                                 return Ok(());
                             }
                         }
                         KeyCode::Up => {
-                            if app.history_mode {
+                            if app.ui_state.history_mode {
                                 app.move_history_selection(-1);
                             } else {
                                 app.move_selection(-1);
@@ -2000,14 +2034,14 @@ fn run_app(
                         KeyCode::Char('p')
                             if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
                         {
-                            if app.history_mode {
+                            if app.ui_state.history_mode {
                                 app.move_history_selection(-1);
                             } else {
                                 app.move_selection(-1);
                             }
                         }
                         KeyCode::Down => {
-                            if app.history_mode {
+                            if app.ui_state.history_mode {
                                 app.move_history_selection(1);
                             } else {
                                 app.move_selection(1);
@@ -2016,7 +2050,7 @@ fn run_app(
                         KeyCode::Char('n')
                             if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
                         {
-                            if app.history_mode {
+                            if app.ui_state.history_mode {
                                 app.move_history_selection(1);
                             } else {
                                 app.move_selection(1);
@@ -2047,7 +2081,7 @@ fn run_app(
                             ));
                         }
                         KeyCode::Enter => {
-                            if app.history_mode {
+                            if app.ui_state.history_mode {
                                 app.handle_history_enter()?;
                             } else if app.total_results > 0 {
                                 // Force log impressions before click
