@@ -1329,6 +1329,22 @@ fn run_app(
                         KeyCode::Esc => {
                             return Ok(());
                         }
+                        KeyCode::Up => {
+                            app.move_selection(-1);
+                        }
+                        KeyCode::Char('p')
+                            if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
+                        {
+                            app.move_selection(-1);
+                        }
+                        KeyCode::Down => {
+                            app.move_selection(1);
+                        }
+                        KeyCode::Char('n')
+                            if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
+                        {
+                            app.move_selection(1);
+                        }
                         KeyCode::Char(c) => {
                             app.query.push(c);
                             let query_id = app.next_subsession_id;
@@ -1350,12 +1366,6 @@ fn run_app(
                                     query_id,
                                 },
                             ));
-                        }
-                        KeyCode::Up => {
-                            app.move_selection(-1);
-                        }
-                        KeyCode::Down => {
-                            app.move_selection(1);
                         }
                         KeyCode::Enter => {
                             if app.total_results > 0 {
