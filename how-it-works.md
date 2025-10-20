@@ -406,6 +406,8 @@ Impressions are logged to the database after a 200ms debounce period (to avoid l
 - Type → send UpdateQuery to worker
 - Up/Down → move selection, request new visible slice if needed
 - Enter → log click, launch editor, resume TUI
+- Ctrl-J → open shell in CWD (or print path and exit in shell integration mode)
+- Ctrl-H → go back to previous directory
 - Ctrl-U → clear query
 - Ctrl-O → toggle debug pane
 - Ctrl-F → toggle filter picker
@@ -417,6 +419,12 @@ Impressions are logged to the database after a 200ms debounce period (to avoid l
 
 Why mouse scrolls preview: Keyboard for navigation (fast), mouse for exploration (natural). Most users don't use mouse for results list.
 
+**Shell Integration:**
+Run `eval "$(psychic zsh)"` in your ~/.zshrc to enable the `p` and `pd` commands:
+- `p` - launch psychic, press Ctrl-J to cd your shell to the selected directory
+- `pd` - launch psychic in directories-only mode (same as `psychic --shell-integration --filter=dirs`)
+- Without shell integration, Ctrl-J spawns a new shell in the selected directory (old behavior)
+
 **Filters:**
 Filter picker appears as a popup overlay in the bottom-right when Ctrl-F is pressed. Four filter options:
 - 0: No filter (show all matching files)
@@ -427,6 +435,8 @@ Filter picker appears as a popup overlay in the bottom-right when Ctrl-F is pres
 The current filter is shown in the file list title with green highlighting when active (e.g., "CWD (50/200)" in green).
 When no filter is active, it shows "All (200/200)" without highlighting.
 Filters are applied in addition to the text query - both must match for a file to be included.
+
+You can also set the initial filter via CLI: `psychic --filter=dirs` or `--filter=cwd` or `--filter=files`.
 
 **Preview:**
 - Uses `bat --color=always --style=numbers --paging=never`

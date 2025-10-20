@@ -12,6 +12,7 @@ use crossterm::{
     ExecutableCommand,
     cursor::Show,
     event::{self, Event, KeyCode, KeyEventKind},
+    execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use db::{Database, EventData, FileMetadata};
@@ -29,7 +30,6 @@ use search_worker::{
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     env,
-    io::{self, stdout},
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver},
     thread::JoinHandle,
@@ -132,6 +132,17 @@ enum Commands {
     /// Retrain the ranking model using collected events. This does everything,
     /// including feature gen.
     Retrain,
+    /// Output shell integration script for zsh
+    Zsh,
+}
+
+/// Filter type for initial filter
+#[derive(ValueEnum, Clone, Debug)]
+enum FilterArg {
+    None,
+    Cwd,
+    Dirs,
+    Files,
 }
 
 /// A terminal-based file browser that learns which files you want to see.
@@ -141,6 +152,14 @@ struct Cli {
     /// Data directory for database and training files (default: ~/.local/share/psychic)
     #[arg(long, global = true, value_name = "DIR")]
     data_dir: Option<PathBuf>,
+
+    /// Enable shell integration mode (Ctrl-J writes path and exits instead of spawning shell)
+    #[arg(long)]
+    shell_integration: bool,
+
+    /// Set initial filter (none, cwd, dirs, files)
+    #[arg(long, value_enum)]
+    filter: Option<FilterArg>,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -199,6 +218,9 @@ struct App {
     current_filter: search_worker::FilterType,
     filter_picker_visible: bool,
 
+    // Shell integration
+    shell_integration: bool,
+
     // Search worker thread communication
     worker_tx: mpsc::Sender<WorkerRequest>,
     worker_rx: mpsc::Receiver<WorkerResponse>,
@@ -206,7 +228,7 @@ struct App {
 }
 
 impl App {
-    fn new(root: PathBuf, data_dir: &Path, log_receiver: Receiver<String>) -> Result<Self> {
+    fn new(root: PathBuf, data_dir: &Path, log_receiver: Receiver<String>, shell_integration: bool, initial_filter: search_worker::FilterType) -> Result<Self> {
         use std::collections::hash_map::RandomState;
         use std::hash::{BuildHasher, Hash, Hasher};
 
@@ -253,8 +275,9 @@ impl App {
             log_receiver,
             recent_logs: VecDeque::with_capacity(50),
             debug_pane_maximized: false,
-            current_filter: search_worker::FilterType::None,
+            current_filter: initial_filter,
             filter_picker_visible: false,
+            shell_integration,
             worker_tx: worker_tx.clone(),
             worker_rx,
             worker_handle: Some(worker_handle),
@@ -264,7 +287,7 @@ impl App {
         let _ = worker_tx.send(WorkerRequest::UpdateQuery(search_worker::UpdateQueryRequest {
             query: String::new(),
             query_id: 0,
-            filter: search_worker::FilterType::None,
+            filter: initial_filter,
         }));
 
         Ok(app)
@@ -595,6 +618,11 @@ fn main() -> Result<()> {
                 println!("Done.");
                 return Ok(());
             }
+            Commands::Zsh => {
+                // Output zsh integration script
+                print!("{}", include_str!("../shell/psychic.zsh"));
+                return Ok(());
+            }
         }
     }
 
@@ -623,8 +651,16 @@ fn main() -> Result<()> {
         let _ = retrain_tx.send(false); // Signal retraining completed
     });
 
+    // Convert CLI filter to internal FilterType
+    let initial_filter = match cli.filter {
+        Some(FilterArg::None) | None => search_worker::FilterType::None,
+        Some(FilterArg::Cwd) => search_worker::FilterType::OnlyCwd,
+        Some(FilterArg::Dirs) => search_worker::FilterType::OnlyDirs,
+        Some(FilterArg::Files) => search_worker::FilterType::OnlyFiles,
+    };
+
     // Initialize app
-    let mut app = App::new(root.clone(), &data_dir, log_rx)?;
+    let mut app = App::new(root.clone(), &data_dir, log_rx, cli.shell_integration, initial_filter)?;
 
     log::info!(
         "Started psychic in directory {}, session {}",
@@ -678,10 +714,16 @@ fn main() -> Result<()> {
     });
 
     // Setup terminal
+    // Use /dev/tty directly so shell integration can redirect stdout
+    let mut tty = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")?;
+
     enable_raw_mode()?;
-    stdout().execute(EnterAlternateScreen)?;
-    stdout().execute(crossterm::event::EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(stdout());
+    execute!(tty, EnterAlternateScreen)?;
+    execute!(tty, crossterm::event::EnableMouseCapture)?;
+    let backend = CrosstermBackend::new(tty);
     let mut terminal = Terminal::new(backend)?;
 
     // Run the app
@@ -702,15 +744,18 @@ fn main() -> Result<()> {
 
     // Terminal cleanup
     disable_raw_mode()?;
-    stdout().execute(crossterm::event::DisableMouseCapture)?;
-    stdout().execute(LeaveAlternateScreen)?;
-    stdout().execute(Show)?;
+    execute!(
+        terminal.backend_mut(),
+        crossterm::event::DisableMouseCapture,
+        LeaveAlternateScreen,
+        Show
+    )?;
 
     result
 }
 
 fn run_app(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    terminal: &mut Terminal<CrosstermBackend<std::fs::File>>,
     app: &mut App,
     retrain_rx: Receiver<bool>,
 ) -> Result<()> {
@@ -1389,47 +1434,77 @@ fn run_app(
                         KeyCode::Char('j')
                             if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
                         {
-                            // Ctrl-J: Open shell in CWD
-                            log::info!("Opening shell in cwd: {:?}", app.cwd);
+                            if app.shell_integration {
+                                // Shell integration mode: print directory and exit
+                                // Clean up terminal first
+                                disable_raw_mode()?;
+                                terminal
+                                    .backend_mut()
+                                    .execute(crossterm::event::DisableMouseCapture)?;
+                                terminal.backend_mut().execute(LeaveAlternateScreen)?;
+                                terminal.backend_mut().execute(Show)?;
 
-                            // Suspend TUI
-                            disable_raw_mode()?;
-                            terminal
-                                .backend_mut()
-                                .execute(crossterm::event::DisableMouseCapture)?;
-                            terminal.backend_mut().execute(LeaveAlternateScreen)?;
-                            terminal.backend_mut().execute(Show)?;
+                                // Print the current directory to stdout
+                                println!("{}", app.cwd.display());
+                                return Ok(());
+                            } else {
+                                // Normal mode: Open shell in CWD
+                                log::info!("Opening shell in cwd: {:?}", app.cwd);
 
-                            let shell =
-                                std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
-                            let status = std::process::Command::new(&shell)
-                                .current_dir(&app.cwd) // Use app.cwd
-                                .status();
+                                // Suspend TUI
+                                disable_raw_mode()?;
+                                terminal
+                                    .backend_mut()
+                                    .execute(crossterm::event::DisableMouseCapture)?;
+                                terminal.backend_mut().execute(LeaveAlternateScreen)?;
+                                terminal.backend_mut().execute(Show)?;
 
-                            // Resume TUI
-                            enable_raw_mode()?;
-                            terminal.backend_mut().execute(EnterAlternateScreen)?;
-                            terminal
-                                .backend_mut()
-                                .execute(crossterm::event::EnableMouseCapture)?;
-                            terminal.clear()?;
+                                // Use /dev/tty for shell so it can interact with the terminal
+                                use std::process::Stdio;
+                                let tty_in = std::fs::OpenOptions::new()
+                                    .read(true)
+                                    .open("/dev/tty")?;
+                                let tty_out = std::fs::OpenOptions::new()
+                                    .write(true)
+                                    .open("/dev/tty")?;
+                                let tty_err = std::fs::OpenOptions::new()
+                                    .write(true)
+                                    .open("/dev/tty")?;
 
-                            if let Err(e) = status {
-                                log::error!("Failed to launch shell: {}", e);
-                            }
+                                let shell =
+                                    std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
+                                let status = std::process::Command::new(&shell)
+                                    .current_dir(&app.cwd)
+                                    .stdin(Stdio::from(tty_in))
+                                    .stdout(Stdio::from(tty_out))
+                                    .stderr(Stdio::from(tty_err))
+                                    .status();
 
-                            // Reload model (may have been retrained in background)
-                            let query_id_model = app.next_subsession_id;
-                            app.next_subsession_id += 1;
-                            if let Err(e) = app.reload_model(query_id_model) {
-                                log::error!("Failed to reload model: {}", e);
-                            }
+                                // Resume TUI
+                                enable_raw_mode()?;
+                                terminal.backend_mut().execute(EnterAlternateScreen)?;
+                                terminal
+                                    .backend_mut()
+                                    .execute(crossterm::event::EnableMouseCapture)?;
+                                terminal.clear()?;
 
-                            // Reload click data and rerank files after shell
-                            let query_id_clicks = app.next_subsession_id;
-                            app.next_subsession_id += 1;
-                            if let Err(e) = app.reload_and_rerank(query_id_clicks) {
-                                log::error!("Failed to reload and rerank: {}", e);
+                                if let Err(e) = status {
+                                    log::error!("Failed to launch shell: {}", e);
+                                }
+
+                                // Reload model (may have been retrained in background)
+                                let query_id_model = app.next_subsession_id;
+                                app.next_subsession_id += 1;
+                                if let Err(e) = app.reload_model(query_id_model) {
+                                    log::error!("Failed to reload model: {}", e);
+                                }
+
+                                // Reload click data and rerank files after shell
+                                let query_id_clicks = app.next_subsession_id;
+                                app.next_subsession_id += 1;
+                                if let Err(e) = app.reload_and_rerank(query_id_clicks) {
+                                    log::error!("Failed to reload and rerank: {}", e);
+                                }
                             }
                         }
                         KeyCode::Char('h')
@@ -1640,8 +1715,24 @@ fn run_app(
                                         terminal.backend_mut().execute(LeaveAlternateScreen)?;
                                         terminal.backend_mut().execute(Show)?;
 
+                                        // Use /dev/tty for editor so it can interact with the terminal
+                                        // This works in both normal and shell-integration mode
+                                        use std::process::Stdio;
+                                        let tty_in = std::fs::OpenOptions::new()
+                                            .read(true)
+                                            .open("/dev/tty")?;
+                                        let tty_out = std::fs::OpenOptions::new()
+                                            .write(true)
+                                            .open("/dev/tty")?;
+                                        let tty_err = std::fs::OpenOptions::new()
+                                            .write(true)
+                                            .open("/dev/tty")?;
+
                                         let status = std::process::Command::new("hx")
                                             .arg(&display_info.full_path)
+                                            .stdin(Stdio::from(tty_in))
+                                            .stdout(Stdio::from(tty_out))
+                                            .stderr(Stdio::from(tty_err))
                                             .status();
 
                                         // Resume TUI
