@@ -8,8 +8,6 @@ Separation of concerns: think hard about the API between different components. A
 
 Read src/main.rs to understand the entrypoint. Read train.py to understand how the model is made.
 
-It should reflect the current state of the world, and also be a dev log. It should have caveats, gotchas, decisions, and bugs fixed.
-
 After adding a fair amount of new code to implement a feature or fix a bug:
 * run `cargo build --release`
 * run `cargo test`
