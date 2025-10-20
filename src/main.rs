@@ -1034,8 +1034,10 @@ fn main() -> Result<()> {
     );
     log::info!("TIMING {{\"op\":\"session_log_message\",\"ms\":{}}}", log_session_start.elapsed().as_secs_f64() * 1000.0);
 
-    // Log the initial directory as a click event (with empty query)
-    // This ensures directories we start in appear in history
+    // DISABLED: Log the initial directory as a click event (with empty query)
+    // This was taking 200ms+ due to synchronous DB write, blocking startup
+    // TODO: Re-enable with async logging or move to background thread
+    /*
     let log_dir_click_start = Instant::now();
     {
         let dir_name = root
@@ -1070,6 +1072,7 @@ fn main() -> Result<()> {
         });
     }
     log::info!("TIMING {{\"op\":\"log_initial_dir_click\",\"ms\":{}}}", log_dir_click_start.elapsed().as_secs_f64() * 1000.0);
+    */
 
     // Gather context in background thread
     let context_spawn_start = Instant::now();

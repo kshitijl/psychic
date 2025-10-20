@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use jiff::{Span, Timestamp};
+use jiff::Timestamp;
 use lightgbm3::Booster;
 use rayon::prelude::*;
 use rusqlite::Connection;
@@ -110,10 +110,9 @@ impl Ranker {
 
         let timestamp_calc_start = std::time::Instant::now();
         let now = Timestamp::now();
-        let session_tz = jiff::tz::TimeZone::system();
-        let now_zoned = now.to_zoned(session_tz);
-        let thirty_days_ago = now_zoned.checked_sub(Span::new().days(30))?.timestamp();
-        let thirty_days_ago_ts = thirty_days_ago.as_second();
+        let now_ts = now.as_second();
+        // Simple arithmetic: 30 days = 30 * 24 * 60 * 60 seconds
+        let thirty_days_ago_ts = now_ts - (30 * 24 * 60 * 60);
         log::info!("TIMING {{\"op\":\"timestamp_calc\",\"ms\":{}}}", timestamp_calc_start.elapsed().as_secs_f64() * 1000.0);
 
         let mut clicks_by_file: HashMap<String, Vec<ClickEvent>> = HashMap::new();
