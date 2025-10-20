@@ -428,6 +428,22 @@ struct Cli {
     #[arg(long, value_enum)]
     filter: Option<FilterArg>,
 
+    /// Disable preview pane (show blank preview to improve startup time)
+    #[arg(long)]
+    no_preview: bool,
+
+    /// Disable loading click history and historical files (improves startup time)
+    #[arg(long)]
+    no_click_loading: bool,
+
+    /// Disable ML ranking model (sort by mtime instead, improves startup time)
+    #[arg(long)]
+    no_model: bool,
+
+    /// Disable logging clicks/scrolls/impressions to database
+    #[arg(long)]
+    no_click_logging: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -491,6 +507,10 @@ struct App {
     on_dir_click: OnDirClickAction,
     on_cwd_visit: OnCwdVisitAction,
 
+    // Performance flags
+    no_preview: bool,
+    no_click_logging: bool,
+
     // Search worker thread communication
     worker_tx: mpsc::Sender<WorkerRequest>,
     worker_rx: mpsc::Receiver<WorkerResponse>,
@@ -502,7 +522,7 @@ struct App {
 }
 
 impl App {
-    fn new(root: PathBuf, data_dir: &Path, log_receiver: Receiver<String>, on_dir_click: OnDirClickAction, on_cwd_visit: OnCwdVisitAction, initial_filter: search_worker::FilterType) -> Result<Self> {
+    fn new(root: PathBuf, data_dir: &Path, log_receiver: Receiver<String>, on_dir_click: OnDirClickAction, on_cwd_visit: OnCwdVisitAction, initial_filter: search_worker::FilterType, no_preview: bool, no_click_loading: bool, no_model: bool, no_click_logging: bool) -> Result<Self> {
         let start_time = Instant::now();
         log::debug!("App::new() started");
 
@@ -515,7 +535,7 @@ impl App {
         let db = Database::new(&db_path)?;
         log::debug!("Database initialization took {:?}", db_start.elapsed());
 
-        let (worker_tx, worker_rx, worker_handle) = search_worker::spawn(root.clone(), data_dir)?;
+        let (worker_tx, worker_rx, worker_handle) = search_worker::spawn(root.clone(), data_dir, no_click_loading, no_model)?;
 
         log::debug!("App::new() total time: {:?}", start_time.elapsed());
 
@@ -548,6 +568,8 @@ impl App {
             ui_state: ui_state::UiState::new(),
             on_dir_click,
             on_cwd_visit,
+            no_preview,
+            no_click_logging,
             worker_tx: worker_tx.clone(),
             worker_rx,
             worker_handle: Some(worker_handle),
@@ -621,6 +643,11 @@ impl App {
     }
 
     fn check_and_log_impressions(&mut self, force: bool) -> Result<()> {
+        // Skip logging if disabled
+        if self.no_click_logging {
+            return Ok(());
+        }
+
         // Extract values we need before borrowing subsession mutably
         let (subsession_id, subsession_query, created_at, already_logged) = match &self.current_subsession {
             Some(s) => (s.id, s.query.clone(), s.created_at, s.events_have_been_logged),
@@ -763,7 +790,7 @@ impl App {
     }
 
     fn log_preview_scroll(&mut self) -> Result<()> {
-        if self.total_results == 0 {
+        if self.no_click_logging || self.total_results == 0 {
             return Ok(());
         }
 
@@ -1033,7 +1060,7 @@ fn main() -> Result<()> {
 
     // Initialize app
     let app_new_start = Instant::now();
-    let mut app = App::new(root.clone(), &data_dir, log_rx, cli.on_dir_click.clone(), cli.on_cwd_visit.clone(), initial_filter)?;
+    let mut app = App::new(root.clone(), &data_dir, log_rx, cli.on_dir_click.clone(), cli.on_cwd_visit.clone(), initial_filter, cli.no_preview, cli.no_click_loading, cli.no_model, cli.no_click_logging)?;
     log::info!("TIMING {{\"op\":\"app_new\",\"ms\":{}}}", app_new_start.elapsed().as_secs_f64() * 1000.0);
 
     let log_session_start = Instant::now();
@@ -1373,7 +1400,10 @@ fn run_app(
 
             // Preview on the right using bat (with smart caching)
             let preview_height = top_chunks[1].height.saturating_sub(2);
-            let preview_text = if current_file_info.is_some() && app.total_results > 0 {
+            let preview_text = if app.no_preview {
+                // Skip preview generation when --no-preview is enabled
+                Text::from("")
+            } else if current_file_info.is_some() && app.total_results > 0 {
                 if let Some(current_file_path) = &current_file_path {
                     let full_path = PathBuf::from(current_file_path);
 
@@ -2169,23 +2199,27 @@ fn run_app(
                                 app.handle_history_enter()?;
                             } else if app.total_results > 0 {
                                 // Force log impressions before click
-                                app.check_and_log_impressions(true)?;
+                                if !app.no_click_logging {
+                                    app.check_and_log_impressions(true)?;
+                                }
 
                                 if let Some(display_info) = app.get_file_at_index(app.selected_index) {
                                     // Log the click
-                                    let subsession_id =
-                                        app.current_subsession.as_ref().map(|s| s.id).unwrap_or(1);
-                                    app.db.log_event(EventData {
-                                        query: &app.query,
-                                        file_path: &display_info.display_name,
-                                        full_path: &display_info.full_path.to_string_lossy(),
-                                        mtime: display_info.mtime,
-                                        atime: display_info.atime,
-                                        file_size: display_info.file_size,
-                                        subsession_id,
-                                        action: db::UserInteraction::Click,
-                                        session_id: &app.session_id,
-                                    })?;
+                                    if !app.no_click_logging {
+                                        let subsession_id =
+                                            app.current_subsession.as_ref().map(|s| s.id).unwrap_or(1);
+                                        app.db.log_event(EventData {
+                                            query: &app.query,
+                                            file_path: &display_info.display_name,
+                                            full_path: &display_info.full_path.to_string_lossy(),
+                                            mtime: display_info.mtime,
+                                            atime: display_info.atime,
+                                            file_size: display_info.file_size,
+                                            subsession_id,
+                                            action: db::UserInteraction::Click,
+                                            session_id: &app.session_id,
+                                        })?;
+                                    }
 
                                     if display_info.is_dir {
                                         // On a directory, perform configured action

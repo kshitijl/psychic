@@ -54,7 +54,7 @@ pub struct ClickData {
 }
 
 pub struct Ranker {
-    model: Booster,
+    model: Option<Booster>,
     pub clicks: ClickData,
     pub stats: Option<ModelStats>,
 }
@@ -78,9 +78,22 @@ impl Ranker {
         let stats = Self::load_stats(&stats_path);
 
         Ok(Ranker {
-            model,
+            model: Some(model),
             clicks,
             stats,
+        })
+    }
+
+    pub fn new_empty(_db_path: &Path) -> Result<Self> {
+        // Empty ranker with no model and no click data
+        Ok(Ranker {
+            model: None,
+            clicks: ClickData {
+                clicks_by_file: HashMap::new(),
+                clicks_by_parent_dir: HashMap::new(),
+                clicks_by_query_and_file: HashMap::new(),
+            },
+            stats: None,
         })
     }
 
@@ -203,6 +216,20 @@ impl Ranker {
             return Ok(Vec::new());
         }
 
+        // If no model, just sort by mtime (most recent first)
+        if self.model.is_none() {
+            let mut scored_files: Vec<FileScore> = files
+                .iter()
+                .map(|file| FileScore {
+                    file_id: file.file_id,
+                    score: file.mtime.unwrap_or(0) as f64,
+                    features: Vec::new(),
+                })
+                .collect();
+            scored_files.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+            return Ok(scored_files);
+        }
+
         // Compute features for all files in parallel
         let compute_start = Instant::now();
 
@@ -251,6 +278,8 @@ impl Ranker {
         let predict_start = Instant::now();
         let prediction_results = self
             .model
+            .as_ref()
+            .unwrap()
             .predict_with_params(&flat_features, num_features as i32, true, "num_threads=8")
             .context("Failed to batch predict with model")?;
         log::debug!(

@@ -166,6 +166,8 @@ impl FileInfo {
 pub fn spawn(
     cwd: PathBuf,
     data_dir: &Path,
+    no_click_loading: bool,
+    no_model: bool,
 ) -> Result<(Sender<WorkerRequest>, Receiver<WorkerResponse>, JoinHandle<()>)> {
     let (worker_tx, worker_task_rx) = mpsc::channel::<WorkerRequest>();
     let (worker_result_tx, worker_rx) = mpsc::channel::<WorkerResponse>();
@@ -180,7 +182,7 @@ pub fn spawn(
         // between thread. It's technically thread-safe to move for read-only
         // operations, but doing it this way means we don't have to do an unsafe
         // impl Send.
-        let worker_state = WorkerState::new(cwd_clone, &data_dir, walker_command_tx_clone).unwrap();
+        let worker_state = WorkerState::new(cwd_clone, &data_dir, walker_command_tx_clone, no_click_loading, no_model).unwrap();
         worker_thread_loop(worker_task_rx, worker_result_tx, walker_message_rx, worker_state);
     });
 
@@ -204,18 +206,25 @@ struct WorkerState {
     model_path: PathBuf,
     db_path: PathBuf,
     walker_command_tx: Sender<WalkerCommand>,
+    no_model: bool,
 }
 
 impl WorkerState {
-    fn new(root: PathBuf, data_dir: &Path, walker_command_tx: Sender<WalkerCommand>) -> Result<Self> {
+    fn new(root: PathBuf, data_dir: &Path, walker_command_tx: Sender<WalkerCommand>, no_click_loading: bool, no_model: bool) -> Result<Self> {
         let worker_state_start = std::time::Instant::now();
 
         let ranker_start = std::time::Instant::now();
         let model_path = data_dir.join("model.txt");
         let db_path = Database::get_db_path(data_dir);
 
-        let ranker = ranker::Ranker::new(&model_path, &db_path).unwrap();
-        log::info!("Loaded ranking model from {:?}", model_path);
+        let ranker = if no_click_loading || no_model {
+            // Skip loading model and clicks if either flag is set
+            ranker::Ranker::new_empty(&db_path).unwrap()
+        } else {
+            let r = ranker::Ranker::new(&model_path, &db_path).unwrap();
+            log::info!("Loaded ranking model from {:?}", model_path);
+            r
+        };
         log::info!("TIMING {{\"op\":\"ranker_init\",\"ms\":{}}}", ranker_start.elapsed().as_secs_f64() * 1000.0);
 
         // Load historical files.
@@ -223,36 +232,38 @@ impl WorkerState {
         let mut file_registry = Vec::new();
         let mut path_to_id: HashMap<PathBuf, FileId> = HashMap::new();
 
-        let db = Database::new(&db_path)?;
-        let historical_paths: Vec<PathBuf> = db
-            .get_previously_interacted_files()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|p| {
-                let path = PathBuf::from(&p);
-                if path.exists() { Some(path) } else { None }
-            })
-            .collect();
-        log::info!("Loading {} historical paths", historical_paths.len());
+        if !no_click_loading {
+            let db = Database::new(&db_path)?;
+            let historical_paths: Vec<PathBuf> = db
+                .get_previously_interacted_files()
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|p| {
+                    let path = PathBuf::from(&p);
+                    if path.exists() { Some(path) } else { None }
+                })
+                .collect();
+            log::info!("Loading {} historical paths", historical_paths.len());
 
-        for path in historical_paths {
-            // Canonicalize historical paths and get their metadata once, at
-            // startup, to minimize syscalls later during searches.
-            let canonical_path = path.canonicalize().unwrap_or(path);
+            for path in historical_paths {
+                // Canonicalize historical paths and get their metadata once, at
+                // startup, to minimize syscalls later during searches.
+                let canonical_path = path.canonicalize().unwrap_or(path);
 
-            if !path_to_id.contains_key(&canonical_path) {
-                let metadata = get_file_metadata(&canonical_path);
-                let file_info = FileInfo::from_history(
-                    canonical_path.clone(),
-                    metadata.mtime,
-                    metadata.atime,
-                    metadata.file_size,
-                    metadata.is_dir,
-                    &root,
-                );
-                let file_id = FileId(file_registry.len());
-                path_to_id.insert(canonical_path, file_id);
-                file_registry.push(file_info);
+                if !path_to_id.contains_key(&canonical_path) {
+                    let metadata = get_file_metadata(&canonical_path);
+                    let file_info = FileInfo::from_history(
+                        canonical_path.clone(),
+                        metadata.mtime,
+                        metadata.atime,
+                        metadata.file_size,
+                        metadata.is_dir,
+                        &root,
+                    );
+                    let file_id = FileId(file_registry.len());
+                    path_to_id.insert(canonical_path, file_id);
+                    file_registry.push(file_info);
+                }
             }
         }
 
@@ -307,6 +318,7 @@ impl WorkerState {
             model_path,
             db_path,
             walker_command_tx,
+            no_model,
         })
     }
 
