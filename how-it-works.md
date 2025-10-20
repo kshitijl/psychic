@@ -19,7 +19,9 @@ This document describes the current state of the code, with a brief description 
 5. **`feature_defs/`** - Trait-based feature registry
 6. **`ranker.rs`** - LightGBM model inference
 7. **`search_worker.rs`** - Async worker thread for filtering/ranking
-8. **`main.rs`** - TUI event loop and rendering
+8. **`ui_state.rs`** - UI state machine (history mode, filter picker, debug pane)
+9. **`history.rs`** - Directory navigation history with branch-point semantics
+10. **`main.rs`** - TUI event loop and rendering
 
 Why: Worker thread architecture prevents UI lag during expensive filtering/ranking operations.
 
@@ -114,8 +116,12 @@ Background thread that recursively walks current directory using `walkdir`.
 - Extracts mtime, atime, and file_size from walkdir's cached metadata
 - Adaptive depth: switches to depth=1 if >8k items found (shallow mode)
 - Sends `AllDone` message when walk completes
+- Supports dynamic directory changes via `ChangeCwd` command
+- Checks for commands every 100 files (COMMAND_CHECK_INTERVAL)
 
 **Shallow mode:** If walker encounters more than 8,000 items during full-depth exploration, it aborts and restarts with `max_depth(1)` to only show first-level items. This prevents performance issues in large directory trees like `~/`.
+
+**Command support:** Walker can receive `ChangeCwd` commands to restart walking in a new directory. It checks for commands periodically (every 100 files) during walks to remain responsive to navigation requests.
 
 **WalkerMessage enum:**
 ```rust
@@ -130,6 +136,7 @@ The `AllDone` message bypasses the worker's 200ms debounce to ensure the UI upda
 Why background thread: Large directories take seconds to scan. Streaming keeps UI responsive.
 Why send metadata: Avoids re-fetching later (performance).
 Why AllDone: Ensures UI updates even when walker completes in <200ms (debounce bypass).
+Why periodic command checks: Allows aborting long walks when user navigates to different directory.
 
 ### Module: `context.rs`
 
@@ -140,11 +147,16 @@ Gathers system context at startup in background thread:
 - `dns` - First DNS nameserver from `scutil --dns`
 - `shell_history` - Last 10 commands from ~/.zsh_history or ~/.bash_history
 - `running_processes` - Output of `ps -u $USER -o pid,comm`
-- `timezone` - From `date +%Z`
+- `timezone` - Multi-tier fallback: $TZ env var → /etc/localtime symlink → "UTC"
 
 Why gather this: Network context (home/office/cafe), shell history (user intent), and running processes help analyze search patterns and could become ML features.
 
 **Error handling:** All fields fallback to "unknown" on error. Never crash due to missing tools.
+
+**Timezone detection:** Uses sophisticated fallback chain:
+1. Check $TZ environment variable
+2. Read /etc/localtime symlink and extract timezone from path (handles both /usr/share/zoneinfo and /var/db/timezone paths)
+3. Default to "UTC" if all methods fail
 
 ### Module: `search_worker.rs`
 
@@ -239,8 +251,13 @@ pub static FEATURE_REGISTRY: Lazy<Vec<Box<dyn Feature>>> = Lazy::new(|| {
 
 Why: Adding a new feature only requires: (1) implement trait, (2) add to registry. No manual synchronization across files. Feature vector order comes from registry order automatically.
 
-**Schema export:** `generate-features` command outputs `feature_schema.json` with feature names and types.
-Why: Python training script reads schema to know feature order and types. No manual duplication.
+**Schema export:** `generate-features` command outputs `feature_schema.json` with feature names, types, and monotonicity hints.
+Why: Python training script reads schema to know feature order, types, and can apply monotonic constraints during training. No manual duplication.
+
+**Monotonicity hints:** Each feature can declare its monotonicity (increasing=1, decreasing=-1, or null for none). For example:
+- `clicks_last_hour`: increasing (more clicks → higher relevance)
+- `modified_age`: decreasing (older files → lower relevance)
+- `filename_starts_with_query`: no monotonicity (binary feature)
 
 **Query-specific features:** The `clicks_for_this_query` feature tracks clicks for specific (query, file) pairs. This distinguishes between files clicked for different search contexts - e.g., a file clicked 10 times for query "config" vs 0 times for query "test" is more relevant for "config" searches.
 Why: General click counts don't capture query-specific relevance. A frequently clicked file for one query may be irrelevant for another.
@@ -357,9 +374,67 @@ Why: Ensures Rust and Python agree on feature order.
 
 **Visualizations:** Training curves, feature importance, SHAP analysis, score distributions, rank position analysis.
 
+### Module: `ui_state.rs`
+
+Pure state machine for UI mode transitions (no IO, just state).
+
+**State components:**
+```rust
+pub struct UiState {
+    pub history_mode: bool,
+    pub filter_picker_visible: bool,
+    pub debug_pane_mode: DebugPaneMode,  // Hidden, Small, or Expanded
+}
+```
+
+**Methods:**
+- `toggle_history_mode()`, `enter_history_mode()`, `exit_history_mode()`
+- `toggle_filter_picker()`, `hide_filter_picker()`
+- `cycle_debug_pane_mode()` - cycles through Hidden → Small → Expanded → Hidden
+- `get_eza_flags(width)` - returns compact flags for narrow screens (<80 cols)
+- `is_debug_pane_visible()`, `is_debug_pane_expanded()`
+
+Why separate module: Testable pure functions. State transitions are tested with expect tests (no IO).
+Why DebugPaneMode enum: Prevents invalid states, makes cycling logic explicit.
+
+### Module: `history.rs`
+
+Directory navigation history with browser-style branch-point semantics.
+
+**Model:**
+```rust
+pub struct History {
+    dirs: Vec<PathBuf>,        // Chronological order (dirs[i+1] came after dirs[i])
+    current_index: usize,      // Current position in history
+}
+// Invariant: cwd == dirs[current_index]
+```
+
+**Key operations:**
+- `items_for_display()` - Returns dirs in reverse order (most recent first)
+- `navigate_to_display_index(i)` - Navigate to item in display list
+- `navigate_to(new_dir)` - Navigate forward or branch
+- `current_display_index()` - Get current position for UI cursor
+
+**Branch-point behavior:**
+When navigating to a directory:
+1. If it's the next item in history (dirs[current_index + 1]), just increment current_index (preserve future)
+2. Otherwise, truncate history after current_index and append new directory (create new branch, discard future)
+
+Why: Browser-style history is intuitive. Users can go back, then navigate elsewhere to create a new branch.
+Why chronological storage + reverse display: Natural for append, efficient for display.
+Why tested: 11 unit tests verify invariants, edge cases, and the bug fix for history disappearing.
+
 ### Module: `main.rs`
 
 TUI event loop using ratatui + crossterm.
+
+**Startup behavior:**
+- Spawns a background thread to retrain the model using collected events
+- Training runs asynchronously and doesn't block the UI
+- Training output is appended to `~/.local/share/psychic/training.log`
+- Worker loads the new model automatically when retraining completes
+Why: Fresh model on every launch ensures ranking improves as you use the tool. Background execution means no startup delay.
 
 **Layout:**
 ```
@@ -376,8 +451,45 @@ TUI event loop using ratatui + crossterm.
 └──────────────────────────────────────────┘
 ```
 
-**Debug pane maximization:** Ctrl-O toggles 75% debug / 25% file list (hides preview).
-Why: More space for logs and longer lines when debugging.
+**Debug pane modes:** Ctrl-O cycles through three states:
+- Hidden (default): No debug pane visible
+- Small: Debug pane at 20% width
+- Expanded: Debug pane at 75% width, file list at 25%, preview hidden
+Why: Progressive disclosure - hide when not needed, expand for detailed debugging.
+
+**App structure:**
+```rust
+struct App {
+    // Search state
+    query: String,
+    page_cache: HashMap<usize, Page>,
+    total_results: usize,
+    total_files: usize,
+    selected_index: usize,
+
+    // UI state
+    ui_state: ui_state::UiState,
+    history: history::History,
+    history_selected: usize,
+
+    // Analytics
+    current_subsession: Option<Subsession>,
+    next_subsession_id: u64,
+    scrolled_files: HashSet<(String, String)>,
+    session_id: String,
+
+    // Configuration
+    on_dir_click: OnDirClickAction,    // Navigate, PrintToStdout, or DropIntoShell
+    on_cwd_visit: OnCwdVisitAction,    // PrintToStdout or DropIntoShell
+    current_filter: search_worker::FilterType,
+
+    // Worker communication
+    worker_tx: mpsc::Sender<WorkerRequest>,
+    worker_rx: mpsc::Receiver<WorkerResponse>,
+
+    // ... (other fields)
+}
+```
 
 **Subsession tracking:**
 ```rust
@@ -385,7 +497,7 @@ struct Subsession {
     id: u64,
     query: String,
     created_at: Instant,
-    impressions_logged: bool,
+    events_have_been_logged: bool,
 }
 ```
 
@@ -394,6 +506,15 @@ New subsession metadata is created when the UI receives a valid `QueryUpdated` r
 2.  It acts as the `query_id` for the robust communication protocol with the search worker.
 
 Impressions are logged to the database after a 200ms debounce period (to avoid logging on every keystroke) or immediately before a click/scroll event (to ensure temporal correctness).
+
+**Action configuration:**
+- `on_dir_click`: What happens when user presses Enter on a directory
+  - `Navigate`: Change into that directory (default)
+  - `PrintToStdout`: Print path and exit (for shell integration)
+  - `DropIntoShell`: Spawn a shell in that directory
+- `on_cwd_visit`: What happens when user presses Ctrl-J
+  - `DropIntoShell`: Spawn a shell in current directory (default)
+  - `PrintToStdout`: Print path and exit (for shell integration)
 
 **Event loop:**
 1. Poll worker responses (non-blocking `try_recv`)
@@ -600,11 +721,35 @@ Why this order: Worker can log its shutdown message before logging channel close
 # Run TUI
 psychic
 
+# Run with initial filter
+psychic --filter=dirs      # Show only directories
+psychic --filter=cwd       # Show only files in current working directory
+psychic --filter=files     # Show only files (not directories)
+
+# Configure directory click behavior
+psychic --on-dir-click=navigate        # Navigate into directory (default)
+psychic --on-dir-click=print-to-stdout # Print path and exit
+psychic --on-dir-click=drop-into-shell # Open shell in that directory
+
+# Configure Ctrl-J behavior (current directory visit)
+psychic --on-cwd-visit=drop-into-shell # Open shell in cwd (default)
+psychic --on-cwd-visit=print-to-stdout # Print path and exit (for shell integration)
+
+# Custom data directory
+psychic --data-dir=/path/to/data
+
 # Generate training data
 psychic generate-features
 # Outputs: features.csv + feature_schema.json
 
-# Train model
+# Retrain model (runs feature generation + training)
+psychic retrain
+
+# Output shell integration script
+psychic zsh > ~/.psychic.zsh
+# Then add to ~/.zshrc: source ~/.psychic.zsh
+
+# Train model (standalone Python script)
 python train.py features.csv output
 # Outputs: output.txt + ~/.local/share/psychic/model.txt + output_viz.pdf
 ```
@@ -613,4 +758,8 @@ python train.py features.csv output
 
 - `~/.local/share/psychic/events.db` - SQLite database
 - `~/.local/share/psychic/model.txt` - LightGBM model (optional)
+- `~/.local/share/psychic/model_stats.json` - Model training statistics (feature importance, accuracy, etc.)
+- `~/.local/share/psychic/features.csv` - Generated training features
+- `~/.local/share/psychic/feature_schema.json` - Feature definitions for Python training script
 - `~/.local/share/psychic/app.log` - Application logs
+- `~/.local/share/psychic/training.log` - Background model retraining output
