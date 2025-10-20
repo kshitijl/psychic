@@ -1,5 +1,16 @@
 ## notes on performance
 
+### 2025-10-20
+
+Trying to make startup faster. Time to fully rendered initial screen.
+
+Commented out for now:
+ - initial dir logging
+
+Try commenting out preview. Actually add an argument to turn off preview, so we can always measure startup time without preview.
+
+### 2025-10-10
+
 On 5000 files, `update_filtered_files` takes 150-200ms. All of that comes from `rank_files`. The majority of THAT is from feature computation, not actually from running the model.
 
 Update: with some optimizations, model is actually more expensive than computing features.
@@ -11,7 +22,6 @@ Feature computation can be sped up in a bunch of ways:
 Helix file picker is a lot faster. Maybe implement a mode that doesn't sort or run the model or compute features, to make sure it's somewhat as fast.
 
 ## now
-
 - make it faster
 - change layout. if columns getting narrow then do a vertical stack layout so we can see file paths more clearly.
 - dir preview should switch from eza -al to a different command when narrow, so we see the actual filenames instead of less useful owner and permissions.
