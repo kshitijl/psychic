@@ -155,6 +155,7 @@ Worker thread owns all file data and processes queries asynchronously.
 - `path_to_id: HashMap<PathBuf, FileId>` - Deduplication
 - `filtered_files: Vec<FileId>` - Ranked result IDs
 - `file_scores: Vec<FileScore>` - Scores and features
+- `current_filter: FilterType` - Active filter (None, OnlyCwd, OnlyDirs, OnlyFiles)
 - `ranker: Ranker` - ML model
 
 **Worker loop:**
@@ -170,6 +171,14 @@ Why: Avoids wasted computation and improves responsiveness.
 
 **Auto-refresh:** When new files arrive from the walker, the worker sends a `FilesChanged` notification to the UI thread (debounced to 200ms intervals). When walker sends `AllDone`, the debounce is bypassed to ensure immediate UI update. The UI is then responsible for triggering a new query with a new `query_id` to get fresh results. This preserves the "UI generates IDs" architecture and ensures the page cache is handled correctly.
 
+**Filtering:** The worker applies filters in `filter_and_rank()`. Filters are additive - both the text query and the filter type must match. Filter logic:
+- `FilterType::None`: No additional filtering beyond text query
+- `FilterType::OnlyCwd`: Only files with `origin == FileOrigin::CwdWalker` (excludes historical files)
+- `FilterType::OnlyDirs`: Only files where `is_dir == true`
+- `FilterType::OnlyFiles`: Only files where `is_dir == false`
+
+The filter is part of `UpdateQueryRequest` and persists across query changes until the user selects a different filter.
+
 **File Registry Design:**
 
 ```rust
@@ -177,7 +186,7 @@ struct FileId(usize);  // Newtype for type safety
 
 struct FileInfo {
     full_path: PathBuf,
-    display_name: String,  // Computed once (relative path or ".../filename")
+    display_name: String,  // Computed once (relative path or ".../filename" or directory name for cwd)
     mtime: Option<i64>,    // From walker or historical load
     origin: FileOrigin,    // CwdWalker or UserClickedInEventsDb
 }
@@ -186,6 +195,11 @@ struct FileInfo {
 Why FileId: O(1) lookups. No string cloning in hot paths. Type-safe (can't mix with other usize).
 Why display_name computed once: Filtering checks display_name repeatedly. Computing it once at registration avoids repeated allocations.
 Why origin tracking: Historical files (from other directories) show as ".../filename" to indicate they're not local.
+
+**Current Working Directory Display:**
+The current working directory itself appears in search results as just its directory name (not the full path) with a " (cwd)" suffix in magenta (or yellow when selected). This makes it easy to navigate into the current directory for exploration. Clicking on it is properly logged in the events database for ML training.
+
+On startup, psychic automatically logs a click event for the initial directory (with an empty query string), ensuring that directories you browse to via psychic will appear in your historical files in future sessions.
 
 **Historical files:** Loads previously clicked/scrolled files from events.db at startup.
 Why: User can find files from other projects they've accessed before.
@@ -394,12 +408,25 @@ Impressions are logged to the database after a 200ms debounce period (to avoid l
 - Enter → log click, launch editor, resume TUI
 - Ctrl-U → clear query
 - Ctrl-O → toggle debug pane
-- Ctrl-C/Esc → quit
+- Ctrl-F → toggle filter picker
+- 0/c/d/f (when filter picker visible) → select filter (0=none, c=cwd, d=dirs, f=files)
+- Ctrl-C/Ctrl-D/Esc → quit (Esc also closes filter picker if open)
 
 **Mouse:**
 - ScrollUp/ScrollDown → scroll preview pane
 
 Why mouse scrolls preview: Keyboard for navigation (fast), mouse for exploration (natural). Most users don't use mouse for results list.
+
+**Filters:**
+Filter picker appears as a popup overlay in the bottom-right when Ctrl-F is pressed. Four filter options:
+- 0: No filter (show all matching files)
+- c: Only CWD (show only files from current working directory, excludes historical files)
+- d: Only directories
+- f: Only files (non-directories)
+
+The current filter is shown in the file list title with green highlighting when active (e.g., "CWD (50/200)" in green).
+When no filter is active, it shows "All (200/200)" without highlighting.
+Filters are applied in addition to the text query - both must match for a file to be included.
 
 **Preview:**
 - Uses `bat --color=always --style=numbers --paging=never`

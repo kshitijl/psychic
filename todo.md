@@ -12,7 +12,7 @@ Helix file picker is a lot faster. Maybe implement a mode that doesn't sort or r
 
 ## now
 
-- keyword or something to filter to just dirs. at that point it becomes a zoxide replacement.- display is broken if we scroll past a binary file and it gets previewed
+- display is broken if we scroll past a binary file and it gets previewed
 - if we hit up while file walker is still walking then it shows loading and we end up in some strange middle of the results. instead we should remember our scroll position as -1 and reevaluate that when results are updated.
 - pick some good keybindings for going to top, and paging up and down the results
 - watch the cwd + all historical files; if mtime changes then update. more generally, our internal file data structure must be kept up-to-date with the filesystem. Right now this works because the file list view polls the filesytem for file metadata every frame or something awful like that. But the fixes below will break that.

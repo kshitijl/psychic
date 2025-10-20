@@ -20,8 +20,8 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
-    text::Text,
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    text::{Line, Span, Text},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
 };
 use search_worker::{
     DisplayFileInfo, WorkerRequest, WorkerResponse,
@@ -195,6 +195,10 @@ struct App {
     recent_logs: VecDeque<String>,
     debug_pane_maximized: bool,
 
+    // Filter state
+    current_filter: search_worker::FilterType,
+    filter_picker_visible: bool,
+
     // Search worker thread communication
     worker_tx: mpsc::Sender<WorkerRequest>,
     worker_rx: mpsc::Receiver<WorkerResponse>,
@@ -249,6 +253,8 @@ impl App {
             log_receiver,
             recent_logs: VecDeque::with_capacity(50),
             debug_pane_maximized: false,
+            current_filter: search_worker::FilterType::None,
+            filter_picker_visible: false,
             worker_tx: worker_tx.clone(),
             worker_rx,
             worker_handle: Some(worker_handle),
@@ -258,6 +264,7 @@ impl App {
         let _ = worker_tx.send(WorkerRequest::UpdateQuery(search_worker::UpdateQueryRequest {
             query: String::new(),
             query_id: 0,
+            filter: search_worker::FilterType::None,
         }));
 
         Ok(app)
@@ -625,6 +632,41 @@ fn main() -> Result<()> {
         app.session_id
     );
 
+    // Log the initial directory as a click event (with empty query)
+    // This ensures directories we start in appear in history
+    {
+        let dir_name = root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(".");
+
+        // Get metadata for the directory
+        let metadata = std::fs::metadata(&root).ok();
+        let mtime = metadata.as_ref().and_then(|m| {
+            m.modified().ok().and_then(|t| {
+                t.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs() as i64)
+            })
+        });
+        let atime = metadata.as_ref().and_then(|m| {
+            m.accessed().ok().and_then(|t| {
+                t.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs() as i64)
+            })
+        });
+        let file_size = metadata.as_ref().map(|m| m.len() as i64);
+
+        let _ = app.db.log_event(EventData {
+            query: "",
+            file_path: dir_name,
+            full_path: &root.to_string_lossy(),
+            mtime,
+            atime,
+            file_size,
+            subsession_id: 0, // Initial event, before any query
+            action: db::UserInteraction::Click,
+            session_id: &app.session_id,
+        });
+    }
+
     // Gather context in background thread
     let session_id_clone = app.session_id.clone();
     let data_dir_clone = data_dir.clone();
@@ -742,25 +784,22 @@ fn run_app(
                         let available = list_width.saturating_sub(prefix_len + time_len);
                         let file_width = available.saturating_sub(2); // leave at least 2 spaces padding
 
-                        // Add "/" suffix for directories
+                        // Add "/" suffix for directories and "(cwd)" for current directory
+                        let cwd_suffix = if display_info.is_cwd { " (cwd)" } else { "" };
+                        let cwd_suffix_len = cwd_suffix.len();
+
                         let display_name = if display_info.is_dir {
                             format!("{}/", display_info.display_name)
                         } else {
                             display_info.display_name.clone()
                         };
 
-                        let truncated_path = truncate_path(&display_name, file_width);
+                        // Adjust file_width to account for cwd suffix
+                        let adjusted_file_width = file_width.saturating_sub(cwd_suffix_len);
+                        let truncated_path = truncate_path(&display_name, adjusted_file_width);
 
-                        // Right-justify time by padding filename to fill available space
-                        let line = format!(
-                            "{}{:<width$}  {}",
-                            rank_prefix,
-                            truncated_path,
-                            time_ago,
-                            width = file_width
-                        );
-
-                        let style = if i == app.selected_index {
+                        // Build line with styled spans
+                        let base_style = if i == app.selected_index {
                             Style::default()
                                 .fg(Color::Yellow)
                                 .add_modifier(Modifier::BOLD)
@@ -770,7 +809,39 @@ fn run_app(
                         } else {
                             Style::default()
                         };
-                        ListItem::new(line).style(style)
+
+                        let cwd_style = if i == app.selected_index {
+                            // If selected, keep yellow but make it even more visible
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            // Otherwise use magenta to stand out
+                            Style::default()
+                                .fg(Color::Magenta)
+                                .add_modifier(Modifier::BOLD)
+                        };
+
+                        // Calculate padding to right-justify time
+                        let padding_len = adjusted_file_width.saturating_sub(truncated_path.len());
+                        let padding = " ".repeat(padding_len);
+
+                        let line = if display_info.is_cwd {
+                            Line::from(vec![
+                                Span::styled(rank_prefix.clone(), base_style),
+                                Span::styled(truncated_path.clone(), base_style),
+                                Span::styled(cwd_suffix, cwd_style),
+                                Span::raw(padding),
+                                Span::raw("  "),
+                                Span::styled(time_ago.clone(), base_style),
+                            ])
+                        } else {
+                            Line::from(vec![
+                                Span::styled(format!("{}{:<width$}  {}", rank_prefix, truncated_path, time_ago, width = adjusted_file_width), base_style),
+                            ])
+                        };
+
+                        ListItem::new(line)
                     } else {
                         // Page is not cached, show a loading indicator
                         ListItem::new("[Loading...]").style(Style::default().fg(Color::DarkGray))
@@ -778,10 +849,34 @@ fn run_app(
                 })
                 .collect();
 
+            // Create title with filter indicator
+            let filter_name = match app.current_filter {
+                search_worker::FilterType::None => "All",
+                search_worker::FilterType::OnlyCwd => "CWD",
+                search_worker::FilterType::OnlyDirs => "Dirs",
+                search_worker::FilterType::OnlyFiles => "Files",
+            };
+
+            let title_line = if app.current_filter == search_worker::FilterType::None {
+                // No filter active - no highlight
+                Line::from(vec![
+                    Span::raw(format!("{} ({}/{})", filter_name, app.total_results, app.total_files)),
+                ])
+            } else {
+                // Filter active - highlight in green
+                Line::from(vec![
+                    Span::styled(
+                        filter_name,
+                        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+                    ),
+                    Span::raw(format!(" ({}/{})", app.total_results, app.total_files)),
+                ])
+            };
+
             let list = List::new(items).block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(format!("Files ({}/{})", app.total_results, app.total_files)),
+                    .title(title_line),
             );
             f.render_widget(list, top_chunks[0]);
 
@@ -1113,10 +1208,66 @@ fn run_app(
 
             // Search input at the bottom
             let cwd_str = app.cwd.to_string_lossy();
-            let search_title = format!("Search: {}", cwd_str);
+            let filter_indicator = match app.current_filter {
+                search_worker::FilterType::None => "",
+                search_worker::FilterType::OnlyCwd => " [CWD]",
+                search_worker::FilterType::OnlyDirs => " [DIRS]",
+                search_worker::FilterType::OnlyFiles => " [FILES]",
+            };
+            let search_title = format!("Search: {}{}", cwd_str, filter_indicator);
             let input = Paragraph::new(app.query.as_str())
                 .block(Block::default().borders(Borders::ALL).title(search_title));
             f.render_widget(input, main_chunks[2]);
+
+            // Filter picker overlay (rendered on top if visible)
+            if app.filter_picker_visible {
+                use ratatui::layout::Rect;
+
+                // Create a popup in the bottom-right
+                let popup_width = 30;
+                let popup_height = 6;  // 4 options + top/bottom borders
+                let area = f.area();
+
+                // Position in bottom-right corner with some margin
+                let popup_x = area.width.saturating_sub(popup_width + 2);
+                let popup_y = area.height.saturating_sub(popup_height + 2);
+
+                let popup_area = Rect {
+                    x: popup_x,
+                    y: popup_y,
+                    width: popup_width,
+                    height: popup_height,
+                };
+
+                // Clear the area first to make it opaque
+                f.render_widget(Clear, popup_area);
+
+                // Build filter options text with current selection highlighted
+                let mut lines = vec![];
+
+                let options = [
+                    (search_worker::FilterType::None, "0: No filter"),
+                    (search_worker::FilterType::OnlyCwd, "c: Only CWD"),
+                    (search_worker::FilterType::OnlyDirs, "d: Only directories"),
+                    (search_worker::FilterType::OnlyFiles, "f: Only files"),
+                ];
+
+                for (filter_type, label) in options.iter() {
+                    if *filter_type == app.current_filter {
+                        lines.push(format!("> {}", label));
+                    } else {
+                        lines.push(format!("  {}", label));
+                    }
+                }
+
+                let filter_text = lines.join("\n");
+                let filter_popup = Paragraph::new(filter_text)
+                    .block(Block::default()
+                        .borders(Borders::ALL)
+                        .title("Filters (Ctrl-F)"));
+
+                f.render_widget(filter_popup, popup_area);
+            }
 
             // Position cursor in the search input at the end of the query text
             // Account for border (1 char) + query length
@@ -1208,6 +1359,7 @@ fn run_app(
                         search_worker::UpdateQueryRequest {
                             query: app.query.clone(),
                             query_id,
+                            filter: app.current_filter,
                         },
                     ));
                 }
@@ -1306,6 +1458,11 @@ fn run_app(
                         {
                             return Ok(());
                         }
+                        KeyCode::Char('d')
+                            if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
+                        {
+                            return Ok(());
+                        }
                         KeyCode::Char('u')
                             if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
                         {
@@ -1317,6 +1474,7 @@ fn run_app(
                                 search_worker::UpdateQueryRequest {
                                     query: app.query.clone(),
                                     query_id,
+                                    filter: app.current_filter,
                                 },
                             ));
                         }
@@ -1326,8 +1484,75 @@ fn run_app(
                             // Ctrl-O: toggle debug pane maximization
                             app.debug_pane_maximized = !app.debug_pane_maximized;
                         }
+                        KeyCode::Char('f')
+                            if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
+                        {
+                            // Ctrl-F: toggle filter picker
+                            app.filter_picker_visible = !app.filter_picker_visible;
+                        }
+                        KeyCode::Char('0') if app.filter_picker_visible => {
+                            // Filter 0: None
+                            app.current_filter = search_worker::FilterType::None;
+                            app.filter_picker_visible = false;
+                            let query_id = app.next_subsession_id;
+                            app.next_subsession_id += 1;
+                            let _ = app.worker_tx.send(WorkerRequest::UpdateQuery(
+                                search_worker::UpdateQueryRequest {
+                                    query: app.query.clone(),
+                                    query_id,
+                                    filter: app.current_filter,
+                                },
+                            ));
+                        }
+                        KeyCode::Char('c') if app.filter_picker_visible => {
+                            // Filter c: Only CWD
+                            app.current_filter = search_worker::FilterType::OnlyCwd;
+                            app.filter_picker_visible = false;
+                            let query_id = app.next_subsession_id;
+                            app.next_subsession_id += 1;
+                            let _ = app.worker_tx.send(WorkerRequest::UpdateQuery(
+                                search_worker::UpdateQueryRequest {
+                                    query: app.query.clone(),
+                                    query_id,
+                                    filter: app.current_filter,
+                                },
+                            ));
+                        }
+                        KeyCode::Char('d') if app.filter_picker_visible => {
+                            // Filter d: Only Dirs
+                            app.current_filter = search_worker::FilterType::OnlyDirs;
+                            app.filter_picker_visible = false;
+                            let query_id = app.next_subsession_id;
+                            app.next_subsession_id += 1;
+                            let _ = app.worker_tx.send(WorkerRequest::UpdateQuery(
+                                search_worker::UpdateQueryRequest {
+                                    query: app.query.clone(),
+                                    query_id,
+                                    filter: app.current_filter,
+                                },
+                            ));
+                        }
+                        KeyCode::Char('f') if app.filter_picker_visible => {
+                            // Filter f: Only Files
+                            app.current_filter = search_worker::FilterType::OnlyFiles;
+                            app.filter_picker_visible = false;
+                            let query_id = app.next_subsession_id;
+                            app.next_subsession_id += 1;
+                            let _ = app.worker_tx.send(WorkerRequest::UpdateQuery(
+                                search_worker::UpdateQueryRequest {
+                                    query: app.query.clone(),
+                                    query_id,
+                                    filter: app.current_filter,
+                                },
+                            ));
+                        }
                         KeyCode::Esc => {
-                            return Ok(());
+                            if app.filter_picker_visible {
+                                // Close filter picker without changing filter
+                                app.filter_picker_visible = false;
+                            } else {
+                                return Ok(());
+                            }
                         }
                         KeyCode::Up => {
                             app.move_selection(-1);
@@ -1353,6 +1578,7 @@ fn run_app(
                                 search_worker::UpdateQueryRequest {
                                     query: app.query.clone(),
                                     query_id,
+                                    filter: app.current_filter,
                                 },
                             ));
                         }
@@ -1364,6 +1590,7 @@ fn run_app(
                                 search_worker::UpdateQueryRequest {
                                     query: app.query.clone(),
                                     query_id,
+                                    filter: app.current_filter,
                                 },
                             ));
                         }

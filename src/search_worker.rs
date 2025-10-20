@@ -34,6 +34,15 @@ pub enum WalkerMessage {
     AllDone,
 }
 
+// Filter types
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterType {
+    None,          // 0 - no filter
+    OnlyCwd,       // 1 - only things in cwd
+    OnlyDirs,      // 2 - only directories
+    OnlyFiles,     // 3 - only files
+}
+
 // These next three are types for communicating with the UI thread.
 #[derive(Debug, Clone)]
 pub struct DisplayFileInfo {
@@ -45,11 +54,13 @@ pub struct DisplayFileInfo {
     pub atime: Option<i64>,
     pub file_size: Option<i64>,
     pub is_dir: bool,
+    pub is_cwd: bool,
 }
 
 pub struct UpdateQueryRequest {
     pub query: String,
     pub query_id: u64,
+    pub filter: FilterType,
 }
 
 pub enum WorkerRequest {
@@ -118,19 +129,27 @@ impl FileInfo {
         is_dir: bool,
         root: &PathBuf,
     ) -> Self {
-        let display_name = match full_path.strip_prefix(root) {
-            Ok(postfix) => {
-                // File is in current tree - show relative path
-                postfix.to_string_lossy().to_string()
-            }
-            Err(_) => {
-                // File is from elsewhere - show .../{filename} as a shorthand
-                // for "it's not from this dir"
-                let filename = full_path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("unknown");
-                format!(".../{}", filename)
+        let display_name = if full_path == *root {
+            // Special case: if this is the root directory itself, show just the dir name
+            root.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(".")
+                .to_string()
+        } else {
+            match full_path.strip_prefix(root) {
+                Ok(postfix) => {
+                    // File is in current tree - show relative path
+                    postfix.to_string_lossy().to_string()
+                }
+                Err(_) => {
+                    // File is from elsewhere - show .../{filename} as a shorthand
+                    // for "it's not from this dir"
+                    let filename = full_path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("unknown");
+                    format!(".../{}", filename)
+                }
             }
         };
 
@@ -181,6 +200,7 @@ struct WorkerState {
     file_scores: Vec<ranker::FileScore>,
     current_query: String,
     current_query_id: u64,
+    current_filter: FilterType,
     root: PathBuf,
     ranker: ranker::Ranker,
     model_path: PathBuf,
@@ -243,6 +263,34 @@ impl WorkerState {
             file_registry.len()
         );
 
+        // Add the root directory itself to the registry
+        // (walker skips it, but we want it to appear in results as "(cwd)")
+        let canonical_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+        if !path_to_id.contains_key(&canonical_root) {
+            let metadata = get_file_metadata(&canonical_root);
+            let display_name = canonical_root
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(".")
+                .to_string();
+
+            log::debug!("Adding root directory to registry: canonical_root={:?}, display_name={:?}", canonical_root, display_name);
+
+            let file_info = FileInfo {
+                full_path: canonical_root.clone(),
+                display_name,
+                mtime: metadata.mtime,
+                atime: metadata.atime,
+                file_size: metadata.file_size,
+                origin: FileOrigin::CwdWalker,
+                is_dir: true,
+            };
+
+            let file_id = FileId(file_registry.len());
+            path_to_id.insert(canonical_root.clone(), file_id);
+            file_registry.push(file_info);
+        }
+
         Ok(WorkerState {
             file_registry,
             path_to_id,
@@ -250,7 +298,8 @@ impl WorkerState {
             file_scores: Vec::new(),
             current_query: String::new(),
             current_query_id: 0,
-            root,
+            current_filter: FilterType::None,
+            root: canonical_root,
             ranker,
             model_path,
             db_path,
@@ -265,11 +314,20 @@ impl WorkerState {
         if !self.path_to_id.contains_key(&canonical_path) {
             // We have a new file.
             // The display path should be the original `path` relative to `self.root`.
-            let display_name = path
-                .strip_prefix(&self.root)
-                .unwrap_or(&path) // fallback to original path if not in root
-                .to_string_lossy()
-                .to_string();
+            let display_name = if canonical_path == self.root {
+                // For the root directory itself, show just the directory name
+                self.root
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(".")
+                    .to_string()
+            } else {
+                path
+                    .strip_prefix(&self.root)
+                    .unwrap_or(&path) // fallback to original path if not in root
+                    .to_string_lossy()
+                    .to_string()
+            };
 
             let file_info = FileInfo {
                 full_path: canonical_path.clone(), // Store the canonical path
@@ -297,13 +355,21 @@ impl WorkerState {
             .filter(|&file_id| {
                 let file_info = &self.file_registry[file_id.0];
 
-                // Do not include the root directory in results
-                if file_info.full_path == self.root {
+                // Apply text query filter
+                let matches_query = query_lower.is_empty()
+                    || file_info.display_name.to_lowercase().contains(&query_lower);
+
+                if !matches_query {
                     return false;
                 }
 
-                query_lower.is_empty()
-                    || file_info.display_name.to_lowercase().contains(&query_lower)
+                // Apply type filter
+                match self.current_filter {
+                    FilterType::None => true,
+                    FilterType::OnlyCwd => file_info.origin == FileOrigin::CwdWalker,
+                    FilterType::OnlyDirs => file_info.is_dir,
+                    FilterType::OnlyFiles => !file_info.is_dir,
+                }
             })
             .collect();
 
@@ -371,6 +437,9 @@ impl WorkerState {
                 let score = file_score.map(|fs| fs.score).unwrap_or(0.0);
                 let features = file_score.map(|fs| fs.features.clone()).unwrap_or_default();
 
+                // Check if this is the current working directory
+                let is_cwd = file_info.full_path == self.root;
+
                 DisplayFileInfo {
                     display_name: file_info.display_name.clone(),
                     full_path: file_info.full_path.clone(),
@@ -380,6 +449,7 @@ impl WorkerState {
                     atime: file_info.atime,
                     file_size: file_info.file_size,
                     is_dir: file_info.is_dir,
+                    is_cwd,
                 }
             })
             .collect()
@@ -508,6 +578,7 @@ fn worker_thread_loop(
                 let latest_req = drain_latest_update_request(&task_rx, update_req);
                 state.current_query = latest_req.query.clone();
                 state.current_query_id = latest_req.query_id;
+                state.current_filter = latest_req.filter;
 
                 // Filter and rank
                 if let Err(e) = state.filter_and_rank(&latest_req.query) {
