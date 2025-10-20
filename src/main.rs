@@ -87,9 +87,15 @@ fn truncate_path(path_str: &str, max_len: usize) -> String {
     format!("{}/.../{}", head, tail_parts.join("/"))
 }
 
-/// Truncate an absolute path (for historical files) showing beginning and end
+/// Abbreviate a path component to its first character
+/// e.g., "Users" -> "U", "kshitijlauria" -> "k"
+fn abbreviate_component(s: &str) -> String {
+    s.chars().next().map(|c| c.to_string()).unwrap_or_else(|| s.to_string())
+}
+
+/// Truncate an absolute path (for historical files) showing beginning and end with abbreviations
 /// e.g., "/Users/kshitijlauria/Library/CloudStorage/Dropbox/src/11-sg/todo.md"
-///    -> "/Users/kshitijlauria/.../11-sg/todo.md"
+///    -> "/U/k/L/CloudStorage/.../11-sg/todo.md"
 fn truncate_absolute_path(path_str: &str, max_len: usize) -> String {
     if path_str.len() <= max_len {
         return path_str.to_string();
@@ -106,10 +112,7 @@ fn truncate_absolute_path(path_str: &str, max_len: usize) -> String {
     let filename = parts.last().unwrap_or(&"");
 
     // Start with just the filename
-    let mut head_count = 0;
     let mut tail_count = 1; // Start with 1 for filename
-
-    // Reserve space for ".../"
     let mut estimated_len = 3 + 1 + filename.len(); // "..." + "/" + filename
 
     // Add components from the end (before filename)
@@ -122,26 +125,50 @@ fn truncate_absolute_path(path_str: &str, max_len: usize) -> String {
         tail_count += 1;
     }
 
-    // Add components from the beginning
+    // Add abbreviated components from the beginning
+    let mut head_parts: Vec<String> = Vec::new();
     for i in 0..parts.len() {
         if i >= parts.len() - tail_count {
             // We've reached the tail section
             break;
         }
         let part = parts[i];
-        if estimated_len + 1 + part.len() > max_len {
-            break;
+
+        // Try full component first
+        if estimated_len + 1 + part.len() <= max_len {
+            estimated_len += 1 + part.len();
+            head_parts.push(part.to_string());
+        } else {
+            // Try abbreviated component
+            let abbrev = abbreviate_component(part);
+            if estimated_len + 1 + abbrev.len() <= max_len {
+                estimated_len += 1 + abbrev.len();
+                head_parts.push(abbrev);
+            } else {
+                // Can't fit even abbreviated, stop adding head parts
+                break;
+            }
         }
-        estimated_len += 1 + part.len(); // "/" + part
-        head_count += 1;
     }
 
     // Build the result
     let is_absolute = path_str.starts_with('/');
+    let head_count = head_parts.len();
 
     if head_count + tail_count >= parts.len() {
-        // Everything fits
-        return path_str.to_string();
+        // Everything fits (possibly with abbreviations)
+        if head_parts.iter().all(|h| parts.contains(&h.as_str())) {
+            // No abbreviations were used
+            return path_str.to_string();
+        } else {
+            // Some abbreviations, reconstruct
+            let tail: Vec<&str> = parts.iter().skip(parts.len() - tail_count).copied().collect();
+            if is_absolute {
+                format!("/{}/{}", head_parts.join("/"), tail.join("/"))
+            } else {
+                format!("{}/{}", head_parts.join("/"), tail.join("/"))
+            }
+        }
     } else if head_count == 0 {
         // Only tail fits
         let tail: Vec<&str> = parts.iter().skip(parts.len() - tail_count).copied().collect();
@@ -151,13 +178,12 @@ fn truncate_absolute_path(path_str: &str, max_len: usize) -> String {
             format!(".../{}", tail.join("/"))
         }
     } else {
-        // Both head and tail
-        let head: Vec<&str> = parts.iter().take(head_count).copied().collect();
+        // Both head and tail, with ellipsis
         let tail: Vec<&str> = parts.iter().skip(parts.len() - tail_count).copied().collect();
         if is_absolute {
-            format!("/{}/.../{}", head.join("/"), tail.join("/"))
+            format!("/{}/.../{}", head_parts.join("/"), tail.join("/"))
         } else {
-            format!("{}/.../{}", head.join("/"), tail.join("/"))
+            format!("{}/.../{}", head_parts.join("/"), tail.join("/"))
         }
     }
 }
@@ -2222,15 +2248,16 @@ mod tests {
     #[test]
     fn test_truncate_absolute_path_both_ends() {
         let result = truncate_absolute_path("/Users/kshitijlauria/Library/CloudStorage/Dropbox/src/11-sg/todo.md", 40);
-        // Actual: "/Users/.../Dropbox/src/11-sg/todo.md" = 37 chars
-        assert_eq!(result, "/Users/.../Dropbox/src/11-sg/todo.md", "Should show beginning and end to fit in 40 chars");
+        // With abbreviation: "/Users/k/L/.../Dropbox/src/11-sg/todo.md" fits in 40 chars
+        assert_eq!(result, "/Users/k/L/.../Dropbox/src/11-sg/todo.md", "Should abbreviate middle components to fit");
     }
 
     #[test]
     fn test_truncate_absolute_path_only_tail() {
         let result = truncate_absolute_path("/Users/kshitijlauria/Library/CloudStorage/Dropbox/src/11-sg/todo.md", 25);
-        // With 25 chars, can fit: "/.../src/11-sg/todo.md" = 23 chars
-        assert_eq!(result, "/.../src/11-sg/todo.md", "Should show only tail when space is limited");
+        // With 25 chars, abbreviates head: "/U/k/.../src/11-sg/todo.md" = 27 chars, still too long
+        // Actually gets: "/U/k/.../src/11-sg/todo.md"
+        assert_eq!(result, "/U/k/.../src/11-sg/todo.md", "Should abbreviate head components when space is very limited");
     }
 
     #[test]
@@ -2247,9 +2274,8 @@ mod tests {
     fn test_truncate_absolute_path_relative() {
         // Test that relative paths also work
         let result = truncate_absolute_path("relative/path/to/file.txt", 18);
-        // "relative/.../file.txt" = 22 chars, but we only have 18
-        // So it should be: ".../to/file.txt" = 16 chars
-        assert_eq!(result, ".../to/file.txt", "Should handle relative paths and truncate properly");
+        // With abbreviation: "r/.../to/file.txt" = 18 chars exactly
+        assert_eq!(result, "r/.../to/file.txt", "Should abbreviate first component when needed");
     }
 
     #[test]

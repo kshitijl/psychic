@@ -12,6 +12,11 @@ Helix file picker is a lot faster. Maybe implement a mode that doesn't sort or r
 
 ## now
 
+- if we navigate to cwd then do nothing. including, don't add it to history.
+- after that think about how to make the filter logic fast, i worry that all that
+constant file path checking over and over is bad, we should do it once and store it in some
+struct that gets recomputed when we change dirs.- once above is fixed: history gets items double added to it
+- when history is filtered, suppose number of items becomes less than selected index, then selected index should become 0 so the top item is automatically becomes selected.
 - display is broken if we scroll past a binary file and it gets previewed
 - if we hit up while file walker is still walking then it shows loading and we end up in some strange middle of the results. instead we should remember our scroll position as -1 and reevaluate that when results are updated.
 - pick some good keybindings for going to top, and paging up and down the results

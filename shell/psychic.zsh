@@ -15,3 +15,10 @@ pd() {
     \builtin local result
     result="$(\command psychic --filter=dirs --on-dir-click=print-to-stdout)" && \builtin cd -- "${result}"
 }
+
+# Jump to a directory using psychic (current directory files only)
+# Navigate within current dir, Ctrl-J to cd there
+pc() {
+    \builtin local result
+    result="$(\command psychic --filter=cwd --on-cwd-visit=print-to-stdout)" && \builtin cd -- "${result}"
+}

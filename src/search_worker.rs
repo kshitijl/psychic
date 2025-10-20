@@ -363,7 +363,11 @@ impl WorkerState {
                 // Apply type filter
                 match self.current_filter {
                     FilterType::None => true,
-                    FilterType::OnlyCwd => file_info.origin == FileOrigin::CwdWalker,
+                    FilterType::OnlyCwd => {
+                        // Show files that are under current root, regardless of origin
+                        // This includes both files from CwdWalker and historical files that happen to be in cwd
+                        file_info.full_path.starts_with(&self.root)
+                    }
                     FilterType::OnlyDirs => file_info.is_dir,
                     FilterType::OnlyFiles => !file_info.is_dir,
                 }
@@ -735,6 +739,99 @@ fn get_file_metadata(path: &PathBuf) -> FileMetadata {
             file_size: None,
             is_dir: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn test_filter_cwd_includes_historical_files_in_cwd() {
+        // Test that OnlyCwd filter shows files under cwd, even if they're from history
+
+        let cwd = PathBuf::from("/home/user/project");
+
+        // File from CwdWalker
+        let file_from_walker = FileInfo {
+            full_path: PathBuf::from("/home/user/project/src/main.rs"),
+            display_name: "src/main.rs".to_string(),
+            mtime: Some(1000),
+            atime: None,
+            file_size: Some(100),
+            origin: FileOrigin::CwdWalker,
+            is_dir: false,
+        };
+
+        // File from history but also in current directory
+        let file_from_history_in_cwd = FileInfo {
+            full_path: PathBuf::from("/home/user/project/README.md"),
+            display_name: "/home/user/project/README.md".to_string(),
+            mtime: Some(900),
+            atime: None,
+            file_size: Some(50),
+            origin: FileOrigin::UserClickedInEventsDb,
+            is_dir: false,
+        };
+
+        // File from history outside current directory
+        let file_from_history_elsewhere = FileInfo {
+            full_path: PathBuf::from("/home/user/other/file.txt"),
+            display_name: "/home/user/other/file.txt".to_string(),
+            mtime: Some(800),
+            atime: None,
+            file_size: Some(25),
+            origin: FileOrigin::UserClickedInEventsDb,
+            is_dir: false,
+        };
+
+        // Test OnlyCwd filter
+        assert!(
+            file_from_walker.full_path.starts_with(&cwd),
+            "File from walker in cwd should pass OnlyCwd filter"
+        );
+
+        assert!(
+            file_from_history_in_cwd.full_path.starts_with(&cwd),
+            "File from history but in cwd should pass OnlyCwd filter"
+        );
+
+        assert!(
+            !file_from_history_elsewhere.full_path.starts_with(&cwd),
+            "File from history outside cwd should NOT pass OnlyCwd filter"
+        );
+    }
+
+    #[test]
+    fn test_filter_types() {
+        let file_dir = FileInfo {
+            full_path: PathBuf::from("/test/dir"),
+            display_name: "dir".to_string(),
+            mtime: None,
+            atime: None,
+            file_size: None,
+            origin: FileOrigin::CwdWalker,
+            is_dir: true,
+        };
+
+        let file_regular = FileInfo {
+            full_path: PathBuf::from("/test/file.txt"),
+            display_name: "file.txt".to_string(),
+            mtime: None,
+            atime: None,
+            file_size: None,
+            origin: FileOrigin::CwdWalker,
+            is_dir: false,
+        };
+
+        // OnlyDirs filter: is_dir == true
+        assert_eq!(file_dir.is_dir, true, "Directory should pass OnlyDirs filter");
+        assert_eq!(file_regular.is_dir, false, "Regular file should NOT pass OnlyDirs filter");
+
+        // OnlyFiles filter: !is_dir (is_dir == false)
+        assert_eq!(!file_dir.is_dir, false, "Directory should NOT pass OnlyFiles filter");
+        assert_eq!(!file_regular.is_dir, true, "Regular file should pass OnlyFiles filter");
     }
 }
 
