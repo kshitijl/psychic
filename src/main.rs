@@ -179,6 +179,7 @@ struct App {
     next_subsession_id: u64,
     db: Database,
     cwd: PathBuf, // Current working directory
+    dir_history: Vec<PathBuf>,
 
     num_results_to_log_as_impressions: usize,
 
@@ -238,6 +239,8 @@ impl App {
             next_subsession_id: 1, // Start with 1, 0 is for initial query
             num_results_to_log_as_impressions: 25,
             db,
+            cwd: root,
+            dir_history: Vec::new(),
             path_bar_scroll: 0,
             path_bar_scroll_direction: 1,
             last_path_bar_update: Instant::now(),
@@ -1109,8 +1112,10 @@ fn run_app(
             f.render_widget(path_bar, main_chunks[1]);
 
             // Search input at the bottom
+            let cwd_str = app.cwd.to_string_lossy();
+            let search_title = format!("Search: {}", cwd_str);
             let input = Paragraph::new(app.query.as_str())
-                .block(Block::default().borders(Borders::ALL).title("Search"));
+                .block(Block::default().borders(Borders::ALL).title(search_title));
             f.render_widget(input, main_chunks[2]);
 
             // Position cursor in the search input at the end of the query text
@@ -1232,27 +1237,68 @@ fn run_app(
                         KeyCode::Char('j')
                             if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
                         {
-                            // Ctrl-J: Change cwd to selected directory
-                            if app.total_results > 0 {
-                                // Clone the path first to avoid borrow checker issues
-                                let dir_path = app.get_file_at_index(app.selected_index)
-                                    .filter(|f| f.is_dir)
-                                    .map(|f| f.full_path.clone());
+                            // Ctrl-J: Open shell in CWD
+                            log::info!("Opening shell in cwd: {:?}", app.cwd);
 
-                                if let Some(new_cwd) = dir_path {
-                                    log::info!("Changing cwd to {:?}", new_cwd);
+                            // Suspend TUI
+                            disable_raw_mode()?;
+                            terminal
+                                .backend_mut()
+                                .execute(crossterm::event::DisableMouseCapture)?;
+                            terminal.backend_mut().execute(LeaveAlternateScreen)?;
+                            terminal.backend_mut().execute(Show)?;
 
-                                    // Clear query
-                                    app.query.clear();
+                            let shell =
+                                std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
+                            let status = std::process::Command::new(&shell)
+                                .current_dir(&app.cwd) // Use app.cwd
+                                .status();
 
-                                    // Send ChangeCwd request to worker
-                                    let query_id = app.next_subsession_id;
-                                    app.next_subsession_id += 1;
-                                    let _ = app.worker_tx.send(WorkerRequest::ChangeCwd {
-                                        new_cwd,
-                                        query_id,
-                                    });
-                                }
+                            // Resume TUI
+                            enable_raw_mode()?;
+                            terminal.backend_mut().execute(EnterAlternateScreen)?;
+                            terminal
+                                .backend_mut()
+                                .execute(crossterm::event::EnableMouseCapture)?;
+                            terminal.clear()?;
+
+                            if let Err(e) = status {
+                                log::error!("Failed to launch shell: {}", e);
+                            }
+
+                            // Reload model (may have been retrained in background)
+                            let query_id_model = app.next_subsession_id;
+                            app.next_subsession_id += 1;
+                            if let Err(e) = app.reload_model(query_id_model) {
+                                log::error!("Failed to reload model: {}", e);
+                            }
+
+                            // Reload click data and rerank files after shell
+                            let query_id_clicks = app.next_subsession_id;
+                            app.next_subsession_id += 1;
+                            if let Err(e) = app.reload_and_rerank(query_id_clicks) {
+                                log::error!("Failed to reload and rerank: {}", e);
+                            }
+                        }
+                        KeyCode::Char('h')
+                            if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
+                        {
+                            // Ctrl-H: Go back to previous directory
+                            if let Some(prev_cwd) = app.dir_history.pop() {
+                                log::info!("Going back to {:?}", prev_cwd);
+
+                                app.cwd = prev_cwd.clone();
+
+                                // Clear query
+                                app.query.clear();
+
+                                // Send ChangeCwd request to worker
+                                let query_id = app.next_subsession_id;
+                                app.next_subsession_id += 1;
+                                let _ = app.worker_tx.send(WorkerRequest::ChangeCwd {
+                                    new_cwd: prev_cwd,
+                                    query_id,
+                                });
                             }
                         }
                         KeyCode::Char('c')
@@ -1332,51 +1378,60 @@ fn run_app(
                                         session_id: &app.session_id,
                                     })?;
 
-                                    // Suspend TUI
-                                    disable_raw_mode()?;
-                                    terminal
-                                        .backend_mut()
-                                        .execute(crossterm::event::DisableMouseCapture)?;
-                                    terminal.backend_mut().execute(LeaveAlternateScreen)?;
-                                    terminal.backend_mut().execute(Show)?;
+                                    if display_info.is_dir {
+                                        // On a directory, change CWD
+                                        let new_cwd = display_info.full_path.clone();
+                                        log::info!("Changing cwd to {:?}", new_cwd);
 
-                                    let status = if display_info.is_dir {
-                                        // If directory, cd and spawn shell
-                                        let shell = std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
-                                        std::process::Command::new(&shell)
-                                            .current_dir(&display_info.full_path)
-                                            .status()
+                                        app.dir_history.push(app.cwd.clone());
+                                        app.cwd = new_cwd.clone();
+
+                                        // Clear query and send request to worker
+                                        app.query.clear();
+                                        let query_id = app.next_subsession_id;
+                                        app.next_subsession_id += 1;
+                                        let _ = app.worker_tx.send(WorkerRequest::ChangeCwd {
+                                            new_cwd,
+                                            query_id,
+                                        });
                                     } else {
-                                        // If file, launch editor
-                                        std::process::Command::new("hx")
+                                        // On a file, suspend TUI and open editor
+                                        disable_raw_mode()?;
+                                        terminal
+                                            .backend_mut()
+                                            .execute(crossterm::event::DisableMouseCapture)?;
+                                        terminal.backend_mut().execute(LeaveAlternateScreen)?;
+                                        terminal.backend_mut().execute(Show)?;
+
+                                        let status = std::process::Command::new("hx")
                                             .arg(&display_info.full_path)
-                                            .status()
-                                    };
+                                            .status();
 
-                                    // Resume TUI
-                                    enable_raw_mode()?;
-                                    terminal.backend_mut().execute(EnterAlternateScreen)?;
-                                    terminal
-                                        .backend_mut()
-                                        .execute(crossterm::event::EnableMouseCapture)?;
-                                    terminal.clear()?;
+                                        // Resume TUI
+                                        enable_raw_mode()?;
+                                        terminal.backend_mut().execute(EnterAlternateScreen)?;
+                                        terminal
+                                            .backend_mut()
+                                            .execute(crossterm::event::EnableMouseCapture)?;
+                                        terminal.clear()?;
 
-                                    if let Err(e) = status {
-                                        log::error!("Failed to launch {}: {}", if display_info.is_dir { "shell" } else { "editor" }, e);
-                                    }
+                                        if let Err(e) = status {
+                                            log::error!("Failed to launch editor: {}", e);
+                                        }
 
-                                    // Reload model (may have been retrained in background)
-                                    let query_id_model = app.next_subsession_id;
-                                    app.next_subsession_id += 1;
-                                    if let Err(e) = app.reload_model(query_id_model) {
-                                        log::error!("Failed to reload model: {}", e);
-                                    }
+                                        // Reload model (may have been retrained in background)
+                                        let query_id_model = app.next_subsession_id;
+                                        app.next_subsession_id += 1;
+                                        if let Err(e) = app.reload_model(query_id_model) {
+                                            log::error!("Failed to reload model: {}", e);
+                                        }
 
-                                    // Reload click data and rerank files after editing
-                                    let query_id_clicks = app.next_subsession_id;
-                                    app.next_subsession_id += 1;
-                                    if let Err(e) = app.reload_and_rerank(query_id_clicks) {
-                                        log::error!("Failed to reload and rerank: {}", e);
+                                        // Reload click data and rerank files after editing
+                                        let query_id_clicks = app.next_subsession_id;
+                                        app.next_subsession_id += 1;
+                                        if let Err(e) = app.reload_and_rerank(query_id_clicks) {
+                                            log::error!("Failed to reload and rerank: {}", e);
+                                        }
                                     }
                                 }
                             }

@@ -298,6 +298,12 @@ impl WorkerState {
             .map(FileId)
             .filter(|&file_id| {
                 let file_info = &self.file_registry[file_id.0];
+
+                // Do not include the root directory in results
+                if file_info.full_path == self.root {
+                    return false;
+                }
+
                 query_lower.is_empty()
                     || file_info.display_name.to_lowercase().contains(&query_lower)
             })

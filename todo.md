@@ -12,11 +12,6 @@ Helix file picker is a lot faster. Maybe implement a mode that doesn't sort or r
 
 ## now
 
-- show cwd somewhere in the ui
-- when cwd changed then recalculate historical file names
-- keyboard shortcut to go back and forward in history
-- shortcut to open a shell in cwd
-- yeah actually just ENTER to change cwd of psychic to some directory, then use the shortcut to drop into shell there. that's better.
 - then it be cool to have ctrl-enter be "enter this directory" and that makes it the new cwd.
 - keyword or something to filter to just dirs. at that point it becomes a zoxide replacement.- display is broken if we scroll past a binary file and it gets previewed
 - if we hit up while file walker is still walking then it shows loading and we end up in some strange middle of the results. instead we should remember our scroll position as -1 and reevaluate that when results are updated.
