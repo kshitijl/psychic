@@ -2,6 +2,7 @@ mod context;
 mod db;
 mod feature_defs;
 mod features;
+mod history;
 mod ranker;
 mod search_worker;
 mod walker;
@@ -255,8 +256,8 @@ fn render_history_mode(f: &mut Frame, app: &App) {
         .collect();
 
     // Render directory list
-    // Total includes dir_history + current directory
-    let total_dirs = app.dir_history.len() + 1;
+    // Total includes all items in history display
+    let total_dirs = app.history.items_for_display().len();
     let title = format!("History (most recent at top) — {}/{}", filtered_history.len(), total_dirs);
     let list = List::new(items).block(
         Block::default()
@@ -440,9 +441,8 @@ struct App {
     next_subsession_id: u64,
     db: Database,
     cwd: PathBuf, // Current working directory
-    dir_history: Vec<PathBuf>,
+    history: history::History,
     history_mode: bool,      // Are we in history navigation mode?
-    history_index: usize,    // Current position in history (where we are)
     history_selected: usize, // Selected item in history mode UI
 
     num_results_to_log_as_impressions: usize,
@@ -511,10 +511,9 @@ impl App {
             next_subsession_id: 1, // Start with 1, 0 is for initial query
             num_results_to_log_as_impressions: 25,
             db,
-            cwd: root,
-            dir_history: Vec::new(),
+            cwd: root.clone(),
+            history: history::History::new(root),
             history_mode: false,
-            history_index: 0,
             history_selected: 0,
             path_bar_scroll: 0,
             path_bar_scroll_direction: 1,
@@ -668,12 +667,8 @@ impl App {
     fn get_filtered_history(&self) -> Vec<PathBuf> {
         let query_lower = self.query.to_lowercase();
 
-        // Start with dir_history and append current directory
-        let mut all_dirs: Vec<PathBuf> = self.dir_history.clone();
-        all_dirs.push(self.cwd.clone());
-
-        // Reverse so most recent is at the top
-        all_dirs.reverse();
+        // Get all history items (already in reverse order from the History module)
+        let all_dirs = self.history.items_for_display();
 
         if query_lower.is_empty() {
             all_dirs
@@ -712,41 +707,34 @@ impl App {
             return Ok(());
         }
 
-        let selected_dir = filtered_history[self.history_selected].clone();
+        // Map the selected index in the filtered list back to the display index
+        // in the unfiltered list
+        let selected_dir = &filtered_history[self.history_selected];
+        let all_dirs = self.history.items_for_display();
+        let display_index = all_dirs.iter().position(|p| p == selected_dir).unwrap_or(0);
 
-        // Find the index of this directory in the full (unfiltered) history
-        let full_history_index = self.dir_history
-            .iter()
-            .position(|p| p == &selected_dir)
-            .unwrap_or(0);
+        // Use the History module to navigate
+        if let Some(new_dir) = self.history.navigate_to_display_index(display_index) {
+            log::info!("Navigating to {:?} from history", new_dir);
+            self.cwd = new_dir.clone();
 
-        // Check if this is the next item in history after our current position
-        if full_history_index == self.history_index {
-            // We're selecting the next item in history - just increment the index
-            self.history_index += 1;
+            // Exit history mode
+            self.history_mode = false;
+            self.query.clear();
+
+            // Send ChangeCwd request to worker
+            let query_id = self.next_subsession_id;
+            self.next_subsession_id += 1;
+            let _ = self.worker_tx.send(WorkerRequest::ChangeCwd {
+                new_cwd: new_dir,
+                query_id,
+            });
         } else {
-            // This is a branch point - truncate history and append new dir
-            // First, add current cwd to history up to history_index
-            self.dir_history.truncate(self.history_index);
-            self.dir_history.push(self.cwd.clone());
-            self.history_index = self.dir_history.len();
+            // Directory is same as current, just exit history mode
+            log::info!("Already in selected directory, not navigating");
+            self.history_mode = false;
+            self.query.clear();
         }
-
-        // Navigate to the selected directory
-        log::info!("Navigating to {:?} from history", selected_dir);
-        self.cwd = selected_dir.clone();
-
-        // Exit history mode
-        self.history_mode = false;
-        self.query.clear();
-
-        // Send ChangeCwd request to worker
-        let query_id = self.next_subsession_id;
-        self.next_subsession_id += 1;
-        let _ = self.worker_tx.send(WorkerRequest::ChangeCwd {
-            new_cwd: selected_dir,
-            query_id,
-        });
 
         Ok(())
     }
@@ -1880,7 +1868,8 @@ fn run_app(
                             } else {
                                 // Enter history mode (always allow, even with empty history)
                                 app.history_mode = true;
-                                app.history_selected = 0;
+                                // Set cursor to current position in history
+                                app.history_selected = app.history.current_display_index();
                                 app.query.clear();
                                 app.preview_cache = None; // Clear preview cache
                             }
@@ -2075,8 +2064,14 @@ fn run_app(
 
                                         match app.on_dir_click {
                                             OnDirClickAction::Navigate => {
+                                                // Don't navigate if already in that directory
+                                                if dir_path == app.cwd {
+                                                    log::info!("Already in {:?}, not navigating", dir_path);
+                                                    continue;
+                                                }
+
                                                 log::info!("Navigating to directory: {:?}", dir_path);
-                                                app.dir_history.push(app.cwd.clone());
+                                                app.history.navigate_to(dir_path.clone());
                                                 app.cwd = dir_path.clone();
 
                                                 // Clear query and send request to worker
