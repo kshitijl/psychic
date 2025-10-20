@@ -108,13 +108,28 @@ Why: Files can be modified between discovery and impression. Event-time metadata
 Background thread that recursively walks current directory using `walkdir`.
 
 **Key points:**
-- Streams results via mpsc channel as discovered
+- Streams results via mpsc channel using `WalkerMessage` enum
 - Filters: `.git`, `node_modules`, `.venv`, `target`
-- Sends files only (not directories)
-- Extracts mtime from walkdir's cached metadata
+- Sends both files and directories (with `is_dir` flag)
+- Extracts mtime, atime, and file_size from walkdir's cached metadata
+- Adaptive depth: switches to depth=1 if >8k items found (shallow mode)
+- Sends `AllDone` message when walk completes
+
+**Shallow mode:** If walker encounters more than 8,000 items during full-depth exploration, it aborts and restarts with `max_depth(1)` to only show first-level items. This prevents performance issues in large directory trees like `~/`.
+
+**WalkerMessage enum:**
+```rust
+pub enum WalkerMessage {
+    FileMetadata(WalkerFileMetadata),
+    AllDone,
+}
+```
+
+The `AllDone` message bypasses the worker's 200ms debounce to ensure the UI updates immediately when the walk completes, even if it finishes quickly.
 
 Why background thread: Large directories take seconds to scan. Streaming keeps UI responsive.
-Why send mtime: Avoids re-fetching metadata later (performance).
+Why send metadata: Avoids re-fetching later (performance).
+Why AllDone: Ensures UI updates even when walker completes in <200ms (debounce bypass).
 
 ### Module: `context.rs`
 
@@ -144,14 +159,16 @@ Worker thread owns all file data and processes queries asynchronously.
 
 **Worker loop:**
 1. Process walker updates (non-blocking `try_recv`)
-2. Auto-refresh every 100ms if files changed
+   - `FileMetadata`: Add file to registry, mark files_changed
+   - `AllDone`: Mark walker_done, force immediate FilesChanged notification
+2. Send FilesChanged if files changed AND (walker_done OR >200ms since last notification)
 3. Process work requests with 5ms timeout
 4. Debounce queries (drain channel, keep latest)
 
 **Debouncing:** If user types "hello" quickly, only process final query (not 5 intermediate queries).
 Why: Avoids wasted computation and improves responsiveness.
 
-**Auto-refresh:** When new files arrive from the walker, the worker sends a `FilesChanged` notification to the UI thread. The UI is then responsible for triggering a new query with a new `query_id` to get fresh results. This preserves the "UI generates IDs" architecture and ensures the page cache is handled correctly.
+**Auto-refresh:** When new files arrive from the walker, the worker sends a `FilesChanged` notification to the UI thread (debounced to 200ms intervals). When walker sends `AllDone`, the debounce is bypassed to ensure immediate UI update. The UI is then responsible for triggering a new query with a new `query_id` to get fresh results. This preserves the "UI generates IDs" architecture and ensures the page cache is handled correctly.
 
 **File Registry Design:**
 

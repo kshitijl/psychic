@@ -21,6 +21,12 @@ pub struct WalkerFileMetadata {
     pub is_dir: bool,
 }
 
+// Commands sent from worker to walker
+#[derive(Debug, Clone)]
+pub enum WalkerCommand {
+    ChangeCwd(PathBuf),
+}
+
 // Messages from walker to worker
 #[derive(Debug, Clone)]
 pub enum WalkerMessage {
@@ -54,6 +60,10 @@ pub enum WorkerRequest {
     },
     ReloadModel { query_id: u64 },
     ReloadClicks { query_id: u64 },
+    ChangeCwd {
+        new_cwd: PathBuf,
+        query_id: u64,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -167,23 +177,23 @@ pub fn spawn(
 ) -> Result<(Sender<WorkerRequest>, Receiver<WorkerResponse>, JoinHandle<()>)> {
     let (worker_tx, worker_task_rx) = mpsc::channel::<WorkerRequest>();
     let (worker_result_tx, worker_rx) = mpsc::channel::<WorkerResponse>();
-    let (walker_tx, walker_rx) = mpsc::channel::<WalkerMessage>();
+    let (walker_message_tx, walker_message_rx) = mpsc::channel::<WalkerMessage>();
+    let (walker_command_tx, walker_command_rx) = mpsc::channel::<WalkerCommand>();
 
     let data_dir = data_dir.to_path_buf();
     let cwd_clone = cwd.clone();
+    let walker_command_tx_clone = walker_command_tx.clone();
     let worker_handle = std::thread::spawn(move || {
         // WorkerState is constructed in this thread so the ranker never moves
         // between thread. It's technically thread-safe to move for read-only
         // operations, but doing it this way means we don't have to do an unsafe
         // impl Send.
-        let worker_state = WorkerState::new(cwd_clone, &data_dir).unwrap();
-        worker_thread_loop(worker_task_rx, worker_result_tx, walker_rx, worker_state);
+        let worker_state = WorkerState::new(cwd_clone, &data_dir, walker_command_tx_clone).unwrap();
+        worker_thread_loop(worker_task_rx, worker_result_tx, walker_message_rx, worker_state);
     });
 
-    let root_clone = cwd.clone();
-    std::thread::spawn(move || {
-        start_file_walker(root_clone, walker_tx);
-    });
+    // Start walker thread
+    start_file_walker(cwd, walker_command_rx, walker_message_tx);
 
     Ok((worker_tx, worker_rx, worker_handle))
 }
@@ -200,10 +210,11 @@ struct WorkerState {
     ranker: ranker::Ranker,
     model_path: PathBuf,
     db_path: PathBuf,
+    walker_command_tx: Sender<WalkerCommand>,
 }
 
 impl WorkerState {
-    fn new(root: PathBuf, data_dir: &Path) -> Result<Self> {
+    fn new(root: PathBuf, data_dir: &Path, walker_command_tx: Sender<WalkerCommand>) -> Result<Self> {
         let ranker_start = jiff::Timestamp::now();
         let model_path = data_dir.join("model.txt");
 
@@ -265,6 +276,7 @@ impl WorkerState {
             ranker,
             model_path,
             db_path,
+            walker_command_tx,
         })
     }
 
@@ -409,6 +421,45 @@ impl WorkerState {
         log::info!("Worker: Click data reloaded successfully");
         Ok(())
     }
+
+    fn change_cwd(&mut self, new_cwd: PathBuf) -> Result<()> {
+        log::info!("Worker: Changing cwd from {:?} to {:?}", self.root, new_cwd);
+
+        // Remove all walker-sourced files from registry
+        self.file_registry.retain(|f| f.origin != FileOrigin::CwdWalker);
+
+        // Update root
+        self.root = new_cwd.clone();
+
+        // Recalculate display names for all historical files with new root
+        for file in self.file_registry.iter_mut() {
+            file.display_name = match file.full_path.strip_prefix(&self.root) {
+                Ok(postfix) => {
+                    // File is in current tree - show relative path
+                    postfix.to_string_lossy().to_string()
+                }
+                Err(_) => {
+                    // File is from elsewhere - show .../{filename} as a shorthand
+                    let filename = file.full_path.file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("unknown");
+                    format!(".../{}", filename)
+                }
+            };
+        }
+
+        // Rebuild path_to_id map (only keep historical files)
+        self.path_to_id.clear();
+        for (idx, file) in self.file_registry.iter().enumerate() {
+            self.path_to_id.insert(file.full_path.clone(), FileId(idx));
+        }
+
+        // Send command to walker thread to change directory
+        self.walker_command_tx.send(WalkerCommand::ChangeCwd(new_cwd))?;
+
+        log::info!("Worker: CWD change command sent to walker");
+        Ok(())
+    }
 }
 // Worker thread main loop
 fn worker_thread_loop(
@@ -508,6 +559,27 @@ fn worker_thread_loop(
                     let query = state.current_query.clone();
                     if let Err(e) = state.filter_and_rank(&query) {
                         log::error!("Filter/rank failed after clicks reload: {}", e);
+                    } else {
+                        let initial_page = state.get_page(0, 128);
+                        let _ = result_tx.send(WorkerResponse::QueryUpdated {
+                            query_id,
+                            total_results: state.filtered_files.len(),
+                            total_files: state.file_registry.len(),
+                            initial_page,
+                            model_stats: state.ranker.stats.clone(),
+                        });
+                    }
+                }
+            }
+            Ok(WorkerRequest::ChangeCwd { new_cwd, query_id }) => {
+                state.current_query_id = query_id;
+                if let Err(e) = state.change_cwd(new_cwd) {
+                    log::error!("Failed to change cwd: {}", e);
+                } else {
+                    // Clear query and re-filter (will show only historical files until walker sends new ones)
+                    state.current_query = String::new();
+                    if let Err(e) = state.filter_and_rank("") {
+                        log::error!("Filter/rank failed after cwd change: {}", e);
                     } else {
                         let initial_page = state.get_page(0, 128);
                         let _ = result_tx.send(WorkerResponse::QueryUpdated {

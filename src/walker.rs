@@ -1,19 +1,54 @@
-use crate::search_worker::{WalkerFileMetadata, WalkerMessage};
+use crate::search_worker::{WalkerCommand, WalkerFileMetadata, WalkerMessage};
 use std::path::PathBuf;
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Receiver, Sender};
 use walkdir::WalkDir;
 
 const IGNORED_DIRS: &[&str] = &[".git", "node_modules", ".venv", "target"];
 const MAX_FILES: usize = 250_000;
 const SHALLOW_MODE_THRESHOLD: usize = 8_000;
+const COMMAND_CHECK_INTERVAL: usize = 100; // Check for commands every N files
 
-pub fn start_file_walker(root: PathBuf, tx: Sender<WalkerMessage>) {
+pub fn start_file_walker(
+    initial_root: PathBuf,
+    command_rx: Receiver<WalkerCommand>,
+    message_tx: Sender<WalkerMessage>,
+) {
     std::thread::spawn(move || {
-        // First pass: try full-depth exploration
-        let mut item_count = 0;
-        let mut items = Vec::new();
+        let mut current_root = initial_root;
 
-        for entry in WalkDir::new(&root)
+        'outer: loop {
+            walk_directory(&current_root, &command_rx, &message_tx);
+
+            // After walk completes, send AllDone
+            let _ = message_tx.send(WalkerMessage::AllDone);
+
+            // Wait for next command (blocking)
+            match command_rx.recv() {
+                Ok(WalkerCommand::ChangeCwd(new_root)) => {
+                    log::info!("Walker: Changing directory to {:?}", new_root);
+                    current_root = new_root;
+                    // Continue to next iteration of outer loop
+                }
+                Err(_) => {
+                    // Channel closed, exit thread
+                    log::info!("Walker: Command channel closed, exiting");
+                    break 'outer;
+                }
+            }
+        }
+    });
+}
+
+fn walk_directory(
+    root: &PathBuf,
+    command_rx: &Receiver<WalkerCommand>,
+    tx: &Sender<WalkerMessage>,
+) {
+    // First pass: try full-depth exploration
+    let mut item_count = 0;
+    let mut items = Vec::new();
+
+    for entry in WalkDir::new(root)
             .follow_links(true)
             .into_iter()
             .filter_entry(|e| {
@@ -35,13 +70,21 @@ pub fn start_file_walker(root: PathBuf, tx: Sender<WalkerMessage>) {
 
             item_count += 1;
 
+            // Check for commands periodically
+            if item_count % COMMAND_CHECK_INTERVAL == 0 {
+                if let Ok(WalkerCommand::ChangeCwd(_)) = command_rx.try_recv() {
+                    log::info!("Walker: Received ChangeCwd during walk, aborting current walk");
+                    return; // Abort current walk, outer loop will handle the command
+                }
+            }
+
             // If we exceed the shallow mode threshold, switch to depth=1 exploration
             if item_count > SHALLOW_MODE_THRESHOLD {
                 // Clear collected items and restart with depth=1
                 items.clear();
                 item_count = 0;
 
-                for entry in WalkDir::new(&root)
+                for entry in WalkDir::new(root)
                     .follow_links(true)
                     .max_depth(1)
                     .into_iter()
@@ -55,8 +98,15 @@ pub fn start_file_walker(root: PathBuf, tx: Sender<WalkerMessage>) {
                     })
                     .filter_map(|e| e.ok())
                 {
-                    let is_root = entry.path() == root;
+                    let is_root = entry.path() == root.as_path();
                     if !is_root && item_count < MAX_FILES {
+                        // Check for commands periodically in shallow mode too
+                        if item_count % COMMAND_CHECK_INTERVAL == 0 {
+                            if let Ok(WalkerCommand::ChangeCwd(_)) = command_rx.try_recv() {
+                                log::info!("Walker: Received ChangeCwd during shallow walk, aborting");
+                                return;
+                            }
+                        }
                         let is_dir = entry.file_type().is_dir();
                         let metadata = entry.metadata().ok();
                         let mtime = metadata
@@ -83,9 +133,7 @@ pub fn start_file_walker(root: PathBuf, tx: Sender<WalkerMessage>) {
                         item_count += 1;
                     }
                 }
-                // Send AllDone message after shallow mode walk completes
-                let _ = tx.send(WalkerMessage::AllDone);
-                return; // Exit after shallow mode pass
+                return; // Exit after shallow mode pass (AllDone sent by outer loop)
             }
 
             // Continue collecting items in full-depth mode
@@ -116,11 +164,9 @@ pub fn start_file_walker(root: PathBuf, tx: Sender<WalkerMessage>) {
             }
         }
 
-        // If we finished without hitting the threshold, send all collected items
-        for item in items {
-            let _ = tx.send(WalkerMessage::FileMetadata(item));
-        }
-        // Send AllDone message after full-depth walk completes
-        let _ = tx.send(WalkerMessage::AllDone);
-    });
+    // If we finished without hitting the threshold, send all collected items
+    for item in items {
+        let _ = tx.send(WalkerMessage::FileMetadata(item));
+    }
+    // AllDone will be sent by outer loop
 }

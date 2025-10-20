@@ -178,6 +178,7 @@ struct App {
     current_subsession: Option<Subsession>,
     next_subsession_id: u64,
     db: Database,
+    cwd: PathBuf, // Current working directory
 
     num_results_to_log_as_impressions: usize,
 
@@ -1228,6 +1229,32 @@ fn run_app(
                 }
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     match key.code {
+                        KeyCode::Char('j')
+                            if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
+                        {
+                            // Ctrl-J: Change cwd to selected directory
+                            if app.total_results > 0 {
+                                // Clone the path first to avoid borrow checker issues
+                                let dir_path = app.get_file_at_index(app.selected_index)
+                                    .filter(|f| f.is_dir)
+                                    .map(|f| f.full_path.clone());
+
+                                if let Some(new_cwd) = dir_path {
+                                    log::info!("Changing cwd to {:?}", new_cwd);
+
+                                    // Clear query
+                                    app.query.clear();
+
+                                    // Send ChangeCwd request to worker
+                                    let query_id = app.next_subsession_id;
+                                    app.next_subsession_id += 1;
+                                    let _ = app.worker_tx.send(WorkerRequest::ChangeCwd {
+                                        new_cwd,
+                                        query_id,
+                                    });
+                                }
+                            }
+                        }
                         KeyCode::Char('c')
                             if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
                         {
