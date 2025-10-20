@@ -19,17 +19,14 @@ use crossterm::{
 };
 use db::{Database, EventData, FileMetadata};
 use ratatui::{
-    Frame,
-    Terminal,
+    Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
 };
-use search_worker::{
-    DisplayFileInfo, WorkerRequest, WorkerResponse,
-};
+use search_worker::{DisplayFileInfo, WorkerRequest, WorkerResponse};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     env,
@@ -38,8 +35,6 @@ use std::{
     thread::JoinHandle,
     time::{Duration, Instant},
 };
-
-
 
 /// Truncates a path string in the middle if it's too long, keeping the first
 /// component and the end of the path.
@@ -92,7 +87,10 @@ fn truncate_path(path_str: &str, max_len: usize) -> String {
 /// Abbreviate a path component to its first character
 /// e.g., "Users" -> "U", "kshitijlauria" -> "k"
 fn abbreviate_component(s: &str) -> String {
-    s.chars().next().map(|c| c.to_string()).unwrap_or_else(|| s.to_string())
+    s.chars()
+        .next()
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| s.to_string())
 }
 
 /// Truncate an absolute path (for historical files) showing beginning and end with abbreviations
@@ -164,7 +162,11 @@ fn truncate_absolute_path(path_str: &str, max_len: usize) -> String {
             return path_str.to_string();
         } else {
             // Some abbreviations, reconstruct
-            let tail: Vec<&str> = parts.iter().skip(parts.len() - tail_count).copied().collect();
+            let tail: Vec<&str> = parts
+                .iter()
+                .skip(parts.len() - tail_count)
+                .copied()
+                .collect();
             if is_absolute {
                 format!("/{}/{}", head_parts.join("/"), tail.join("/"))
             } else {
@@ -173,7 +175,11 @@ fn truncate_absolute_path(path_str: &str, max_len: usize) -> String {
         }
     } else if head_count == 0 {
         // Only tail fits
-        let tail: Vec<&str> = parts.iter().skip(parts.len() - tail_count).copied().collect();
+        let tail: Vec<&str> = parts
+            .iter()
+            .skip(parts.len() - tail_count)
+            .copied()
+            .collect();
         if is_absolute {
             format!("/.../{}", tail.join("/"))
         } else {
@@ -181,7 +187,11 @@ fn truncate_absolute_path(path_str: &str, max_len: usize) -> String {
         }
     } else {
         // Both head and tail, with ellipsis
-        let tail: Vec<&str> = parts.iter().skip(parts.len() - tail_count).copied().collect();
+        let tail: Vec<&str> = parts
+            .iter()
+            .skip(parts.len() - tail_count)
+            .copied()
+            .collect();
         if is_absolute {
             format!("/{}/.../{}", head_parts.join("/"), tail.join("/"))
         } else {
@@ -270,16 +280,25 @@ fn render_history_mode(f: &mut Frame, app: &App) {
     // Render directory list
     // Total includes all items in history display
     let total_dirs = app.history.items_for_display().len();
-    let title = format!("History (most recent at top) — {}/{}", filtered_history.len(), total_dirs);
+    let title = format!(
+        "History (most recent at top) — {}/{}",
+        filtered_history.len(),
+        total_dirs
+    );
     let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(Span::styled(title, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))),
+        Block::default().borders(Borders::ALL).title(Span::styled(
+            title,
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )),
     );
     f.render_widget(list, top_chunks[0]);
 
     // Preview pane: show eza -al of selected directory
-    let preview_text = if !filtered_history.is_empty() && app.history_selected < filtered_history.len() {
+    let preview_text = if !filtered_history.is_empty()
+        && app.history_selected < filtered_history.len()
+    {
         let selected_dir = &filtered_history[app.history_selected];
 
         let preview_width = top_chunks[1].width;
@@ -298,15 +317,16 @@ fn render_history_mode(f: &mut Frame, app: &App) {
         eza_cmd.arg(selected_dir);
         let eza_start = Instant::now();
         let eza_output = eza_cmd.output();
-        log::info!("TIMING {{\"op\":\"eza_history_preview\",\"ms\":{}}}", eza_start.elapsed().as_secs_f64() * 1000.0);
+        log::info!(
+            "TIMING {{\"op\":\"eza_history_preview\",\"ms\":{}}}",
+            eza_start.elapsed().as_secs_f64() * 1000.0
+        );
 
         match eza_output {
-            Ok(output) => {
-                match ansi_to_tui::IntoText::into_text(&output.stdout) {
-                    Ok(text) => text,
-                    Err(_) => Text::from("[Unable to parse directory listing]"),
-                }
-            }
+            Ok(output) => match ansi_to_tui::IntoText::into_text(&output.stdout) {
+                Ok(text) => text,
+                Err(_) => Text::from("[Unable to parse directory listing]"),
+            },
             Err(_) => {
                 // Fallback to ls if eza not available
                 let ls_output = std::process::Command::new("ls")
@@ -324,11 +344,7 @@ fn render_history_mode(f: &mut Frame, app: &App) {
     };
 
     let preview_para = Paragraph::new(preview_text)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Preview"),
-        )
+        .block(Block::default().borders(Borders::ALL).title("Preview"))
         .scroll((app.preview_scroll as u16, 0));
     f.render_widget(preview_para, top_chunks[1]);
 
@@ -522,20 +538,32 @@ struct App {
 }
 
 impl App {
-    fn new(root: PathBuf, data_dir: &Path, log_receiver: Receiver<String>, on_dir_click: OnDirClickAction, on_cwd_visit: OnCwdVisitAction, initial_filter: search_worker::FilterType, no_preview: bool, no_click_loading: bool, no_model: bool, no_click_logging: bool) -> Result<Self> {
+    fn new(
+        root: PathBuf,
+        data_dir: &Path,
+        log_receiver: Receiver<String>,
+        on_dir_click: OnDirClickAction,
+        on_cwd_visit: OnCwdVisitAction,
+        initial_filter: search_worker::FilterType,
+        no_preview: bool,
+        no_click_loading: bool,
+        no_model: bool,
+        no_click_logging: bool,
+    ) -> Result<Self> {
         let start_time = Instant::now();
         log::debug!("App::new() started");
 
         // Get session ID from environment (set in main())
-        let session_id = std::env::var("PSYCHIC_SESSION_ID")
-            .unwrap_or_else(|_| "unknown".to_string());
+        let session_id =
+            std::env::var("PSYCHIC_SESSION_ID").unwrap_or_else(|_| "unknown".to_string());
 
         let db_start = Instant::now();
         let db_path = Database::get_db_path(data_dir);
         let db = Database::new(&db_path)?;
         log::debug!("Database initialization took {:?}", db_start.elapsed());
 
-        let (worker_tx, worker_rx, worker_handle) = search_worker::spawn(root.clone(), data_dir, no_click_loading, no_model)?;
+        let (worker_tx, worker_rx, worker_handle) =
+            search_worker::spawn(root.clone(), data_dir, no_click_loading, no_model)?;
 
         log::debug!("App::new() total time: {:?}", start_time.elapsed());
 
@@ -578,11 +606,13 @@ impl App {
         };
 
         // Send initial query to worker with ID 0
-        let _ = worker_tx.send(WorkerRequest::UpdateQuery(search_worker::UpdateQueryRequest {
-            query: String::new(),
-            query_id: 0,
-            filter: initial_filter,
-        }));
+        let _ = worker_tx.send(WorkerRequest::UpdateQuery(
+            search_worker::UpdateQueryRequest {
+                query: String::new(),
+                query_id: 0,
+                filter: initial_filter,
+            },
+        ));
 
         Ok(app)
     }
@@ -649,10 +679,16 @@ impl App {
         }
 
         // Extract values we need before borrowing subsession mutably
-        let (subsession_id, subsession_query, created_at, already_logged) = match &self.current_subsession {
-            Some(s) => (s.id, s.query.clone(), s.created_at, s.events_have_been_logged),
-            None => return Ok(()),
-        };
+        let (subsession_id, subsession_query, created_at, already_logged) =
+            match &self.current_subsession {
+                Some(s) => (
+                    s.id,
+                    s.query.clone(),
+                    s.created_at,
+                    s.events_have_been_logged,
+                ),
+                None => return Ok(()),
+            };
 
         // Skip if already logged
         if already_logged {
@@ -670,7 +706,10 @@ impl App {
         // Log top N visible files with metadata
         // Collect from page cache starting at index 0
         let mut top_n = Vec::new();
-        for i in 0..self.num_results_to_log_as_impressions.min(self.total_results) {
+        for i in 0..self
+            .num_results_to_log_as_impressions
+            .min(self.total_results)
+        {
             if let Some(display_info) = self.get_file_at_index(i) {
                 top_n.push(FileMetadata {
                     relative_path: display_info.display_name.clone(),
@@ -725,9 +764,7 @@ impl App {
         } else {
             all_dirs
                 .into_iter()
-                .filter(|path| {
-                    path.to_string_lossy().to_lowercase().contains(&query_lower)
-                })
+                .filter(|path| path.to_string_lossy().to_lowercase().contains(&query_lower))
                 .collect()
         }
     }
@@ -802,11 +839,7 @@ impl App {
             let key = (self.query.clone(), full_path_str.clone());
 
             if !self.scrolled_files.contains(&key) {
-                let subsession_id = self
-                    .current_subsession
-                    .as_ref()
-                    .map(|s| s.id)
-                    .unwrap_or(1);
+                let subsession_id = self.current_subsession.as_ref().map(|s| s.id).unwrap_or(1);
                 self.db.log_event(EventData {
                     query: &self.query,
                     file_path: &display_info.display_name,
@@ -848,7 +881,11 @@ impl App {
                 // Smart positioning: leave some space from bottom (5 lines)
                 // This makes wrap-around more comfortable
                 let margin = 5usize;
-                self.file_list_scroll = selected.saturating_sub(visible_height.saturating_sub(margin).min(visible_height - 1));
+                self.file_list_scroll = selected.saturating_sub(
+                    visible_height
+                        .saturating_sub(margin)
+                        .min(visible_height - 1),
+                );
             }
             // If we're in the bottom 5 items and there's more to see, keep scrolling
             else if selected >= scroll + visible_height.saturating_sub(5) {
@@ -942,7 +979,8 @@ fn main() -> Result<()> {
 
         fern::Dispatch::new()
             .format(|out, message, record| {
-                let session = std::env::var("PSYCHIC_SESSION_ID").unwrap_or_else(|_| "unknown".to_string());
+                let session =
+                    std::env::var("PSYCHIC_SESSION_ID").unwrap_or_else(|_| "unknown".to_string());
                 out.finish(format_args!(
                     "[{} {} {} {}] {}",
                     jiff::Timestamp::now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -1024,7 +1062,10 @@ fn main() -> Result<()> {
     // Get current working directory and canonicalize once
     let root_start = Instant::now();
     let root = env::current_dir()?.canonicalize()?;
-    log::info!("TIMING {{\"op\":\"get_canonicalize_root\",\"ms\":{}}}", root_start.elapsed().as_secs_f64() * 1000.0);
+    log::info!(
+        "TIMING {{\"op\":\"get_canonicalize_root\",\"ms\":{}}}",
+        root_start.elapsed().as_secs_f64() * 1000.0
+    );
 
     // Get data directory for main app
     let data_dir = cli
@@ -1048,7 +1089,10 @@ fn main() -> Result<()> {
         }
         let _ = retrain_tx.send(false); // Signal retraining completed
     });
-    log::info!("TIMING {{\"op\":\"spawn_retrain_thread\",\"ms\":{}}}", retrain_start.elapsed().as_secs_f64() * 1000.0);
+    log::info!(
+        "TIMING {{\"op\":\"spawn_retrain_thread\",\"ms\":{}}}",
+        retrain_start.elapsed().as_secs_f64() * 1000.0
+    );
 
     // Convert CLI filter to internal FilterType
     let initial_filter = match cli.filter {
@@ -1060,8 +1104,22 @@ fn main() -> Result<()> {
 
     // Initialize app
     let app_new_start = Instant::now();
-    let mut app = App::new(root.clone(), &data_dir, log_rx, cli.on_dir_click.clone(), cli.on_cwd_visit.clone(), initial_filter, cli.no_preview, cli.no_click_loading, cli.no_model, cli.no_click_logging)?;
-    log::info!("TIMING {{\"op\":\"app_new\",\"ms\":{}}}", app_new_start.elapsed().as_secs_f64() * 1000.0);
+    let mut app = App::new(
+        root.clone(),
+        &data_dir,
+        log_rx,
+        cli.on_dir_click.clone(),
+        cli.on_cwd_visit.clone(),
+        initial_filter,
+        cli.no_preview,
+        cli.no_click_loading,
+        cli.no_model,
+        cli.no_click_logging,
+    )?;
+    log::info!(
+        "TIMING {{\"op\":\"app_new\",\"ms\":{}}}",
+        app_new_start.elapsed().as_secs_f64() * 1000.0
+    );
 
     let log_session_start = Instant::now();
     log::info!(
@@ -1069,7 +1127,10 @@ fn main() -> Result<()> {
         root.display(),
         app.session_id
     );
-    log::info!("TIMING {{\"op\":\"session_log_message\",\"ms\":{}}}", log_session_start.elapsed().as_secs_f64() * 1000.0);
+    log::info!(
+        "TIMING {{\"op\":\"session_log_message\",\"ms\":{}}}",
+        log_session_start.elapsed().as_secs_f64() * 1000.0
+    );
 
     // DISABLED: Log the initial directory as a click event (with empty query)
     // This was taking 200ms+ due to synchronous DB write, blocking startup
@@ -1121,7 +1182,10 @@ fn main() -> Result<()> {
             let _ = db.log_session(&session_id_clone, &context);
         }
     });
-    log::info!("TIMING {{\"op\":\"spawn_context_thread\",\"ms\":{}}}", context_spawn_start.elapsed().as_secs_f64() * 1000.0);
+    log::info!(
+        "TIMING {{\"op\":\"spawn_context_thread\",\"ms\":{}}}",
+        context_spawn_start.elapsed().as_secs_f64() * 1000.0
+    );
 
     // Setup terminal
     let terminal_setup_start = Instant::now();
@@ -1136,9 +1200,15 @@ fn main() -> Result<()> {
     execute!(tty, crossterm::event::EnableMouseCapture)?;
     let backend = CrosstermBackend::new(tty);
     let mut terminal = Terminal::new(backend)?;
-    log::info!("TIMING {{\"op\":\"terminal_setup\",\"ms\":{}}}", terminal_setup_start.elapsed().as_secs_f64() * 1000.0);
+    log::info!(
+        "TIMING {{\"op\":\"terminal_setup\",\"ms\":{}}}",
+        terminal_setup_start.elapsed().as_secs_f64() * 1000.0
+    );
 
-    log::info!("TIMING {{\"op\":\"main_setup_total\",\"ms\":{}}}", main_start.elapsed().as_secs_f64() * 1000.0);
+    log::info!(
+        "TIMING {{\"op\":\"main_setup_total\",\"ms\":{}}}",
+        main_start.elapsed().as_secs_f64() * 1000.0
+    );
 
     // Run the app
     let result = run_app(&mut terminal, &mut app, retrain_rx, main_start);
@@ -1190,7 +1260,10 @@ fn run_app(
         terminal.draw(|f| {
             // Log first render
             if !first_render_logged {
-                log::info!("TIMING {{\"op\":\"first_render\",\"ms\":{}}}", main_start.elapsed().as_secs_f64() * 1000.0);
+                log::info!(
+                    "TIMING {{\"op\":\"first_render\",\"ms\":{}}}",
+                    main_start.elapsed().as_secs_f64() * 1000.0
+                );
                 first_render_logged = true;
             }
 
@@ -1348,7 +1421,15 @@ fn run_app(
                         } else {
                             Line::from(vec![
                                 Span::styled(rank_prefix.clone(), rank_style),
-                                Span::styled(format!("{:<width$}  {}", truncated_path, time_ago, width = adjusted_file_width), base_style),
+                                Span::styled(
+                                    format!(
+                                        "{:<width$}  {}",
+                                        truncated_path,
+                                        time_ago,
+                                        width = adjusted_file_width
+                                    ),
+                                    base_style,
+                                ),
                             ])
                         };
 
@@ -1370,33 +1451,38 @@ fn run_app(
 
             let title_line = if app.current_filter == search_worker::FilterType::None {
                 // No filter active - no highlight
-                Line::from(vec![
-                    Span::raw(format!("{} ({}/{})", filter_name, app.total_results, app.total_files)),
-                ])
+                Line::from(vec![Span::raw(format!(
+                    "{} ({}/{})",
+                    filter_name, app.total_results, app.total_files
+                ))])
             } else {
                 // Filter active - highlight in green
                 Line::from(vec![
                     Span::styled(
                         filter_name,
-                        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD),
                     ),
                     Span::raw(format!(" ({}/{})", app.total_results, app.total_files)),
                 ])
             };
 
-            let list = List::new(items).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(title_line),
-            );
+            let list =
+                List::new(items).block(Block::default().borders(Borders::ALL).title(title_line));
             f.render_widget(list, top_chunks[0]);
 
             // Get current file from page cache - clone the info we need to avoid borrow issues
             let current_file_info: Option<(PathBuf, String, bool)> = app
                 .get_file_at_index(app.selected_index)
                 .map(|f| (f.full_path.clone(), f.display_name.clone(), f.is_dir));
-            let current_file_path = current_file_info.as_ref().map(|(p, _, _)| p.to_string_lossy().to_string());
-            let is_dir = current_file_info.as_ref().map(|(_, _, d)| *d).unwrap_or(false);
+            let current_file_path = current_file_info
+                .as_ref()
+                .map(|(p, _, _)| p.to_string_lossy().to_string());
+            let is_dir = current_file_info
+                .as_ref()
+                .map(|(_, _, d)| *d)
+                .unwrap_or(false);
 
             // Preview on the right using bat (with smart caching)
             let preview_height = top_chunks[1].height.saturating_sub(2);
@@ -1425,15 +1511,16 @@ fn run_app(
                         eza_cmd.arg(&full_path);
                         let eza_start = Instant::now();
                         let eza_output = eza_cmd.output();
-                        log::info!("TIMING {{\"op\":\"eza_dir_preview\",\"ms\":{}}}", eza_start.elapsed().as_secs_f64() * 1000.0);
+                        log::info!(
+                            "TIMING {{\"op\":\"eza_dir_preview\",\"ms\":{}}}",
+                            eza_start.elapsed().as_secs_f64() * 1000.0
+                        );
 
                         match eza_output {
-                            Ok(output) => {
-                                match ansi_to_tui::IntoText::into_text(&output.stdout) {
-                                    Ok(text) => text,
-                                    Err(_) => Text::from("[Unable to parse directory listing]"),
-                                }
-                            }
+                            Ok(output) => match ansi_to_tui::IntoText::into_text(&output.stdout) {
+                                Ok(text) => text,
+                                Err(_) => Text::from("[Unable to parse directory listing]"),
+                            },
                             Err(_) => {
                                 // Fallback to ls if eza not available
                                 let ls_output = std::process::Command::new("ls")
@@ -1441,7 +1528,9 @@ fn run_app(
                                     .arg(&full_path)
                                     .output();
                                 match ls_output {
-                                    Ok(output) => Text::from(String::from_utf8_lossy(&output.stdout).to_string()),
+                                    Ok(output) => Text::from(
+                                        String::from_utf8_lossy(&output.stdout).to_string(),
+                                    ),
                                     Err(_) => Text::from("[Unable to list directory]"),
                                 }
                             }
@@ -1450,91 +1539,97 @@ fn run_app(
                         // For files, use bat as before
                         let full_path = PathBuf::from(current_file_path);
 
-                    // Check for a full, cached preview
-                    if let Some(cached_text) =
-                        app.preview_cache.as_ref().and_then(|(path, text)| {
-                            if path == current_file_path {
-                                Some(text.clone())
-                            } else {
-                                None
-                            }
-                        })
-                    {
-                        // FAST PATH: Full preview is cached, just use it.
-                        cached_text
-                    } else {
-                        // SLOW PATH: No full preview in cache.
-                        // Decide whether to render a light preview or a full one.
-                        let (text_to_render, should_cache) = if app.preview_scroll == 0 {
-                            // Initial view (unscrolled): render a light preview of N lines.
-                            let line_range = format!(":{}", preview_height);
-                            let bat_start = Instant::now();
-                            let bat_output = std::process::Command::new("bat")
-                                .arg("--color=always")
-                                .arg("--style=numbers")
-                                .arg("--line-range")
-                                .arg(&line_range)
-                                .arg(&full_path)
-                                .output();
-                            log::info!("TIMING {{\"op\":\"bat_light_preview\",\"ms\":{}}}", bat_start.elapsed().as_secs_f64() * 1000.0);
-
-                            let text = match bat_output {
-                                Ok(output) => {
-                                    match ansi_to_tui::IntoText::into_text(&output.stdout) {
-                                        Ok(text) => text,
-                                        Err(_) => Text::from("[Unable to parse preview]"),
-                                    }
+                        // Check for a full, cached preview
+                        if let Some(cached_text) =
+                            app.preview_cache.as_ref().and_then(|(path, text)| {
+                                if path == current_file_path {
+                                    Some(text.clone())
+                                } else {
+                                    None
                                 }
-                                Err(_) => {
-                                    // Fallback for light preview
-                                    match std::fs::read_to_string(&full_path) {
-                                        Ok(content) => Text::from(
-                                            content
-                                                .lines()
-                                                .take(preview_height as usize)
-                                                .collect::<Vec<_>>()
-                                                .join("\n"),
-                                        ),
-                                        Err(_) => Text::from("[Unable to preview file]"),
-                                    }
-                                }
-                            };
-                            (text, false) // Don't cache the light preview
+                            })
+                        {
+                            // FAST PATH: Full preview is cached, just use it.
+                            cached_text
                         } else {
-                            // User is scrolling, and we need to generate the full preview.
-                            let bat_start = Instant::now();
-                            let bat_output = std::process::Command::new("bat")
-                                .arg("--color=always")
-                                .arg("--style=numbers")
-                                .arg("--paging=never")
-                                .arg(&full_path)
-                                .output();
-                            log::info!("TIMING {{\"op\":\"bat_full_preview\",\"ms\":{}}}", bat_start.elapsed().as_secs_f64() * 1000.0);
+                            // SLOW PATH: No full preview in cache.
+                            // Decide whether to render a light preview or a full one.
+                            let (text_to_render, should_cache) = if app.preview_scroll == 0 {
+                                // Initial view (unscrolled): render a light preview of N lines.
+                                let line_range = format!(":{}", preview_height);
+                                let bat_start = Instant::now();
+                                let bat_output = std::process::Command::new("bat")
+                                    .arg("--color=always")
+                                    .arg("--style=numbers")
+                                    .arg("--line-range")
+                                    .arg(&line_range)
+                                    .arg(&full_path)
+                                    .output();
+                                log::info!(
+                                    "TIMING {{\"op\":\"bat_light_preview\",\"ms\":{}}}",
+                                    bat_start.elapsed().as_secs_f64() * 1000.0
+                                );
 
-                            let text = match bat_output {
-                                Ok(output) => {
-                                    match ansi_to_tui::IntoText::into_text(&output.stdout) {
-                                        Ok(text) => text,
-                                        Err(_) => Text::from("[Unable to parse preview]"),
+                                let text = match bat_output {
+                                    Ok(output) => {
+                                        match ansi_to_tui::IntoText::into_text(&output.stdout) {
+                                            Ok(text) => text,
+                                            Err(_) => Text::from("[Unable to parse preview]"),
+                                        }
                                     }
-                                }
-                                Err(_) => {
-                                    // Fallback for full preview
-                                    match std::fs::read_to_string(&full_path) {
-                                        Ok(content) => Text::from(content),
-                                        Err(_) => Text::from("[Unable to preview file]"),
+                                    Err(_) => {
+                                        // Fallback for light preview
+                                        match std::fs::read_to_string(&full_path) {
+                                            Ok(content) => Text::from(
+                                                content
+                                                    .lines()
+                                                    .take(preview_height as usize)
+                                                    .collect::<Vec<_>>()
+                                                    .join("\n"),
+                                            ),
+                                            Err(_) => Text::from("[Unable to preview file]"),
+                                        }
                                     }
-                                }
+                                };
+                                (text, false) // Don't cache the light preview
+                            } else {
+                                // User is scrolling, and we need to generate the full preview.
+                                let bat_start = Instant::now();
+                                let bat_output = std::process::Command::new("bat")
+                                    .arg("--color=always")
+                                    .arg("--style=numbers")
+                                    .arg("--paging=never")
+                                    .arg(&full_path)
+                                    .output();
+                                log::info!(
+                                    "TIMING {{\"op\":\"bat_full_preview\",\"ms\":{}}}",
+                                    bat_start.elapsed().as_secs_f64() * 1000.0
+                                );
+
+                                let text = match bat_output {
+                                    Ok(output) => {
+                                        match ansi_to_tui::IntoText::into_text(&output.stdout) {
+                                            Ok(text) => text,
+                                            Err(_) => Text::from("[Unable to parse preview]"),
+                                        }
+                                    }
+                                    Err(_) => {
+                                        // Fallback for full preview
+                                        match std::fs::read_to_string(&full_path) {
+                                            Ok(content) => Text::from(content),
+                                            Err(_) => Text::from("[Unable to preview file]"),
+                                        }
+                                    }
+                                };
+                                (text, true) // Cache the full preview
                             };
-                            (text, true) // Cache the full preview
-                        };
 
-                        if should_cache {
-                            app.preview_cache =
-                                Some((current_file_path.to_string(), text_to_render.clone()));
+                            if should_cache {
+                                app.preview_cache =
+                                    Some((current_file_path.to_string(), text_to_render.clone()));
+                            }
+                            text_to_render
                         }
-                        text_to_render
-                    }
                     } // End of else block for files
                 } else {
                     Text::from("[Loading preview...]")
@@ -1666,11 +1761,19 @@ fn run_app(
             // Add recent logs
             debug_lines.push(String::from("Recent Logs:"));
             // Show more log lines when debug is maximized
-            let log_count = if app.ui_state.is_debug_pane_expanded() { 30 } else { 10 };
+            let log_count = if app.ui_state.is_debug_pane_expanded() {
+                30
+            } else {
+                10
+            };
             let log_start = app.recent_logs.len().saturating_sub(log_count);
             for log_line in app.recent_logs.iter().skip(log_start) {
                 // Truncate long lines to fit
-                let max_len = if app.ui_state.is_debug_pane_expanded() { 120 } else { 60 };
+                let max_len = if app.ui_state.is_debug_pane_expanded() {
+                    120
+                } else {
+                    60
+                };
                 if log_line.len() > max_len {
                     debug_lines.push(format!("  {}...", &log_line[..(max_len - 3)]));
                 } else {
@@ -1708,7 +1811,8 @@ fn run_app(
                 let max_scroll = padded_path.len().saturating_sub(path_bar_width) as u16;
 
                 // Pause at the ends of the scroll
-                let should_scroll = if app.path_bar_scroll == 0 || app.path_bar_scroll >= max_scroll {
+                let should_scroll = if app.path_bar_scroll == 0 || app.path_bar_scroll >= max_scroll
+                {
                     time_since_update > marquee_delay
                 } else {
                     time_since_update > marquee_speed
@@ -1755,7 +1859,7 @@ fn run_app(
 
                 // Create a popup in the bottom-right
                 let popup_width = 30;
-                let popup_height = 6;  // 4 options + top/bottom borders
+                let popup_height = 6; // 4 options + top/bottom borders
                 let area = f.area();
 
                 // Position in bottom-right corner with some margin
@@ -1791,10 +1895,11 @@ fn run_app(
                 }
 
                 let filter_text = lines.join("\n");
-                let filter_popup = Paragraph::new(filter_text)
-                    .block(Block::default()
+                let filter_popup = Paragraph::new(filter_text).block(
+                    Block::default()
                         .borders(Borders::ALL)
-                        .title("Filters (Ctrl-F)"));
+                        .title("Filters (Ctrl-F)"),
+                );
 
                 f.render_widget(filter_popup, popup_area);
             }
@@ -1809,14 +1914,23 @@ fn run_app(
         // Log draw time and check for first full render (with data)
         let draw_time = draw_start.elapsed().as_secs_f64() * 1000.0;
         if !first_full_render_logged && app.total_results > 0 {
-            log::info!("TIMING {{\"op\":\"first_full_render_complete\",\"ms\":{}}}", main_start.elapsed().as_secs_f64() * 1000.0);
-            log::info!("TIMING {{\"op\":\"first_full_render_draw_time\",\"ms\":{}}}", draw_time);
+            log::info!(
+                "TIMING {{\"op\":\"first_full_render_complete\",\"ms\":{}}}",
+                main_start.elapsed().as_secs_f64() * 1000.0
+            );
+            log::info!(
+                "TIMING {{\"op\":\"first_full_render_draw_time\",\"ms\":{}}}",
+                draw_time
+            );
             first_full_render_logged = true;
         }
 
         // Check for startup complete: walker done + we have results + UI rendered
         if !app.startup_complete_logged && app.walker_done && app.total_results > 0 {
-            log::info!("TIMING {{\"op\":\"startup_complete\",\"ms\":{}}}", main_start.elapsed().as_secs_f64() * 1000.0);
+            log::info!(
+                "TIMING {{\"op\":\"startup_complete\",\"ms\":{}}}",
+                main_start.elapsed().as_secs_f64() * 1000.0
+            );
             app.startup_complete_logged = true;
         }
 
@@ -1845,7 +1959,8 @@ fn run_app(
                     initial_page,
                     model_stats,
                 } => {
-                    let active_query_id = app.current_subsession.as_ref().map(|s| s.id).unwrap_or(0);
+                    let active_query_id =
+                        app.current_subsession.as_ref().map(|s| s.id).unwrap_or(0);
 
                     // Only accept updates for queries that are newer than what we currently have.
                     // This handles out-of-order responses.
@@ -1872,7 +1987,10 @@ fn run_app(
 
                         // Log first query completion
                         if !first_query_complete_logged {
-                            log::info!("TIMING {{\"op\":\"first_query_complete\",\"ms\":{}}}", main_start.elapsed().as_secs_f64() * 1000.0);
+                            log::info!(
+                                "TIMING {{\"op\":\"first_query_complete\",\"ms\":{}}}",
+                                main_start.elapsed().as_secs_f64() * 1000.0
+                            );
                             first_query_complete_logged = true;
                         }
 
@@ -1885,8 +2003,12 @@ fn run_app(
                         });
                     }
                 }
-                WorkerResponse::Page { query_id, page_data } => {
-                    let active_query_id = app.current_subsession.as_ref().map(|s| s.id).unwrap_or(0);
+                WorkerResponse::Page {
+                    query_id,
+                    page_data,
+                } => {
+                    let active_query_id =
+                        app.current_subsession.as_ref().map(|s| s.id).unwrap_or(0);
 
                     // Only accept page data for the currently active query
                     if query_id == active_query_id {
@@ -1920,7 +2042,7 @@ fn run_app(
         }
 
         // Handle events with timeout
-        if event::poll(Duration::from_millis(100))? {
+        if event::poll(Duration::from_millis(5))? {
             let event_read = event::read()?;
             match event_read {
                 Event::Mouse(mouse_event) => {
@@ -1969,15 +2091,12 @@ fn run_app(
 
                                     // Use /dev/tty for shell so it can interact with the terminal
                                     use std::process::Stdio;
-                                    let tty_in = std::fs::OpenOptions::new()
-                                        .read(true)
-                                        .open("/dev/tty")?;
-                                    let tty_out = std::fs::OpenOptions::new()
-                                        .write(true)
-                                        .open("/dev/tty")?;
-                                    let tty_err = std::fs::OpenOptions::new()
-                                        .write(true)
-                                        .open("/dev/tty")?;
+                                    let tty_in =
+                                        std::fs::OpenOptions::new().read(true).open("/dev/tty")?;
+                                    let tty_out =
+                                        std::fs::OpenOptions::new().write(true).open("/dev/tty")?;
+                                    let tty_err =
+                                        std::fs::OpenOptions::new().write(true).open("/dev/tty")?;
 
                                     let shell =
                                         std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
@@ -2068,7 +2187,8 @@ fn run_app(
                             if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
                         {
                             // Ctrl-F: toggle filter picker
-                            app.ui_state.filter_picker_visible = !app.ui_state.filter_picker_visible;
+                            app.ui_state.filter_picker_visible =
+                                !app.ui_state.filter_picker_visible;
                         }
                         KeyCode::Char('0') if app.ui_state.filter_picker_visible => {
                             // Filter 0: None
@@ -2203,11 +2323,16 @@ fn run_app(
                                     app.check_and_log_impressions(true)?;
                                 }
 
-                                if let Some(display_info) = app.get_file_at_index(app.selected_index) {
+                                if let Some(display_info) =
+                                    app.get_file_at_index(app.selected_index)
+                                {
                                     // Log the click
                                     if !app.no_click_logging {
-                                        let subsession_id =
-                                            app.current_subsession.as_ref().map(|s| s.id).unwrap_or(1);
+                                        let subsession_id = app
+                                            .current_subsession
+                                            .as_ref()
+                                            .map(|s| s.id)
+                                            .unwrap_or(1);
                                         app.db.log_event(EventData {
                                             query: &app.query,
                                             file_path: &display_info.display_name,
@@ -2229,11 +2354,17 @@ fn run_app(
                                             OnDirClickAction::Navigate => {
                                                 // Don't navigate if already in that directory
                                                 if dir_path == app.cwd {
-                                                    log::info!("Already in {:?}, not navigating", dir_path);
+                                                    log::info!(
+                                                        "Already in {:?}, not navigating",
+                                                        dir_path
+                                                    );
                                                     continue;
                                                 }
 
-                                                log::info!("Navigating to directory: {:?}", dir_path);
+                                                log::info!(
+                                                    "Navigating to directory: {:?}",
+                                                    dir_path
+                                                );
                                                 app.history.navigate_to(dir_path.clone());
                                                 app.cwd = dir_path.clone();
 
@@ -2241,18 +2372,21 @@ fn run_app(
                                                 app.query.clear();
                                                 let query_id = app.next_subsession_id;
                                                 app.next_subsession_id += 1;
-                                                let _ = app.worker_tx.send(WorkerRequest::ChangeCwd {
-                                                    new_cwd: dir_path,
-                                                    query_id,
-                                                });
+                                                let _ =
+                                                    app.worker_tx.send(WorkerRequest::ChangeCwd {
+                                                        new_cwd: dir_path,
+                                                        query_id,
+                                                    });
                                             }
                                             OnDirClickAction::PrintToStdout => {
                                                 // Print directory path and exit
                                                 disable_raw_mode()?;
+                                                terminal.backend_mut().execute(
+                                                    crossterm::event::DisableMouseCapture,
+                                                )?;
                                                 terminal
                                                     .backend_mut()
-                                                    .execute(crossterm::event::DisableMouseCapture)?;
-                                                terminal.backend_mut().execute(LeaveAlternateScreen)?;
+                                                    .execute(LeaveAlternateScreen)?;
                                                 terminal.backend_mut().execute(Show)?;
 
                                                 println!("{}", dir_path.display());
@@ -2260,13 +2394,18 @@ fn run_app(
                                             }
                                             OnDirClickAction::DropIntoShell => {
                                                 // Drop into shell in the selected directory
-                                                log::info!("Dropping into shell in directory: {:?}", dir_path);
+                                                log::info!(
+                                                    "Dropping into shell in directory: {:?}",
+                                                    dir_path
+                                                );
 
                                                 disable_raw_mode()?;
+                                                terminal.backend_mut().execute(
+                                                    crossterm::event::DisableMouseCapture,
+                                                )?;
                                                 terminal
                                                     .backend_mut()
-                                                    .execute(crossterm::event::DisableMouseCapture)?;
-                                                terminal.backend_mut().execute(LeaveAlternateScreen)?;
+                                                    .execute(LeaveAlternateScreen)?;
                                                 terminal.backend_mut().execute(Show)?;
 
                                                 use std::process::Stdio;
@@ -2280,7 +2419,8 @@ fn run_app(
                                                     .write(true)
                                                     .open("/dev/tty")?;
 
-                                                let shell = std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
+                                                let shell = std::env::var("SHELL")
+                                                    .unwrap_or_else(|_| "sh".to_string());
                                                 let status = std::process::Command::new(&shell)
                                                     .current_dir(&dir_path)
                                                     .stdin(Stdio::from(tty_in))
@@ -2290,10 +2430,12 @@ fn run_app(
 
                                                 // Resume TUI
                                                 enable_raw_mode()?;
-                                                terminal.backend_mut().execute(EnterAlternateScreen)?;
                                                 terminal
                                                     .backend_mut()
-                                                    .execute(crossterm::event::EnableMouseCapture)?;
+                                                    .execute(EnterAlternateScreen)?;
+                                                terminal.backend_mut().execute(
+                                                    crossterm::event::EnableMouseCapture,
+                                                )?;
                                                 terminal.clear()?;
 
                                                 if let Err(e) = status {
@@ -2381,7 +2523,10 @@ mod tests {
     #[test]
     fn test_truncate_path_simple() {
         let result = truncate_path("a/b/c/d/e.txt", 12);
-        assert_eq!(result, "a/.../e.txt", "Should truncate middle components when too long");
+        assert_eq!(
+            result, "a/.../e.txt",
+            "Should truncate middle components when too long"
+        );
     }
 
     #[test]
@@ -2394,28 +2539,46 @@ mod tests {
     fn test_truncate_path_builds_from_end() {
         let result = truncate_path("a/b/c/d/e/f/g.txt", 15);
         // Actual: "a/.../e/f/g.txt" = 15 chars
-        assert_eq!(result, "a/.../e/f/g.txt", "Should build from end to fit more context");
+        assert_eq!(
+            result, "a/.../e/f/g.txt",
+            "Should build from end to fit more context"
+        );
     }
 
     #[test]
     fn test_truncate_absolute_path_no_truncation() {
         let result = truncate_absolute_path("/Users/test/file.txt", 100);
-        assert_eq!(result, "/Users/test/file.txt", "Short absolute paths should not be truncated");
+        assert_eq!(
+            result, "/Users/test/file.txt",
+            "Short absolute paths should not be truncated"
+        );
     }
 
     #[test]
     fn test_truncate_absolute_path_both_ends() {
-        let result = truncate_absolute_path("/Users/kshitijlauria/Library/CloudStorage/Dropbox/src/11-sg/todo.md", 40);
+        let result = truncate_absolute_path(
+            "/Users/kshitijlauria/Library/CloudStorage/Dropbox/src/11-sg/todo.md",
+            40,
+        );
         // With abbreviation: "/Users/k/L/.../Dropbox/src/11-sg/todo.md" fits in 40 chars
-        assert_eq!(result, "/Users/k/L/.../Dropbox/src/11-sg/todo.md", "Should abbreviate middle components to fit");
+        assert_eq!(
+            result, "/Users/k/L/.../Dropbox/src/11-sg/todo.md",
+            "Should abbreviate middle components to fit"
+        );
     }
 
     #[test]
     fn test_truncate_absolute_path_only_tail() {
-        let result = truncate_absolute_path("/Users/kshitijlauria/Library/CloudStorage/Dropbox/src/11-sg/todo.md", 25);
+        let result = truncate_absolute_path(
+            "/Users/kshitijlauria/Library/CloudStorage/Dropbox/src/11-sg/todo.md",
+            25,
+        );
         // With 25 chars, abbreviates head: "/U/k/.../src/11-sg/todo.md" = 27 chars, still too long
         // Actually gets: "/U/k/.../src/11-sg/todo.md"
-        assert_eq!(result, "/U/k/.../src/11-sg/todo.md", "Should abbreviate head components when space is very limited");
+        assert_eq!(
+            result, "/U/k/.../src/11-sg/todo.md",
+            "Should abbreviate head components when space is very limited"
+        );
     }
 
     #[test]
@@ -2425,7 +2588,10 @@ mod tests {
         let result = truncate_absolute_path(input, 50);
         // Actual: "/.../Library/CloudStorage/Dropbox/src/11-sg/todo.md" = 53 chars
         // Note: This exceeds 50 chars because we prioritize showing complete components
-        assert_eq!(result, "/.../Library/CloudStorage/Dropbox/src/11-sg/todo.md", "Shows as much tail as fits complete components");
+        assert_eq!(
+            result, "/.../Library/CloudStorage/Dropbox/src/11-sg/todo.md",
+            "Shows as much tail as fits complete components"
+        );
     }
 
     #[test]
@@ -2433,20 +2599,29 @@ mod tests {
         // Test that relative paths also work
         let result = truncate_absolute_path("relative/path/to/file.txt", 18);
         // With abbreviation: "r/.../to/file.txt" = 18 chars exactly
-        assert_eq!(result, "r/.../to/file.txt", "Should abbreviate first component when needed");
+        assert_eq!(
+            result, "r/.../to/file.txt",
+            "Should abbreviate first component when needed"
+        );
     }
 
     #[test]
     fn test_truncate_absolute_path_preserves_leading_slash() {
         let result = truncate_absolute_path("/a/b/c/d/e/f/g.txt", 15);
-        assert!(result.starts_with("/"), "Should preserve leading slash for absolute paths");
+        assert!(
+            result.starts_with("/"),
+            "Should preserve leading slash for absolute paths"
+        );
         assert!(result.contains("..."), "Should truncate");
         assert!(result.ends_with("g.txt"), "Should keep filename");
     }
 
     #[test]
     fn test_truncate_absolute_path_fits_more_tail() {
-        let result = truncate_absolute_path("/Users/name/Documents/Projects/rust/psychic/src/main.rs", 35);
+        let result = truncate_absolute_path(
+            "/Users/name/Documents/Projects/rust/psychic/src/main.rs",
+            35,
+        );
         // Should prioritize tail (more recent parts of path)
         assert!(result.ends_with("main.rs"), "Should keep filename");
         assert!(result.contains("src"), "Should keep parent directory");
