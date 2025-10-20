@@ -1,0 +1,29 @@
+# Run psychic in release mode
+run *ARGS:
+    cargo run --release -- {{ARGS}}
+
+# Build release binary
+build:
+    cargo build --release
+
+# Run tests
+test:
+    cargo test
+
+# Run clippy linter
+lint:
+    cargo clippy
+
+# Analyze performance of latest psychic run
+analyze-perf:
+    @./scripts/analyze-perf.sh
+
+# Clear performance logs and run fresh measurement
+measure-perf *ARGS:
+    @echo "Clearing old logs..."
+    @> ~/.local/share/psychic/app.log
+    @echo "Running psychic..."
+    @cargo run --release -- {{ARGS}} || true
+    @sleep 0.5
+    @echo ""
+    @./scripts/analyze-perf.sh
