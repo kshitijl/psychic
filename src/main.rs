@@ -497,17 +497,12 @@ struct App {
 
 impl App {
     fn new(root: PathBuf, data_dir: &Path, log_receiver: Receiver<String>, on_dir_click: OnDirClickAction, on_cwd_visit: OnCwdVisitAction, initial_filter: search_worker::FilterType) -> Result<Self> {
-        use std::collections::hash_map::RandomState;
-        use std::hash::{BuildHasher, Hash, Hasher};
-
         let start_time = Instant::now();
         log::debug!("App::new() started");
 
-        // Generate random 64-bit session ID
-        let mut hasher = RandomState::new().build_hasher();
-        Instant::now().hash(&mut hasher);
-        std::process::id().hash(&mut hasher);
-        let session_id = hasher.finish().to_string();
+        // Get session ID from environment (set in main())
+        let session_id = std::env::var("PSYCHIC_SESSION_ID")
+            .unwrap_or_else(|_| "unknown".to_string());
 
         let db_start = Instant::now();
         let db_path = Database::get_db_path(data_dir);
@@ -882,6 +877,20 @@ impl App {
 }
 
 fn main() -> Result<()> {
+    // Generate session ID early so we can include it in all logs
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hash, Hasher};
+    let mut hasher = RandomState::new().build_hasher();
+    Instant::now().hash(&mut hasher);
+    std::process::id().hash(&mut hasher);
+    let session_id = hasher.finish().to_string();
+
+    // Set as environment variable so all threads can access it
+    // SAFETY: We set this once at the very beginning of main() before any other threads exist
+    unsafe {
+        std::env::set_var("PSYCHIC_SESSION_ID", &session_id);
+    }
+
     // Initialize logger with fern to write to both file and memory
     let (log_tx, log_rx) = mpsc::channel();
 
@@ -895,11 +904,13 @@ fn main() -> Result<()> {
 
         fern::Dispatch::new()
             .format(|out, message, record| {
+                let session = std::env::var("PSYCHIC_SESSION_ID").unwrap_or_else(|_| "unknown".to_string());
                 out.finish(format_args!(
-                    "[{} {} {}] {}",
+                    "[{} {} {} {}] {}",
                     jiff::Timestamp::now().strftime("%Y-%m-%d %H:%M:%S"),
                     record.level(),
                     record.target(),
+                    session,
                     message
                 ))
             })
@@ -970,8 +981,13 @@ fn main() -> Result<()> {
         }
     }
 
+    let main_start = Instant::now();
+    log::info!("=== STARTUP TIMING ===");
+
     // Get current working directory and canonicalize once
+    let root_start = Instant::now();
     let root = env::current_dir()?.canonicalize()?;
+    log::info!("TIMING {{\"op\":\"get_canonicalize_root\",\"ms\":{}}}", root_start.elapsed().as_secs_f64() * 1000.0);
 
     // Get data directory for main app
     let data_dir = cli
@@ -982,6 +998,7 @@ fn main() -> Result<()> {
     let (retrain_tx, retrain_rx) = mpsc::channel();
 
     // Start background retraining in a new thread
+    let retrain_start = Instant::now();
     let data_dir_clone = data_dir.clone();
     let training_log_path = data_dir.join("training.log");
     std::thread::spawn(move || {
@@ -994,6 +1011,7 @@ fn main() -> Result<()> {
         }
         let _ = retrain_tx.send(false); // Signal retraining completed
     });
+    log::info!("TIMING {{\"op\":\"spawn_retrain_thread\",\"ms\":{}}}", retrain_start.elapsed().as_secs_f64() * 1000.0);
 
     // Convert CLI filter to internal FilterType
     let initial_filter = match cli.filter {
@@ -1004,16 +1022,21 @@ fn main() -> Result<()> {
     };
 
     // Initialize app
+    let app_new_start = Instant::now();
     let mut app = App::new(root.clone(), &data_dir, log_rx, cli.on_dir_click.clone(), cli.on_cwd_visit.clone(), initial_filter)?;
+    log::info!("TIMING {{\"op\":\"app_new\",\"ms\":{}}}", app_new_start.elapsed().as_secs_f64() * 1000.0);
 
+    let log_session_start = Instant::now();
     log::info!(
         "Started psychic in directory {}, session {}",
         root.display(),
         app.session_id
     );
+    log::info!("TIMING {{\"op\":\"session_log_message\",\"ms\":{}}}", log_session_start.elapsed().as_secs_f64() * 1000.0);
 
     // Log the initial directory as a click event (with empty query)
     // This ensures directories we start in appear in history
+    let log_dir_click_start = Instant::now();
     {
         let dir_name = root
             .file_name()
@@ -1046,8 +1069,10 @@ fn main() -> Result<()> {
             session_id: &app.session_id,
         });
     }
+    log::info!("TIMING {{\"op\":\"log_initial_dir_click\",\"ms\":{}}}", log_dir_click_start.elapsed().as_secs_f64() * 1000.0);
 
     // Gather context in background thread
+    let context_spawn_start = Instant::now();
     let session_id_clone = app.session_id.clone();
     let data_dir_clone = data_dir.clone();
     std::thread::spawn(move || {
@@ -1056,8 +1081,10 @@ fn main() -> Result<()> {
             let _ = db.log_session(&session_id_clone, &context);
         }
     });
+    log::info!("TIMING {{\"op\":\"spawn_context_thread\",\"ms\":{}}}", context_spawn_start.elapsed().as_secs_f64() * 1000.0);
 
     // Setup terminal
+    let terminal_setup_start = Instant::now();
     // Use /dev/tty directly so shell integration can redirect stdout
     let mut tty = std::fs::OpenOptions::new()
         .read(true)
@@ -1069,6 +1096,9 @@ fn main() -> Result<()> {
     execute!(tty, crossterm::event::EnableMouseCapture)?;
     let backend = CrosstermBackend::new(tty);
     let mut terminal = Terminal::new(backend)?;
+    log::info!("TIMING {{\"op\":\"terminal_setup\",\"ms\":{}}}", terminal_setup_start.elapsed().as_secs_f64() * 1000.0);
+
+    log::info!("TIMING {{\"op\":\"main_setup_total\",\"ms\":{}}}", main_start.elapsed().as_secs_f64() * 1000.0);
 
     // Run the app
     let result = run_app(&mut terminal, &mut app, retrain_rx);
@@ -1103,6 +1133,10 @@ fn run_app(
     app: &mut App,
     retrain_rx: Receiver<bool>,
 ) -> Result<()> {
+    let run_app_start = Instant::now();
+    let mut first_render_logged = false;
+    let mut first_query_complete_logged = false;
+
     let marquee_delay = Duration::from_millis(500); // 0.5s pause at ends
     let marquee_speed = Duration::from_millis(80); // scroll every 80ms
 
@@ -1112,6 +1146,12 @@ fn run_app(
 
         // Draw UI
         terminal.draw(|f| {
+            // Log first render
+            if !first_render_logged {
+                log::info!("TIMING {{\"op\":\"first_render\",\"ms\":{}}}", run_app_start.elapsed().as_secs_f64() * 1000.0);
+                first_render_logged = true;
+            }
+
             // If in history mode, render history-specific UI
             if app.ui_state.history_mode {
                 render_history_mode(f, app);
@@ -1763,6 +1803,12 @@ fn run_app(
                         // Reset selection if needed
                         if app.selected_index >= total_results {
                             app.selected_index = 0;
+                        }
+
+                        // Log first query completion
+                        if !first_query_complete_logged {
+                            log::info!("TIMING {{\"op\":\"first_query_complete\",\"ms\":{}}}", run_app_start.elapsed().as_secs_f64() * 1000.0);
+                            first_query_complete_logged = true;
                         }
 
                         // Create subsession, using the query text from the app state

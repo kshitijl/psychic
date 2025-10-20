@@ -12,6 +12,7 @@ Helix file picker is a lot faster. Maybe implement a mode that doesn't sort or r
 
 ## now
 
+- make it faster
 - dir preview should switch from eza -al to a different command when narrow, so we see the actual filenames instead of less useful owner and permissions.
 - audit the whole codebase for modularity. can we refactor extract something into a module, which can then be expect tested? right now its a big ball of very IO heavy code that makes it difficult to test. maybe the overall state logic and keypress logic? maybe the page caching logic? maybe the logic that when walker is finished it sends an AllDone message? maybe the logic that historical files in cwd still need to shown in filter view?
 - after that think about how to make the filter logic fast, i worry that all that

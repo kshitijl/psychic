@@ -207,19 +207,18 @@ struct WorkerState {
 
 impl WorkerState {
     fn new(root: PathBuf, data_dir: &Path, walker_command_tx: Sender<WalkerCommand>) -> Result<Self> {
-        let ranker_start = jiff::Timestamp::now();
-        let model_path = data_dir.join("model.txt");
+        let worker_state_start = std::time::Instant::now();
 
+        let ranker_start = std::time::Instant::now();
+        let model_path = data_dir.join("model.txt");
         let db_path = Database::get_db_path(data_dir);
 
         let ranker = ranker::Ranker::new(&model_path, &db_path).unwrap();
         log::info!("Loaded ranking model from {:?}", model_path);
-        log::debug!(
-            "Ranker initialization took {:?}",
-            jiff::Timestamp::now() - ranker_start
-        );
+        log::info!("TIMING {{\"op\":\"ranker_init\",\"ms\":{}}}", ranker_start.elapsed().as_secs_f64() * 1000.0);
 
         // Load historical files.
+        let historical_start = std::time::Instant::now();
         let mut file_registry = Vec::new();
         let mut path_to_id: HashMap<PathBuf, FileId> = HashMap::new();
 
@@ -233,6 +232,7 @@ impl WorkerState {
                 if path.exists() { Some(path) } else { None }
             })
             .collect();
+        log::info!("Loading {} historical paths", historical_paths.len());
 
         for path in historical_paths {
             // Canonicalize historical paths and get their metadata once, at
@@ -255,12 +255,14 @@ impl WorkerState {
             }
         }
 
-        log::debug!(
-            "WorkerState loaded {} historical files",
+        log::info!(
+            "TIMING {{\"op\":\"load_historical_files\",\"ms\":{},\"count\":{}}}",
+            historical_start.elapsed().as_secs_f64() * 1000.0,
             file_registry.len()
         );
 
         // Add the root directory itself to the registry
+        let root_add_start = std::time::Instant::now();
         // (walker skips it, but we want it to appear in results as "(cwd)")
         let canonical_root = root.canonicalize().unwrap_or_else(|_| root.clone());
         if !path_to_id.contains_key(&canonical_root) {
@@ -287,6 +289,9 @@ impl WorkerState {
             path_to_id.insert(canonical_root.clone(), file_id);
             file_registry.push(file_info);
         }
+        log::info!("TIMING {{\"op\":\"add_root_directory\",\"ms\":{}}}", root_add_start.elapsed().as_secs_f64() * 1000.0);
+
+        log::info!("TIMING {{\"op\":\"worker_state_new_total\",\"ms\":{}}}", worker_state_start.elapsed().as_secs_f64() * 1000.0);
 
         Ok(WorkerState {
             file_registry,

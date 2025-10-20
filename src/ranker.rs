@@ -61,10 +61,14 @@ pub struct Ranker {
 
 impl Ranker {
     pub fn new(model_path: &Path, db_path: &Path) -> Result<Self> {
+        let model_load_start = std::time::Instant::now();
         let model = Booster::from_file(model_path.to_str().unwrap())
             .context("Failed to load LightGBM model")?;
+        log::info!("TIMING {{\"op\":\"booster_from_file\",\"ms\":{}}}", model_load_start.elapsed().as_secs_f64() * 1000.0);
 
+        let clicks_load_start = std::time::Instant::now();
         let clicks = Self::load_clicks(db_path)?;
+        log::info!("TIMING {{\"op\":\"load_clicks\",\"ms\":{}}}", clicks_load_start.elapsed().as_secs_f64() * 1000.0);
 
         // Load model stats from same directory as model
         let stats_path = model_path
@@ -102,18 +106,25 @@ impl Ranker {
 
     /// Load click events from last 30 days from database
     pub fn load_clicks(db_path: &Path) -> Result<ClickData> {
+        let total_start = std::time::Instant::now();
+
+        let timestamp_calc_start = std::time::Instant::now();
         let now = Timestamp::now();
         let session_tz = jiff::tz::TimeZone::system();
         let now_zoned = now.to_zoned(session_tz);
         let thirty_days_ago = now_zoned.checked_sub(Span::new().days(30))?.timestamp();
         let thirty_days_ago_ts = thirty_days_ago.as_second();
+        log::info!("TIMING {{\"op\":\"timestamp_calc\",\"ms\":{}}}", timestamp_calc_start.elapsed().as_secs_f64() * 1000.0);
 
         let mut clicks_by_file: HashMap<String, Vec<ClickEvent>> = HashMap::new();
         let mut clicks_by_query_and_file: HashMap<(String, String), Vec<ClickEvent>> = HashMap::new();
 
+        let db_open_start = std::time::Instant::now();
         let conn =
             Connection::open(db_path).context("Failed to open database for preloading clicks")?;
+        log::info!("TIMING {{\"op\":\"db_open\",\"ms\":{}}}", db_open_start.elapsed().as_secs_f64() * 1000.0);
 
+        let query_start = std::time::Instant::now();
         let mut stmt = conn.prepare(
             "SELECT full_path, timestamp, query
              FROM events
@@ -128,10 +139,14 @@ impl Ranker {
                 row.get::<_, String>(2)?,
             ))
         })?;
+        log::info!("TIMING {{\"op\":\"db_query_prepare\",\"ms\":{}}}", query_start.elapsed().as_secs_f64() * 1000.0);
 
+        let indexing_start = std::time::Instant::now();
+        let mut row_count = 0;
         for row in rows {
             let (path, timestamp, query) = row?;
             let click_event = ClickEvent { timestamp };
+            row_count += 1;
 
             // Index by file path only
             clicks_by_file
@@ -145,8 +160,10 @@ impl Ranker {
                 .or_default()
                 .push(click_event);
         }
+        log::info!("TIMING {{\"op\":\"process_click_rows\",\"ms\":{},\"count\":{}}}", indexing_start.elapsed().as_secs_f64() * 1000.0, row_count);
 
         // Build parent directory index
+        let parent_dir_start = std::time::Instant::now();
         let mut clicks_by_parent_dir: HashMap<PathBuf, Vec<ClickEvent>> = HashMap::new();
         for (path, clicks) in &clicks_by_file {
             if let Some(parent) = Path::new(path).parent() {
@@ -156,7 +173,9 @@ impl Ranker {
                     .extend(clicks.iter().copied());
             }
         }
+        log::info!("TIMING {{\"op\":\"build_parent_dir_index\",\"ms\":{}}}", parent_dir_start.elapsed().as_secs_f64() * 1000.0);
 
+        log::info!("TIMING {{\"op\":\"load_clicks_total\",\"ms\":{}}}", total_start.elapsed().as_secs_f64() * 1000.0);
         log::debug!(
             "Loaded {} files with click history from last 30 days",
             clicks_by_file.len()
