@@ -17,6 +17,7 @@ use crossterm::{
 };
 use db::{Database, EventData, FileMetadata};
 use ratatui::{
+    Frame,
     Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
@@ -104,6 +105,122 @@ fn get_time_ago(mtime: Option<i64>) -> String {
         return formatter.convert(duration);
     }
     String::from("unknown")
+}
+
+fn render_history_mode(f: &mut Frame, app: &App) {
+    use ratatui::widgets::{List, ListItem, Paragraph};
+
+    // Split vertically: top for dir list + preview, bottom for input
+    let main_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(0),    // Dir list + Preview
+            Constraint::Length(3), // Search input at bottom
+        ])
+        .split(f.area());
+
+    // Split horizontally: left for dir list, right for preview
+    let top_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(50), // Directory list
+            Constraint::Percentage(50), // Preview
+        ])
+        .split(main_chunks[0]);
+
+    // Get filtered history (sorted chronologically as stored)
+    let filtered_history = app.get_filtered_history();
+
+    // Build list items for directory history
+    let items: Vec<ListItem> = filtered_history
+        .iter()
+        .enumerate()
+        .map(|(idx, path)| {
+            let rank = idx + 1;
+            let rank_prefix = format!("{:2}. ", rank);
+            let display_text = path.to_string_lossy().to_string();
+            let style = if idx == app.history_selected {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Cyan)
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(rank_prefix, style),
+                Span::styled(display_text, style),
+            ]))
+        })
+        .collect();
+
+    // Render directory list
+    // Total includes dir_history + current directory
+    let total_dirs = app.dir_history.len() + 1;
+    let title = format!("History (most recent at top) — {}/{}", filtered_history.len(), total_dirs);
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(Span::styled(title, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))),
+    );
+    f.render_widget(list, top_chunks[0]);
+
+    // Preview pane: show eza -al of selected directory
+    let preview_text = if !filtered_history.is_empty() && app.history_selected < filtered_history.len() {
+        let selected_dir = &filtered_history[app.history_selected];
+
+        let eza_output = std::process::Command::new("eza")
+            .arg("-al")
+            .arg("--color=always")
+            .arg(selected_dir)
+            .output();
+
+        match eza_output {
+            Ok(output) => {
+                match ansi_to_tui::IntoText::into_text(&output.stdout) {
+                    Ok(text) => text,
+                    Err(_) => Text::from("[Unable to parse directory listing]"),
+                }
+            }
+            Err(_) => {
+                // Fallback to ls if eza not available
+                let ls_output = std::process::Command::new("ls")
+                    .arg("-lah")
+                    .arg(selected_dir)
+                    .output();
+                match ls_output {
+                    Ok(output) => Text::from(String::from_utf8_lossy(&output.stdout).to_string()),
+                    Err(_) => Text::from("[Unable to list directory]"),
+                }
+            }
+        }
+    } else {
+        Text::from("No history available")
+    };
+
+    let preview_para = Paragraph::new(preview_text)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Preview"),
+        )
+        .scroll((app.preview_scroll as u16, 0));
+    f.render_widget(preview_para, top_chunks[1]);
+
+    // Search input at bottom
+    let input_area = main_chunks[1];
+    let input_text = if app.query.is_empty() {
+        "Filter history..."
+    } else {
+        &app.query
+    };
+    let input_para = Paragraph::new(input_text)
+        .style(Style::default().fg(Color::Gray))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Search (Ctrl-H/Esc to exit)"),
+        );
+    f.render_widget(input_para, input_area);
 }
 
 /// A page of DisplayFileInfo for caching
@@ -199,6 +316,9 @@ struct App {
     db: Database,
     cwd: PathBuf, // Current working directory
     dir_history: Vec<PathBuf>,
+    history_mode: bool,      // Are we in history navigation mode?
+    history_index: usize,    // Current position in history (where we are)
+    history_selected: usize, // Selected item in history mode UI
 
     num_results_to_log_as_impressions: usize,
 
@@ -267,6 +387,9 @@ impl App {
             db,
             cwd: root,
             dir_history: Vec::new(),
+            history_mode: false,
+            history_index: 0,
+            history_selected: 0,
             path_bar_scroll: 0,
             path_bar_scroll_direction: 1,
             last_path_bar_update: Instant::now(),
@@ -413,6 +536,92 @@ impl App {
         self.path_bar_scroll = 0;
         self.path_bar_scroll_direction = 1;
         self.last_path_bar_update = Instant::now();
+    }
+
+    fn get_filtered_history(&self) -> Vec<PathBuf> {
+        let query_lower = self.query.to_lowercase();
+
+        // Start with dir_history and append current directory
+        let mut all_dirs: Vec<PathBuf> = self.dir_history.clone();
+        all_dirs.push(self.cwd.clone());
+
+        // Reverse so most recent is at the top
+        all_dirs.reverse();
+
+        if query_lower.is_empty() {
+            all_dirs
+        } else {
+            all_dirs
+                .into_iter()
+                .filter(|path| {
+                    path.to_string_lossy().to_lowercase().contains(&query_lower)
+                })
+                .collect()
+        }
+    }
+
+    fn move_history_selection(&mut self, delta: isize) {
+        let filtered_history = self.get_filtered_history();
+        if filtered_history.is_empty() {
+            return;
+        }
+
+        let len = filtered_history.len() as isize;
+        let new_index = (self.history_selected as isize + delta).rem_euclid(len);
+        self.history_selected = new_index as usize;
+
+        // Clear preview cache when selection changes
+        self.preview_cache = None;
+        self.preview_scroll = 0;
+    }
+
+    fn handle_history_enter(&mut self) -> Result<()> {
+        let filtered_history = self.get_filtered_history();
+        if filtered_history.is_empty() {
+            return Ok(());
+        }
+
+        if self.history_selected >= filtered_history.len() {
+            return Ok(());
+        }
+
+        let selected_dir = filtered_history[self.history_selected].clone();
+
+        // Find the index of this directory in the full (unfiltered) history
+        let full_history_index = self.dir_history
+            .iter()
+            .position(|p| p == &selected_dir)
+            .unwrap_or(0);
+
+        // Check if this is the next item in history after our current position
+        if full_history_index == self.history_index {
+            // We're selecting the next item in history - just increment the index
+            self.history_index += 1;
+        } else {
+            // This is a branch point - truncate history and append new dir
+            // First, add current cwd to history up to history_index
+            self.dir_history.truncate(self.history_index);
+            self.dir_history.push(self.cwd.clone());
+            self.history_index = self.dir_history.len();
+        }
+
+        // Navigate to the selected directory
+        log::info!("Navigating to {:?} from history", selected_dir);
+        self.cwd = selected_dir.clone();
+
+        // Exit history mode
+        self.history_mode = false;
+        self.query.clear();
+
+        // Send ChangeCwd request to worker
+        let query_id = self.next_subsession_id;
+        self.next_subsession_id += 1;
+        let _ = self.worker_tx.send(WorkerRequest::ChangeCwd {
+            new_cwd: selected_dir,
+            query_id,
+        });
+
+        Ok(())
     }
 
     fn log_preview_scroll(&mut self) -> Result<()> {
@@ -768,6 +977,12 @@ fn run_app(
 
         // Draw UI
         terminal.draw(|f| {
+            // If in history mode, render history-specific UI
+            if app.history_mode {
+                render_history_mode(f, app);
+                return;
+            }
+
             // Split vertically: top for results/preview, bottom for input
             let main_chunks = Layout::default()
                 .direction(Direction::Vertical)
@@ -1510,22 +1725,17 @@ fn run_app(
                         KeyCode::Char('h')
                             if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
                         {
-                            // Ctrl-H: Go back to previous directory
-                            if let Some(prev_cwd) = app.dir_history.pop() {
-                                log::info!("Going back to {:?}", prev_cwd);
-
-                                app.cwd = prev_cwd.clone();
-
-                                // Clear query
+                            // Ctrl-H: Toggle history navigation mode
+                            if app.history_mode {
+                                // Exit history mode
+                                app.history_mode = false;
                                 app.query.clear();
-
-                                // Send ChangeCwd request to worker
-                                let query_id = app.next_subsession_id;
-                                app.next_subsession_id += 1;
-                                let _ = app.worker_tx.send(WorkerRequest::ChangeCwd {
-                                    new_cwd: prev_cwd,
-                                    query_id,
-                                });
+                            } else {
+                                // Enter history mode (always allow, even with empty history)
+                                app.history_mode = true;
+                                app.history_selected = 0;
+                                app.query.clear();
+                                app.preview_cache = None; // Clear preview cache
                             }
                         }
                         KeyCode::Char('c')
@@ -1625,25 +1835,45 @@ fn run_app(
                             if app.filter_picker_visible {
                                 // Close filter picker without changing filter
                                 app.filter_picker_visible = false;
+                            } else if app.history_mode {
+                                // Exit history mode
+                                app.history_mode = false;
+                                app.query.clear();
                             } else {
                                 return Ok(());
                             }
                         }
                         KeyCode::Up => {
-                            app.move_selection(-1);
+                            if app.history_mode {
+                                app.move_history_selection(-1);
+                            } else {
+                                app.move_selection(-1);
+                            }
                         }
                         KeyCode::Char('p')
                             if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
                         {
-                            app.move_selection(-1);
+                            if app.history_mode {
+                                app.move_history_selection(-1);
+                            } else {
+                                app.move_selection(-1);
+                            }
                         }
                         KeyCode::Down => {
-                            app.move_selection(1);
+                            if app.history_mode {
+                                app.move_history_selection(1);
+                            } else {
+                                app.move_selection(1);
+                            }
                         }
                         KeyCode::Char('n')
                             if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
                         {
-                            app.move_selection(1);
+                            if app.history_mode {
+                                app.move_history_selection(1);
+                            } else {
+                                app.move_selection(1);
+                            }
                         }
                         KeyCode::Char(c) => {
                             app.query.push(c);
@@ -1670,7 +1900,9 @@ fn run_app(
                             ));
                         }
                         KeyCode::Enter => {
-                            if app.total_results > 0 {
+                            if app.history_mode {
+                                app.handle_history_enter()?;
+                            } else if app.total_results > 0 {
                                 // Force log impressions before click
                                 app.check_and_log_impressions(true)?;
 

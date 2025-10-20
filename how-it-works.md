@@ -171,7 +171,7 @@ Why: Avoids wasted computation and improves responsiveness.
 
 **Auto-refresh:** When new files arrive from the walker, the worker sends a `FilesChanged` notification to the UI thread (debounced to 200ms intervals). When walker sends `AllDone`, the debounce is bypassed to ensure immediate UI update. The UI is then responsible for triggering a new query with a new `query_id` to get fresh results. This preserves the "UI generates IDs" architecture and ensures the page cache is handled correctly.
 
-**Filtering:** The worker applies filters in `filter_and_rank()`. Filters are additive - both the text query and the filter type must match. Filter logic:
+**Filtering:** The worker applies filters in `filter_and_rank()`. Text queries use **case-insensitive substring matching** (`.contains()`), not fuzzy matching. Filters are additive - both the text query and the filter type must match. Filter logic:
 - `FilterType::None`: No additional filtering beyond text query
 - `FilterType::OnlyCwd`: Only files with `origin == FileOrigin::CwdWalker` (excludes historical files)
 - `FilterType::OnlyDirs`: Only files where `is_dir == true`
@@ -405,14 +405,15 @@ Impressions are logged to the database after a 200ms debounce period (to avoid l
 **Keyboard:**
 - Type → send UpdateQuery to worker
 - Up/Down → move selection, request new visible slice if needed
+- Ctrl-P/Ctrl-N → move selection up/down (same as Up/Down)
 - Enter → log click, launch editor, resume TUI
 - Ctrl-J → open shell in CWD (or print path and exit in shell integration mode)
-- Ctrl-H → go back to previous directory
+- Ctrl-H → toggle history navigation mode
 - Ctrl-U → clear query
 - Ctrl-O → toggle debug pane
 - Ctrl-F → toggle filter picker
 - 0/c/d/f (when filter picker visible) → select filter (0=none, c=cwd, d=dirs, f=files)
-- Ctrl-C/Ctrl-D/Esc → quit (Esc also closes filter picker if open)
+- Ctrl-C/Ctrl-D/Esc → quit (Esc also closes filter picker or history mode if open)
 
 **Mouse:**
 - ScrollUp/ScrollDown → scroll preview pane
@@ -437,6 +438,38 @@ When no filter is active, it shows "All (200/200)" without highlighting.
 Filters are applied in addition to the text query - both must match for a file to be included.
 
 You can also set the initial filter via CLI: `psychic --filter=dirs` or `--filter=cwd` or `--filter=files`.
+
+**History Navigation Mode:**
+Pressing Ctrl-H enters history navigation mode, which provides a browser-style back/forward navigation through directories visited during the current session.
+
+**State Management:**
+- `dir_history: Vec<PathBuf>` - chronologically ordered list of visited directories
+- `history_index: usize` - current position in history (where we are in the timeline)
+- `history_selected: usize` - UI selection within filtered history list
+- `history_mode: bool` - whether history mode is active
+
+**Navigation behavior:**
+When you navigate to a directory via Enter:
+1. If selecting the directory at `history_index` (next in chronological order), increment `history_index` to preserve history
+2. Otherwise, this is a branch point: truncate history at `history_index`, append current `cwd`, then set `history_index` to the new end
+
+This creates a branch-point model similar to browser history - you can go back, then navigate to a different directory, which creates a new branch and discards the "future" history.
+
+**UI in history mode:**
+- Left pane: List of directories in reverse chronological order (most recent at top, with line numbers)
+  - Includes current directory as the first entry (most recent)
+  - Works even when starting fresh with no history (shows just current dir)
+- Right pane: Preview of selected directory using `eza -al` (or `ls -lah` fallback)
+- Bottom: Search bar filters history using case-insensitive substring matching
+- Navigation: Up/Down, Ctrl-P/Ctrl-N to move selection
+- Enter: Navigate to selected directory and exit history mode
+- Ctrl-H or Esc: Exit history mode without navigating
+- Title: "History (most recent at top) — N/M" where N is filtered count, M is total
+
+Why reverse chronological: Most recent directories are most relevant, so they should be at the top for quick access.
+Why include current dir: Allows seeing where you are in context of history, and provides consistent behavior even when history is empty.
+Why substring filtering: Consistent with normal search behavior (both use `.contains()`).
+Why auto-exit on Enter: Most common use case is "go back to X" - staying in history mode would require extra keypress.
 
 **Preview:**
 - Uses `bat --color=always --style=numbers --paging=never`
