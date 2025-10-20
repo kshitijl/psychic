@@ -110,31 +110,6 @@ struct FileInfo {
 }
 
 impl FileInfo {
-    fn from_walkdir(
-        full_path: PathBuf,
-        mtime: Option<i64>,
-        atime: Option<i64>,
-        file_size: Option<i64>,
-        is_dir: bool,
-        root: &PathBuf,
-    ) -> Self {
-        let display_name = full_path
-            .strip_prefix(root)
-            .unwrap_or(&full_path)
-            .to_string_lossy()
-            .to_string();
-
-        FileInfo {
-            full_path,
-            display_name,
-            mtime,
-            atime,
-            file_size,
-            origin: FileOrigin::CwdWalker,
-            is_dir,
-        }
-    }
-
     fn from_history(
         full_path: PathBuf,
         mtime: Option<i64>,
@@ -246,18 +221,21 @@ impl WorkerState {
             // Canonicalize historical paths and get their metadata once, at
             // startup, to minimize syscalls later during searches.
             let canonical_path = path.canonicalize().unwrap_or(path);
-            let metadata = get_file_metadata(&canonical_path);
-            let file_info = FileInfo::from_history(
-                canonical_path.clone(),
-                metadata.mtime,
-                metadata.atime,
-                metadata.file_size,
-                metadata.is_dir,
-                &root,
-            );
-            let file_id = FileId(file_registry.len());
-            path_to_id.insert(canonical_path, file_id);
-            file_registry.push(file_info);
+
+            if !path_to_id.contains_key(&canonical_path) {
+                let metadata = get_file_metadata(&canonical_path);
+                let file_info = FileInfo::from_history(
+                    canonical_path.clone(),
+                    metadata.mtime,
+                    metadata.atime,
+                    metadata.file_size,
+                    metadata.is_dir,
+                    &root,
+                );
+                let file_id = FileId(file_registry.len());
+                path_to_id.insert(canonical_path, file_id);
+                file_registry.push(file_info);
+            }
         }
 
         log::debug!(
@@ -281,10 +259,30 @@ impl WorkerState {
     }
 
     fn add_file(&mut self, path: PathBuf, mtime: Option<i64>, atime: Option<i64>, file_size: Option<i64>, is_dir: bool) {
-        if !self.path_to_id.contains_key(&path) {
-            let file_info = FileInfo::from_walkdir(path.clone(), mtime, atime, file_size, is_dir, &self.root);
+        // `path` is the original path from the walker.
+        let canonical_path = path.canonicalize().unwrap_or_else(|_| path.clone());
+
+        if !self.path_to_id.contains_key(&canonical_path) {
+            // We have a new file.
+            // The display path should be the original `path` relative to `self.root`.
+            let display_name = path
+                .strip_prefix(&self.root)
+                .unwrap_or(&path) // fallback to original path if not in root
+                .to_string_lossy()
+                .to_string();
+
+            let file_info = FileInfo {
+                full_path: canonical_path.clone(), // Store the canonical path
+                display_name,
+                mtime,
+                atime,
+                file_size,
+                origin: FileOrigin::CwdWalker,
+                is_dir,
+            };
+
             let file_id = FileId(self.file_registry.len());
-            self.path_to_id.insert(path, file_id);
+            self.path_to_id.insert(canonical_path, file_id);
             self.file_registry.push(file_info);
         }
     }
