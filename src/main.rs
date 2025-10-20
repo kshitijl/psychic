@@ -296,7 +296,9 @@ fn render_history_mode(f: &mut Frame, app: &App) {
         }
 
         eza_cmd.arg(selected_dir);
+        let eza_start = Instant::now();
         let eza_output = eza_cmd.output();
+        log::info!("TIMING {{\"op\":\"eza_history_preview\",\"ms\":{}}}", eza_start.elapsed().as_secs_f64() * 1000.0);
 
         match eza_output {
             Ok(output) => {
@@ -493,6 +495,10 @@ struct App {
     worker_tx: mpsc::Sender<WorkerRequest>,
     worker_rx: mpsc::Receiver<WorkerResponse>,
     worker_handle: Option<JoinHandle<()>>,
+
+    // Startup tracking
+    walker_done: bool,
+    startup_complete_logged: bool,
 }
 
 impl App {
@@ -545,6 +551,8 @@ impl App {
             worker_tx: worker_tx.clone(),
             worker_rx,
             worker_handle: Some(worker_handle),
+            walker_done: false,
+            startup_complete_logged: false,
         };
 
         // Send initial query to worker with ID 0
@@ -877,6 +885,9 @@ impl App {
 }
 
 fn main() -> Result<()> {
+    // Start global timer at the very beginning
+    let main_start = Instant::now();
+
     // Generate session ID early so we can include it in all logs
     use std::collections::hash_map::RandomState;
     use std::hash::{BuildHasher, Hash, Hasher};
@@ -981,7 +992,6 @@ fn main() -> Result<()> {
         }
     }
 
-    let main_start = Instant::now();
     log::info!("=== STARTUP TIMING ===");
 
     // Get current working directory and canonicalize once
@@ -1104,7 +1114,7 @@ fn main() -> Result<()> {
     log::info!("TIMING {{\"op\":\"main_setup_total\",\"ms\":{}}}", main_start.elapsed().as_secs_f64() * 1000.0);
 
     // Run the app
-    let result = run_app(&mut terminal, &mut app, retrain_rx);
+    let result = run_app(&mut terminal, &mut app, retrain_rx, main_start);
 
     // Shutdown sequence: extract and drop worker_tx to signal the worker to stop,
     // then wait for the worker thread to finish, THEN drop app (which drops log_rx).
@@ -1135,10 +1145,11 @@ fn run_app(
     terminal: &mut Terminal<CrosstermBackend<std::fs::File>>,
     app: &mut App,
     retrain_rx: Receiver<bool>,
+    main_start: Instant,
 ) -> Result<()> {
-    let run_app_start = Instant::now();
     let mut first_render_logged = false;
     let mut first_query_complete_logged = false;
+    let mut first_full_render_logged = false;
 
     let marquee_delay = Duration::from_millis(500); // 0.5s pause at ends
     let marquee_speed = Duration::from_millis(80); // scroll every 80ms
@@ -1148,10 +1159,11 @@ fn run_app(
         let _ = app.check_and_log_impressions(false);
 
         // Draw UI
+        let draw_start = Instant::now();
         terminal.draw(|f| {
             // Log first render
             if !first_render_logged {
-                log::info!("TIMING {{\"op\":\"first_render\",\"ms\":{}}}", run_app_start.elapsed().as_secs_f64() * 1000.0);
+                log::info!("TIMING {{\"op\":\"first_render\",\"ms\":{}}}", main_start.elapsed().as_secs_f64() * 1000.0);
                 first_render_logged = true;
             }
 
@@ -1381,7 +1393,9 @@ fn run_app(
                         }
 
                         eza_cmd.arg(&full_path);
+                        let eza_start = Instant::now();
                         let eza_output = eza_cmd.output();
+                        log::info!("TIMING {{\"op\":\"eza_dir_preview\",\"ms\":{}}}", eza_start.elapsed().as_secs_f64() * 1000.0);
 
                         match eza_output {
                             Ok(output) => {
@@ -1424,6 +1438,7 @@ fn run_app(
                         let (text_to_render, should_cache) = if app.preview_scroll == 0 {
                             // Initial view (unscrolled): render a light preview of N lines.
                             let line_range = format!(":{}", preview_height);
+                            let bat_start = Instant::now();
                             let bat_output = std::process::Command::new("bat")
                                 .arg("--color=always")
                                 .arg("--style=numbers")
@@ -1431,6 +1446,7 @@ fn run_app(
                                 .arg(&line_range)
                                 .arg(&full_path)
                                 .output();
+                            log::info!("TIMING {{\"op\":\"bat_light_preview\",\"ms\":{}}}", bat_start.elapsed().as_secs_f64() * 1000.0);
 
                             let text = match bat_output {
                                 Ok(output) => {
@@ -1456,12 +1472,14 @@ fn run_app(
                             (text, false) // Don't cache the light preview
                         } else {
                             // User is scrolling, and we need to generate the full preview.
+                            let bat_start = Instant::now();
                             let bat_output = std::process::Command::new("bat")
                                 .arg("--color=always")
                                 .arg("--style=numbers")
                                 .arg("--paging=never")
                                 .arg(&full_path)
                                 .output();
+                            log::info!("TIMING {{\"op\":\"bat_full_preview\",\"ms\":{}}}", bat_start.elapsed().as_secs_f64() * 1000.0);
 
                             let text = match bat_output {
                                 Ok(output) => {
@@ -1758,6 +1776,20 @@ fn run_app(
             f.set_cursor_position((cursor_x, cursor_y));
         })?;
 
+        // Log draw time and check for first full render (with data)
+        let draw_time = draw_start.elapsed().as_secs_f64() * 1000.0;
+        if !first_full_render_logged && app.total_results > 0 {
+            log::info!("TIMING {{\"op\":\"first_full_render_complete\",\"ms\":{}}}", main_start.elapsed().as_secs_f64() * 1000.0);
+            log::info!("TIMING {{\"op\":\"first_full_render_draw_time\",\"ms\":{}}}", draw_time);
+            first_full_render_logged = true;
+        }
+
+        // Check for startup complete: walker done + we have results + UI rendered
+        if !app.startup_complete_logged && app.walker_done && app.total_results > 0 {
+            log::info!("TIMING {{\"op\":\"startup_complete\",\"ms\":{}}}", main_start.elapsed().as_secs_f64() * 1000.0);
+            app.startup_complete_logged = true;
+        }
+
         // Check for retraining status updates
         if let Ok(retraining_status) = retrain_rx.try_recv() {
             app.currently_retraining = retraining_status;
@@ -1810,7 +1842,7 @@ fn run_app(
 
                         // Log first query completion
                         if !first_query_complete_logged {
-                            log::info!("TIMING {{\"op\":\"first_query_complete\",\"ms\":{}}}", run_app_start.elapsed().as_secs_f64() * 1000.0);
+                            log::info!("TIMING {{\"op\":\"first_query_complete\",\"ms\":{}}}", main_start.elapsed().as_secs_f64() * 1000.0);
                             first_query_complete_logged = true;
                         }
 
@@ -1850,6 +1882,9 @@ fn run_app(
                             filter: app.current_filter,
                         },
                     ));
+                }
+                WorkerResponse::WalkerDone => {
+                    app.walker_done = true;
                 }
             }
         }

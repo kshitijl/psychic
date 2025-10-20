@@ -99,6 +99,7 @@ pub enum WorkerResponse {
         page_data: PageData,
     },
     FilesChanged,
+    WalkerDone,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -551,6 +552,7 @@ fn worker_thread_loop(
     use std::sync::mpsc::RecvTimeoutError;
     use std::time::Instant;
 
+    let worker_loop_start = Instant::now();
     let mut last_files_changed_notification = Instant::now();
 
     loop {
@@ -564,8 +566,11 @@ fn worker_thread_loop(
                     files_changed = true;
                 }
                 WalkerMessage::AllDone => {
+                    log::info!("TIMING {{\"op\":\"walker_complete\",\"ms\":{}}}", worker_loop_start.elapsed().as_secs_f64() * 1000.0);
                     walker_done = true;
                     files_changed = true;
+                    // Notify UI that walker is done
+                    let _ = result_tx.send(WorkerResponse::WalkerDone);
                 }
             }
         }
