@@ -4,10 +4,11 @@
 
 Trying to make startup faster. Time to fully rendered initial screen.
 
-Commented out for now:
- - initial dir logging
-
 Try commenting out preview. Actually add an argument to turn off preview, so we can always measure startup time without preview.
+
+Added arguments to turn off various features to see if they were the culprit.
+
+The real culprit: a 100ms per frame sleep/timeout. Fixed by refactoring to use a single event stream, and fast polling done on just the input events.
 
 ### 2025-10-10
 

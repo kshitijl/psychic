@@ -364,10 +364,12 @@ impl WorkerState {
     }
 
     fn filter_and_rank(&mut self, query: &str) -> Result<()> {
+        let filter_rank_start = std::time::Instant::now();
         self.current_query = query.to_string();
         let query_lower = query.to_lowercase();
 
         // Filter files that match the query
+        let filter_start = std::time::Instant::now();
         let matching_file_ids: Vec<FileId> = (0..self.file_registry.len())
             .map(FileId)
             .filter(|&file_id| {
@@ -410,14 +412,17 @@ impl WorkerState {
                 }
             })
             .collect();
+        log::info!("TIMING {{\"op\":\"filter_files\",\"ms\":{},\"count\":{}}}", filter_start.elapsed().as_secs_f64() * 1000.0, file_candidates.len());
 
         // Rank them with the model
+        let rank_start = std::time::Instant::now();
         let current_timestamp = jiff::Timestamp::now().as_second();
         match self
             .ranker
             .rank_files(query, &file_candidates, current_timestamp, &self.root)
         {
             Ok(scored) => {
+                log::info!("TIMING {{\"op\":\"rank_files\",\"ms\":{},\"count\":{}}}", rank_start.elapsed().as_secs_f64() * 1000.0, scored.len());
                 self.filtered_files = scored.iter().map(|fs| FileId(fs.file_id)).collect();
                 self.file_scores = scored;
             }
@@ -428,6 +433,7 @@ impl WorkerState {
             }
         }
 
+        log::info!("TIMING {{\"op\":\"filter_and_rank_total\",\"ms\":{}}}", filter_rank_start.elapsed().as_secs_f64() * 1000.0);
         Ok(())
     }
 

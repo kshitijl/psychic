@@ -257,26 +257,20 @@ impl Ranker {
             })
             .collect();
 
-        log::debug!(
-            "Parallel feature computation for {} files took {:?}",
-            files.len(),
-            compute_start.elapsed()
+        log::info!(
+            "TIMING {{\"op\":\"ml_compute_features\",\"ms\":{},\"count\":{}}}",
+            compute_start.elapsed().as_secs_f64() * 1000.0,
+            files.len()
         );
 
         // Batch predict all files at once
         // Flatten features into a single vector for batch prediction
-        let flatten_start = Instant::now();
         let num_features = if all_features.is_empty() {
             0
         } else {
             all_features[0].len()
         };
         let flat_features: Vec<f64> = all_features.iter().flatten().copied().collect();
-        log::debug!(
-            "Flattening features for {} files took {:?}",
-            files.len(),
-            flatten_start.elapsed()
-        );
 
         let predict_start = Instant::now();
         let prediction_results = self
@@ -285,10 +279,10 @@ impl Ranker {
             .unwrap()
             .predict_with_params(&flat_features, num_features as i32, true, "num_threads=8")
             .context("Failed to batch predict with model")?;
-        log::debug!(
-            "Batch model prediction for {} files took {:?}",
-            files.len(),
-            predict_start.elapsed()
+        log::info!(
+            "TIMING {{\"op\":\"ml_predict\",\"ms\":{},\"count\":{}}}",
+            predict_start.elapsed().as_secs_f64() * 1000.0,
+            files.len()
         );
 
         // Build scored files
@@ -302,17 +296,11 @@ impl Ranker {
         }
 
         // Sort by score descending (higher scores first)
-        let sort_start = Instant::now();
         scored_files.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        log::debug!(
-            "Sorting {} scored files took {:?}",
-            scored_files.len(),
-            sort_start.elapsed()
-        );
 
         Ok(scored_files)
     }
