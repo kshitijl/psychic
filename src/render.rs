@@ -146,14 +146,28 @@ pub fn render_history_mode(f: &mut Frame, ctx: HistoryRenderContext<'_>) {
         ])
         .split(f.area());
 
-    // Split horizontally: left for dir list, right for preview
-    let top_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(50), // Directory list
-            Constraint::Percentage(50), // Preview
-        ])
-        .split(main_chunks[0]);
+    // Match normal mode: stack vertically when the terminal is narrow
+    let terminal_width = f.area().width;
+    let use_vertical_stack = terminal_width < 120;
+
+    // Choose layout direction based on available width
+    let top_chunks = if use_vertical_stack {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Percentage(45), // Directory list
+                Constraint::Percentage(55), // Preview
+            ])
+            .split(main_chunks[0])
+    } else {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(50), // Directory list
+                Constraint::Percentage(50), // Preview
+            ])
+            .split(main_chunks[0])
+    };
 
     // Get filtered history (sorted chronologically as stored)
     let filtered_history = ctx.filtered_history;
