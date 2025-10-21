@@ -1,15 +1,16 @@
 use anyhow::{Context, Result};
 use ratatui::text::Text;
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver},
     thread::JoinHandle,
     time::Instant,
 };
 
+use crate::analytics::Analytics;
 use crate::cli::{OnCwdVisitAction, OnDirClickAction};
-use crate::db::{Database, EventData, FileMetadata};
+use crate::db::{EventData, FileMetadata};
 use crate::search_worker::{self, DisplayFileInfo, WorkerRequest};
 use crate::{history, ranker, ui_state};
 
@@ -19,15 +20,6 @@ pub struct Page {
     pub start_index: usize,
     pub end_index: usize,
     pub files: Vec<DisplayFileInfo>,
-}
-
-/// Every time the query changes, as the user types, corresponds to a new
-/// subsession. Subsession id is logged to the db.
-pub struct Subsession {
-    pub id: u64,
-    pub query: String,
-    pub created_at: jiff::Timestamp,
-    pub events_have_been_logged: bool,
 }
 
 /// Preview cache state - tracks whether we have a light or full preview cached
@@ -89,11 +81,6 @@ pub struct App {
     pub file_list_scroll: usize, // Scroll offset for file list
     pub preview_scroll: usize,
     pub preview_cache: PreviewCache,
-    pub scrolled_files: HashSet<(String, String)>, // (query, full_path) - track what we've logged scroll for
-    pub session_id: String,
-    pub current_subsession: Option<Subsession>,
-    pub next_subsession_id: u64,
-    pub db: Database,
     pub cwd: PathBuf, // Current working directory
     pub history: history::History,
     pub history_selected: usize, // Selected item in history mode UI
@@ -123,7 +110,9 @@ pub struct App {
 
     // Performance flags
     pub no_preview: bool,
-    pub no_click_logging: bool,
+
+    // Analytics tracking (subsessions, impressions, scrolls)
+    pub analytics: Analytics,
 
     // Search worker thread communication
     pub worker_tx: mpsc::Sender<WorkerRequest>,
@@ -160,9 +149,12 @@ impl App {
             std::env::var("PSYCHIC_SESSION_ID").unwrap_or_else(|_| "unknown".to_string());
 
         let db_start = Instant::now();
-        let db_path = Database::get_db_path(data_dir);
-        let db = Database::new(&db_path)?;
+        let db_path = crate::db::Database::get_db_path(data_dir);
+        let db = crate::db::Database::new(&db_path)?;
         log::debug!("Database initialization took {:?}", db_start.elapsed());
+
+        // Create analytics tracker
+        let analytics = Analytics::new(session_id, db, no_click_logging);
 
         let (worker_tx, worker_handle) = search_worker::spawn(
             root.clone(),
@@ -183,15 +175,10 @@ impl App {
             file_list_scroll: 0,
             preview_scroll: 0,
             preview_cache: PreviewCache::None,
-            scrolled_files: HashSet::new(),
-            session_id,
-            current_subsession: None,
-            next_subsession_id: 1, // Start with 1, 0 is for initial query
-            num_results_to_log_as_impressions: 25,
-            db,
             cwd: root.clone(),
             history: history::History::new(root),
             history_selected: 0,
+            num_results_to_log_as_impressions: 25,
             path_bar_scroll: 0,
             path_bar_scroll_direction: 1,
             last_path_bar_update: Instant::now(),
@@ -204,7 +191,7 @@ impl App {
             on_dir_click,
             on_cwd_visit,
             no_preview,
-            no_click_logging,
+            analytics,
             worker_tx: worker_tx.clone(),
             worker_handle: Some(worker_handle),
             input_control_tx,
@@ -280,38 +267,7 @@ impl App {
     }
 
     pub fn check_and_log_impressions(&mut self, force: bool) -> Result<()> {
-        // Skip logging if disabled
-        if self.no_click_logging {
-            return Ok(());
-        }
-
-        // Extract values we need before borrowing subsession mutably
-        let (subsession_id, subsession_query, created_at, already_logged) =
-            match &self.current_subsession {
-                Some(s) => (
-                    s.id,
-                    s.query.clone(),
-                    s.created_at,
-                    s.events_have_been_logged,
-                ),
-                None => return Ok(()),
-            };
-
-        // Skip if already logged
-        if already_logged {
-            return Ok(());
-        }
-
-        // Check if we should log: either forced or >200ms old
-        let elapsed = jiff::Timestamp::now().duration_since(created_at);
-        let threshold = jiff::SignedDuration::from_millis(200);
-        let should_log = force || elapsed >= threshold;
-        if !should_log {
-            return Ok(());
-        }
-
-        // Log top N visible files with metadata
-        // Collect from page cache starting at index 0
+        // Collect top N visible files with metadata from page cache
         let mut top_n = Vec::new();
         for i in 0..self
             .num_results_to_log_as_impressions
@@ -328,17 +284,8 @@ impl App {
             }
         }
 
-        if !top_n.is_empty() {
-            self.db
-                .log_impressions(&subsession_query, &top_n, subsession_id, &self.session_id)?;
-
-            // Mark as logged
-            if let Some(ref mut s) = self.current_subsession {
-                s.events_have_been_logged = true;
-            }
-        }
-
-        Ok(())
+        // Delegate to analytics module
+        self.analytics.check_and_log_impressions(force, top_n)
     }
 
     pub fn move_selection(&mut self, delta: isize) {
@@ -417,8 +364,7 @@ impl App {
             self.query.clear();
 
             // Send ChangeCwd request to worker
-            let query_id = self.next_subsession_id;
-            self.next_subsession_id += 1;
+            let query_id = self.analytics.next_subsession_id();
             let _ = self.worker_tx.send(WorkerRequest::ChangeCwd {
                 new_cwd: new_dir,
                 query_id,
@@ -434,32 +380,40 @@ impl App {
     }
 
     pub fn log_preview_scroll(&mut self) -> Result<()> {
-        if self.no_click_logging || self.total_results == 0 {
+        if self.total_results == 0 {
             return Ok(());
         }
 
         // Force log impressions before scroll
         self.check_and_log_impressions(true)?;
 
+        // Extract all data we need before borrowing analytics mutably
         if let Some(display_info) = self.get_file_at_index(self.selected_index) {
-            let full_path_str = display_info.full_path.to_string_lossy().to_string();
-            let key = (self.query.clone(), full_path_str.clone());
+            let display_name = display_info.display_name.clone();
+            let full_path = display_info.full_path.to_string_lossy().to_string();
+            let mtime = display_info.mtime;
+            let atime = display_info.atime;
+            let file_size = display_info.file_size;
+            let query = self.query.clone();
 
-            if !self.scrolled_files.contains(&key) {
-                let subsession_id = self.current_subsession.as_ref().map(|s| s.id).unwrap_or(1);
-                self.db.log_event(EventData {
-                    query: &self.query,
-                    file_path: &display_info.display_name,
-                    full_path: &full_path_str,
-                    mtime: display_info.mtime,
-                    atime: display_info.atime,
-                    file_size: display_info.file_size,
+            // Now we can safely borrow analytics
+            let subsession_id = self.analytics.current_subsession_id();
+            let session_id = self.analytics.session_id().to_string();
+
+            self.analytics.log_scroll(
+                &query,
+                EventData {
+                    query: &query,
+                    file_path: &display_name,
+                    full_path: &full_path,
+                    mtime,
+                    atime,
+                    file_size,
                     subsession_id,
                     action: crate::db::UserInteraction::Scroll,
-                    session_id: &self.session_id,
-                })?;
-                self.scrolled_files.insert(key);
-            }
+                    session_id: &session_id,
+                },
+            )?;
         }
 
         Ok(())
@@ -500,7 +454,7 @@ impl App {
             }
         }
 
-        let active_query_id = self.current_subsession.as_ref().map(|s| s.id).unwrap_or(0);
+        let active_query_id = self.analytics.current_subsession_id();
 
         // Page-based prefetching
         let current_page = self.selected_index / PAGE_SIZE;

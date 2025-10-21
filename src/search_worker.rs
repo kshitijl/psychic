@@ -209,18 +209,17 @@ struct WorkerState {
     model_path: PathBuf,
     db_path: PathBuf,
     walker_command_tx: Sender<WalkerCommand>,
-    no_model: bool,
 }
 
 impl WorkerState {
-    fn new(root: PathBuf, data_dir: &Path, walker_command_tx: Sender<WalkerCommand>, no_click_loading: bool, no_model: bool) -> Result<Self> {
+    fn new(root: PathBuf, data_dir: &Path, walker_command_tx: Sender<WalkerCommand>, no_click_loading: bool, _no_model: bool) -> Result<Self> {
         let worker_state_start = std::time::Instant::now();
 
         let ranker_start = std::time::Instant::now();
         let model_path = data_dir.join("model.txt");
         let db_path = Database::get_db_path(data_dir);
 
-        let ranker = if no_click_loading || no_model {
+        let ranker = if no_click_loading || _no_model {
             // Skip loading model and clicks if either flag is set
             ranker::Ranker::new_empty(&db_path).unwrap()
         } else {
@@ -253,10 +252,10 @@ impl WorkerState {
                 // startup, to minimize syscalls later during searches.
                 let canonical_path = path.canonicalize().unwrap_or(path);
 
-                if !path_to_id.contains_key(&canonical_path) {
+                path_to_id.entry(canonical_path.clone()).or_insert_with(|| {
                     let metadata = get_file_metadata(&canonical_path);
                     let file_info = FileInfo::from_history(
-                        canonical_path.clone(),
+                        canonical_path,
                         metadata.mtime,
                         metadata.atime,
                         metadata.file_size,
@@ -264,9 +263,9 @@ impl WorkerState {
                         &root,
                     );
                     let file_id = FileId(file_registry.len());
-                    path_to_id.insert(canonical_path, file_id);
                     file_registry.push(file_info);
-                }
+                    file_id
+                });
             }
         }
 
@@ -321,7 +320,6 @@ impl WorkerState {
             model_path,
             db_path,
             walker_command_tx,
-            no_model,
         })
     }
 

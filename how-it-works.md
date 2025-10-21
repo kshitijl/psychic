@@ -12,36 +12,43 @@ This document describes the current state of the code, with a brief description 
 
 ### Core Components
 
-The codebase follows John Ousterhout's "deep modules" philosophy: small interfaces hiding substantial complexity.
+The codebase follows John Ousterhout's "deep modules" philosophy: simple interfaces hiding complex implementations. After a major refactoring, the codebase has been split into focused, independently testable modules.
 
 **Data & Analytics:**
 1. **`db.rs`** - SQLite event logging (clicks, scrolls, impressions)
+2. **`analytics.rs`** - Subsession tracking, impression debouncing (200ms logic), scroll deduplication
 
 **File Discovery & Ranking:**
-2. **`walker.rs`** - Background file discovery via walkdir
-3. **`context.rs`** - System context gathering for ML features
-4. **`features.rs`** - ML feature generation for training
-5. **`feature_defs/`** - Trait-based feature registry
-6. **`ranker.rs`** - LightGBM model inference
+3. **`walker.rs`** - Background file discovery via walkdir
+4. **`context.rs`** - System context gathering for ML features
+5. **`features.rs`** - ML feature generation for training
+6. **`feature_defs/`** - Trait-based feature registry
+7. **`ranker.rs`** - LightGBM model inference
 
 **Worker Thread:**
-7. **`search_worker.rs`** - Async worker thread for filtering/ranking
+8. **`search_worker.rs`** - Async worker thread for filtering/ranking
 
-**UI & State:**
-8. **`ui_state.rs`** - UI state machine (history mode, filter picker, debug pane)
-9. **`history.rs`** - Directory navigation history with branch-point semantics
-10. **`app.rs`** - Application state (App struct, page cache, preview cache, analytics)
-11. **`path_display.rs`** - Path formatting utilities (truncation, abbreviation)
-12. **`cli.rs`** - CLI argument parsing with clap
-13. **`render.rs`** - History mode rendering (directory list + preview)
+**UI & Interaction:**
+9. **`ui_state.rs`** - UI state machine (history mode, filter picker, debug pane)
+10. **`history.rs`** - Directory navigation history with branch-point semantics
+11. **`input.rs`** - Keyboard and mouse event handling, terminal suspension
+12. **`render.rs`** - All UI rendering (normal mode, history mode, layouts)
+13. **`preview.rs`** - Preview generation with three-state caching (None/Light/Full)
+
+**Application State:**
+14. **`app.rs`** - Application state (App struct, page cache management)
+
+**Utilities:**
+15. **`path_display.rs`** - Path formatting utilities (truncation, abbreviation)
+16. **`cli.rs`** - CLI argument parsing with clap
 
 **Main Entry Point:**
-14. **`main.rs`** - TUI event loop, normal mode rendering, and application glue code
+17. **`main.rs`** - Event loop glue (~600 lines, down from ~2000+)
 
 **Development Tools:**
-15. **`analyze_perf.rs`** - Performance analysis for timing logs
+18. **`analyze_perf.rs`** - Performance analysis for timing logs
 
-Why: Worker thread architecture prevents UI lag during expensive filtering/ranking operations. Module extraction keeps main.rs focused on event handling and rendering.
+**Why this architecture:** Each module has a simple, focused interface hiding complex implementation. Main.rs is now just the event loop and module coordination. All business logic is in focused modules that can be tested independently.
 
 ### Thread Architecture
 
@@ -465,16 +472,125 @@ Why: Browser-style history is intuitive. Users can go back, then navigate elsewh
 Why chronological storage + reverse display: Natural for append, efficient for display.
 Why tested: 11 unit tests verify invariants, edge cases, and the bug fix for history disappearing.
 
+### Module: `analytics.rs`
+
+**Simple interface:**
+```rust
+pub struct Analytics { /* ... */ }
+
+impl Analytics {
+    pub fn check_and_log_impressions(&mut self, force: bool, top_n: Vec<FileMetadata>) -> Result<()>
+    pub fn log_scroll(&mut self, query: &str, event_data: EventData) -> Result<()>
+    pub fn log_click(&self, event_data: EventData) -> Result<()>
+    pub fn new_subsession(&mut self, query_id: u64, query: String)
+    pub fn next_subsession_id(&mut self) -> u64
+    pub fn current_subsession_id(&self) -> u64
+    pub fn session_id(&self) -> &str
+}
+```
+
+**Complex implementation:**
+- Subsession tracking (query changes create new subsessions)
+- 200ms impression debouncing (don't log on every keystroke)
+- Scroll deduplication (HashSet tracks scrolled files to avoid duplicates)
+- Event data formatting for database
+- Temporal correctness (force flush before click/scroll events)
+
+**Why this module:** Encapsulates all analytics complexity behind simple log_* methods. Main code just calls the methods without worrying about debouncing, deduplication, or subsession management.
+
+### Module: `input.rs`
+
+**Simple interface:**
+```rust
+pub enum InputAction { Continue, Exit, PrintAndExit(String) }
+
+pub fn handle_input(
+    app: &mut App,
+    event: Event,
+    terminal: &mut Terminal<CrosstermBackend<std::fs::File>>,
+) -> Result<InputAction>
+```
+
+**Complex implementation:**
+- Keyboard shortcuts (Ctrl-C, Ctrl-H, Ctrl-J, Ctrl-U, Ctrl-O, Ctrl-F, etc.)
+- Mouse scrolling (wheel events)
+- Text input for search query
+- Directory navigation (Enter on files/dirs)
+- Terminal suspension for editor/shell
+- Terminal cleanup and restoration
+- Input control channel management (pausing/resuming crossterm thread)
+
+**Why this module:** Hides all terminal management complexity. Main event loop just calls handle_input() and gets back a simple action to take.
+
+### Module: `render.rs`
+
+**Simple interface:**
+```rust
+pub fn render_normal_mode(f: &mut Frame, app: &mut App, marquee_delay: Duration, marquee_speed: Duration)
+pub fn render_history_mode(f: &mut Frame, app: &App)
+```
+
+**Complex implementation:**
+- Layout calculation (horizontal vs vertical, adaptive based on terminal width)
+- Debug pane modes (Hidden, Small, Expanded)
+- File list rendering with ranking, colors, truncation
+- Preview pane rendering with bat/eza integration
+- Marquee scrolling for long paths
+- Filter picker overlay popup
+- Path bar with scrolling animation
+- History mode layout (directory list + preview)
+
+**Why this module:** Hides all UI rendering complexity. Main loop just calls render_*() functions without understanding layout logic, colors, or animations.
+
+### Module: `preview.rs`
+
+**Simple interface:**
+```rust
+pub fn get_preview_with_cache(
+    cache: &PreviewCache,
+    path: &str,
+    is_dir: bool,
+    preview_height: u16,
+    preview_scroll: usize,
+    extra_flags: &str,
+) -> (Text<'static>, PreviewCache)
+
+pub fn generate_directory_preview(path: &Path, extra_flags: &str) -> Text<'static>
+pub fn generate_full_file_preview(path: &Path) -> Text<'static>
+pub fn generate_light_file_preview(path: &Path, preview_height: u16) -> Text<'static>
+```
+
+**Complex implementation:**
+- Three-state caching (None, Light preview for first screen, Full preview when scrolled)
+- bat command execution with ANSI parsing
+- eza command execution with flags based on terminal width
+- Fallback to plain text/ls when bat/eza not available
+- Cache invalidation logic
+- Performance optimization (light preview = first N lines, full = entire file)
+
+**Why this module:** Encapsulates preview generation and caching complexity. Caller just gets back (preview_text, updated_cache) without understanding bat flags, caching strategy, or ANSI parsing.
+
 ### Module: `main.rs`
 
-TUI event loop using ratatui + crossterm.
+Now a clean ~600-line event loop and application glue (down from 2000+ lines before refactoring).
 
 **Startup behavior:**
 - Spawns a background thread to retrain the model using collected events
 - Training runs asynchronously and doesn't block the UI
 - Training output is appended to `~/.local/share/psychic/training.log`
 - Worker loads the new model automatically when retraining completes
-Why: Fresh model on every launch ensures ranking improves as you use the tool. Background execution means no startup delay.
+
+**Why:** Fresh model on every launch ensures ranking improves as you use the tool. Background execution means no startup delay.
+
+**Main responsibilities:**
+- Create unified event channel
+- Spawn threads (worker, walker, crossterm forwarder, tick timer, retraining)
+- Initialize App state
+- Run event loop (draw UI, receive events, dispatch to modules)
+- Coordinate modules (analytics, input, render, preview)
+- Shutdown sequence
+
+**Why now so small:** All business logic moved to focused modules. Main.rs is just coordination and glue code.
 
 **Layout:**
 

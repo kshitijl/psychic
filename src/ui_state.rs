@@ -31,30 +31,6 @@ impl UiState {
         }
     }
 
-    /// Toggle history mode on/off
-    pub fn toggle_history_mode(&mut self) {
-        self.history_mode = !self.history_mode;
-    }
-
-    /// Enter history mode
-    pub fn enter_history_mode(&mut self) {
-        self.history_mode = true;
-    }
-
-    /// Exit history mode
-    pub fn exit_history_mode(&mut self) {
-        self.history_mode = false;
-    }
-
-    /// Toggle filter picker on/off
-    pub fn toggle_filter_picker(&mut self) {
-        self.filter_picker_visible = !self.filter_picker_visible;
-    }
-
-    /// Hide filter picker
-    pub fn hide_filter_picker(&mut self) {
-        self.filter_picker_visible = false;
-    }
 
     /// Cycle debug pane mode: Small -> Expanded -> Hidden -> Small
     pub fn cycle_debug_pane_mode(&mut self) {
@@ -81,11 +57,6 @@ impl UiState {
         }
     }
 
-    /// Should the debug pane be visible?
-    pub fn is_debug_pane_visible(&self) -> bool {
-        !matches!(self.debug_pane_mode, DebugPaneMode::Hidden)
-    }
-
     /// Is the debug pane expanded (taking more space)?
     pub fn is_debug_pane_expanded(&self) -> bool {
         matches!(self.debug_pane_mode, DebugPaneMode::Expanded)
@@ -102,57 +73,28 @@ mod tests {
         assert_eq!(state.history_mode, false);
         assert_eq!(state.filter_picker_visible, false);
         assert_eq!(state.debug_pane_mode, DebugPaneMode::Hidden);
-        assert_eq!(state.is_debug_pane_visible(), false);
         assert_eq!(state.is_debug_pane_expanded(), false);
     }
 
     #[test]
-    fn test_toggle_history_mode() {
+    fn test_history_mode_field() {
         let mut state = UiState::new();
 
-        state.toggle_history_mode();
+        state.history_mode = true;
         assert_eq!(state.history_mode, true);
 
-        state.toggle_history_mode();
+        state.history_mode = false;
         assert_eq!(state.history_mode, false);
     }
 
     #[test]
-    fn test_enter_exit_history_mode() {
+    fn test_filter_picker_field() {
         let mut state = UiState::new();
 
-        state.enter_history_mode();
-        assert_eq!(state.history_mode, true);
-
-        state.enter_history_mode(); // Should stay true
-        assert_eq!(state.history_mode, true);
-
-        state.exit_history_mode();
-        assert_eq!(state.history_mode, false);
-    }
-
-    #[test]
-    fn test_toggle_filter_picker() {
-        let mut state = UiState::new();
-
-        state.toggle_filter_picker();
+        state.filter_picker_visible = true;
         assert_eq!(state.filter_picker_visible, true);
 
-        state.toggle_filter_picker();
-        assert_eq!(state.filter_picker_visible, false);
-    }
-
-    #[test]
-    fn test_hide_filter_picker() {
-        let mut state = UiState::new();
-
-        state.toggle_filter_picker();
-        assert_eq!(state.filter_picker_visible, true);
-
-        state.hide_filter_picker();
-        assert_eq!(state.filter_picker_visible, false);
-
-        state.hide_filter_picker(); // Should stay false
+        state.filter_picker_visible = false;
         assert_eq!(state.filter_picker_visible, false);
     }
 
@@ -162,25 +104,21 @@ mod tests {
 
         // Initial: Hidden
         assert_eq!(state.debug_pane_mode, DebugPaneMode::Hidden);
-        assert_eq!(state.is_debug_pane_visible(), false);
         assert_eq!(state.is_debug_pane_expanded(), false);
 
         // Cycle to Small
         state.cycle_debug_pane_mode();
         assert_eq!(state.debug_pane_mode, DebugPaneMode::Small);
-        assert_eq!(state.is_debug_pane_visible(), true);
         assert_eq!(state.is_debug_pane_expanded(), false);
 
         // Cycle to Expanded
         state.cycle_debug_pane_mode();
         assert_eq!(state.debug_pane_mode, DebugPaneMode::Expanded);
-        assert_eq!(state.is_debug_pane_visible(), true);
         assert_eq!(state.is_debug_pane_expanded(), true);
 
         // Cycle back to Hidden
         state.cycle_debug_pane_mode();
         assert_eq!(state.debug_pane_mode, DebugPaneMode::Hidden);
-        assert_eq!(state.is_debug_pane_visible(), false);
         assert_eq!(state.is_debug_pane_expanded(), false);
     }
 
@@ -229,11 +167,11 @@ mod tests {
         let mut state = UiState::new();
 
         // User opens history mode
-        state.enter_history_mode();
+        state.history_mode = true;
         assert_eq!(state.history_mode, true);
 
         // User toggles filter picker while in history
-        state.toggle_filter_picker();
+        state.filter_picker_visible = true;
         assert_eq!(state.filter_picker_visible, true);
         assert_eq!(
             state.history_mode, true,
@@ -253,7 +191,7 @@ mod tests {
         );
 
         // User exits history mode
-        state.exit_history_mode();
+        state.history_mode = false;
         assert_eq!(state.history_mode, false);
         assert_eq!(
             state.filter_picker_visible, true,

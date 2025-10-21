@@ -64,8 +64,8 @@ pub fn analyze_perf(log_path: &Path) -> Result<()> {
         }
 
         // Extract JSON portion
-        if let Some(start) = line.find('{') {
-            if let Some(end) = line.rfind('}') {
+        if let Some(start) = line.find('{')
+            && let Some(end) = line.rfind('}') {
                 let json = &line[start..=end];
                 if let Ok(event) = serde_json::from_str::<TimingEvent>(json) {
                     // Stop after startup complete to avoid showing subsequent queries
@@ -78,7 +78,6 @@ pub fn analyze_perf(log_path: &Path) -> Result<()> {
                     }
                 }
             }
-        }
     }
 
     if !seen_startup_complete && !timing_events.is_empty() {

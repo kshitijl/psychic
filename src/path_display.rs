@@ -124,7 +124,7 @@ pub fn truncate_absolute_path(path_str: &str, max_len: usize) -> String {
         // Everything fits (possibly with abbreviations)
         if head_parts.iter().all(|h| parts.contains(&h.as_str())) {
             // No abbreviations were used
-            return path_str.to_string();
+            path_str.to_string()
         } else {
             // Some abbreviations, reconstruct
             let tail: Vec<&str> = parts

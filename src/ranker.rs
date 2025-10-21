@@ -338,6 +338,7 @@ pub fn features_to_map(features: &[f64]) -> FxHashMap<String, f64> {
         .collect()
 }
 
+#[cfg(test)]
 /// Compute features for a file (for tests, no timing)
 fn compute_features(
     query: &str,

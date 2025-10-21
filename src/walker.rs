@@ -71,12 +71,11 @@ fn walk_directory(
             item_count += 1;
 
             // Check for commands periodically
-            if item_count % COMMAND_CHECK_INTERVAL == 0 {
-                if let Ok(WalkerCommand::ChangeCwd(_)) = command_rx.try_recv() {
+            if item_count % COMMAND_CHECK_INTERVAL == 0
+                && let Ok(WalkerCommand::ChangeCwd(_)) = command_rx.try_recv() {
                     log::info!("Walker: Received ChangeCwd during walk, aborting current walk");
                     return; // Abort current walk, outer loop will handle the command
                 }
-            }
 
             // If we exceed the shallow mode threshold, switch to depth=1 exploration
             if item_count > SHALLOW_MODE_THRESHOLD {
@@ -101,12 +100,11 @@ fn walk_directory(
                     let is_root = entry.path() == root.as_path();
                     if !is_root && item_count < MAX_FILES {
                         // Check for commands periodically in shallow mode too
-                        if item_count % COMMAND_CHECK_INTERVAL == 0 {
-                            if let Ok(WalkerCommand::ChangeCwd(_)) = command_rx.try_recv() {
+                        if item_count % COMMAND_CHECK_INTERVAL == 0
+                            && let Ok(WalkerCommand::ChangeCwd(_)) = command_rx.try_recv() {
                                 log::info!("Walker: Received ChangeCwd during shallow walk, aborting");
                                 return;
                             }
-                        }
                         let is_dir = entry.file_type().is_dir();
                         let metadata = entry.metadata().ok();
                         let mtime = metadata
