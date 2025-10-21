@@ -133,7 +133,7 @@ pub fn render_history_mode(f: &mut Frame, app: &App) {
         let selected_dir = &filtered_history[app.history_selected];
 
         let preview_width = top_chunks[1].width;
-        let extra_flags = app.ui_state.get_eza_flags(preview_width);
+        let extra_flags = get_eza_flags(preview_width);
 
         let mut eza_cmd = std::process::Command::new("eza");
         eza_cmd.arg("-al").arg("--color=always");
@@ -247,10 +247,10 @@ pub fn render_normal_mode(
     use ratatui::layout::Rect;
     use ratatui::widgets::Clear;
     use std::path::PathBuf;
-    
-    use crate::{feature_defs, ranker, search_worker, ui_state};
+
     use crate::app::PAGE_SIZE;
     use crate::path_display::{get_time_ago, truncate_path};
+    use crate::{feature_defs, ranker, search_worker, ui_state};
 
     // Check terminal width to decide layout direction
     let terminal_width = f.area().width;
@@ -471,8 +471,7 @@ pub fn render_normal_mode(
         ])
     };
 
-    let list =
-        List::new(items).block(Block::default().borders(Borders::ALL).title(title_line));
+    let list = List::new(items).block(Block::default().borders(Borders::ALL).title(title_line));
     f.render_widget(list, top_chunks[0]);
 
     // Get current file from page cache - clone the info we need to avoid borrow issues
@@ -573,8 +572,8 @@ pub fn render_normal_mode(
         if let Ok(trained_at) = stats.trained_at.parse::<jiff::Timestamp>() {
             let now = jiff::Timestamp::now();
             let duration = now.duration_since(trained_at);
-            let time_ago = formatter
-                .convert(std::time::Duration::from_secs(duration.as_secs() as u64));
+            let time_ago =
+                formatter.convert(std::time::Duration::from_secs(duration.as_secs() as u64));
             debug_lines.push(format!("  Trained: {}", time_ago));
         } else {
             debug_lines.push(format!("  Trained: {}", stats.trained_at));
@@ -587,9 +586,7 @@ pub fn render_normal_mode(
         debug_lines.push(format!("  Features: {}", stats.num_features));
         debug_lines.push(format!(
             "  Examples: {} ({} pos, {} neg)",
-            stats.num_total_examples,
-            stats.num_positive_examples,
-            stats.num_negative_examples
+            stats.num_total_examples, stats.num_positive_examples, stats.num_negative_examples
         ));
         debug_lines.push(String::from("  Top features:"));
         for feat in &stats.top_3_features {
@@ -659,8 +656,8 @@ pub fn render_normal_mode(
         ui_state::DebugPaneMode::Expanded => "Debug (Ctrl-O: hide)",
         ui_state::DebugPaneMode::Hidden => "Debug (Ctrl-O: show)",
     };
-    let debug_pane = Paragraph::new(debug_text)
-        .block(Block::default().borders(Borders::ALL).title(debug_title));
+    let debug_pane =
+        Paragraph::new(debug_text).block(Block::default().borders(Borders::ALL).title(debug_title));
     f.render_widget(debug_pane, top_chunks[2]);
 
     // Get path of currently selected file for marquee
@@ -683,8 +680,7 @@ pub fn render_normal_mode(
             let max_scroll = padded_path.len().saturating_sub(path_bar_width) as u16;
 
             // Pause at the ends of the scroll
-            let should_scroll = if app.path_bar_scroll == 0 || app.path_bar_scroll >= max_scroll
-            {
+            let should_scroll = if app.path_bar_scroll == 0 || app.path_bar_scroll >= max_scroll {
                 time_since_update > marquee_delay
             } else {
                 time_since_update > marquee_speed
@@ -797,4 +793,53 @@ pub fn render_normal_mode(
     f.set_cursor_position((cursor_x, cursor_y));
 
     updates
+}
+
+/// Get eza command flags based on preview pane width
+///
+/// # Arguments
+/// * `width` - Available width for the preview pane
+///
+/// # Returns
+/// The flags to pass to eza (everything after "eza -al")
+fn get_eza_flags(width: u16) -> &'static str {
+    // If width is small, omit user and permissions to save space
+    if width < 80 {
+        " --no-user --no-permissions"
+    } else {
+        ""
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_get_eza_flags_wide_screen() {
+        // Wide screens get full eza output
+        assert_eq!(get_eza_flags(80), "", "80 width should use full eza");
+        assert_eq!(get_eza_flags(100), "", "100 width should use full eza");
+        assert_eq!(get_eza_flags(120), "", "120 width should use full eza");
+    }
+
+    #[test]
+    fn test_get_eza_flags_narrow_screen() {
+        // Narrow screens get compact eza output
+        assert_eq!(
+            get_eza_flags(79),
+            " --no-user --no-permissions",
+            "79 width should use compact eza"
+        );
+        assert_eq!(
+            get_eza_flags(60),
+            " --no-user --no-permissions",
+            "60 width should use compact eza"
+        );
+        assert_eq!(
+            get_eza_flags(40),
+            " --no-user --no-permissions",
+            "40 width should use compact eza"
+        );
+    }
 }

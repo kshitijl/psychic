@@ -31,7 +31,6 @@ impl UiState {
         }
     }
 
-
     /// Cycle debug pane mode: Small -> Expanded -> Hidden -> Small
     pub fn cycle_debug_pane_mode(&mut self) {
         self.debug_pane_mode = match self.debug_pane_mode {
@@ -39,22 +38,6 @@ impl UiState {
             DebugPaneMode::Expanded => DebugPaneMode::Hidden,
             DebugPaneMode::Hidden => DebugPaneMode::Small,
         };
-    }
-
-    /// Get eza command flags based on preview pane width
-    ///
-    /// # Arguments
-    /// * `width` - Available width for the preview pane
-    ///
-    /// # Returns
-    /// The flags to pass to eza (everything after "eza -al")
-    pub fn get_eza_flags(&self, width: u16) -> &'static str {
-        // If width is small, omit user and permissions to save space
-        if width < 80 {
-            " --no-user --no-permissions"
-        } else {
-            ""
-        }
     }
 
     /// Is the debug pane expanded (taking more space)?
@@ -120,46 +103,6 @@ mod tests {
         state.cycle_debug_pane_mode();
         assert_eq!(state.debug_pane_mode, DebugPaneMode::Hidden);
         assert_eq!(state.is_debug_pane_expanded(), false);
-    }
-
-    #[test]
-    fn test_get_eza_flags_wide_screen() {
-        let state = UiState::new();
-
-        // Wide screens get full eza output
-        assert_eq!(state.get_eza_flags(80), "", "80 width should use full eza");
-        assert_eq!(
-            state.get_eza_flags(100),
-            "",
-            "100 width should use full eza"
-        );
-        assert_eq!(
-            state.get_eza_flags(120),
-            "",
-            "120 width should use full eza"
-        );
-    }
-
-    #[test]
-    fn test_get_eza_flags_narrow_screen() {
-        let state = UiState::new();
-
-        // Narrow screens get compact eza output
-        assert_eq!(
-            state.get_eza_flags(79),
-            " --no-user --no-permissions",
-            "79 width should use compact eza"
-        );
-        assert_eq!(
-            state.get_eza_flags(60),
-            " --no-user --no-permissions",
-            "60 width should use compact eza"
-        );
-        assert_eq!(
-            state.get_eza_flags(40),
-            " --no-user --no-permissions",
-            "40 width should use compact eza"
-        );
     }
 
     #[test]
