@@ -47,19 +47,25 @@ enum PreviewCache {
     /// Full preview cached (entire file) for a file
     Full { path: String, text: Text<'static> },
     /// Directory preview cached (eza output)
-    Directory { path: String, text: Text<'static>, extra_flags: String },
+    Directory {
+        path: String,
+        text: Text<'static>,
+        extra_flags: String,
+    },
 }
 
 impl PreviewCache {
     fn get_if_matches(&self, path: &str) -> Option<(Text<'static>, bool)> {
         match self {
             PreviewCache::None => None,
-            PreviewCache::Light { path: cached_path, text } if cached_path == path => {
-                Some((text.clone(), false))
-            }
-            PreviewCache::Full { path: cached_path, text } if cached_path == path => {
-                Some((text.clone(), true))
-            }
+            PreviewCache::Light {
+                path: cached_path,
+                text,
+            } if cached_path == path => Some((text.clone(), false)),
+            PreviewCache::Full {
+                path: cached_path,
+                text,
+            } if cached_path == path => Some((text.clone(), true)),
             PreviewCache::Directory { .. } => None, // Use get_dir_if_matches instead
             _ => None,
         }
@@ -67,10 +73,11 @@ impl PreviewCache {
 
     fn get_dir_if_matches(&self, path: &str, extra_flags: &str) -> Option<Text<'static>> {
         match self {
-            PreviewCache::Directory { path: cached_path, text, extra_flags: cached_flags }
-                if cached_path == path && cached_flags == extra_flags => {
-                Some(text.clone())
-            }
+            PreviewCache::Directory {
+                path: cached_path,
+                text,
+                extra_flags: cached_flags,
+            } if cached_path == path && cached_flags == extra_flags => Some(text.clone()),
             _ => None,
         }
     }
@@ -1135,15 +1142,13 @@ fn main() -> Result<()> {
                 print!("{}", include_str!("../shell/psychic.zsh"));
                 return Ok(());
             }
-            Commands::Internal { command } => {
-                match command {
-                    InternalCommands::AnalyzePerf => {
-                        let log_path = data_dir.join("app.log");
-                        analyze_perf::analyze_perf(&log_path)?;
-                        return Ok(());
-                    }
+            Commands::Internal { command } => match command {
+                InternalCommands::AnalyzePerf => {
+                    let log_path = data_dir.join("app.log");
+                    analyze_perf::analyze_perf(&log_path)?;
+                    return Ok(());
                 }
-            }
+            },
         }
     }
 
@@ -1299,12 +1304,16 @@ fn main() -> Result<()> {
             let metadata = std::fs::metadata(&root_clone).ok();
             let mtime = metadata.as_ref().and_then(|m| {
                 m.modified().ok().and_then(|t| {
-                    t.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs() as i64)
+                    t.duration_since(std::time::UNIX_EPOCH)
+                        .ok()
+                        .map(|d| d.as_secs() as i64)
                 })
             });
             let atime = metadata.as_ref().and_then(|m| {
                 m.accessed().ok().and_then(|t| {
-                    t.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs() as i64)
+                    t.duration_since(std::time::UNIX_EPOCH)
+                        .ok()
+                        .map(|d| d.as_secs() as i64)
                 })
             });
             let file_size = metadata.as_ref().map(|m| m.len() as i64);
@@ -1418,7 +1427,7 @@ fn run_app(
 
             // Check terminal width to decide layout direction
             let terminal_width = f.area().width;
-            let use_vertical_stack = terminal_width < 100;
+            let use_vertical_stack = terminal_width < 120;
 
             // Split vertically: top for results/preview, bottom for input
             let main_chunks = Layout::default()
@@ -1445,39 +1454,39 @@ fn run_app(
             } else {
                 // Horizontal layout for wide terminals
                 match app.ui_state.debug_pane_mode {
-                ui_state::DebugPaneMode::Expanded => {
-                    // Debug expanded: give it most of the space
-                    Layout::default()
-                        .direction(Direction::Horizontal)
-                        .constraints([
-                            Constraint::Percentage(25), // File list (smaller)
-                            Constraint::Percentage(0),  // Preview (hidden)
-                            Constraint::Percentage(75), // Debug (expanded)
-                        ])
-                        .split(main_chunks[0])
-                }
-                ui_state::DebugPaneMode::Small => {
-                    // Debug small: normal layout
-                    Layout::default()
-                        .direction(Direction::Horizontal)
-                        .constraints([
-                            Constraint::Percentage(35), // File list
-                            Constraint::Percentage(45), // Preview
-                            Constraint::Percentage(20), // Debug (small)
-                        ])
-                        .split(main_chunks[0])
-                }
-                ui_state::DebugPaneMode::Hidden => {
-                    // Debug hidden: no space for debug pane
-                    Layout::default()
-                        .direction(Direction::Horizontal)
-                        .constraints([
-                            Constraint::Percentage(40), // File list (more space)
-                            Constraint::Percentage(60), // Preview (more space)
-                            Constraint::Percentage(0),  // Debug (hidden)
-                        ])
-                        .split(main_chunks[0])
-                }
+                    ui_state::DebugPaneMode::Expanded => {
+                        // Debug expanded: give it most of the space
+                        Layout::default()
+                            .direction(Direction::Horizontal)
+                            .constraints([
+                                Constraint::Percentage(25), // File list (smaller)
+                                Constraint::Percentage(0),  // Preview (hidden)
+                                Constraint::Percentage(75), // Debug (expanded)
+                            ])
+                            .split(main_chunks[0])
+                    }
+                    ui_state::DebugPaneMode::Small => {
+                        // Debug small: normal layout
+                        Layout::default()
+                            .direction(Direction::Horizontal)
+                            .constraints([
+                                Constraint::Percentage(35), // File list
+                                Constraint::Percentage(45), // Preview
+                                Constraint::Percentage(20), // Debug (small)
+                            ])
+                            .split(main_chunks[0])
+                    }
+                    ui_state::DebugPaneMode::Hidden => {
+                        // Debug hidden: no space for debug pane
+                        Layout::default()
+                            .direction(Direction::Horizontal)
+                            .constraints([
+                                Constraint::Percentage(40), // File list (more space)
+                                Constraint::Percentage(60), // Preview (more space)
+                                Constraint::Percentage(0),  // Debug (hidden)
+                            ])
+                            .split(main_chunks[0])
+                    }
                 }
             };
 
@@ -1660,7 +1669,10 @@ fn run_app(
                         let extra_flags = app.ui_state.get_eza_flags(preview_width);
 
                         // Check cache first
-                        if let Some(cached_text) = app.preview_cache.get_dir_if_matches(current_file_path, &extra_flags) {
+                        if let Some(cached_text) = app
+                            .preview_cache
+                            .get_dir_if_matches(current_file_path, &extra_flags)
+                        {
                             // FAST PATH: Directory listing is cached with matching flags
                             cached_text
                         } else {
@@ -1684,10 +1696,12 @@ fn run_app(
                             );
 
                             let text = match eza_output {
-                                Ok(output) => match ansi_to_tui::IntoText::into_text(&output.stdout) {
-                                    Ok(text) => text,
-                                    Err(_) => Text::from("[Unable to parse directory listing]"),
-                                },
+                                Ok(output) => {
+                                    match ansi_to_tui::IntoText::into_text(&output.stdout) {
+                                        Ok(text) => text,
+                                        Err(_) => Text::from("[Unable to parse directory listing]"),
+                                    }
+                                }
                                 Err(_) => {
                                     // Fallback to ls if eza not available
                                     let ls_output = std::process::Command::new("ls")
@@ -1744,12 +1758,10 @@ fn run_app(
                                                 Err(_) => Text::from("[Unable to parse preview]"),
                                             }
                                         }
-                                        Err(_) => {
-                                            match std::fs::read_to_string(&full_path) {
-                                                Ok(content) => Text::from(content),
-                                                Err(_) => Text::from("[Unable to preview file]"),
-                                            }
-                                        }
+                                        Err(_) => match std::fs::read_to_string(&full_path) {
+                                            Ok(content) => Text::from(content),
+                                            Err(_) => Text::from("[Unable to preview file]"),
+                                        },
                                     };
 
                                     // Cache full preview
@@ -1906,7 +1918,9 @@ fn run_app(
                     PreviewCache::None => "Not cached",
                     PreviewCache::Light { path, .. } if path == &full_path_str => "Cached (light)",
                     PreviewCache::Full { path, .. } if path == &full_path_str => "Cached (full)",
-                    PreviewCache::Directory { path, extra_flags, .. } if path == &full_path_str => {
+                    PreviewCache::Directory {
+                        path, extra_flags, ..
+                    } if path == &full_path_str => {
                         if extra_flags.is_empty() {
                             "Cached (dir)"
                         } else {
