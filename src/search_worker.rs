@@ -163,14 +163,17 @@ impl FileInfo {
     }
 }
 
-pub fn spawn(
+pub fn spawn<T>(
     cwd: PathBuf,
     data_dir: &Path,
+    event_tx: Sender<T>,
     no_click_loading: bool,
     no_model: bool,
-) -> Result<(Sender<WorkerRequest>, Receiver<WorkerResponse>, JoinHandle<()>)> {
+) -> Result<(Sender<WorkerRequest>, JoinHandle<()>)>
+where
+    T: From<WorkerResponse> + Send + 'static,
+{
     let (worker_tx, worker_task_rx) = mpsc::channel::<WorkerRequest>();
-    let (worker_result_tx, worker_rx) = mpsc::channel::<WorkerResponse>();
     let (walker_message_tx, walker_message_rx) = mpsc::channel::<WalkerMessage>();
     let (walker_command_tx, walker_command_rx) = mpsc::channel::<WalkerCommand>();
 
@@ -183,13 +186,13 @@ pub fn spawn(
         // operations, but doing it this way means we don't have to do an unsafe
         // impl Send.
         let worker_state = WorkerState::new(cwd_clone, &data_dir, walker_command_tx_clone, no_click_loading, no_model).unwrap();
-        worker_thread_loop(worker_task_rx, worker_result_tx, walker_message_rx, worker_state);
+        worker_thread_loop(worker_task_rx, event_tx, walker_message_rx, worker_state);
     });
 
     // Start walker thread
     start_file_walker(cwd, walker_command_rx, walker_message_tx);
 
-    Ok((worker_tx, worker_rx, worker_handle))
+    Ok((worker_tx, worker_handle))
 }
 
 // Worker thread state - owns all file data
@@ -555,12 +558,15 @@ impl WorkerState {
     }
 }
 // Worker thread main loop
-fn worker_thread_loop(
+fn worker_thread_loop<T>(
     task_rx: mpsc::Receiver<WorkerRequest>,
-    result_tx: mpsc::Sender<WorkerResponse>,
+    event_tx: mpsc::Sender<T>,
     walker_rx: mpsc::Receiver<WalkerMessage>,
     mut state: WorkerState,
-) {
+)
+where
+    T: From<WorkerResponse> + Send,
+{
     use std::sync::mpsc::RecvTimeoutError;
     use std::time::Instant;
 
@@ -582,7 +588,7 @@ fn worker_thread_loop(
                     walker_done = true;
                     files_changed = true;
                     // Notify UI that walker is done
-                    let _ = result_tx.send(WorkerResponse::WalkerDone);
+                    let _ = event_tx.send(WorkerResponse::WalkerDone.into());
                 }
             }
         }
@@ -590,7 +596,7 @@ fn worker_thread_loop(
         // If files changed, notify the UI so it can decide to trigger a refresh.
         // We debounce this to avoid spamming the UI thread, UNLESS the walker is done.
         if files_changed && (walker_done || last_files_changed_notification.elapsed() > Duration::from_millis(200)) {
-            let _ = result_tx.send(WorkerResponse::FilesChanged);
+            let _ = event_tx.send(WorkerResponse::FilesChanged.into());
             last_files_changed_notification = Instant::now();
         }
 
@@ -611,13 +617,13 @@ fn worker_thread_loop(
 
                 // Send back results with initial page (page 0)
                 let initial_page = state.get_page(0, 128);
-                let _ = result_tx.send(WorkerResponse::QueryUpdated {
+                let _ = event_tx.send(WorkerResponse::QueryUpdated {
                     query_id: latest_req.query_id,
                     total_results: state.filtered_files.len(),
                     total_files: state.file_registry.len(),
                     initial_page,
                     model_stats: state.ranker.stats.clone(),
-                });
+                }.into());
             }
             Ok(WorkerRequest::GetPage { query_id, page_num }) => {
                 // If the request is for an old query, ignore it.
@@ -625,7 +631,7 @@ fn worker_thread_loop(
                     continue;
                 }
                 let page_data = state.get_page(page_num, 128);
-                let _ = result_tx.send(WorkerResponse::Page { query_id, page_data });
+                let _ = event_tx.send(WorkerResponse::Page { query_id, page_data }.into());
             }
             Ok(WorkerRequest::ReloadModel { query_id }) => {
                 state.current_query_id = query_id;
@@ -638,13 +644,13 @@ fn worker_thread_loop(
                         log::error!("Filter/rank failed after model reload: {}", e);
                     } else {
                         let initial_page = state.get_page(0, 128);
-                        let _ = result_tx.send(WorkerResponse::QueryUpdated {
+                        let _ = event_tx.send(WorkerResponse::QueryUpdated {
                             query_id,
                             total_results: state.filtered_files.len(),
                             total_files: state.file_registry.len(),
                             initial_page,
                             model_stats: state.ranker.stats.clone(),
-                        });
+                        }.into());
                     }
                 }
             }
@@ -659,13 +665,13 @@ fn worker_thread_loop(
                         log::error!("Filter/rank failed after clicks reload: {}", e);
                     } else {
                         let initial_page = state.get_page(0, 128);
-                        let _ = result_tx.send(WorkerResponse::QueryUpdated {
+                        let _ = event_tx.send(WorkerResponse::QueryUpdated {
                             query_id,
                             total_results: state.filtered_files.len(),
                             total_files: state.file_registry.len(),
                             initial_page,
                             model_stats: state.ranker.stats.clone(),
-                        });
+                        }.into());
                     }
                 }
             }
@@ -680,13 +686,13 @@ fn worker_thread_loop(
                         log::error!("Filter/rank failed after cwd change: {}", e);
                     } else {
                         let initial_page = state.get_page(0, 128);
-                        let _ = result_tx.send(WorkerResponse::QueryUpdated {
+                        let _ = event_tx.send(WorkerResponse::QueryUpdated {
                             query_id,
                             total_results: state.filtered_files.len(),
                             total_files: state.file_registry.len(),
                             initial_page,
                             model_stats: state.ranker.stats.clone(),
-                        });
+                        }.into());
                     }
                 }
             }

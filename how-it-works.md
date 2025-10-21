@@ -27,24 +27,46 @@ Why: Worker thread architecture prevents UI lag during expensive filtering/ranki
 
 ### Thread Architecture
 
-**3 threads:**
-- **Main (UI)**: Renders UI, handles keyboard/mouse, owns visible file slice only
-- **Worker**: Owns all file data, does filtering/ranking, sends results to main
+**5 threads:**
+- **Main (UI)**: Renders UI, blocks on unified event channel, owns visible file slice only
+- **Worker**: Owns all file data, does filtering/ranking, sends results to unified channel
 - **Walker**: Discovers files via walkdir, sends to worker
+- **Crossterm forwarder**: Polls for keyboard/mouse events, sends to unified channel
+- **Tick timer**: Sends tick events every 250ms for UI animations (marquee)
 
-**Communication:**
+**Communication via Unified Event Channel:**
 ```
 Walker → (path, mtime) → Worker
 
-// UI generates a unique ID for every request
-Main → UpdateQuery{query: "foo", query_id: 1} → Worker
-Worker → QueryUpdated{query_id: 1, ...} → Main
+// Worker sends directly to unified AppEvent channel
+Worker → AppEvent::Worker(QueryUpdated{...}) → Main
+Worker → AppEvent::Worker(Page{...}) → Main
+Worker → AppEvent::Worker(FilesChanged) → Main
+Worker → AppEvent::Worker(WalkerDone) → Main
 
-Main → GetPage{query_id: 1, page_num: 2} → Worker
-Worker → Page{query_id: 1, ...} → Main
+// Crossterm thread forwards input events
+Crossterm → AppEvent::Input(Event) → Main
+
+// Tick timer for animations
+Tick → AppEvent::Tick → Main
+
+// Retrain thread sends status
+Retrain → AppEvent::Retrain(bool) → Main
+
+// All events go through single unified channel
+Main blocks on event_rx.recv() → instant wake on ANY event
 ```
 
-Why: Worker owns file data to avoid blocking UI. Main thread only keeps what's visible (20-40 files), not all files (thousands).
+**Why unified event channel:**
+The main thread uses a single blocking `recv()` on a unified event channel instead of polling multiple channels with timeouts. This provides instant wake-up when any event arrives (worker response, keyboard input, tick, retrain status), eliminating the 0-100ms polling delay that previously caused sluggish first renders. All event sources send to the same channel, and main wakes instantly.
+
+**Why separate crossterm thread:**
+crossterm's `event::poll()` is blocking and would prevent instant response to worker events. By running it in a separate thread that forwards events to the unified channel, we can use crossterm's efficient polling while still maintaining instant response to all event types.
+
+**Why separate tick thread:**
+Previously relied on event poll timeout for periodic UI updates (marquee animation). Now that we use blocking recv(), a dedicated tick thread sends periodic events to trigger redraws for animations.
+
+Why: Worker owns file data to avoid blocking UI. Main thread only keeps what's visible (20-40 files), not all files (thousands). Unified event channel ensures instant rendering of worker responses (~10ms) vs previous polling delay (~50ms average).
 
 ### Robust Communication with Query IDs
 
@@ -485,7 +507,6 @@ struct App {
 
     // Worker communication
     worker_tx: mpsc::Sender<WorkerRequest>,
-    worker_rx: mpsc::Receiver<WorkerResponse>,
 
     // ... (other fields)
 }
@@ -517,11 +538,37 @@ Impressions are logged to the database after a 200ms debounce period (to avoid l
   - `PrintToStdout`: Print path and exit (for shell integration)
 
 **Event loop:**
-1. Poll worker responses (non-blocking `try_recv`)
-2. Drain logging channel (non-blocking)
-3. Poll keyboard/mouse events (50ms timeout)
-4. Check and log impressions if >200ms elapsed
-5. Draw UI
+```rust
+loop {
+    // Check and log impressions if >200ms elapsed
+    app.check_and_log_impressions(false)?;
+
+    // Draw UI
+    terminal.draw(|f| { render_ui(f, &mut app, ...) })?;
+
+    // Drain logging channel (non-blocking, for logs sent before unified channel migration)
+    while let Ok(log_msg) = app.log_receiver.try_recv() { ... }
+
+    // Block until ANY event arrives (instant wake!)
+    let app_event = event_rx.recv()?;
+
+    // Handle event
+    match app_event {
+        AppEvent::Worker(response) => { /* handle worker response */ }
+        AppEvent::Input(event) => { /* handle keyboard/mouse */ }
+        AppEvent::Tick => { /* trigger animation redraw */ }
+        AppEvent::Retrain(status) => { /* update retraining status */ }
+        AppEvent::Log(msg) => { /* add to recent logs */ }
+    }
+}
+```
+
+**Why this structure:**
+- Blocking `recv()` instead of polling with timeout eliminates 0-100ms delay (avg ~50ms)
+- Worker responses render instantly (~10ms total: 6ms worker + ~4ms render)
+- Zero CPU usage when idle (recv() blocks until event arrives)
+- All event sources wake main thread immediately via unified channel
+- Draw happens after each event to ensure UI stays responsive
 
 **Keyboard:**
 - Type → send UpdateQuery to worker

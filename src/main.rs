@@ -36,6 +36,27 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Unified event type for the main event loop.
+/// All event sources (worker, keyboard/mouse, tick timer) send to a single channel.
+enum AppEvent {
+    /// Worker thread sent a response (query results, page data, etc.)
+    Worker(WorkerResponse),
+    /// User input event (keyboard or mouse)
+    Input(Event),
+    /// Periodic tick for background tasks (marquee scroll, impression logging)
+    Tick,
+    /// Model retraining status update
+    Retrain(bool),
+    /// Log message from fern logging system
+    Log(String),
+}
+
+impl From<WorkerResponse> for AppEvent {
+    fn from(response: WorkerResponse) -> Self {
+        AppEvent::Worker(response)
+    }
+}
+
 /// Truncates a path string in the middle if it's too long, keeping the first
 /// component and the end of the path.
 /// e.g., "a/b/c/d/e.txt" -> "a/.../d/e.txt"
@@ -529,7 +550,6 @@ struct App {
 
     // Search worker thread communication
     worker_tx: mpsc::Sender<WorkerRequest>,
-    worker_rx: mpsc::Receiver<WorkerResponse>,
     worker_handle: Option<JoinHandle<()>>,
 
     // Startup tracking
@@ -549,6 +569,7 @@ impl App {
         no_click_loading: bool,
         no_model: bool,
         no_click_logging: bool,
+        event_tx: mpsc::Sender<AppEvent>,
     ) -> Result<Self> {
         let start_time = Instant::now();
         log::debug!("App::new() started");
@@ -562,8 +583,13 @@ impl App {
         let db = Database::new(&db_path)?;
         log::debug!("Database initialization took {:?}", db_start.elapsed());
 
-        let (worker_tx, worker_rx, worker_handle) =
-            search_worker::spawn(root.clone(), data_dir, no_click_loading, no_model)?;
+        let (worker_tx, worker_handle) = search_worker::spawn(
+            root.clone(),
+            data_dir,
+            event_tx.clone(),
+            no_click_loading,
+            no_model,
+        )?;
 
         log::debug!("App::new() total time: {:?}", start_time.elapsed());
 
@@ -599,7 +625,6 @@ impl App {
             no_preview,
             no_click_logging,
             worker_tx: worker_tx.clone(),
-            worker_rx,
             worker_handle: Some(worker_handle),
             walker_done: false,
             startup_complete_logged: false,
@@ -1072,22 +1097,50 @@ fn main() -> Result<()> {
         .data_dir
         .unwrap_or_else(|| get_default_data_dir().expect("Failed to get default data directory"));
 
-    // Create channel for retraining status
-    let (retrain_tx, retrain_rx) = mpsc::channel();
+    // Create unified event channel - all events (worker, input, tick) flow through this
+    let (event_tx, event_rx) = mpsc::channel::<AppEvent>();
+
+    // Thread 1: Crossterm event forwarder
+    let input_tx = event_tx.clone();
+    std::thread::spawn(move || {
+        loop {
+            // Block until keyboard/mouse event arrives, then forward to unified channel
+            match event::read() {
+                Ok(evt) => {
+                    if input_tx.send(AppEvent::Input(evt)).is_err() {
+                        break; // Main thread died, exit
+                    }
+                }
+                Err(_) => break, // Error reading events, exit thread
+            }
+        }
+    });
+
+    // Thread 2: Tick timer for periodic tasks
+    let tick_tx = event_tx.clone();
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(Duration::from_millis(200));
+            if tick_tx.send(AppEvent::Tick).is_err() {
+                break; // Main thread died, exit
+            }
+        }
+    });
 
     // Start background retraining in a new thread
     let retrain_start = Instant::now();
     let data_dir_clone = data_dir.clone();
     let training_log_path = data_dir.join("training.log");
+    let retrain_event_tx = event_tx.clone();
     std::thread::spawn(move || {
-        let _ = retrain_tx.send(true); // Signal retraining started
+        let _ = retrain_event_tx.send(AppEvent::Retrain(true)); // Signal retraining started
         log::info!("Starting background model retraining");
         if let Err(e) = ranker::retrain_model(&data_dir_clone, Some(training_log_path)) {
             log::error!("Background retraining failed: {}", e);
         } else {
             log::info!("Background retraining completed successfully");
         }
-        let _ = retrain_tx.send(false); // Signal retraining completed
+        let _ = retrain_event_tx.send(AppEvent::Retrain(false)); // Signal retraining completed
     });
     log::info!(
         "TIMING {{\"op\":\"spawn_retrain_thread\",\"ms\":{}}}",
@@ -1115,6 +1168,7 @@ fn main() -> Result<()> {
         cli.no_click_loading,
         cli.no_model,
         cli.no_click_logging,
+        event_tx.clone(),
     )?;
     log::info!(
         "TIMING {{\"op\":\"app_new\",\"ms\":{}}}",
@@ -1211,7 +1265,7 @@ fn main() -> Result<()> {
     );
 
     // Run the app
-    let result = run_app(&mut terminal, &mut app, retrain_rx, main_start);
+    let result = run_app(&mut terminal, &mut app, event_rx, main_start);
 
     // Shutdown sequence: extract and drop worker_tx to signal the worker to stop,
     // then wait for the worker thread to finish, THEN drop app (which drops log_rx).
@@ -1241,7 +1295,7 @@ fn main() -> Result<()> {
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<std::fs::File>>,
     app: &mut App,
-    retrain_rx: Receiver<bool>,
+    event_rx: Receiver<AppEvent>,
     main_start: Instant,
 ) -> Result<()> {
     let mut first_render_logged = false;
@@ -1934,11 +1988,6 @@ fn run_app(
             app.startup_complete_logged = true;
         }
 
-        // Check for retraining status updates
-        if let Ok(retraining_status) = retrain_rx.try_recv() {
-            app.currently_retraining = retraining_status;
-        }
-
         // Collect new log messages (non-blocking)
         while let Ok(log_msg) = app.log_receiver.try_recv() {
             // fern adds a newline to each message sent via channel, so trim it
@@ -1949,502 +1998,139 @@ fn run_app(
             }
         }
 
-        // Poll for worker responses (non-blocking)
-        while let Ok(response) = app.worker_rx.try_recv() {
-            match response {
-                WorkerResponse::QueryUpdated {
-                    query_id,
-                    total_results,
-                    total_files,
-                    initial_page,
-                    model_stats,
-                } => {
-                    let active_query_id =
-                        app.current_subsession.as_ref().map(|s| s.id).unwrap_or(0);
+        // Block until ANY event arrives (worker, input, tick, retrain, log)
+        let app_event = event_rx.recv()?;
 
-                    // Only accept updates for queries that are newer than what we currently have.
-                    // This handles out-of-order responses.
-                    if query_id >= active_query_id {
-                        // Clear page cache on query change
-                        app.page_cache.clear();
-
-                        // Insert initial page
-                        let page = Page {
-                            start_index: initial_page.start_index,
-                            end_index: initial_page.end_index,
-                            files: initial_page.files,
-                        };
-                        app.page_cache.insert(initial_page.page_num, page);
-
-                        app.total_results = total_results;
-                        app.total_files = total_files;
-                        app.model_stats_cache = model_stats;
-
-                        // Reset selection if needed
-                        if app.selected_index >= total_results {
-                            app.selected_index = 0;
-                        }
-
-                        // Log first query completion
-                        if !first_query_complete_logged {
-                            log::info!(
-                                "TIMING {{\"op\":\"first_query_complete\",\"ms\":{}}}",
-                                main_start.elapsed().as_secs_f64() * 1000.0
-                            );
-                            first_query_complete_logged = true;
-                        }
-
-                        // Create subsession, using the query text from the app state
-                        app.current_subsession = Some(Subsession {
-                            id: query_id,
-                            query: app.query.clone(),
-                            created_at: jiff::Timestamp::now(),
-                            events_have_been_logged: false,
-                        });
-                    }
-                }
-                WorkerResponse::Page {
-                    query_id,
-                    page_data,
-                } => {
-                    let active_query_id =
-                        app.current_subsession.as_ref().map(|s| s.id).unwrap_or(0);
-
-                    // Only accept page data for the currently active query
-                    if query_id == active_query_id {
-                        // Insert page into cache
-                        let page = Page {
-                            start_index: page_data.start_index,
-                            end_index: page_data.end_index,
-                            files: page_data.files,
-                        };
-                        app.page_cache.insert(page_data.page_num, page);
-                    }
-                }
-                WorkerResponse::FilesChanged => {
-                    // The worker detected file changes, so we trigger a refresh
-                    // of the current query to get fresh results.
-                    log::info!("Auto-refreshing query due to file changes.");
-                    let query_id = app.next_subsession_id;
-                    app.next_subsession_id += 1;
-                    let _ = app.worker_tx.send(WorkerRequest::UpdateQuery(
-                        search_worker::UpdateQueryRequest {
-                            query: app.query.clone(),
-                            query_id,
-                            filter: app.current_filter,
-                        },
-                    ));
-                }
-                WorkerResponse::WalkerDone => {
-                    app.walker_done = true;
+        // Handle the event
+        match app_event {
+            AppEvent::Retrain(retraining_status) => {
+                app.currently_retraining = retraining_status;
+            }
+            AppEvent::Log(log_msg) => {
+                app.recent_logs.push_back(log_msg.trim_end().to_string());
+                if app.recent_logs.len() > 50 {
+                    app.recent_logs.pop_front();
                 }
             }
-        }
+            AppEvent::Tick => {
+                // Tick event - just triggers a redraw for marquee animation
+            }
+            AppEvent::Worker(response) => {
+                // Handle worker response
+                match response {
+                    WorkerResponse::QueryUpdated {
+                        query_id,
+                        total_results,
+                        total_files,
+                        initial_page,
+                        model_stats,
+                    } => {
+                        let active_query_id =
+                            app.current_subsession.as_ref().map(|s| s.id).unwrap_or(0);
 
-        // Handle events with timeout
-        if event::poll(Duration::from_millis(5))? {
-            let event_read = event::read()?;
-            match event_read {
-                Event::Mouse(mouse_event) => {
-                    use crossterm::event::MouseEventKind;
-                    match mouse_event.kind {
-                        MouseEventKind::ScrollDown => {
-                            app.preview_scroll = app.preview_scroll.saturating_add(3);
-                            let _ = app.log_preview_scroll();
+                        // Only accept updates for queries that are newer than what we currently have.
+                        // This handles out-of-order responses.
+                        if query_id >= active_query_id {
+                            // Clear page cache on query change
+                            app.page_cache.clear();
+
+                            // Insert initial page
+                            let page = Page {
+                                start_index: initial_page.start_index,
+                                end_index: initial_page.end_index,
+                                files: initial_page.files,
+                            };
+                            app.page_cache.insert(initial_page.page_num, page);
+
+                            app.total_results = total_results;
+                            app.total_files = total_files;
+                            app.model_stats_cache = model_stats;
+
+                            // Reset selection if needed
+                            if app.selected_index >= total_results {
+                                app.selected_index = 0;
+                            }
+
+                            // Log first query completion
+                            if !first_query_complete_logged {
+                                log::info!(
+                                    "TIMING {{\"op\":\"first_query_complete\",\"ms\":{}}}",
+                                    main_start.elapsed().as_secs_f64() * 1000.0
+                                );
+                                first_query_complete_logged = true;
+                            }
+
+                            // Create subsession, using the query text from the app state
+                            app.current_subsession = Some(Subsession {
+                                id: query_id,
+                                query: app.query.clone(),
+                                created_at: jiff::Timestamp::now(),
+                                events_have_been_logged: false,
+                            });
                         }
-                        MouseEventKind::ScrollUp => {
-                            app.preview_scroll = app.preview_scroll.saturating_sub(3);
-                            let _ = app.log_preview_scroll();
+                    }
+                    WorkerResponse::Page {
+                        query_id,
+                        page_data,
+                    } => {
+                        let active_query_id =
+                            app.current_subsession.as_ref().map(|s| s.id).unwrap_or(0);
+
+                        // Only accept page data for the currently active query
+                        if query_id == active_query_id {
+                            // Insert page into cache
+                            let page = Page {
+                                start_index: page_data.start_index,
+                                end_index: page_data.end_index,
+                                files: page_data.files,
+                            };
+                            app.page_cache.insert(page_data.page_num, page);
                         }
-                        _ => {}
+                    }
+                    WorkerResponse::FilesChanged => {
+                        // The worker detected file changes, so we trigger a refresh
+                        // of the current query to get fresh results.
+                        log::info!("Auto-refreshing query due to file changes.");
+                        let query_id = app.next_subsession_id;
+                        app.next_subsession_id += 1;
+                        let _ = app.worker_tx.send(WorkerRequest::UpdateQuery(
+                            search_worker::UpdateQueryRequest {
+                                query: app.query.clone(),
+                                query_id,
+                                filter: app.current_filter,
+                            },
+                        ));
+                    }
+                    WorkerResponse::WalkerDone => {
+                        app.walker_done = true;
                     }
                 }
-                Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    match key.code {
-                        KeyCode::Char('j')
-                            if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
-                        {
-                            match app.on_cwd_visit {
-                                OnCwdVisitAction::PrintToStdout => {
-                                    // Print directory and exit (for shell integration)
-                                    disable_raw_mode()?;
-                                    terminal
-                                        .backend_mut()
-                                        .execute(crossterm::event::DisableMouseCapture)?;
-                                    terminal.backend_mut().execute(LeaveAlternateScreen)?;
-                                    terminal.backend_mut().execute(Show)?;
-
-                                    println!("{}", app.cwd.display());
-                                    return Ok(());
-                                }
-                                OnCwdVisitAction::DropIntoShell => {
-                                    // Open shell in CWD
-                                    log::info!("Opening shell in cwd: {:?}", app.cwd);
-
-                                    // Suspend TUI
-                                    disable_raw_mode()?;
-                                    terminal
-                                        .backend_mut()
-                                        .execute(crossterm::event::DisableMouseCapture)?;
-                                    terminal.backend_mut().execute(LeaveAlternateScreen)?;
-                                    terminal.backend_mut().execute(Show)?;
-
-                                    // Use /dev/tty for shell so it can interact with the terminal
-                                    use std::process::Stdio;
-                                    let tty_in =
-                                        std::fs::OpenOptions::new().read(true).open("/dev/tty")?;
-                                    let tty_out =
-                                        std::fs::OpenOptions::new().write(true).open("/dev/tty")?;
-                                    let tty_err =
-                                        std::fs::OpenOptions::new().write(true).open("/dev/tty")?;
-
-                                    let shell =
-                                        std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
-                                    let status = std::process::Command::new(&shell)
-                                        .current_dir(&app.cwd)
-                                        .stdin(Stdio::from(tty_in))
-                                        .stdout(Stdio::from(tty_out))
-                                        .stderr(Stdio::from(tty_err))
-                                        .status();
-
-                                    // Resume TUI
-                                    enable_raw_mode()?;
-                                    terminal.backend_mut().execute(EnterAlternateScreen)?;
-                                    terminal
-                                        .backend_mut()
-                                        .execute(crossterm::event::EnableMouseCapture)?;
-                                    terminal.clear()?;
-
-                                    if let Err(e) = status {
-                                        log::error!("Failed to launch shell: {}", e);
-                                    }
-
-                                    // Reload model (may have been retrained in background)
-                                    let query_id_model = app.next_subsession_id;
-                                    app.next_subsession_id += 1;
-                                    if let Err(e) = app.reload_model(query_id_model) {
-                                        log::error!("Failed to reload model: {}", e);
-                                    }
-
-                                    // Reload click data and rerank files after shell
-                                    let query_id_clicks = app.next_subsession_id;
-                                    app.next_subsession_id += 1;
-                                    if let Err(e) = app.reload_and_rerank(query_id_clicks) {
-                                        log::error!("Failed to reload and rerank: {}", e);
-                                    }
-                                }
+            }
+            AppEvent::Input(event_read) => {
+                // Handle keyboard/mouse input
+                match event_read {
+                    Event::Mouse(mouse_event) => {
+                        use crossterm::event::MouseEventKind;
+                        match mouse_event.kind {
+                            MouseEventKind::ScrollDown => {
+                                app.preview_scroll = app.preview_scroll.saturating_add(3);
+                                let _ = app.log_preview_scroll();
                             }
-                        }
-                        KeyCode::Char('h')
-                            if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
-                        {
-                            // Ctrl-H: Toggle history navigation mode
-                            if app.ui_state.history_mode {
-                                // Exit history mode
-                                app.ui_state.history_mode = false;
-                                app.query.clear();
-                            } else {
-                                // Enter history mode (always allow, even with empty history)
-                                app.ui_state.history_mode = true;
-                                // Set cursor to current position in history
-                                app.history_selected = app.history.current_display_index();
-                                app.query.clear();
-                                app.preview_cache = None; // Clear preview cache
+                            MouseEventKind::ScrollUp => {
+                                app.preview_scroll = app.preview_scroll.saturating_sub(3);
+                                let _ = app.log_preview_scroll();
                             }
+                            _ => {}
                         }
-                        KeyCode::Char('c')
-                            if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
-                        {
-                            return Ok(());
-                        }
-                        KeyCode::Char('d')
-                            if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
-                        {
-                            return Ok(());
-                        }
-                        KeyCode::Char('u')
-                            if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
-                        {
-                            // Ctrl-U: clear entire search
-                            app.query.clear();
-                            let query_id = app.next_subsession_id;
-                            app.next_subsession_id += 1;
-                            let _ = app.worker_tx.send(WorkerRequest::UpdateQuery(
-                                search_worker::UpdateQueryRequest {
-                                    query: app.query.clone(),
-                                    query_id,
-                                    filter: app.current_filter,
-                                },
-                            ));
-                        }
-                        KeyCode::Char('o')
-                            if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
-                        {
-                            // Ctrl-O: cycle debug pane mode (Small -> Expanded -> Hidden -> Small)
-                            app.ui_state.cycle_debug_pane_mode();
-                        }
-                        KeyCode::Char('f')
-                            if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
-                        {
-                            // Ctrl-F: toggle filter picker
-                            app.ui_state.filter_picker_visible =
-                                !app.ui_state.filter_picker_visible;
-                        }
-                        KeyCode::Char('0') if app.ui_state.filter_picker_visible => {
-                            // Filter 0: None
-                            app.current_filter = search_worker::FilterType::None;
-                            app.ui_state.filter_picker_visible = false;
-                            let query_id = app.next_subsession_id;
-                            app.next_subsession_id += 1;
-                            let _ = app.worker_tx.send(WorkerRequest::UpdateQuery(
-                                search_worker::UpdateQueryRequest {
-                                    query: app.query.clone(),
-                                    query_id,
-                                    filter: app.current_filter,
-                                },
-                            ));
-                        }
-                        KeyCode::Char('c') if app.ui_state.filter_picker_visible => {
-                            // Filter c: Only CWD
-                            app.current_filter = search_worker::FilterType::OnlyCwd;
-                            app.ui_state.filter_picker_visible = false;
-                            let query_id = app.next_subsession_id;
-                            app.next_subsession_id += 1;
-                            let _ = app.worker_tx.send(WorkerRequest::UpdateQuery(
-                                search_worker::UpdateQueryRequest {
-                                    query: app.query.clone(),
-                                    query_id,
-                                    filter: app.current_filter,
-                                },
-                            ));
-                        }
-                        KeyCode::Char('d') if app.ui_state.filter_picker_visible => {
-                            // Filter d: Only Dirs
-                            app.current_filter = search_worker::FilterType::OnlyDirs;
-                            app.ui_state.filter_picker_visible = false;
-                            let query_id = app.next_subsession_id;
-                            app.next_subsession_id += 1;
-                            let _ = app.worker_tx.send(WorkerRequest::UpdateQuery(
-                                search_worker::UpdateQueryRequest {
-                                    query: app.query.clone(),
-                                    query_id,
-                                    filter: app.current_filter,
-                                },
-                            ));
-                        }
-                        KeyCode::Char('f') if app.ui_state.filter_picker_visible => {
-                            // Filter f: Only Files
-                            app.current_filter = search_worker::FilterType::OnlyFiles;
-                            app.ui_state.filter_picker_visible = false;
-                            let query_id = app.next_subsession_id;
-                            app.next_subsession_id += 1;
-                            let _ = app.worker_tx.send(WorkerRequest::UpdateQuery(
-                                search_worker::UpdateQueryRequest {
-                                    query: app.query.clone(),
-                                    query_id,
-                                    filter: app.current_filter,
-                                },
-                            ));
-                        }
-                        KeyCode::Esc => {
-                            if app.ui_state.filter_picker_visible {
-                                // Close filter picker without changing filter
-                                app.ui_state.filter_picker_visible = false;
-                            } else if app.ui_state.history_mode {
-                                // Exit history mode
-                                app.ui_state.history_mode = false;
-                                app.query.clear();
-                            } else {
-                                return Ok(());
-                            }
-                        }
-                        KeyCode::Up => {
-                            if app.ui_state.history_mode {
-                                app.move_history_selection(-1);
-                            } else {
-                                app.move_selection(-1);
-                            }
-                        }
-                        KeyCode::Char('p')
-                            if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
-                        {
-                            if app.ui_state.history_mode {
-                                app.move_history_selection(-1);
-                            } else {
-                                app.move_selection(-1);
-                            }
-                        }
-                        KeyCode::Down => {
-                            if app.ui_state.history_mode {
-                                app.move_history_selection(1);
-                            } else {
-                                app.move_selection(1);
-                            }
-                        }
-                        KeyCode::Char('n')
-                            if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
-                        {
-                            if app.ui_state.history_mode {
-                                app.move_history_selection(1);
-                            } else {
-                                app.move_selection(1);
-                            }
-                        }
-                        KeyCode::Char(c) => {
-                            app.query.push(c);
-                            let query_id = app.next_subsession_id;
-                            app.next_subsession_id += 1;
-                            let _ = app.worker_tx.send(WorkerRequest::UpdateQuery(
-                                search_worker::UpdateQueryRequest {
-                                    query: app.query.clone(),
-                                    query_id,
-                                    filter: app.current_filter,
-                                },
-                            ));
-                        }
-                        KeyCode::Backspace => {
-                            app.query.pop();
-                            let query_id = app.next_subsession_id;
-                            app.next_subsession_id += 1;
-                            let _ = app.worker_tx.send(WorkerRequest::UpdateQuery(
-                                search_worker::UpdateQueryRequest {
-                                    query: app.query.clone(),
-                                    query_id,
-                                    filter: app.current_filter,
-                                },
-                            ));
-                        }
-                        KeyCode::Enter => {
-                            if app.ui_state.history_mode {
-                                app.handle_history_enter()?;
-                            } else if app.total_results > 0 {
-                                // Force log impressions before click
-                                if !app.no_click_logging {
-                                    app.check_and_log_impressions(true)?;
-                                }
-
-                                if let Some(display_info) =
-                                    app.get_file_at_index(app.selected_index)
-                                {
-                                    // Log the click
-                                    if !app.no_click_logging {
-                                        let subsession_id = app
-                                            .current_subsession
-                                            .as_ref()
-                                            .map(|s| s.id)
-                                            .unwrap_or(1);
-                                        app.db.log_event(EventData {
-                                            query: &app.query,
-                                            file_path: &display_info.display_name,
-                                            full_path: &display_info.full_path.to_string_lossy(),
-                                            mtime: display_info.mtime,
-                                            atime: display_info.atime,
-                                            file_size: display_info.file_size,
-                                            subsession_id,
-                                            action: db::UserInteraction::Click,
-                                            session_id: &app.session_id,
-                                        })?;
-                                    }
-
-                                    if display_info.is_dir {
-                                        // On a directory, perform configured action
-                                        let dir_path = display_info.full_path.clone();
-
-                                        match app.on_dir_click {
-                                            OnDirClickAction::Navigate => {
-                                                // Don't navigate if already in that directory
-                                                if dir_path == app.cwd {
-                                                    log::info!(
-                                                        "Already in {:?}, not navigating",
-                                                        dir_path
-                                                    );
-                                                    continue;
-                                                }
-
-                                                log::info!(
-                                                    "Navigating to directory: {:?}",
-                                                    dir_path
-                                                );
-                                                app.history.navigate_to(dir_path.clone());
-                                                app.cwd = dir_path.clone();
-
-                                                // Clear query and send request to worker
-                                                app.query.clear();
-                                                let query_id = app.next_subsession_id;
-                                                app.next_subsession_id += 1;
-                                                let _ =
-                                                    app.worker_tx.send(WorkerRequest::ChangeCwd {
-                                                        new_cwd: dir_path,
-                                                        query_id,
-                                                    });
-                                            }
-                                            OnDirClickAction::PrintToStdout => {
-                                                // Print directory path and exit
-                                                disable_raw_mode()?;
-                                                terminal.backend_mut().execute(
-                                                    crossterm::event::DisableMouseCapture,
-                                                )?;
-                                                terminal
-                                                    .backend_mut()
-                                                    .execute(LeaveAlternateScreen)?;
-                                                terminal.backend_mut().execute(Show)?;
-
-                                                println!("{}", dir_path.display());
-                                                return Ok(());
-                                            }
-                                            OnDirClickAction::DropIntoShell => {
-                                                // Drop into shell in the selected directory
-                                                log::info!(
-                                                    "Dropping into shell in directory: {:?}",
-                                                    dir_path
-                                                );
-
-                                                disable_raw_mode()?;
-                                                terminal.backend_mut().execute(
-                                                    crossterm::event::DisableMouseCapture,
-                                                )?;
-                                                terminal
-                                                    .backend_mut()
-                                                    .execute(LeaveAlternateScreen)?;
-                                                terminal.backend_mut().execute(Show)?;
-
-                                                use std::process::Stdio;
-                                                let tty_in = std::fs::OpenOptions::new()
-                                                    .read(true)
-                                                    .open("/dev/tty")?;
-                                                let tty_out = std::fs::OpenOptions::new()
-                                                    .write(true)
-                                                    .open("/dev/tty")?;
-                                                let tty_err = std::fs::OpenOptions::new()
-                                                    .write(true)
-                                                    .open("/dev/tty")?;
-
-                                                let shell = std::env::var("SHELL")
-                                                    .unwrap_or_else(|_| "sh".to_string());
-                                                let status = std::process::Command::new(&shell)
-                                                    .current_dir(&dir_path)
-                                                    .stdin(Stdio::from(tty_in))
-                                                    .stdout(Stdio::from(tty_out))
-                                                    .stderr(Stdio::from(tty_err))
-                                                    .status();
-
-                                                // Resume TUI
-                                                enable_raw_mode()?;
-                                                terminal
-                                                    .backend_mut()
-                                                    .execute(EnterAlternateScreen)?;
-                                                terminal.backend_mut().execute(
-                                                    crossterm::event::EnableMouseCapture,
-                                                )?;
-                                                terminal.clear()?;
-
-                                                if let Err(e) = status {
-                                                    log::error!("Failed to launch shell: {}", e);
-                                                }
-                                            }
-                                        }
-                                    } else {
-                                        // On a file, suspend TUI and open editor
+                    }
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        match key.code {
+                            KeyCode::Char('j')
+                                if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
+                            {
+                                match app.on_cwd_visit {
+                                    OnCwdVisitAction::PrintToStdout => {
+                                        // Print directory and exit (for shell integration)
                                         disable_raw_mode()?;
                                         terminal
                                             .backend_mut()
@@ -2452,8 +2138,22 @@ fn run_app(
                                         terminal.backend_mut().execute(LeaveAlternateScreen)?;
                                         terminal.backend_mut().execute(Show)?;
 
-                                        // Use /dev/tty for editor so it can interact with the terminal
-                                        // This works in both normal and shell-integration mode
+                                        println!("{}", app.cwd.display());
+                                        return Ok(());
+                                    }
+                                    OnCwdVisitAction::DropIntoShell => {
+                                        // Open shell in CWD
+                                        log::info!("Opening shell in cwd: {:?}", app.cwd);
+
+                                        // Suspend TUI
+                                        disable_raw_mode()?;
+                                        terminal
+                                            .backend_mut()
+                                            .execute(crossterm::event::DisableMouseCapture)?;
+                                        terminal.backend_mut().execute(LeaveAlternateScreen)?;
+                                        terminal.backend_mut().execute(Show)?;
+
+                                        // Use /dev/tty for shell so it can interact with the terminal
                                         use std::process::Stdio;
                                         let tty_in = std::fs::OpenOptions::new()
                                             .read(true)
@@ -2465,8 +2165,10 @@ fn run_app(
                                             .write(true)
                                             .open("/dev/tty")?;
 
-                                        let status = std::process::Command::new("hx")
-                                            .arg(&display_info.full_path)
+                                        let shell = std::env::var("SHELL")
+                                            .unwrap_or_else(|_| "sh".to_string());
+                                        let status = std::process::Command::new(&shell)
+                                            .current_dir(&app.cwd)
                                             .stdin(Stdio::from(tty_in))
                                             .stdout(Stdio::from(tty_out))
                                             .stderr(Stdio::from(tty_err))
@@ -2481,7 +2183,7 @@ fn run_app(
                                         terminal.clear()?;
 
                                         if let Err(e) = status {
-                                            log::error!("Failed to launch editor: {}", e);
+                                            log::error!("Failed to launch shell: {}", e);
                                         }
 
                                         // Reload model (may have been retrained in background)
@@ -2491,7 +2193,7 @@ fn run_app(
                                             log::error!("Failed to reload model: {}", e);
                                         }
 
-                                        // Reload click data and rerank files after editing
+                                        // Reload click data and rerank files after shell
                                         let query_id_clicks = app.next_subsession_id;
                                         app.next_subsession_id += 1;
                                         if let Err(e) = app.reload_and_rerank(query_id_clicks) {
@@ -2500,11 +2202,383 @@ fn run_app(
                                     }
                                 }
                             }
+                            KeyCode::Char('h')
+                                if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
+                            {
+                                // Ctrl-H: Toggle history navigation mode
+                                if app.ui_state.history_mode {
+                                    // Exit history mode
+                                    app.ui_state.history_mode = false;
+                                    app.query.clear();
+                                } else {
+                                    // Enter history mode (always allow, even with empty history)
+                                    app.ui_state.history_mode = true;
+                                    // Set cursor to current position in history
+                                    app.history_selected = app.history.current_display_index();
+                                    app.query.clear();
+                                    app.preview_cache = None; // Clear preview cache
+                                }
+                            }
+                            KeyCode::Char('c')
+                                if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
+                            {
+                                return Ok(());
+                            }
+                            KeyCode::Char('d')
+                                if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
+                            {
+                                return Ok(());
+                            }
+                            KeyCode::Char('u')
+                                if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
+                            {
+                                // Ctrl-U: clear entire search
+                                app.query.clear();
+                                let query_id = app.next_subsession_id;
+                                app.next_subsession_id += 1;
+                                let _ = app.worker_tx.send(WorkerRequest::UpdateQuery(
+                                    search_worker::UpdateQueryRequest {
+                                        query: app.query.clone(),
+                                        query_id,
+                                        filter: app.current_filter,
+                                    },
+                                ));
+                            }
+                            KeyCode::Char('o')
+                                if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
+                            {
+                                // Ctrl-O: cycle debug pane mode (Small -> Expanded -> Hidden -> Small)
+                                app.ui_state.cycle_debug_pane_mode();
+                            }
+                            KeyCode::Char('f')
+                                if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
+                            {
+                                // Ctrl-F: toggle filter picker
+                                app.ui_state.filter_picker_visible =
+                                    !app.ui_state.filter_picker_visible;
+                            }
+                            KeyCode::Char('0') if app.ui_state.filter_picker_visible => {
+                                // Filter 0: None
+                                app.current_filter = search_worker::FilterType::None;
+                                app.ui_state.filter_picker_visible = false;
+                                let query_id = app.next_subsession_id;
+                                app.next_subsession_id += 1;
+                                let _ = app.worker_tx.send(WorkerRequest::UpdateQuery(
+                                    search_worker::UpdateQueryRequest {
+                                        query: app.query.clone(),
+                                        query_id,
+                                        filter: app.current_filter,
+                                    },
+                                ));
+                            }
+                            KeyCode::Char('c') if app.ui_state.filter_picker_visible => {
+                                // Filter c: Only CWD
+                                app.current_filter = search_worker::FilterType::OnlyCwd;
+                                app.ui_state.filter_picker_visible = false;
+                                let query_id = app.next_subsession_id;
+                                app.next_subsession_id += 1;
+                                let _ = app.worker_tx.send(WorkerRequest::UpdateQuery(
+                                    search_worker::UpdateQueryRequest {
+                                        query: app.query.clone(),
+                                        query_id,
+                                        filter: app.current_filter,
+                                    },
+                                ));
+                            }
+                            KeyCode::Char('d') if app.ui_state.filter_picker_visible => {
+                                // Filter d: Only Dirs
+                                app.current_filter = search_worker::FilterType::OnlyDirs;
+                                app.ui_state.filter_picker_visible = false;
+                                let query_id = app.next_subsession_id;
+                                app.next_subsession_id += 1;
+                                let _ = app.worker_tx.send(WorkerRequest::UpdateQuery(
+                                    search_worker::UpdateQueryRequest {
+                                        query: app.query.clone(),
+                                        query_id,
+                                        filter: app.current_filter,
+                                    },
+                                ));
+                            }
+                            KeyCode::Char('f') if app.ui_state.filter_picker_visible => {
+                                // Filter f: Only Files
+                                app.current_filter = search_worker::FilterType::OnlyFiles;
+                                app.ui_state.filter_picker_visible = false;
+                                let query_id = app.next_subsession_id;
+                                app.next_subsession_id += 1;
+                                let _ = app.worker_tx.send(WorkerRequest::UpdateQuery(
+                                    search_worker::UpdateQueryRequest {
+                                        query: app.query.clone(),
+                                        query_id,
+                                        filter: app.current_filter,
+                                    },
+                                ));
+                            }
+                            KeyCode::Esc => {
+                                if app.ui_state.filter_picker_visible {
+                                    // Close filter picker without changing filter
+                                    app.ui_state.filter_picker_visible = false;
+                                } else if app.ui_state.history_mode {
+                                    // Exit history mode
+                                    app.ui_state.history_mode = false;
+                                    app.query.clear();
+                                } else {
+                                    return Ok(());
+                                }
+                            }
+                            KeyCode::Up => {
+                                if app.ui_state.history_mode {
+                                    app.move_history_selection(-1);
+                                } else {
+                                    app.move_selection(-1);
+                                }
+                            }
+                            KeyCode::Char('p')
+                                if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
+                            {
+                                if app.ui_state.history_mode {
+                                    app.move_history_selection(-1);
+                                } else {
+                                    app.move_selection(-1);
+                                }
+                            }
+                            KeyCode::Down => {
+                                if app.ui_state.history_mode {
+                                    app.move_history_selection(1);
+                                } else {
+                                    app.move_selection(1);
+                                }
+                            }
+                            KeyCode::Char('n')
+                                if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
+                            {
+                                if app.ui_state.history_mode {
+                                    app.move_history_selection(1);
+                                } else {
+                                    app.move_selection(1);
+                                }
+                            }
+                            KeyCode::Char(c) => {
+                                app.query.push(c);
+                                let query_id = app.next_subsession_id;
+                                app.next_subsession_id += 1;
+                                let _ = app.worker_tx.send(WorkerRequest::UpdateQuery(
+                                    search_worker::UpdateQueryRequest {
+                                        query: app.query.clone(),
+                                        query_id,
+                                        filter: app.current_filter,
+                                    },
+                                ));
+                            }
+                            KeyCode::Backspace => {
+                                app.query.pop();
+                                let query_id = app.next_subsession_id;
+                                app.next_subsession_id += 1;
+                                let _ = app.worker_tx.send(WorkerRequest::UpdateQuery(
+                                    search_worker::UpdateQueryRequest {
+                                        query: app.query.clone(),
+                                        query_id,
+                                        filter: app.current_filter,
+                                    },
+                                ));
+                            }
+                            KeyCode::Enter => {
+                                if app.ui_state.history_mode {
+                                    app.handle_history_enter()?;
+                                } else if app.total_results > 0 {
+                                    // Force log impressions before click
+                                    if !app.no_click_logging {
+                                        app.check_and_log_impressions(true)?;
+                                    }
+
+                                    if let Some(display_info) =
+                                        app.get_file_at_index(app.selected_index)
+                                    {
+                                        // Log the click
+                                        if !app.no_click_logging {
+                                            let subsession_id = app
+                                                .current_subsession
+                                                .as_ref()
+                                                .map(|s| s.id)
+                                                .unwrap_or(1);
+                                            app.db.log_event(EventData {
+                                                query: &app.query,
+                                                file_path: &display_info.display_name,
+                                                full_path: &display_info
+                                                    .full_path
+                                                    .to_string_lossy(),
+                                                mtime: display_info.mtime,
+                                                atime: display_info.atime,
+                                                file_size: display_info.file_size,
+                                                subsession_id,
+                                                action: db::UserInteraction::Click,
+                                                session_id: &app.session_id,
+                                            })?;
+                                        }
+
+                                        if display_info.is_dir {
+                                            // On a directory, perform configured action
+                                            let dir_path = display_info.full_path.clone();
+
+                                            match app.on_dir_click {
+                                                OnDirClickAction::Navigate => {
+                                                    // Don't navigate if already in that directory
+                                                    if dir_path == app.cwd {
+                                                        log::info!(
+                                                            "Already in {:?}, not navigating",
+                                                            dir_path
+                                                        );
+                                                        continue;
+                                                    }
+
+                                                    log::info!(
+                                                        "Navigating to directory: {:?}",
+                                                        dir_path
+                                                    );
+                                                    app.history.navigate_to(dir_path.clone());
+                                                    app.cwd = dir_path.clone();
+
+                                                    // Clear query and send request to worker
+                                                    app.query.clear();
+                                                    let query_id = app.next_subsession_id;
+                                                    app.next_subsession_id += 1;
+                                                    let _ = app.worker_tx.send(
+                                                        WorkerRequest::ChangeCwd {
+                                                            new_cwd: dir_path,
+                                                            query_id,
+                                                        },
+                                                    );
+                                                }
+                                                OnDirClickAction::PrintToStdout => {
+                                                    // Print directory path and exit
+                                                    disable_raw_mode()?;
+                                                    terminal.backend_mut().execute(
+                                                        crossterm::event::DisableMouseCapture,
+                                                    )?;
+                                                    terminal
+                                                        .backend_mut()
+                                                        .execute(LeaveAlternateScreen)?;
+                                                    terminal.backend_mut().execute(Show)?;
+
+                                                    println!("{}", dir_path.display());
+                                                    return Ok(());
+                                                }
+                                                OnDirClickAction::DropIntoShell => {
+                                                    // Drop into shell in the selected directory
+                                                    log::info!(
+                                                        "Dropping into shell in directory: {:?}",
+                                                        dir_path
+                                                    );
+
+                                                    disable_raw_mode()?;
+                                                    terminal.backend_mut().execute(
+                                                        crossterm::event::DisableMouseCapture,
+                                                    )?;
+                                                    terminal
+                                                        .backend_mut()
+                                                        .execute(LeaveAlternateScreen)?;
+                                                    terminal.backend_mut().execute(Show)?;
+
+                                                    use std::process::Stdio;
+                                                    let tty_in = std::fs::OpenOptions::new()
+                                                        .read(true)
+                                                        .open("/dev/tty")?;
+                                                    let tty_out = std::fs::OpenOptions::new()
+                                                        .write(true)
+                                                        .open("/dev/tty")?;
+                                                    let tty_err = std::fs::OpenOptions::new()
+                                                        .write(true)
+                                                        .open("/dev/tty")?;
+
+                                                    let shell = std::env::var("SHELL")
+                                                        .unwrap_or_else(|_| "sh".to_string());
+                                                    let status = std::process::Command::new(&shell)
+                                                        .current_dir(&dir_path)
+                                                        .stdin(Stdio::from(tty_in))
+                                                        .stdout(Stdio::from(tty_out))
+                                                        .stderr(Stdio::from(tty_err))
+                                                        .status();
+
+                                                    // Resume TUI
+                                                    enable_raw_mode()?;
+                                                    terminal
+                                                        .backend_mut()
+                                                        .execute(EnterAlternateScreen)?;
+                                                    terminal.backend_mut().execute(
+                                                        crossterm::event::EnableMouseCapture,
+                                                    )?;
+                                                    terminal.clear()?;
+
+                                                    if let Err(e) = status {
+                                                        log::error!(
+                                                            "Failed to launch shell: {}",
+                                                            e
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            // On a file, suspend TUI and open editor
+                                            disable_raw_mode()?;
+                                            terminal
+                                                .backend_mut()
+                                                .execute(crossterm::event::DisableMouseCapture)?;
+                                            terminal.backend_mut().execute(LeaveAlternateScreen)?;
+                                            terminal.backend_mut().execute(Show)?;
+
+                                            // Use /dev/tty for editor so it can interact with the terminal
+                                            // This works in both normal and shell-integration mode
+                                            use std::process::Stdio;
+                                            let tty_in = std::fs::OpenOptions::new()
+                                                .read(true)
+                                                .open("/dev/tty")?;
+                                            let tty_out = std::fs::OpenOptions::new()
+                                                .write(true)
+                                                .open("/dev/tty")?;
+                                            let tty_err = std::fs::OpenOptions::new()
+                                                .write(true)
+                                                .open("/dev/tty")?;
+
+                                            let status = std::process::Command::new("hx")
+                                                .arg(&display_info.full_path)
+                                                .stdin(Stdio::from(tty_in))
+                                                .stdout(Stdio::from(tty_out))
+                                                .stderr(Stdio::from(tty_err))
+                                                .status();
+
+                                            // Resume TUI
+                                            enable_raw_mode()?;
+                                            terminal.backend_mut().execute(EnterAlternateScreen)?;
+                                            terminal
+                                                .backend_mut()
+                                                .execute(crossterm::event::EnableMouseCapture)?;
+                                            terminal.clear()?;
+
+                                            if let Err(e) = status {
+                                                log::error!("Failed to launch editor: {}", e);
+                                            }
+
+                                            // Reload model (may have been retrained in background)
+                                            let query_id_model = app.next_subsession_id;
+                                            app.next_subsession_id += 1;
+                                            if let Err(e) = app.reload_model(query_id_model) {
+                                                log::error!("Failed to reload model: {}", e);
+                                            }
+
+                                            // Reload click data and rerank files after editing
+                                            let query_id_clicks = app.next_subsession_id;
+                                            app.next_subsession_id += 1;
+                                            if let Err(e) = app.reload_and_rerank(query_id_clicks) {
+                                                log::error!("Failed to reload and rerank: {}", e);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
+                    _ => {}
                 }
-                _ => {}
             }
         }
     }
