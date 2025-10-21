@@ -4,7 +4,7 @@ run *ARGS:
 
 # Build release binary
 build:
-    cargo build --release && cargo doc
+    cargo build --release && cargo doc && cargo fmt
 
 # Run tests
 test:

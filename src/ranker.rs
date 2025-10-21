@@ -64,11 +64,17 @@ impl Ranker {
         let model_load_start = std::time::Instant::now();
         let model = Booster::from_file(model_path.to_str().unwrap())
             .context("Failed to load LightGBM model")?;
-        log::info!("TIMING {{\"op\":\"booster_from_file\",\"ms\":{}}}", model_load_start.elapsed().as_secs_f64() * 1000.0);
+        log::info!(
+            "TIMING {{\"op\":\"booster_from_file\",\"ms\":{}}}",
+            model_load_start.elapsed().as_secs_f64() * 1000.0
+        );
 
         let clicks_load_start = std::time::Instant::now();
         let clicks = Self::load_clicks(db_path)?;
-        log::info!("TIMING {{\"op\":\"load_clicks\",\"ms\":{}}}", clicks_load_start.elapsed().as_secs_f64() * 1000.0);
+        log::info!(
+            "TIMING {{\"op\":\"load_clicks\",\"ms\":{}}}",
+            clicks_load_start.elapsed().as_secs_f64() * 1000.0
+        );
 
         // Load model stats from same directory as model
         let stats_path = model_path
@@ -126,16 +132,24 @@ impl Ranker {
         let now_ts = now.as_second();
         // Simple arithmetic: 30 days = 30 * 24 * 60 * 60 seconds
         let thirty_days_ago_ts = now_ts - (30 * 24 * 60 * 60);
-        log::info!("TIMING {{\"op\":\"timestamp_calc\",\"ms\":{}}}", timestamp_calc_start.elapsed().as_secs_f64() * 1000.0);
+        log::info!(
+            "TIMING {{\"op\":\"timestamp_calc\",\"ms\":{}}}",
+            timestamp_calc_start.elapsed().as_secs_f64() * 1000.0
+        );
 
         // Pre-allocate with reasonable capacity to avoid rehashing
-        let mut clicks_by_file: FxHashMap<String, Vec<ClickEvent>> = FxHashMap::with_capacity_and_hasher(128, Default::default());
-        let mut clicks_by_query_and_file: FxHashMap<(String, String), Vec<ClickEvent>> = FxHashMap::with_capacity_and_hasher(256, Default::default());
+        let mut clicks_by_file: FxHashMap<String, Vec<ClickEvent>> =
+            FxHashMap::with_capacity_and_hasher(128, Default::default());
+        let mut clicks_by_query_and_file: FxHashMap<(String, String), Vec<ClickEvent>> =
+            FxHashMap::with_capacity_and_hasher(256, Default::default());
 
         let db_open_start = std::time::Instant::now();
         let conn =
             Connection::open(db_path).context("Failed to open database for preloading clicks")?;
-        log::info!("TIMING {{\"op\":\"db_open\",\"ms\":{}}}", db_open_start.elapsed().as_secs_f64() * 1000.0);
+        log::info!(
+            "TIMING {{\"op\":\"db_open\",\"ms\":{}}}",
+            db_open_start.elapsed().as_secs_f64() * 1000.0
+        );
 
         let query_start = std::time::Instant::now();
         let mut stmt = conn.prepare(
@@ -152,11 +166,18 @@ impl Ranker {
                 row.get::<_, String>(2)?,
             ))
         })?;
-        log::info!("TIMING {{\"op\":\"db_query_prepare\",\"ms\":{}}}", query_start.elapsed().as_secs_f64() * 1000.0);
+        log::info!(
+            "TIMING {{\"op\":\"db_query_prepare\",\"ms\":{}}}",
+            query_start.elapsed().as_secs_f64() * 1000.0
+        );
 
         let collect_start = std::time::Instant::now();
         let rows: Vec<(String, i64, String)> = rows.collect::<Result<Vec<_>, _>>()?;
-        log::info!("TIMING {{\"op\":\"collect_rows\",\"ms\":{},\"count\":{}}}", collect_start.elapsed().as_secs_f64() * 1000.0, rows.len());
+        log::info!(
+            "TIMING {{\"op\":\"collect_rows\",\"ms\":{},\"count\":{}}}",
+            collect_start.elapsed().as_secs_f64() * 1000.0,
+            rows.len()
+        );
 
         let indexing_start = std::time::Instant::now();
         let row_count = rows.len();
@@ -170,12 +191,13 @@ impl Ranker {
                 .push(click_event);
 
             // Index by file path only (reuse path without clone)
-            clicks_by_file
-                .entry(path)
-                .or_default()
-                .push(click_event);
+            clicks_by_file.entry(path).or_default().push(click_event);
         }
-        log::info!("TIMING {{\"op\":\"process_click_rows\",\"ms\":{},\"count\":{}}}", indexing_start.elapsed().as_secs_f64() * 1000.0, row_count);
+        log::info!(
+            "TIMING {{\"op\":\"process_click_rows\",\"ms\":{},\"count\":{}}}",
+            indexing_start.elapsed().as_secs_f64() * 1000.0,
+            row_count
+        );
 
         // Build parent directory index
         let parent_dir_start = std::time::Instant::now();
@@ -188,9 +210,15 @@ impl Ranker {
                     .extend(clicks.iter().copied());
             }
         }
-        log::info!("TIMING {{\"op\":\"build_parent_dir_index\",\"ms\":{}}}", parent_dir_start.elapsed().as_secs_f64() * 1000.0);
+        log::info!(
+            "TIMING {{\"op\":\"build_parent_dir_index\",\"ms\":{}}}",
+            parent_dir_start.elapsed().as_secs_f64() * 1000.0
+        );
 
-        log::info!("TIMING {{\"op\":\"load_clicks_total\",\"ms\":{}}}", total_start.elapsed().as_secs_f64() * 1000.0);
+        log::info!(
+            "TIMING {{\"op\":\"load_clicks_total\",\"ms\":{}}}",
+            total_start.elapsed().as_secs_f64() * 1000.0
+        );
         log::debug!(
             "Loaded {} files with click history from last 30 days",
             clicks_by_file.len()
@@ -229,7 +257,11 @@ impl Ranker {
                     features: Vec::new(),
                 })
                 .collect();
-            scored_files.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+            scored_files.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
             return Ok(scored_files);
         }
 
@@ -264,7 +296,9 @@ impl Ranker {
         let mut aggregated_timings: FxHashMap<String, Duration> = FxHashMap::default();
         for (_features, timings) in &results {
             for (feature_name, duration) in timings {
-                *aggregated_timings.entry(feature_name.clone()).or_insert(Duration::ZERO) += *duration;
+                *aggregated_timings
+                    .entry(feature_name.clone())
+                    .or_insert(Duration::ZERO) += *duration;
             }
         }
 

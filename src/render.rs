@@ -5,10 +5,93 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, List, ListItem, Paragraph},
 };
-use std::time::Instant;
+use std::{
+    collections::{HashMap, VecDeque},
+    path::{Path, PathBuf},
+    time::Instant,
+};
 
-use crate::app::App;
 use crate::path_display::truncate_absolute_path;
+
+/// Input data required to render the history mode UI.
+pub struct HistoryRenderContext<'a> {
+    pub filtered_history: &'a [PathBuf],
+    pub history_selected: usize,
+    pub total_history_items: usize,
+    pub preview_scroll_position: u16,
+    pub query: &'a str,
+}
+
+/// Input data required to render the normal mode UI.
+pub struct NormalRenderContext<'a> {
+    pub selected_index: usize,
+    pub file_list_scroll: usize,
+    pub total_results: usize,
+    pub total_files: usize,
+    pub current_filter: crate::search_worker::FilterType,
+    pub no_preview: bool,
+    pub preview: &'a crate::preview::PreviewManager,
+    pub currently_retraining: bool,
+    pub model_stats_cache: Option<&'a crate::ranker::ModelStats>,
+    pub page_cache: &'a HashMap<usize, crate::app::Page>,
+    pub ui_state: &'a crate::ui_state::UiState,
+    pub recent_logs: &'a VecDeque<String>,
+    pub last_path_bar_update: Instant,
+    pub path_bar_scroll: u16,
+    pub path_bar_scroll_direction: i8,
+    pub cwd: &'a Path,
+    pub query: &'a str,
+}
+
+impl<'a> NormalRenderContext<'a> {
+    /// Look up a file in the paged cache by its global index.
+    pub fn get_file_at_index(
+        &self,
+        index: usize,
+    ) -> Option<&'a crate::search_worker::DisplayFileInfo> {
+        if index >= self.total_results {
+            return None;
+        }
+
+        let page_num = index / crate::app::PAGE_SIZE;
+        let page = self.page_cache.get(&page_num)?;
+
+        // Preconditions mirror App::get_file_at_index to keep invariants local.
+        assert!(
+            page.start_index < page.end_index,
+            "Page has invalid range: [{}, {})",
+            page.start_index,
+            page.end_index
+        );
+        assert_eq!(
+            page.end_index - page.start_index,
+            page.files.len(),
+            "Page length mismatch: expected {}, found {}",
+            page.end_index - page.start_index,
+            page.files.len()
+        );
+
+        assert!(
+            index >= page.start_index && index < page.end_index,
+            "Index {} outside page {} range [{}, {})",
+            index,
+            page_num,
+            page.start_index,
+            page.end_index
+        );
+
+        let rel_index = index - page.start_index;
+        assert!(
+            rel_index < page.files.len(),
+            "Relative index {} out of bounds for page starting at {} with {} files",
+            rel_index,
+            page.start_index,
+            page.files.len()
+        );
+
+        page.files.get(rel_index)
+    }
+}
 
 /// Compute the scroll offset for the file list based on selection and visible area
 fn compute_scroll(
@@ -53,7 +136,7 @@ fn compute_scroll(
 }
 
 /// Render the history navigation mode UI
-pub fn render_history_mode(f: &mut Frame, app: &App) {
+pub fn render_history_mode(f: &mut Frame, ctx: HistoryRenderContext<'_>) {
     // Split vertically: top for dir list + preview, bottom for input
     let main_chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -73,7 +156,7 @@ pub fn render_history_mode(f: &mut Frame, app: &App) {
         .split(main_chunks[0]);
 
     // Get filtered history (sorted chronologically as stored)
-    let filtered_history = app.get_filtered_history();
+    let filtered_history = ctx.filtered_history;
 
     // Calculate list width (accounting for borders)
     let list_width = top_chunks[0].width.saturating_sub(2) as usize;
@@ -94,7 +177,7 @@ pub fn render_history_mode(f: &mut Frame, app: &App) {
             // Use truncate_absolute_path for good abbreviation
             let display_text = truncate_absolute_path(&path_str, available_width);
 
-            let style = if idx == app.history_selected {
+            let style = if idx == ctx.history_selected {
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD)
@@ -110,7 +193,7 @@ pub fn render_history_mode(f: &mut Frame, app: &App) {
 
     // Render directory list
     // Total includes all items in history display
-    let total_dirs = app.history.items_for_display().len();
+    let total_dirs = ctx.total_history_items;
     let title = format!(
         "History (most recent at top) — {}/{}",
         filtered_history.len(),
@@ -128,9 +211,9 @@ pub fn render_history_mode(f: &mut Frame, app: &App) {
 
     // Preview pane: show eza -al of selected directory
     let preview_text = if !filtered_history.is_empty()
-        && app.history_selected < filtered_history.len()
+        && ctx.history_selected < filtered_history.len()
     {
-        let selected_dir = &filtered_history[app.history_selected];
+        let selected_dir = &filtered_history[ctx.history_selected];
 
         let preview_width = top_chunks[1].width;
         let extra_flags = get_eza_flags(preview_width);
@@ -176,15 +259,15 @@ pub fn render_history_mode(f: &mut Frame, app: &App) {
 
     let preview_para = Paragraph::new(preview_text)
         .block(Block::default().borders(Borders::ALL).title("Preview"))
-        .scroll((app.preview.scroll_position() as u16, 0));
+        .scroll((ctx.preview_scroll_position, 0));
     f.render_widget(preview_para, top_chunks[1]);
 
     // Search input at bottom
     let input_area = main_chunks[1];
-    let input_text = if app.query.is_empty() {
+    let input_text = if ctx.query.is_empty() {
         "Filter history..."
     } else {
-        &app.query
+        ctx.query
     };
     let input_para = Paragraph::new(input_text)
         .style(Style::default().fg(Color::Gray))
@@ -239,7 +322,7 @@ impl RenderUpdates {
 /// Returns computed state updates that should be applied to App after rendering
 pub fn render_normal_mode(
     f: &mut Frame,
-    app: &crate::app::App,
+    ctx: NormalRenderContext<'_>,
     marquee_delay: std::time::Duration,
     marquee_speed: std::time::Duration,
 ) -> RenderUpdates {
@@ -280,7 +363,7 @@ pub fn render_normal_mode(
             .split(main_chunks[0])
     } else {
         // Horizontal layout for wide terminals
-        match app.ui_state.debug_pane_mode {
+        match ctx.ui_state.debug_pane_mode {
             ui_state::DebugPaneMode::Expanded => {
                 // Debug expanded: give it most of the space
                 Layout::default()
@@ -320,9 +403,9 @@ pub fn render_normal_mode(
     // Compute scroll position based on selection and visible height
     let visible_height = top_chunks[0].height.saturating_sub(2); // subtract border
     let file_list_scroll = compute_scroll(
-        app.selected_index,
-        app.file_list_scroll,
-        app.total_results,
+        ctx.selected_index,
+        ctx.file_list_scroll,
+        ctx.total_results,
         visible_height as usize,
     );
     updates.file_list_scroll = Some(file_list_scroll);
@@ -335,11 +418,11 @@ pub fn render_normal_mode(
     let items: Vec<ListItem> = (0..visible_height as usize)
         .map(|display_idx| {
             let i = scroll_offset + display_idx;
-            if i >= app.total_results {
+            if i >= ctx.total_results {
                 return ListItem::new("");
             }
 
-            if let Some(display_info) = app.get_file_at_index(i) {
+            if let Some(display_info) = ctx.get_file_at_index(i) {
                 let time_ago = get_time_ago(display_info.mtime);
                 let rank = i + 1;
 
@@ -373,7 +456,7 @@ pub fn render_normal_mode(
                 };
 
                 // Build line with styled spans
-                let base_style = if i == app.selected_index {
+                let base_style = if i == ctx.selected_index {
                     Style::default()
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD)
@@ -388,7 +471,7 @@ pub fn render_normal_mode(
                 let rank_style = if display_info.is_historical {
                     // Historical files: gray rank number
                     Style::default().fg(Color::DarkGray)
-                } else if i == app.selected_index {
+                } else if i == ctx.selected_index {
                     // Selected: match base style
                     base_style
                 } else {
@@ -396,7 +479,7 @@ pub fn render_normal_mode(
                     base_style
                 };
 
-                let cwd_style = if i == app.selected_index {
+                let cwd_style = if i == ctx.selected_index {
                     // If selected, keep yellow but make it even more visible
                     Style::default()
                         .fg(Color::Yellow)
@@ -445,18 +528,18 @@ pub fn render_normal_mode(
         .collect();
 
     // Create title with filter indicator
-    let filter_name = match app.current_filter {
+    let filter_name = match ctx.current_filter {
         search_worker::FilterType::None => "All",
         search_worker::FilterType::OnlyCwd => "CWD",
         search_worker::FilterType::OnlyDirs => "Dirs",
         search_worker::FilterType::OnlyFiles => "Files",
     };
 
-    let title_line = if app.current_filter == search_worker::FilterType::None {
+    let title_line = if ctx.current_filter == search_worker::FilterType::None {
         // No filter active - no highlight
         Line::from(vec![Span::raw(format!(
             "{} ({}/{})",
-            filter_name, app.total_results, app.total_files
+            filter_name, ctx.total_results, ctx.total_files
         ))])
     } else {
         // Filter active - highlight in green
@@ -467,7 +550,7 @@ pub fn render_normal_mode(
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(format!(" ({}/{})", app.total_results, app.total_files)),
+            Span::raw(format!(" ({}/{})", ctx.total_results, ctx.total_files)),
         ])
     };
 
@@ -475,8 +558,8 @@ pub fn render_normal_mode(
     f.render_widget(list, top_chunks[0]);
 
     // Get current file from page cache - clone the info we need to avoid borrow issues
-    let current_file_info: Option<(PathBuf, String, bool)> = app
-        .get_file_at_index(app.selected_index)
+    let current_file_info: Option<(PathBuf, String, bool)> = ctx
+        .get_file_at_index(ctx.selected_index)
         .map(|f| (f.full_path.clone(), f.display_name.clone(), f.is_dir));
     let current_file_path = current_file_info
         .as_ref()
@@ -487,16 +570,16 @@ pub fn render_normal_mode(
         .unwrap_or(false);
 
     // Preview on the right using bat/eza (with smart caching)
-    let preview_text = if app.no_preview {
+    let preview_text = if ctx.no_preview {
         // Skip preview generation when --no-preview is enabled
         Text::from("")
-    } else if current_file_info.is_some() && app.total_results > 0 {
+    } else if current_file_info.is_some() && ctx.total_results > 0 {
         if let Some(current_file_path) = &current_file_path {
             let preview_width = top_chunks[1].width;
             let preview_height = top_chunks[1].height.saturating_sub(2);
 
             // Use preview manager to render preview
-            let mut preview_clone = app.preview.clone();
+            let mut preview_clone = ctx.preview.clone();
             let text = preview_clone.render(
                 std::path::Path::new(current_file_path),
                 is_dir,
@@ -520,7 +603,7 @@ pub fn render_normal_mode(
         .unwrap_or("No file selected".to_string());
 
     let preview = Paragraph::new(preview_text)
-        .scroll((app.preview.scroll_position() as u16, 0))
+        .scroll((ctx.preview.scroll_position() as u16, 0))
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -532,7 +615,7 @@ pub fn render_normal_mode(
     let mut debug_lines = Vec::new();
 
     // Show current selection info - need another lookup to get score/features
-    if let Some(display_info) = app.get_file_at_index(app.selected_index) {
+    if let Some(display_info) = ctx.get_file_at_index(ctx.selected_index) {
         debug_lines.push(format!("Score: {:.4}", display_info.score));
         debug_lines.push(String::from(""));
         debug_lines.push(String::from("Features:"));
@@ -549,7 +632,7 @@ pub fn render_normal_mode(
         } else {
             debug_lines.push(String::from("  (no features)"));
         }
-    } else if app.total_results > 0 {
+    } else if ctx.total_results > 0 {
         debug_lines.push(String::from("(loading...)"));
     } else {
         debug_lines.push(String::from("No results"));
@@ -558,13 +641,13 @@ pub fn render_normal_mode(
     debug_lines.push(String::from("")); // Separator
 
     // Add retraining status
-    if app.currently_retraining {
+    if ctx.currently_retraining {
         debug_lines.push(String::from("Retraining model..."));
         debug_lines.push(String::from("")); // Separator
     }
 
     // Add model stats
-    if let Some(ref stats) = app.model_stats_cache {
+    if let Some(stats) = ctx.model_stats_cache {
         debug_lines.push(String::from("Model Stats:"));
         let formatter = timeago::Formatter::new();
 
@@ -598,7 +681,7 @@ pub fn render_normal_mode(
     // Add preview cache status
     if let Some((file_path, _, _)) = &current_file_info {
         let full_path_str = file_path.to_string_lossy().to_string();
-        let cache_status = app.preview.status(&full_path_str);
+        let cache_status = ctx.preview.status(&full_path_str);
         debug_lines.push(format!("Preview: {}", cache_status));
     } else {
         debug_lines.push(String::from("Preview: N/A"));
@@ -607,11 +690,11 @@ pub fn render_normal_mode(
     debug_lines.push(String::from("")); // Separator
 
     // Add page cache status
-    if app.total_results > 0 {
-        let current_page = app.selected_index / PAGE_SIZE;
+    if ctx.total_results > 0 {
+        let current_page = ctx.selected_index / PAGE_SIZE;
         debug_lines.push(format!("Current page: {}", current_page));
 
-        let mut cached_pages: Vec<usize> = app.page_cache.keys().copied().collect();
+        let mut cached_pages: Vec<usize> = ctx.page_cache.keys().copied().collect();
         cached_pages.sort_unstable();
         let pages_str = cached_pages
             .iter()
@@ -629,15 +712,15 @@ pub fn render_normal_mode(
     // Add recent logs
     debug_lines.push(String::from("Recent Logs:"));
     // Show more log lines when debug is maximized
-    let log_count = if app.ui_state.is_debug_pane_expanded() {
+    let log_count = if ctx.ui_state.is_debug_pane_expanded() {
         30
     } else {
         10
     };
-    let log_start = app.recent_logs.len().saturating_sub(log_count);
-    for log_line in app.recent_logs.iter().skip(log_start) {
+    let log_start = ctx.recent_logs.len().saturating_sub(log_count);
+    for log_line in ctx.recent_logs.iter().skip(log_start) {
         // Truncate long lines to fit
-        let max_len = if app.ui_state.is_debug_pane_expanded() {
+        let max_len = if ctx.ui_state.is_debug_pane_expanded() {
             120
         } else {
             60
@@ -651,7 +734,7 @@ pub fn render_normal_mode(
 
     let debug_text = debug_lines.join("\n");
 
-    let debug_title = match app.ui_state.debug_pane_mode {
+    let debug_title = match ctx.ui_state.debug_pane_mode {
         ui_state::DebugPaneMode::Small => "Debug (Ctrl-O: expand)",
         ui_state::DebugPaneMode::Expanded => "Debug (Ctrl-O: hide)",
         ui_state::DebugPaneMode::Hidden => "Debug (Ctrl-O: show)",
@@ -661,8 +744,8 @@ pub fn render_normal_mode(
     f.render_widget(debug_pane, top_chunks[2]);
 
     // Get path of currently selected file for marquee
-    let selected_path_str = app
-        .get_file_at_index(app.selected_index)
+    let selected_path_str = ctx
+        .get_file_at_index(ctx.selected_index)
         .map(|f| f.full_path.to_string_lossy().to_string())
         .unwrap_or_default();
 
@@ -675,28 +758,28 @@ pub fn render_normal_mode(
     let (path_bar_scroll, path_bar_scroll_direction, last_path_bar_update) =
         if padded_path.len() > path_bar_width {
             let now = Instant::now();
-            let time_since_update = now.duration_since(app.last_path_bar_update);
+            let time_since_update = now.duration_since(ctx.last_path_bar_update);
 
             let max_scroll = padded_path.len().saturating_sub(path_bar_width) as u16;
 
             // Pause at the ends of the scroll
-            let should_scroll = if app.path_bar_scroll == 0 || app.path_bar_scroll >= max_scroll {
+            let should_scroll = if ctx.path_bar_scroll == 0 || ctx.path_bar_scroll >= max_scroll {
                 time_since_update > marquee_delay
             } else {
                 time_since_update > marquee_speed
             };
 
             if should_scroll {
-                let (new_scroll, new_direction) = if app.path_bar_scroll_direction == 1 {
-                    if app.path_bar_scroll < max_scroll {
-                        (app.path_bar_scroll + 1, app.path_bar_scroll_direction)
+                let (new_scroll, new_direction) = if ctx.path_bar_scroll_direction == 1 {
+                    if ctx.path_bar_scroll < max_scroll {
+                        (ctx.path_bar_scroll + 1, ctx.path_bar_scroll_direction)
                     } else {
-                        (app.path_bar_scroll, -1) // Change direction
+                        (ctx.path_bar_scroll, -1) // Change direction
                     }
-                } else if app.path_bar_scroll > 0 {
-                    (app.path_bar_scroll - 1, app.path_bar_scroll_direction)
+                } else if ctx.path_bar_scroll > 0 {
+                    (ctx.path_bar_scroll - 1, ctx.path_bar_scroll_direction)
                 } else {
-                    (app.path_bar_scroll, 1) // Change direction
+                    (ctx.path_bar_scroll, 1) // Change direction
                 };
                 (Some(new_scroll), Some(new_direction), Some(now))
             } else {
@@ -717,28 +800,28 @@ pub fn render_normal_mode(
         updates.last_path_bar_update = Some(time);
     }
 
-    // Path bar - use current app value for rendering since updates will be applied later
-    let current_path_bar_scroll = path_bar_scroll.unwrap_or(app.path_bar_scroll);
+    // Path bar - use current context value for rendering since updates will be applied later
+    let current_path_bar_scroll = path_bar_scroll.unwrap_or(ctx.path_bar_scroll);
     let path_bar = Paragraph::new(padded_path)
         .style(Style::default().fg(Color::DarkGray))
         .scroll((0, current_path_bar_scroll));
     f.render_widget(path_bar, main_chunks[1]);
 
     // Search input at the bottom
-    let cwd_str = app.cwd.to_string_lossy();
-    let filter_indicator = match app.current_filter {
+    let cwd_str = ctx.cwd.to_string_lossy();
+    let filter_indicator = match ctx.current_filter {
         search_worker::FilterType::None => "",
         search_worker::FilterType::OnlyCwd => " [CWD]",
         search_worker::FilterType::OnlyDirs => " [DIRS]",
         search_worker::FilterType::OnlyFiles => " [FILES]",
     };
     let search_title = format!("Search: {}{}", cwd_str, filter_indicator);
-    let input = Paragraph::new(app.query.as_str())
-        .block(Block::default().borders(Borders::ALL).title(search_title));
+    let input =
+        Paragraph::new(ctx.query).block(Block::default().borders(Borders::ALL).title(search_title));
     f.render_widget(input, main_chunks[2]);
 
     // Filter picker overlay (rendered on top if visible)
-    if app.ui_state.filter_picker_visible {
+    if ctx.ui_state.filter_picker_visible {
         // Create a popup in the bottom-right
         let popup_width = 30;
         let popup_height = 6; // 4 options + top/bottom borders
@@ -769,7 +852,7 @@ pub fn render_normal_mode(
         ];
 
         for (filter_type, label) in options.iter() {
-            if *filter_type == app.current_filter {
+            if *filter_type == ctx.current_filter {
                 lines.push(format!("> {}", label));
             } else {
                 lines.push(format!("  {}", label));
@@ -788,7 +871,7 @@ pub fn render_normal_mode(
 
     // Position cursor in the search input at the end of the query text
     // Account for border (1 char) + query length
-    let cursor_x = main_chunks[2].x + 1 + app.query.len() as u16;
+    let cursor_x = main_chunks[2].x + 1 + ctx.query.len() as u16;
     let cursor_y = main_chunks[2].y + 1; // 1 for top border
     f.set_cursor_position((cursor_x, cursor_y));
 

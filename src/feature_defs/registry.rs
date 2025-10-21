@@ -1,9 +1,8 @@
-use super::schema::{Feature, FeatureType};
 use super::implementations::{
-    ClicksLast30Days, ClicksLast7Days, ClicksLastHour, ClicksLastWeekParentDir, ClicksToday,
-    FilenameStartsWithQuery, IsHidden, IsUnderCwd, ModifiedAge, ModifiedToday,
-    ClicksForThisQuery, IsDir,
+    ClicksForThisQuery, ClicksLast7Days, ClicksLast30Days, ClicksLastHour, ClicksLastWeekParentDir,
+    ClicksToday, FilenameStartsWithQuery, IsDir, IsHidden, IsUnderCwd, ModifiedAge, ModifiedToday,
 };
+use super::schema::{Feature, FeatureType};
 use once_cell::sync::Lazy;
 use serde_json::json;
 

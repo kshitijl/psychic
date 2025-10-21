@@ -1,5 +1,5 @@
-mod analyze_perf;
 mod analytics;
+mod analyze_perf;
 mod app;
 mod cli;
 mod context;
@@ -25,10 +25,7 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use db::EventData;
-use ratatui::{
-    Terminal,
-    backend::CrosstermBackend,
-};
+use ratatui::{Terminal, backend::CrosstermBackend};
 use search_worker::{WorkerRequest, WorkerResponse};
 use std::{
     env,
@@ -189,9 +186,9 @@ fn main() -> Result<()> {
     );
 
     // Get data directory for main app
-    let data_dir = cli
-        .data_dir
-        .unwrap_or_else(|| cli::get_default_data_dir().expect("Failed to get default data directory"));
+    let data_dir = cli.data_dir.unwrap_or_else(|| {
+        cli::get_default_data_dir().expect("Failed to get default data directory")
+    });
 
     // Create unified event channel - all events (worker, input, tick) flow through this
     let (event_tx, event_rx) = mpsc::channel::<AppEvent>();
@@ -448,12 +445,39 @@ fn run_app(
 
             // If in history mode, render history-specific UI
             if app.ui_state.history_mode {
-                render::render_history_mode(f, app);
+                let filtered_history = app.get_filtered_history();
+                let history_ctx = render::HistoryRenderContext {
+                    filtered_history: &filtered_history,
+                    history_selected: app.history_selected,
+                    total_history_items: app.history.items_for_display().len(),
+                    preview_scroll_position: app.preview.scroll_position() as u16,
+                    query: &app.query,
+                };
+                render::render_history_mode(f, history_ctx);
                 return;
             }
 
             // Render normal mode UI using render module
-            let updates = render::render_normal_mode(f, app, marquee_delay, marquee_speed);
+            let normal_ctx = render::NormalRenderContext {
+                selected_index: app.selected_index,
+                file_list_scroll: app.file_list_scroll,
+                total_results: app.total_results,
+                total_files: app.total_files,
+                current_filter: app.current_filter,
+                no_preview: app.no_preview,
+                preview: &app.preview,
+                currently_retraining: app.currently_retraining,
+                model_stats_cache: app.model_stats_cache.as_ref(),
+                page_cache: &app.page_cache,
+                ui_state: &app.ui_state,
+                recent_logs: &app.recent_logs,
+                last_path_bar_update: app.last_path_bar_update,
+                path_bar_scroll: app.path_bar_scroll,
+                path_bar_scroll_direction: app.path_bar_scroll_direction,
+                cwd: app.cwd.as_path(),
+                query: &app.query,
+            };
+            let updates = render::render_normal_mode(f, normal_ctx, marquee_delay, marquee_speed);
             render_updates = Some(updates);
         })?;
 

@@ -78,8 +78,8 @@ impl History {
     /// 2. Otherwise, truncate history after current_index and push new_dir
     pub fn navigate_to(&mut self, new_dir: PathBuf) {
         // Check if new_dir is the next item in history
-        if self.current_index + 1 < self.dirs.len()
-            && self.dirs[self.current_index + 1] == new_dir {
+        if self.current_index + 1 < self.dirs.len() && self.dirs[self.current_index + 1] == new_dir
+        {
             // Just move forward in history
             self.current_index += 1;
         } else {
@@ -154,8 +154,11 @@ mod tests {
 
         // Display should show [C, B, A] (most recent first)
         let display = history.items_for_display();
-        assert_eq!(display, vec![path("/C"), path("/B"), path("/A")],
-                   "Display should show most recent first");
+        assert_eq!(
+            display,
+            vec![path("/C"), path("/B"), path("/A")],
+            "Display should show most recent first"
+        );
     }
 
     #[test]
@@ -172,8 +175,11 @@ mod tests {
         assert_eq!(result, Some(path("/B")));
 
         // History vec should be unchanged
-        assert_eq!(history.dirs(), &[path("/A"), path("/B"), path("/C")],
-                   "History should not change when navigating backward");
+        assert_eq!(
+            history.dirs(),
+            &[path("/A"), path("/B"), path("/C")],
+            "History should not change when navigating backward"
+        );
 
         // current_index should be 1
         assert_eq!(history.current_index(), 1);
@@ -189,8 +195,11 @@ mod tests {
         let result = history.navigate_to_display_index(2);
         assert_eq!(result, Some(path("/A")));
 
-        assert_eq!(history.dirs(), &[path("/A"), path("/B"), path("/C")],
-                   "History should not change");
+        assert_eq!(
+            history.dirs(),
+            &[path("/A"), path("/B"), path("/C")],
+            "History should not change"
+        );
         assert_eq!(history.current_index(), 0);
     }
 
@@ -204,7 +213,10 @@ mod tests {
         history.navigate_to(path("/C"));
 
         // Display: [C, B, A]
-        assert_eq!(history.items_for_display(), vec![path("/C"), path("/B"), path("/A")]);
+        assert_eq!(
+            history.items_for_display(),
+            vec![path("/C"), path("/B"), path("/A")]
+        );
 
         // Select B (display[1])
         let _ = history.navigate_to_display_index(1);
@@ -217,8 +229,11 @@ mod tests {
         history.navigate_to(path("/D"));
 
         // Should truncate at current_index (1), keeping [A, B], then push D
-        assert_eq!(history.dirs(), &[path("/A"), path("/B"), path("/D")],
-                   "Should branch from B, keeping A and B but losing C");
+        assert_eq!(
+            history.dirs(),
+            &[path("/A"), path("/B"), path("/D")],
+            "Should branch from B, keeping A and B but losing C"
+        );
         assert_eq!(history.current_index(), 2);
     }
 
@@ -236,8 +251,11 @@ mod tests {
         history.navigate_to(path("/C"));
 
         // Should just increment current_index, not add duplicate
-        assert_eq!(history.dirs(), &[path("/A"), path("/B"), path("/C")],
-                   "Should not duplicate C");
+        assert_eq!(
+            history.dirs(),
+            &[path("/A"), path("/B"), path("/C")],
+            "Should not duplicate C"
+        );
         assert_eq!(history.current_index(), 2);
     }
 

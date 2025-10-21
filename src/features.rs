@@ -7,7 +7,7 @@ use std::fs;
 use std::path::Path;
 
 // Import the feature definitions module
-use crate::feature_defs::{FeatureInputs, FEATURE_REGISTRY, csv_columns};
+use crate::feature_defs::{FEATURE_REGISTRY, FeatureInputs, csv_columns};
 
 // Re-export types that other modules need
 pub use crate::feature_defs::{ClickEvent, Session};
@@ -93,7 +93,8 @@ impl Accumulator {
     fn add_impression(&mut self, event: &Event, mut features: HashMap<String, String>) {
         // Check if this is a new session - if so, increment group_id
         if let Some(ref last_session) = self.last_session_id
-            && last_session != &event.session_id {
+            && last_session != &event.session_id
+        {
             self.current_group_id += 1;
         }
         self.last_session_id = Some(event.session_id.clone());
@@ -118,7 +119,8 @@ impl Accumulator {
     fn mark_impressions_as_engaged(&mut self, event: &Event) {
         // Update last_session_id when processing click/scroll
         if let Some(ref last_session) = self.last_session_id
-            && last_session != &event.session_id {
+            && last_session != &event.session_id
+        {
             self.current_group_id += 1;
         }
         self.last_session_id = Some(event.session_id.clone());
@@ -131,8 +133,11 @@ impl Accumulator {
         );
 
         if let Some(pending) = self.pending_impressions.get_mut(&key)
-            && pending.timestamp <= event.timestamp {
-            pending.features.insert("label".to_string(), "1".to_string());
+            && pending.timestamp <= event.timestamp
+        {
+            pending
+                .features
+                .insert("label".to_string(), "1".to_string());
         }
 
         // Increment group_id after each engagement event (click or scroll)
@@ -145,9 +150,9 @@ impl Accumulator {
         // Sort by (session_id, subsession_id, full_path) to ensure consistent ordering
         let mut sorted_keys: Vec<_> = self.pending_impressions.keys().cloned().collect();
         sorted_keys.sort_by(|a, b| {
-            a.0.cmp(&b.0)  // session_id
-                .then(a.1.cmp(&b.1))  // subsession_id
-                .then(a.2.cmp(&b.2))  // full_path
+            a.0.cmp(&b.0) // session_id
+                .then(a.1.cmp(&b.1)) // subsession_id
+                .then(a.2.cmp(&b.2)) // full_path
         });
 
         for key in sorted_keys {
@@ -161,7 +166,12 @@ impl Accumulator {
 
 // Main function to generate features
 
-pub fn generate_features(db_path: &Path, output_path: &Path, schema_path: &Path, format: OutputFormat) -> Result<()> {
+pub fn generate_features(
+    db_path: &Path,
+    output_path: &Path,
+    schema_path: &Path,
+    format: OutputFormat,
+) -> Result<()> {
     let conn = Connection::open(db_path).context("Failed to open database")?;
     let mut all_events = fetch_all_events(&conn)?;
     let all_sessions = fetch_all_sessions(&conn)?;
@@ -266,7 +276,10 @@ fn compute_features_from_accumulator(
 
     // Metadata columns
     features.insert("label".to_string(), "0".to_string());
-    features.insert("subsession_id".to_string(), impression.subsession_id.to_string());
+    features.insert(
+        "subsession_id".to_string(),
+        impression.subsession_id.to_string(),
+    );
     features.insert("session_id".to_string(), impression.session_id.clone());
     features.insert("query".to_string(), impression.query.clone());
     features.insert("file_path".to_string(), impression.file_path.clone());
@@ -481,6 +494,9 @@ mod tests {
         let lines: Vec<&str> = csv_content.lines().collect();
 
         assert!(!lines.is_empty(), "CSV should not be empty");
-        assert_eq!(lines[0], "label,query,file_path,filename_starts_with_query,clicks_last_30_days,modified_today");
+        assert_eq!(
+            lines[0],
+            "label,query,file_path,filename_starts_with_query,clicks_last_30_days,modified_today"
+        );
     }
 }

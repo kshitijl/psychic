@@ -188,7 +188,10 @@ mod tests {
     #[test]
     fn test_truncate_path_simple() {
         let result = truncate_path("a/b/c/d/e.txt", 12);
-        assert_eq!(result, "a/.../e.txt", "Should truncate middle components when too long");
+        assert_eq!(
+            result, "a/.../e.txt",
+            "Should truncate middle components when too long"
+        );
     }
 
     #[test]
@@ -229,7 +232,10 @@ mod tests {
     #[test]
     fn test_truncate_absolute_path_relative() {
         let result = truncate_absolute_path("a/b/c/d/e.txt", 15);
-        assert!(!result.starts_with('/'), "Should not add slash to relative paths");
+        assert!(
+            !result.starts_with('/'),
+            "Should not add slash to relative paths"
+        );
     }
 
     #[test]

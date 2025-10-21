@@ -37,10 +37,10 @@ pub enum WalkerMessage {
 // Filter types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilterType {
-    None,          // 0 - no filter
-    OnlyCwd,       // 1 - only things in cwd
-    OnlyDirs,      // 2 - only directories
-    OnlyFiles,     // 3 - only files
+    None,      // 0 - no filter
+    OnlyCwd,   // 1 - only things in cwd
+    OnlyDirs,  // 2 - only directories
+    OnlyFiles, // 3 - only files
 }
 
 // These next three are types for communicating with the UI thread.
@@ -66,16 +66,10 @@ pub struct UpdateQueryRequest {
 
 pub enum WorkerRequest {
     UpdateQuery(UpdateQueryRequest),
-    GetPage {
-        query_id: u64,
-        page_num: usize,
-    },
+    GetPage { query_id: u64, page_num: usize },
     ReloadModel { query_id: u64 },
     ReloadClicks { query_id: u64 },
-    ChangeCwd {
-        new_cwd: PathBuf,
-        query_id: u64,
-    },
+    ChangeCwd { new_cwd: PathBuf, query_id: u64 },
 }
 
 #[derive(Debug, Clone)]
@@ -185,7 +179,14 @@ where
         // between thread. It's technically thread-safe to move for read-only
         // operations, but doing it this way means we don't have to do an unsafe
         // impl Send.
-        let worker_state = WorkerState::new(cwd_clone, &data_dir, walker_command_tx_clone, no_click_loading, no_model).unwrap();
+        let worker_state = WorkerState::new(
+            cwd_clone,
+            &data_dir,
+            walker_command_tx_clone,
+            no_click_loading,
+            no_model,
+        )
+        .unwrap();
         worker_thread_loop(worker_task_rx, event_tx, walker_message_rx, worker_state);
     });
 
@@ -212,7 +213,13 @@ struct WorkerState {
 }
 
 impl WorkerState {
-    fn new(root: PathBuf, data_dir: &Path, walker_command_tx: Sender<WalkerCommand>, no_click_loading: bool, _no_model: bool) -> Result<Self> {
+    fn new(
+        root: PathBuf,
+        data_dir: &Path,
+        walker_command_tx: Sender<WalkerCommand>,
+        no_click_loading: bool,
+        _no_model: bool,
+    ) -> Result<Self> {
         let worker_state_start = std::time::Instant::now();
 
         let ranker_start = std::time::Instant::now();
@@ -227,7 +234,10 @@ impl WorkerState {
             log::info!("Loaded ranking model from {:?}", model_path);
             r
         };
-        log::info!("TIMING {{\"op\":\"ranker_init\",\"ms\":{}}}", ranker_start.elapsed().as_secs_f64() * 1000.0);
+        log::info!(
+            "TIMING {{\"op\":\"ranker_init\",\"ms\":{}}}",
+            ranker_start.elapsed().as_secs_f64() * 1000.0
+        );
 
         // Load historical files.
         let historical_start = std::time::Instant::now();
@@ -287,7 +297,11 @@ impl WorkerState {
                 .unwrap_or(".")
                 .to_string();
 
-            log::debug!("Adding root directory to registry: canonical_root={:?}, display_name={:?}", canonical_root, display_name);
+            log::debug!(
+                "Adding root directory to registry: canonical_root={:?}, display_name={:?}",
+                canonical_root,
+                display_name
+            );
 
             let file_info = FileInfo {
                 full_path: canonical_root.clone(),
@@ -303,9 +317,15 @@ impl WorkerState {
             path_to_id.insert(canonical_root.clone(), file_id);
             file_registry.push(file_info);
         }
-        log::info!("TIMING {{\"op\":\"add_root_directory\",\"ms\":{}}}", root_add_start.elapsed().as_secs_f64() * 1000.0);
+        log::info!(
+            "TIMING {{\"op\":\"add_root_directory\",\"ms\":{}}}",
+            root_add_start.elapsed().as_secs_f64() * 1000.0
+        );
 
-        log::info!("TIMING {{\"op\":\"worker_state_new_total\",\"ms\":{}}}", worker_state_start.elapsed().as_secs_f64() * 1000.0);
+        log::info!(
+            "TIMING {{\"op\":\"worker_state_new_total\",\"ms\":{}}}",
+            worker_state_start.elapsed().as_secs_f64() * 1000.0
+        );
 
         Ok(WorkerState {
             file_registry,
@@ -323,7 +343,14 @@ impl WorkerState {
         })
     }
 
-    fn add_file(&mut self, path: PathBuf, mtime: Option<i64>, atime: Option<i64>, file_size: Option<i64>, is_dir: bool) {
+    fn add_file(
+        &mut self,
+        path: PathBuf,
+        mtime: Option<i64>,
+        atime: Option<i64>,
+        file_size: Option<i64>,
+        is_dir: bool,
+    ) {
         // `path` is the original path from the walker.
         let canonical_path = path.canonicalize().unwrap_or_else(|_| path.clone());
 
@@ -338,8 +365,7 @@ impl WorkerState {
                     .unwrap_or(".")
                     .to_string()
             } else {
-                path
-                    .strip_prefix(&self.root)
+                path.strip_prefix(&self.root)
                     .unwrap_or(&path) // fallback to original path if not in root
                     .to_string_lossy()
                     .to_string()
@@ -410,7 +436,11 @@ impl WorkerState {
                 }
             })
             .collect();
-        log::info!("TIMING {{\"op\":\"filter_files\",\"ms\":{},\"count\":{}}}", filter_start.elapsed().as_secs_f64() * 1000.0, file_candidates.len());
+        log::info!(
+            "TIMING {{\"op\":\"filter_files\",\"ms\":{},\"count\":{}}}",
+            filter_start.elapsed().as_secs_f64() * 1000.0,
+            file_candidates.len()
+        );
 
         // Rank them with the model
         let rank_start = std::time::Instant::now();
@@ -420,7 +450,11 @@ impl WorkerState {
             .rank_files(query, &file_candidates, current_timestamp, &self.root)
         {
             Ok(scored) => {
-                log::info!("TIMING {{\"op\":\"rank_files\",\"ms\":{},\"count\":{}}}", rank_start.elapsed().as_secs_f64() * 1000.0, scored.len());
+                log::info!(
+                    "TIMING {{\"op\":\"rank_files\",\"ms\":{},\"count\":{}}}",
+                    rank_start.elapsed().as_secs_f64() * 1000.0,
+                    scored.len()
+                );
                 self.filtered_files = scored.iter().map(|fs| FileId(fs.file_id)).collect();
                 self.file_scores = scored;
             }
@@ -431,7 +465,10 @@ impl WorkerState {
             }
         }
 
-        log::info!("TIMING {{\"op\":\"filter_and_rank_total\",\"ms\":{}}}", filter_rank_start.elapsed().as_secs_f64() * 1000.0);
+        log::info!(
+            "TIMING {{\"op\":\"filter_and_rank_total\",\"ms\":{}}}",
+            filter_rank_start.elapsed().as_secs_f64() * 1000.0
+        );
         Ok(())
     }
 
@@ -485,7 +522,11 @@ impl WorkerState {
 
     fn get_page(&self, page_num: usize, page_size: usize) -> PageData {
         // Precondition: page_size must be reasonable (non-zero)
-        assert!(page_size > 0, "page_size must be positive, got {}", page_size);
+        assert!(
+            page_size > 0,
+            "page_size must be positive, got {}",
+            page_size
+        );
 
         let start_index = page_num * page_size;
         let end_index = (start_index + page_size).min(self.filtered_files.len());
@@ -528,7 +569,8 @@ impl WorkerState {
         log::info!("Worker: Changing cwd from {:?} to {:?}", self.root, new_cwd);
 
         // Remove all walker-sourced files from registry
-        self.file_registry.retain(|f| f.origin != FileOrigin::CwdWalker);
+        self.file_registry
+            .retain(|f| f.origin != FileOrigin::CwdWalker);
 
         // Update root
         self.root = new_cwd.clone();
@@ -555,7 +597,8 @@ impl WorkerState {
         }
 
         // Send command to walker thread to change directory
-        self.walker_command_tx.send(WalkerCommand::ChangeCwd(new_cwd))?;
+        self.walker_command_tx
+            .send(WalkerCommand::ChangeCwd(new_cwd))?;
 
         log::info!("Worker: CWD change command sent to walker");
         Ok(())
@@ -567,8 +610,7 @@ fn worker_thread_loop<T>(
     event_tx: mpsc::Sender<T>,
     walker_rx: mpsc::Receiver<WalkerMessage>,
     mut state: WorkerState,
-)
-where
+) where
     T: From<WorkerResponse> + Send,
 {
     use std::sync::mpsc::RecvTimeoutError;
@@ -584,11 +626,20 @@ where
         while let Ok(message) = walker_rx.try_recv() {
             match message {
                 WalkerMessage::FileMetadata(metadata) => {
-                    state.add_file(metadata.path, metadata.mtime, metadata.atime, metadata.file_size, metadata.is_dir);
+                    state.add_file(
+                        metadata.path,
+                        metadata.mtime,
+                        metadata.atime,
+                        metadata.file_size,
+                        metadata.is_dir,
+                    );
                     files_changed = true;
                 }
                 WalkerMessage::AllDone => {
-                    log::info!("TIMING {{\"op\":\"walker_complete\",\"ms\":{}}}", worker_loop_start.elapsed().as_secs_f64() * 1000.0);
+                    log::info!(
+                        "TIMING {{\"op\":\"walker_complete\",\"ms\":{}}}",
+                        worker_loop_start.elapsed().as_secs_f64() * 1000.0
+                    );
                     walker_done = true;
                     files_changed = true;
                     // Notify UI that walker is done
@@ -599,7 +650,10 @@ where
 
         // If files changed, notify the UI so it can decide to trigger a refresh.
         // We debounce this to avoid spamming the UI thread, UNLESS the walker is done.
-        if files_changed && (walker_done || last_files_changed_notification.elapsed() > Duration::from_millis(200)) {
+        if files_changed
+            && (walker_done
+                || last_files_changed_notification.elapsed() > Duration::from_millis(200))
+        {
             let _ = event_tx.send(WorkerResponse::FilesChanged.into());
             last_files_changed_notification = Instant::now();
         }
@@ -621,13 +675,16 @@ where
 
                 // Send back results with initial page (page 0)
                 let initial_page = state.get_page(0, 128);
-                let _ = event_tx.send(WorkerResponse::QueryUpdated {
-                    query_id: latest_req.query_id,
-                    total_results: state.filtered_files.len(),
-                    total_files: state.file_registry.len(),
-                    initial_page,
-                    model_stats: state.ranker.stats.clone(),
-                }.into());
+                let _ = event_tx.send(
+                    WorkerResponse::QueryUpdated {
+                        query_id: latest_req.query_id,
+                        total_results: state.filtered_files.len(),
+                        total_files: state.file_registry.len(),
+                        initial_page,
+                        model_stats: state.ranker.stats.clone(),
+                    }
+                    .into(),
+                );
             }
             Ok(WorkerRequest::GetPage { query_id, page_num }) => {
                 // If the request is for an old query, ignore it.
@@ -635,7 +692,13 @@ where
                     continue;
                 }
                 let page_data = state.get_page(page_num, 128);
-                let _ = event_tx.send(WorkerResponse::Page { query_id, page_data }.into());
+                let _ = event_tx.send(
+                    WorkerResponse::Page {
+                        query_id,
+                        page_data,
+                    }
+                    .into(),
+                );
             }
             Ok(WorkerRequest::ReloadModel { query_id }) => {
                 state.current_query_id = query_id;
@@ -648,13 +711,16 @@ where
                         log::error!("Filter/rank failed after model reload: {}", e);
                     } else {
                         let initial_page = state.get_page(0, 128);
-                        let _ = event_tx.send(WorkerResponse::QueryUpdated {
-                            query_id,
-                            total_results: state.filtered_files.len(),
-                            total_files: state.file_registry.len(),
-                            initial_page,
-                            model_stats: state.ranker.stats.clone(),
-                        }.into());
+                        let _ = event_tx.send(
+                            WorkerResponse::QueryUpdated {
+                                query_id,
+                                total_results: state.filtered_files.len(),
+                                total_files: state.file_registry.len(),
+                                initial_page,
+                                model_stats: state.ranker.stats.clone(),
+                            }
+                            .into(),
+                        );
                     }
                 }
             }
@@ -669,13 +735,16 @@ where
                         log::error!("Filter/rank failed after clicks reload: {}", e);
                     } else {
                         let initial_page = state.get_page(0, 128);
-                        let _ = event_tx.send(WorkerResponse::QueryUpdated {
-                            query_id,
-                            total_results: state.filtered_files.len(),
-                            total_files: state.file_registry.len(),
-                            initial_page,
-                            model_stats: state.ranker.stats.clone(),
-                        }.into());
+                        let _ = event_tx.send(
+                            WorkerResponse::QueryUpdated {
+                                query_id,
+                                total_results: state.filtered_files.len(),
+                                total_files: state.file_registry.len(),
+                                initial_page,
+                                model_stats: state.ranker.stats.clone(),
+                            }
+                            .into(),
+                        );
                     }
                 }
             }
@@ -690,13 +759,16 @@ where
                         log::error!("Filter/rank failed after cwd change: {}", e);
                     } else {
                         let initial_page = state.get_page(0, 128);
-                        let _ = event_tx.send(WorkerResponse::QueryUpdated {
-                            query_id,
-                            total_results: state.filtered_files.len(),
-                            total_files: state.file_registry.len(),
-                            initial_page,
-                            model_stats: state.ranker.stats.clone(),
-                        }.into());
+                        let _ = event_tx.send(
+                            WorkerResponse::QueryUpdated {
+                                query_id,
+                                total_results: state.filtered_files.len(),
+                                total_files: state.file_registry.len(),
+                                initial_page,
+                                model_stats: state.ranker.stats.clone(),
+                            }
+                            .into(),
+                        );
                     }
                 }
             }
@@ -858,12 +930,23 @@ mod tests {
         };
 
         // OnlyDirs filter: is_dir == true
-        assert_eq!(file_dir.is_dir, true, "Directory should pass OnlyDirs filter");
-        assert_eq!(file_regular.is_dir, false, "Regular file should NOT pass OnlyDirs filter");
+        assert_eq!(
+            file_dir.is_dir, true,
+            "Directory should pass OnlyDirs filter"
+        );
+        assert_eq!(
+            file_regular.is_dir, false,
+            "Regular file should NOT pass OnlyDirs filter"
+        );
 
         // OnlyFiles filter: !is_dir (is_dir == false)
-        assert_eq!(!file_dir.is_dir, false, "Directory should NOT pass OnlyFiles filter");
-        assert_eq!(!file_regular.is_dir, true, "Regular file should pass OnlyFiles filter");
+        assert_eq!(
+            !file_dir.is_dir, false,
+            "Directory should NOT pass OnlyFiles filter"
+        );
+        assert_eq!(
+            !file_regular.is_dir, true,
+            "Regular file should pass OnlyFiles filter"
+        );
     }
 }
-

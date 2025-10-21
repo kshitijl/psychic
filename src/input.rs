@@ -13,8 +13,12 @@
 use anyhow::Result;
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use crossterm::{cursor::Show, execute, terminal::{EnterAlternateScreen, LeaveAlternateScreen}};
-use ratatui::{backend::CrosstermBackend, Terminal};
+use crossterm::{
+    cursor::Show,
+    execute,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen},
+};
+use ratatui::{Terminal, backend::CrosstermBackend};
 
 use crate::app::App;
 use crate::cli::{OnCwdVisitAction, OnDirClickAction};
@@ -320,17 +324,22 @@ fn set_filter(app: &mut App, filter: FilterType) {
 /// Send query update to worker
 fn send_query_update(app: &mut App) {
     let query_id = app.analytics.next_subsession_id();
-    let _ = app.worker_tx.send(WorkerRequest::UpdateQuery(UpdateQueryRequest {
-        query: app.query.clone(),
-        query_id,
-        filter: app.current_filter,
-    }));
+    let _ = app
+        .worker_tx
+        .send(WorkerRequest::UpdateQuery(UpdateQueryRequest {
+            query: app.query.clone(),
+            query_id,
+            filter: app.current_filter,
+        }));
 }
 
 /// Cleanup terminal before exiting
 fn cleanup_terminal(terminal: &mut Terminal<CrosstermBackend<std::fs::File>>) -> Result<()> {
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), crossterm::event::DisableMouseCapture)?;
+    execute!(
+        terminal.backend_mut(),
+        crossterm::event::DisableMouseCapture
+    )?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     execute!(terminal.backend_mut(), Show)?;
     Ok(())
@@ -347,7 +356,10 @@ fn suspend_tui_and_run_shell(
 
     // Suspend TUI
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), crossterm::event::DisableMouseCapture)?;
+    execute!(
+        terminal.backend_mut(),
+        crossterm::event::DisableMouseCapture
+    )?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     execute!(terminal.backend_mut(), Show)?;
 
@@ -392,7 +404,10 @@ fn suspend_tui_for_editor(
 
     // Suspend TUI
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), crossterm::event::DisableMouseCapture)?;
+    execute!(
+        terminal.backend_mut(),
+        crossterm::event::DisableMouseCapture
+    )?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     execute!(terminal.backend_mut(), Show)?;
 

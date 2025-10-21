@@ -8,8 +8,8 @@ mod implementations;
 pub mod registry;
 
 // Re-export key types for external use
+pub use registry::{FEATURE_REGISTRY, csv_columns, export_json, feature_names};
 pub use schema::FeatureInputs;
-pub use registry::{FEATURE_REGISTRY, feature_names, csv_columns, export_json};
 
 // These types are shared between parent and this module
 #[derive(Debug, Clone, Copy)]

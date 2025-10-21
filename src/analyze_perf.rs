@@ -21,8 +21,8 @@ struct TimingEvent {
 /// Analyze performance timings from the log file
 pub fn analyze_perf(log_path: &Path) -> Result<()> {
     // Read the log file
-    let file = File::open(log_path)
-        .context(format!("Failed to open log file at {:?}", log_path))?;
+    let file =
+        File::open(log_path).context(format!("Failed to open log file at {:?}", log_path))?;
     let reader = BufReader::new(file);
     let lines: Vec<String> = reader.lines().collect::<Result<_, _>>()?;
 
@@ -65,19 +65,20 @@ pub fn analyze_perf(log_path: &Path) -> Result<()> {
 
         // Extract JSON portion
         if let Some(start) = line.find('{')
-            && let Some(end) = line.rfind('}') {
-                let json = &line[start..=end];
-                if let Ok(event) = serde_json::from_str::<TimingEvent>(json) {
-                    // Stop after startup complete to avoid showing subsequent queries
-                    let is_startup_complete = event.op == "startup_complete";
-                    timing_events.push(event);
+            && let Some(end) = line.rfind('}')
+        {
+            let json = &line[start..=end];
+            if let Ok(event) = serde_json::from_str::<TimingEvent>(json) {
+                // Stop after startup complete to avoid showing subsequent queries
+                let is_startup_complete = event.op == "startup_complete";
+                timing_events.push(event);
 
-                    if is_startup_complete {
-                        seen_startup_complete = true;
-                        break;
-                    }
+                if is_startup_complete {
+                    seen_startup_complete = true;
+                    break;
                 }
             }
+        }
     }
 
     if !seen_startup_complete && !timing_events.is_empty() {
@@ -86,11 +87,7 @@ pub fn analyze_perf(log_path: &Path) -> Result<()> {
     }
 
     // Find the longest op name for alignment
-    let max_op_len = timing_events
-        .iter()
-        .map(|e| e.op.len())
-        .max()
-        .unwrap_or(0);
+    let max_op_len = timing_events.iter().map(|e| e.op.len()).max().unwrap_or(0);
 
     // Print timing breakdown with column alignment
     for event in &timing_events {

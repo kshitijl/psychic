@@ -101,8 +101,12 @@ impl Analytics {
 
         // Log impressions
         if !top_n_files.is_empty() {
-            self.db
-                .log_impressions(&subsession_query, &top_n_files, subsession_id, &self.session_id)?;
+            self.db.log_impressions(
+                &subsession_query,
+                &top_n_files,
+                subsession_id,
+                &self.session_id,
+            )?;
 
             // Mark as logged
             if let Some(ref mut s) = self.current_subsession {

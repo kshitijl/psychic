@@ -124,9 +124,17 @@ impl PreviewManager {
     pub fn status(&self, path: &str) -> &str {
         match &self.cache {
             CachedPreview::None => "Not cached",
-            CachedPreview::Light { path: cached_path, .. } if cached_path == path => "Cached (light)",
-            CachedPreview::Full { path: cached_path, .. } if cached_path == path => "Cached (full)",
-            CachedPreview::Directory { path: cached_path, extra_flags, .. } if cached_path == path => {
+            CachedPreview::Light {
+                path: cached_path, ..
+            } if cached_path == path => "Cached (light)",
+            CachedPreview::Full {
+                path: cached_path, ..
+            } if cached_path == path => "Cached (full)",
+            CachedPreview::Directory {
+                path: cached_path,
+                extra_flags,
+                ..
+            } if cached_path == path => {
                 if extra_flags.is_empty() {
                     "Cached (dir)"
                 } else {
@@ -178,9 +186,7 @@ impl PreviewManager {
                     .arg(path)
                     .output();
                 match ls_output {
-                    Ok(output) => {
-                        Text::from(String::from_utf8_lossy(&output.stdout).to_string())
-                    }
+                    Ok(output) => Text::from(String::from_utf8_lossy(&output.stdout).to_string()),
                     Err(_) => Text::from("[Unable to list directory]"),
                 }
             }

@@ -105,7 +105,6 @@ pub struct Cli {
     pub command: Option<Commands>,
 }
 
-
 /// Get the default data directory (~/.local/share/psychic)
 pub fn get_default_data_dir() -> Result<PathBuf> {
     let home = env::var("HOME").context("HOME environment variable not set")?;
