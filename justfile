@@ -16,7 +16,7 @@ lint:
 
 # Analyze performance of latest psychic run
 analyze-perf:
-    @./scripts/analyze-perf.sh
+    @cargo run --release -- internal analyze-perf
 
 # Clear performance logs and run fresh measurement
 measure-perf *ARGS:
@@ -26,4 +26,4 @@ measure-perf *ARGS:
     @cargo run --release -- {{ARGS}} || true
     @sleep 0.5
     @echo ""
-    @./scripts/analyze-perf.sh
+    @cargo run --release -- internal analyze-perf

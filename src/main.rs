@@ -1,3 +1,4 @@
+mod analyze_perf;
 mod context;
 mod db;
 mod feature_defs;
@@ -453,6 +454,17 @@ enum Commands {
     Retrain,
     /// Output shell integration script for zsh
     Zsh,
+    /// Internal development and debugging commands
+    Internal {
+        #[command(subcommand)]
+        command: InternalCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum InternalCommands {
+    /// Analyze performance timings from the latest psychic run
+    AnalyzePerf,
 }
 
 /// Filter type for initial filter
@@ -1122,6 +1134,15 @@ fn main() -> Result<()> {
                 // Output zsh integration script
                 print!("{}", include_str!("../shell/psychic.zsh"));
                 return Ok(());
+            }
+            Commands::Internal { command } => {
+                match command {
+                    InternalCommands::AnalyzePerf => {
+                        let log_path = data_dir.join("app.log");
+                        analyze_perf::analyze_perf(&log_path)?;
+                        return Ok(());
+                    }
+                }
             }
         }
     }

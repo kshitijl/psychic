@@ -23,13 +23,10 @@ Feature computation can be sped up in a bunch of ways:
 Helix file picker is a lot faster. Maybe implement a mode that doesn't sort or run the model or compute features, to make sure it's somewhat as fast.
 
 ## now
-- make it faster
+
+- break main.rs into multiple files. definitely one for that preview caching logic.
 - change layout. if columns getting narrow then do a vertical stack layout so we can see file paths more clearly.
-- dir preview should switch from eza -al to a different command when narrow, so we see the actual filenames instead of less useful owner and permissions.
 - audit the whole codebase for modularity. can we refactor extract something into a module, which can then be expect tested? right now its a big ball of very IO heavy code that makes it difficult to test. maybe the overall state logic and keypress logic? maybe the page caching logic? maybe the logic that when walker is finished it sends an AllDone message? maybe the logic that historical files in cwd still need to shown in filter view?
-- after that think about how to make the filter logic fast, i worry that all that
-constant file path checking over and over is bad, we should do it once and store it in some
-struct that gets recomputed when we change dirs.- once above is fixed: history gets items double added to it
 - when history is filtered, suppose number of items becomes less than selected index, then selected index should become 0 so the top item is automatically becomes selected.
 - display is broken if we scroll past a binary file and it gets previewed
 - if we hit up while file walker is still walking then it shows loading and we end up in some strange middle of the results. instead we should remember our scroll position as -1 and reevaluate that when results are updated.

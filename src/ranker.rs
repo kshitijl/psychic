@@ -241,10 +241,10 @@ impl Ranker {
         let clicks_by_parent_dir = &self.clicks.clicks_by_parent_dir;
         let clicks_by_query_and_file = &self.clicks.clicks_by_query_and_file;
 
-        let all_features: Vec<Vec<f64>> = files
+        let results: Vec<(Vec<f64>, FxHashMap<String, Duration>)> = files
             .par_iter()
             .map(|file| {
-                compute_features(
+                compute_features_with_timing(
                     query,
                     file,
                     current_timestamp,
@@ -257,11 +257,34 @@ impl Ranker {
             })
             .collect();
 
+        // Extract features and aggregate timings
+        let all_features: Vec<Vec<f64>> = results.iter().map(|(f, _)| f.clone()).collect();
+
+        // Aggregate per-feature timings across all files
+        let mut aggregated_timings: FxHashMap<String, Duration> = FxHashMap::default();
+        for (_features, timings) in &results {
+            for (feature_name, duration) in timings {
+                *aggregated_timings.entry(feature_name.clone()).or_insert(Duration::ZERO) += *duration;
+            }
+        }
+
         log::info!(
             "TIMING {{\"op\":\"ml_compute_features\",\"ms\":{},\"count\":{}}}",
             compute_start.elapsed().as_secs_f64() * 1000.0,
             files.len()
         );
+
+        // Log per-feature timings (average per file)
+        let num_files = files.len() as f64;
+        for (feature_name, total_duration) in &aggregated_timings {
+            let avg_ms = total_duration.as_secs_f64() * 1000.0 / num_files;
+            log::info!(
+                "TIMING {{\"op\":\"ml_feature_{}\",\"avg_ms\":{},\"total_ms\":{}}}",
+                feature_name,
+                avg_ms,
+                total_duration.as_secs_f64() * 1000.0
+            );
+        }
 
         // Batch predict all files at once
         // Flatten features into a single vector for batch prediction
