@@ -86,21 +86,37 @@ pub fn analyze_perf(log_path: &Path) -> Result<()> {
         // Just show what we have
     }
 
-    // Print timing breakdown
+    // Find the longest op name for alignment
+    let max_op_len = timing_events
+        .iter()
+        .map(|e| e.op.len())
+        .max()
+        .unwrap_or(0);
+
+    // Print timing breakdown with column alignment
     for event in &timing_events {
         if let Some(avg_ms) = event.avg_ms {
             // ML feature timing with average
             let total_ms = event.total_ms.unwrap_or(0.0);
             println!(
-                "{:.2}\t{}\t(avg per file, total: {:.2}ms)",
-                avg_ms, event.op, total_ms
+                "{:<8.2}{:<width$}(avg per file, total: {:.2}ms)",
+                avg_ms,
+                event.op,
+                total_ms,
+                width = max_op_len + 2
             );
         } else if let Some(ms) = event.ms {
             // Regular timing
             if let Some(count) = event.count {
-                println!("{:.2}\t{}\t({} items)", ms, event.op, count);
+                println!(
+                    "{:<8.2}{:<width$}({} items)",
+                    ms,
+                    event.op,
+                    count,
+                    width = max_op_len + 2
+                );
             } else {
-                println!("{:.2}\t{}", ms, event.op);
+                println!("{:<8.2}{}", ms, event.op);
             }
         }
     }
