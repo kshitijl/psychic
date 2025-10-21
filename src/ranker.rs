@@ -128,8 +128,9 @@ impl Ranker {
         let thirty_days_ago_ts = now_ts - (30 * 24 * 60 * 60);
         log::info!("TIMING {{\"op\":\"timestamp_calc\",\"ms\":{}}}", timestamp_calc_start.elapsed().as_secs_f64() * 1000.0);
 
-        let mut clicks_by_file: HashMap<String, Vec<ClickEvent>> = HashMap::new();
-        let mut clicks_by_query_and_file: HashMap<(String, String), Vec<ClickEvent>> = HashMap::new();
+        // Pre-allocate with reasonable capacity to avoid rehashing
+        let mut clicks_by_file: HashMap<String, Vec<ClickEvent>> = HashMap::with_capacity(128);
+        let mut clicks_by_query_and_file: HashMap<(String, String), Vec<ClickEvent>> = HashMap::with_capacity(256);
 
         let db_open_start = std::time::Instant::now();
         let conn =
@@ -160,15 +161,15 @@ impl Ranker {
             let click_event = ClickEvent { timestamp };
             row_count += 1;
 
-            // Index by file path only
-            clicks_by_file
-                .entry(path.clone())
+            // Index by (query, file_path) first
+            clicks_by_query_and_file
+                .entry((query, path.clone()))
                 .or_default()
                 .push(click_event);
 
-            // Index by (query, file_path)
-            clicks_by_query_and_file
-                .entry((query, path))
+            // Index by file path only (reuse path without clone)
+            clicks_by_file
+                .entry(path)
                 .or_default()
                 .push(click_event);
         }

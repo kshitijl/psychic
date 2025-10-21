@@ -31,8 +31,8 @@ Why: Worker thread architecture prevents UI lag during expensive filtering/ranki
 - **Main (UI)**: Renders UI, blocks on unified event channel, owns visible file slice only
 - **Worker**: Owns all file data, does filtering/ranking, sends results to unified channel
 - **Walker**: Discovers files via walkdir, sends to worker
-- **Crossterm forwarder**: Polls for keyboard/mouse events, sends to unified channel
-- **Tick timer**: Sends tick events every 250ms for UI animations (marquee)
+- **Crossterm forwarder**: Polls for keyboard/mouse events every 10ms, sends to unified channel
+- **Tick timer**: Sends tick events every 200ms for UI animations (marquee)
 
 **Communication via Unified Event Channel:**
 ```

@@ -36,6 +36,45 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Preview cache state - tracks whether we have a light or full preview cached
+#[derive(Clone)]
+enum PreviewCache {
+    /// No preview cached
+    None,
+    /// Light preview cached (first N lines only) for a file
+    Light { path: String, text: Text<'static> },
+    /// Full preview cached (entire file) for a file
+    Full { path: String, text: Text<'static> },
+    /// Directory preview cached (eza output)
+    Directory { path: String, text: Text<'static>, extra_flags: String },
+}
+
+impl PreviewCache {
+    fn get_if_matches(&self, path: &str) -> Option<(Text<'static>, bool)> {
+        match self {
+            PreviewCache::None => None,
+            PreviewCache::Light { path: cached_path, text } if cached_path == path => {
+                Some((text.clone(), false))
+            }
+            PreviewCache::Full { path: cached_path, text } if cached_path == path => {
+                Some((text.clone(), true))
+            }
+            PreviewCache::Directory { .. } => None, // Use get_dir_if_matches instead
+            _ => None,
+        }
+    }
+
+    fn get_dir_if_matches(&self, path: &str, extra_flags: &str) -> Option<Text<'static>> {
+        match self {
+            PreviewCache::Directory { path: cached_path, text, extra_flags: cached_flags }
+                if cached_path == path && cached_flags == extra_flags => {
+                Some(text.clone())
+            }
+            _ => None,
+        }
+    }
+}
+
 /// Unified event type for the main event loop.
 /// All event sources (worker, keyboard/mouse, tick timer) send to a single channel.
 enum AppEvent {
@@ -511,7 +550,7 @@ struct App {
     selected_index: usize,
     file_list_scroll: usize, // Scroll offset for file list
     preview_scroll: usize,
-    preview_cache: Option<(String, Text<'static>)>, // (file_path, rendered_text)
+    preview_cache: PreviewCache,
     scrolled_files: HashSet<(String, String)>, // (query, full_path) - track what we've logged scroll for
     session_id: String,
     current_subsession: Option<Subsession>,
@@ -605,7 +644,7 @@ impl App {
             selected_index: 0,
             file_list_scroll: 0,
             preview_scroll: 0,
-            preview_cache: None,
+            preview_cache: PreviewCache::None,
             scrolled_files: HashSet::new(),
             session_id,
             current_subsession: None,
@@ -775,7 +814,7 @@ impl App {
 
         // Reset preview scroll and clear cache when changing selection
         self.preview_scroll = 0;
-        self.preview_cache = None;
+        self.preview_cache = PreviewCache::None;
 
         // Reset marquee scroll
         self.path_bar_scroll = 0;
@@ -810,7 +849,7 @@ impl App {
         self.history_selected = new_index as usize;
 
         // Clear preview cache when selection changes
-        self.preview_cache = None;
+        self.preview_cache = PreviewCache::None;
         self.preview_scroll = 0;
     }
 
@@ -1220,53 +1259,48 @@ fn main() -> Result<()> {
         log_session_start.elapsed().as_secs_f64() * 1000.0
     );
 
-    // DISABLED: Log the initial directory as a click event (with empty query)
-    // This was taking 200ms+ due to synchronous DB write, blocking startup
-    // TODO: Re-enable with async logging or move to background thread
-    /*
-    let log_dir_click_start = Instant::now();
-    {
-        let dir_name = root
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(".");
-
-        // Get metadata for the directory
-        let metadata = std::fs::metadata(&root).ok();
-        let mtime = metadata.as_ref().and_then(|m| {
-            m.modified().ok().and_then(|t| {
-                t.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs() as i64)
-            })
-        });
-        let atime = metadata.as_ref().and_then(|m| {
-            m.accessed().ok().and_then(|t| {
-                t.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs() as i64)
-            })
-        });
-        let file_size = metadata.as_ref().map(|m| m.len() as i64);
-
-        let _ = app.db.log_event(EventData {
-            query: "",
-            file_path: dir_name,
-            full_path: &root.to_string_lossy(),
-            mtime,
-            atime,
-            file_size,
-            subsession_id: 0, // Initial event, before any query
-            action: db::UserInteraction::Click,
-            session_id: &app.session_id,
-        });
-    }
-    log::info!("TIMING {{\"op\":\"log_initial_dir_click\",\"ms\":{}}}", log_dir_click_start.elapsed().as_secs_f64() * 1000.0);
-    */
-
-    // Gather context in background thread
+    // Gather context in background thread and log initial directory click
     let context_spawn_start = Instant::now();
     let session_id_clone = app.session_id.clone();
     let data_dir_clone = data_dir.clone();
+    let root_clone = root.clone();
     std::thread::spawn(move || {
         let context = context::gather_context();
         if let Ok(db) = db::Database::new(&data_dir_clone) {
+            // Log the initial directory as a click event (with empty query)
+            // This happens in background thread so it doesn't block startup
+            let dir_name = root_clone
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(".");
+
+            // Get metadata for the directory
+            let metadata = std::fs::metadata(&root_clone).ok();
+            let mtime = metadata.as_ref().and_then(|m| {
+                m.modified().ok().and_then(|t| {
+                    t.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs() as i64)
+                })
+            });
+            let atime = metadata.as_ref().and_then(|m| {
+                m.accessed().ok().and_then(|t| {
+                    t.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs() as i64)
+                })
+            });
+            let file_size = metadata.as_ref().map(|m| m.len() as i64);
+
+            let _ = db.log_event(EventData {
+                query: "",
+                file_path: dir_name,
+                full_path: &root_clone.to_string_lossy(),
+                mtime,
+                atime,
+                file_size,
+                subsession_id: 0, // Initial event, before any query
+                action: db::UserInteraction::Click,
+                session_id: &session_id_clone,
+            });
+
+            // Continue with context logging
             let _ = db.log_session(&session_id_clone, &context);
         }
     });
@@ -1573,7 +1607,7 @@ fn run_app(
                 .unwrap_or(false);
 
             // Preview on the right using bat (with smart caching)
-            let preview_height = top_chunks[1].height.saturating_sub(2);
+            let _preview_height = top_chunks[1].height.saturating_sub(2);
             let preview_text = if app.no_preview {
                 // Skip preview generation when --no-preview is enabled
                 Text::from("")
@@ -1581,69 +1615,114 @@ fn run_app(
                 if let Some(current_file_path) = &current_file_path {
                     let full_path = PathBuf::from(current_file_path);
 
-                    // For directories, show eza -al output
+                    // For directories, show eza -al output with caching
                     if is_dir {
                         let preview_width = top_chunks[1].width;
                         let extra_flags = app.ui_state.get_eza_flags(preview_width);
 
-                        let mut eza_cmd = std::process::Command::new("eza");
-                        eza_cmd.arg("-al").arg("--color=always");
-
-                        // Add extra flags if preview is narrow
-                        for flag in extra_flags.split_whitespace() {
-                            if !flag.is_empty() {
-                                eza_cmd.arg(flag);
-                            }
-                        }
-
-                        eza_cmd.arg(&full_path);
-                        let eza_start = Instant::now();
-                        let eza_output = eza_cmd.output();
-                        log::info!(
-                            "TIMING {{\"op\":\"eza_dir_preview\",\"ms\":{}}}",
-                            eza_start.elapsed().as_secs_f64() * 1000.0
-                        );
-
-                        match eza_output {
-                            Ok(output) => match ansi_to_tui::IntoText::into_text(&output.stdout) {
-                                Ok(text) => text,
-                                Err(_) => Text::from("[Unable to parse directory listing]"),
-                            },
-                            Err(_) => {
-                                // Fallback to ls if eza not available
-                                let ls_output = std::process::Command::new("ls")
-                                    .arg("-lah")
-                                    .arg(&full_path)
-                                    .output();
-                                match ls_output {
-                                    Ok(output) => Text::from(
-                                        String::from_utf8_lossy(&output.stdout).to_string(),
-                                    ),
-                                    Err(_) => Text::from("[Unable to list directory]"),
-                                }
-                            }
-                        }
-                    } else {
-                        // For files, use bat as before
-                        let full_path = PathBuf::from(current_file_path);
-
-                        // Check for a full, cached preview
-                        if let Some(cached_text) =
-                            app.preview_cache.as_ref().and_then(|(path, text)| {
-                                if path == current_file_path {
-                                    Some(text.clone())
-                                } else {
-                                    None
-                                }
-                            })
-                        {
-                            // FAST PATH: Full preview is cached, just use it.
+                        // Check cache first
+                        if let Some(cached_text) = app.preview_cache.get_dir_if_matches(current_file_path, &extra_flags) {
+                            // FAST PATH: Directory listing is cached with matching flags
                             cached_text
                         } else {
-                            // SLOW PATH: No full preview in cache.
-                            // Decide whether to render a light preview or a full one.
-                            let (text_to_render, should_cache) = if app.preview_scroll == 0 {
-                                // Initial view (unscrolled): render a light preview of N lines.
+                            // SLOW PATH: Generate directory listing
+                            let mut eza_cmd = std::process::Command::new("eza");
+                            eza_cmd.arg("-al").arg("--color=always");
+
+                            // Add extra flags if preview is narrow
+                            for flag in extra_flags.split_whitespace() {
+                                if !flag.is_empty() {
+                                    eza_cmd.arg(flag);
+                                }
+                            }
+
+                            eza_cmd.arg(&full_path);
+                            let eza_start = Instant::now();
+                            let eza_output = eza_cmd.output();
+                            log::info!(
+                                "TIMING {{\"op\":\"eza_dir_preview\",\"ms\":{}}}",
+                                eza_start.elapsed().as_secs_f64() * 1000.0
+                            );
+
+                            let text = match eza_output {
+                                Ok(output) => match ansi_to_tui::IntoText::into_text(&output.stdout) {
+                                    Ok(text) => text,
+                                    Err(_) => Text::from("[Unable to parse directory listing]"),
+                                },
+                                Err(_) => {
+                                    // Fallback to ls if eza not available
+                                    let ls_output = std::process::Command::new("ls")
+                                        .arg("-lah")
+                                        .arg(&full_path)
+                                        .output();
+                                    match ls_output {
+                                        Ok(output) => Text::from(
+                                            String::from_utf8_lossy(&output.stdout).to_string(),
+                                        ),
+                                        Err(_) => Text::from("[Unable to list directory]"),
+                                    }
+                                }
+                            };
+
+                            // Cache the directory listing
+                            app.preview_cache = PreviewCache::Directory {
+                                path: current_file_path.to_string(),
+                                text: text.clone(),
+                                extra_flags: extra_flags.to_string(),
+                            };
+                            text
+                        }
+                    } else {
+                        // For files, use bat with three-state caching
+                        let full_path = PathBuf::from(current_file_path);
+                        let preview_height = top_chunks[1].height.saturating_sub(2);
+
+                        // Check cache state
+                        match app.preview_cache.get_if_matches(current_file_path) {
+                            Some((cached_text, is_full)) => {
+                                // We have a cached preview
+                                if is_full || app.preview_scroll == 0 {
+                                    // FAST PATH: We have what we need (full, or light + unscrolled)
+                                    cached_text
+                                } else {
+                                    // We have light cached but user scrolled - need to upgrade to full
+                                    let bat_start = Instant::now();
+                                    let bat_output = std::process::Command::new("bat")
+                                        .arg("--color=always")
+                                        .arg("--style=numbers")
+                                        .arg("--paging=never")
+                                        .arg(&full_path)
+                                        .output();
+                                    log::info!(
+                                        "TIMING {{\"op\":\"bat_full_preview\",\"ms\":{}}}",
+                                        bat_start.elapsed().as_secs_f64() * 1000.0
+                                    );
+
+                                    let text = match bat_output {
+                                        Ok(output) => {
+                                            match ansi_to_tui::IntoText::into_text(&output.stdout) {
+                                                Ok(text) => text,
+                                                Err(_) => Text::from("[Unable to parse preview]"),
+                                            }
+                                        }
+                                        Err(_) => {
+                                            match std::fs::read_to_string(&full_path) {
+                                                Ok(content) => Text::from(content),
+                                                Err(_) => Text::from("[Unable to preview file]"),
+                                            }
+                                        }
+                                    };
+
+                                    // Cache full preview
+                                    app.preview_cache = PreviewCache::Full {
+                                        path: current_file_path.to_string(),
+                                        text: text.clone(),
+                                    };
+                                    text
+                                }
+                            }
+                            None => {
+                                // No cache - generate light preview
                                 let line_range = format!(":{}", preview_height);
                                 let bat_start = Instant::now();
                                 let bat_output = std::process::Command::new("bat")
@@ -1679,44 +1758,14 @@ fn run_app(
                                         }
                                     }
                                 };
-                                (text, false) // Don't cache the light preview
-                            } else {
-                                // User is scrolling, and we need to generate the full preview.
-                                let bat_start = Instant::now();
-                                let bat_output = std::process::Command::new("bat")
-                                    .arg("--color=always")
-                                    .arg("--style=numbers")
-                                    .arg("--paging=never")
-                                    .arg(&full_path)
-                                    .output();
-                                log::info!(
-                                    "TIMING {{\"op\":\"bat_full_preview\",\"ms\":{}}}",
-                                    bat_start.elapsed().as_secs_f64() * 1000.0
-                                );
 
-                                let text = match bat_output {
-                                    Ok(output) => {
-                                        match ansi_to_tui::IntoText::into_text(&output.stdout) {
-                                            Ok(text) => text,
-                                            Err(_) => Text::from("[Unable to parse preview]"),
-                                        }
-                                    }
-                                    Err(_) => {
-                                        // Fallback for full preview
-                                        match std::fs::read_to_string(&full_path) {
-                                            Ok(content) => Text::from(content),
-                                            Err(_) => Text::from("[Unable to preview file]"),
-                                        }
-                                    }
+                                // Cache light preview
+                                app.preview_cache = PreviewCache::Light {
+                                    path: current_file_path.to_string(),
+                                    text: text.clone(),
                                 };
-                                (text, true) // Cache the full preview
-                            };
-
-                            if should_cache {
-                                app.preview_cache =
-                                    Some((current_file_path.to_string(), text_to_render.clone()));
+                                text
                             }
-                            text_to_render
                         }
                     } // End of else block for files
                 } else {
@@ -1814,11 +1863,19 @@ fn run_app(
             // Add preview cache status
             if let Some((file_path, _, _)) = &current_file_info {
                 let full_path_str = file_path.to_string_lossy().to_string();
-                let is_cached = app
-                    .preview_cache
-                    .as_ref()
-                    .is_some_and(|(p, _)| p == &full_path_str);
-                let cache_status = if is_cached { "Cached" } else { "Live" };
+                let cache_status = match &app.preview_cache {
+                    PreviewCache::None => "Not cached",
+                    PreviewCache::Light { path, .. } if path == &full_path_str => "Cached (light)",
+                    PreviewCache::Full { path, .. } if path == &full_path_str => "Cached (full)",
+                    PreviewCache::Directory { path, extra_flags, .. } if path == &full_path_str => {
+                        if extra_flags.is_empty() {
+                            "Cached (dir)"
+                        } else {
+                            "Cached (dir+flags)"
+                        }
+                    }
+                    _ => "Not cached",
+                };
                 debug_lines.push(format!("Preview: {}", cache_status));
             } else {
                 debug_lines.push(String::from("Preview: N/A"));
@@ -2256,7 +2313,7 @@ fn run_app(
                                     // Set cursor to current position in history
                                     app.history_selected = app.history.current_display_index();
                                     app.query.clear();
-                                    app.preview_cache = None; // Clear preview cache
+                                    app.preview_cache = PreviewCache::None; // Clear preview cache
                                 }
                             }
                             KeyCode::Char('c')
