@@ -4,7 +4,15 @@ Use asserts liberally throughout the code. For any function, consider documentin
 
 If a function returns a tuple, strongly consider defining and returning a struct instead. This way we give a name to each field.
 
-Separation of concerns: think hard about the API between different components. A minimal API should be exposed. The work of each component should be defined, and functions for that should live in the code for that component. They should not be public.
+## Module Design Philosophy
+
+Follow John Ousterhout's "deep modules" philosophy:
+* **Small interface, deep implementation** - Each module should have a minimal public API that hides substantial complexity inside
+* **Separation of concerns** - Think hard about the API between different components. A minimal API should be exposed.
+* **Information hiding** - The work of each component should be defined, and functions for that should live in the code for that component. They should not be public.
+* **Example of a good deep module:** `preview.rs` (if extracted) would expose just `render()`, `scroll()`, `reset_scroll()` but hide all the bat/eza execution, caching, ANSI parsing, width adaptation logic inside.
+
+See `refactor.md` for planned module extractions following this philosophy.
 
 Read src/main.rs to understand the entrypoint. Read train.py to understand how the model is made.
 
