@@ -10,6 +10,48 @@ use std::time::Instant;
 use crate::app::App;
 use crate::path_display::truncate_absolute_path;
 
+/// Compute the scroll offset for the file list based on selection and visible area
+fn compute_scroll(
+    selected_index: usize,
+    current_scroll: usize,
+    total_results: usize,
+    visible_height: usize,
+) -> usize {
+    if total_results == 0 {
+        return 0;
+    }
+
+    // If all results fit on screen, don't scroll at all
+    if total_results <= visible_height {
+        return 0;
+    }
+
+    // Auto-scroll the file list when selection is near top or bottom
+    let mut scroll = current_scroll;
+
+    // If selected item is above visible area, scroll up
+    if selected_index < scroll {
+        scroll = selected_index;
+    }
+    // If selected item is below visible area, scroll down
+    else if selected_index >= scroll + visible_height {
+        // Smart positioning: leave some space from bottom (5 lines)
+        // This makes wrap-around more comfortable
+        let margin = 5usize;
+        scroll = selected_index.saturating_sub(
+            visible_height
+                .saturating_sub(margin)
+                .min(visible_height - 1),
+        );
+    }
+    // If we're in the bottom 5 items and there's more to see, keep scrolling
+    else if selected_index >= scroll + visible_height.saturating_sub(5) {
+        scroll = selected_index.saturating_sub(visible_height.saturating_sub(5));
+    }
+
+    scroll
+}
+
 /// Render the history navigation mode UI
 pub fn render_history_mode(f: &mut Frame, app: &App) {
     // Split vertically: top for dir list + preview, bottom for input
@@ -153,20 +195,63 @@ pub fn render_history_mode(f: &mut Frame, app: &App) {
         );
     f.render_widget(input_para, input_area);
 }
+/// State updates computed during rendering that need to be applied to App after rendering
+pub struct RenderUpdates {
+    pub file_list_scroll: Option<usize>,
+    pub preview_cache: Option<crate::preview::PreviewCache>,
+    pub path_bar_scroll: Option<u16>,
+    pub path_bar_scroll_direction: Option<i8>,
+    pub last_path_bar_update: Option<std::time::Instant>,
+}
+
+impl RenderUpdates {
+    pub fn new() -> Self {
+        Self {
+            file_list_scroll: None,
+            preview_cache: None,
+            path_bar_scroll: None,
+            path_bar_scroll_direction: None,
+            last_path_bar_update: None,
+        }
+    }
+
+    /// Apply the computed updates to the App
+    pub fn apply_to(self, app: &mut crate::app::App) {
+        if let Some(scroll) = self.file_list_scroll {
+            app.file_list_scroll = scroll;
+        }
+        if let Some(cache) = self.preview_cache {
+            app.preview_cache = cache;
+        }
+        if let Some(scroll) = self.path_bar_scroll {
+            app.path_bar_scroll = scroll;
+        }
+        if let Some(dir) = self.path_bar_scroll_direction {
+            app.path_bar_scroll_direction = dir;
+        }
+        if let Some(time) = self.last_path_bar_update {
+            app.last_path_bar_update = time;
+        }
+    }
+}
+
 /// Render the normal mode UI (file list, preview, debug pane)
+/// Returns computed state updates that should be applied to App after rendering
 pub fn render_normal_mode(
     f: &mut Frame,
-    app: &mut crate::app::App,
+    app: &crate::app::App,
     marquee_delay: std::time::Duration,
     marquee_speed: std::time::Duration,
-) {
+) -> RenderUpdates {
+    let mut updates = RenderUpdates::new();
     use ratatui::layout::Rect;
     use ratatui::widgets::Clear;
     use std::path::PathBuf;
     
     use crate::{feature_defs, preview, ranker, search_worker, ui_state};
-    use crate::app::{PreviewCache, PAGE_SIZE};
+    use crate::app::PAGE_SIZE;
     use crate::path_display::{get_time_ago, truncate_path};
+    use crate::preview::PreviewCache;
 
     // Check terminal width to decide layout direction
     let terminal_width = f.area().width;
@@ -233,13 +318,19 @@ pub fn render_normal_mode(
         }
     };
 
-    // Update scroll position based on selection and visible height
+    // Compute scroll position based on selection and visible height
     let visible_height = top_chunks[0].height.saturating_sub(2); // subtract border
-    app.update_scroll(visible_height);
+    let file_list_scroll = compute_scroll(
+        app.selected_index,
+        app.file_list_scroll,
+        app.total_results,
+        visible_height as usize,
+    );
+    updates.file_list_scroll = Some(file_list_scroll);
 
     // File list on the left
     let list_width = top_chunks[0].width.saturating_sub(2) as usize; // subtract borders
-    let scroll_offset = app.file_list_scroll;
+    let scroll_offset = file_list_scroll;
 
     // Build list items from page cache
     let items: Vec<ListItem> = (0..visible_height as usize)
@@ -416,7 +507,7 @@ pub fn render_normal_mode(
                 app.preview_scroll,
                 extra_flags,
             );
-            app.preview_cache = new_cache;
+            updates.preview_cache = Some(new_cache);
             text
         } else {
             Text::from("[Loading preview...]")
@@ -601,40 +692,57 @@ pub fn render_normal_mode(
     let path_bar_width = main_chunks[1].width as usize;
 
     // Marquee animation logic
-    if padded_path.len() > path_bar_width {
-        let now = Instant::now();
-        let time_since_update = now.duration_since(app.last_path_bar_update);
+    let (path_bar_scroll, path_bar_scroll_direction, last_path_bar_update) =
+        if padded_path.len() > path_bar_width {
+            let now = Instant::now();
+            let time_since_update = now.duration_since(app.last_path_bar_update);
 
-        let max_scroll = padded_path.len().saturating_sub(path_bar_width) as u16;
+            let max_scroll = padded_path.len().saturating_sub(path_bar_width) as u16;
 
-        // Pause at the ends of the scroll
-        let should_scroll = if app.path_bar_scroll == 0 || app.path_bar_scroll >= max_scroll
-        {
-            time_since_update > marquee_delay
+            // Pause at the ends of the scroll
+            let should_scroll = if app.path_bar_scroll == 0 || app.path_bar_scroll >= max_scroll
+            {
+                time_since_update > marquee_delay
+            } else {
+                time_since_update > marquee_speed
+            };
+
+            if should_scroll {
+                let (new_scroll, new_direction) = if app.path_bar_scroll_direction == 1 {
+                    if app.path_bar_scroll < max_scroll {
+                        (app.path_bar_scroll + 1, app.path_bar_scroll_direction)
+                    } else {
+                        (app.path_bar_scroll, -1) // Change direction
+                    }
+                } else if app.path_bar_scroll > 0 {
+                    (app.path_bar_scroll - 1, app.path_bar_scroll_direction)
+                } else {
+                    (app.path_bar_scroll, 1) // Change direction
+                };
+                (Some(new_scroll), Some(new_direction), Some(now))
+            } else {
+                (None, None, None)
+            }
         } else {
-            time_since_update > marquee_speed
+            (None, None, None)
         };
 
-        if should_scroll {
-            if app.path_bar_scroll_direction == 1 {
-                if app.path_bar_scroll < max_scroll {
-                    app.path_bar_scroll += 1;
-                } else {
-                    app.path_bar_scroll_direction = -1; // Change direction
-                }
-            } else if app.path_bar_scroll > 0 {
-                app.path_bar_scroll -= 1;
-            } else {
-                app.path_bar_scroll_direction = 1; // Change direction
-            }
-            app.last_path_bar_update = now;
-        }
+    // Store marquee updates
+    if let Some(scroll) = path_bar_scroll {
+        updates.path_bar_scroll = Some(scroll);
+    }
+    if let Some(dir) = path_bar_scroll_direction {
+        updates.path_bar_scroll_direction = Some(dir);
+    }
+    if let Some(time) = last_path_bar_update {
+        updates.last_path_bar_update = Some(time);
     }
 
-    // Path bar
+    // Path bar - use current app value for rendering since updates will be applied later
+    let current_path_bar_scroll = path_bar_scroll.unwrap_or(app.path_bar_scroll);
     let path_bar = Paragraph::new(padded_path)
         .style(Style::default().fg(Color::DarkGray))
-        .scroll((0, app.path_bar_scroll));
+        .scroll((0, current_path_bar_scroll));
     f.render_widget(path_bar, main_chunks[1]);
 
     // Search input at the bottom
@@ -704,4 +812,6 @@ pub fn render_normal_mode(
     let cursor_x = main_chunks[2].x + 1 + app.query.len() as u16;
     let cursor_y = main_chunks[2].y + 1; // 1 for top border
     f.set_cursor_position((cursor_x, cursor_y));
+
+    updates
 }

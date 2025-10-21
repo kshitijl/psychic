@@ -19,7 +19,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use crate::app::App;
 use crate::cli::{OnCwdVisitAction, OnDirClickAction};
 use crate::db::{EventData, UserInteraction};
-use crate::app::PreviewCache;
+use crate::preview::PreviewCache;
 use crate::search_worker::{FilterType, UpdateQueryRequest, WorkerRequest};
 
 /// Action to take after handling input

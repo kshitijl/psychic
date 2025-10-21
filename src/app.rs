@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use ratatui::text::Text;
 use std::{
     collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
@@ -11,6 +10,7 @@ use std::{
 use crate::analytics::Analytics;
 use crate::cli::{OnCwdVisitAction, OnDirClickAction};
 use crate::db::{EventData, FileMetadata};
+use crate::preview::PreviewCache;
 use crate::search_worker::{self, DisplayFileInfo, WorkerRequest};
 use crate::{history, ranker, ui_state};
 
@@ -20,52 +20,6 @@ pub struct Page {
     pub start_index: usize,
     pub end_index: usize,
     pub files: Vec<DisplayFileInfo>,
-}
-
-/// Preview cache state - tracks whether we have a light or full preview cached
-#[derive(Clone)]
-pub enum PreviewCache {
-    /// No preview cached
-    None,
-    /// Light preview cached (first N lines only) for a file
-    Light { path: String, text: Text<'static> },
-    /// Full preview cached (entire file) for a file
-    Full { path: String, text: Text<'static> },
-    /// Directory preview cached (eza output)
-    Directory {
-        path: String,
-        text: Text<'static>,
-        extra_flags: String,
-    },
-}
-
-impl PreviewCache {
-    pub fn get_if_matches(&self, path: &str) -> Option<(Text<'static>, bool)> {
-        match self {
-            PreviewCache::None => None,
-            PreviewCache::Light {
-                path: cached_path,
-                text,
-            } if cached_path == path => Some((text.clone(), false)),
-            PreviewCache::Full {
-                path: cached_path,
-                text,
-            } if cached_path == path => Some((text.clone(), true)),
-            PreviewCache::Directory { .. } => None, // Use get_dir_if_matches instead
-            _ => None,
-        }
-    }
-
-    pub fn get_dir_if_matches(&self, path: &str, extra_flags: &str) -> Option<Text<'static>> {
-        match self {
-            PreviewCache::Directory {
-                path: cached_path,
-                text,
-                extra_flags: cached_flags,
-            } if cached_path == path && cached_flags == extra_flags => Some(text.clone()),
-            _ => None,
-        }
-    }
 }
 
 // Page-based caching constants

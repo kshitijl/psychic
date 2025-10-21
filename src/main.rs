@@ -435,6 +435,7 @@ fn run_app(
 
         // Draw UI
         let draw_start = Instant::now();
+        let mut render_updates = None;
         terminal.draw(|f| {
             // Log first render
             if !first_render_logged {
@@ -452,8 +453,14 @@ fn run_app(
             }
 
             // Render normal mode UI using render module
-            render::render_normal_mode(f, app, marquee_delay, marquee_speed);
+            let updates = render::render_normal_mode(f, app, marquee_delay, marquee_speed);
+            render_updates = Some(updates);
         })?;
+
+        // Apply render updates to app state after rendering is complete
+        if let Some(updates) = render_updates {
+            updates.apply_to(app);
+        }
 
         // Log draw time and check for first full render (with data)
         let draw_time = draw_start.elapsed().as_secs_f64() * 1000.0;
