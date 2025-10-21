@@ -1,6 +1,6 @@
 use anyhow::Result;
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 // Re-export from parent features module
@@ -25,9 +25,9 @@ pub struct FeatureInputs<'a> {
     pub full_path: &'a Path,
     pub mtime: Option<i64>,
     pub cwd: &'a Path,
-    pub clicks_by_file: &'a HashMap<String, Vec<ClickEvent>>,
-    pub clicks_by_parent_dir: &'a HashMap<PathBuf, Vec<ClickEvent>>,
-    pub clicks_by_query_and_file: &'a HashMap<(String, String), Vec<ClickEvent>>,
+    pub clicks_by_file: &'a FxHashMap<String, Vec<ClickEvent>>,
+    pub clicks_by_parent_dir: &'a FxHashMap<PathBuf, Vec<ClickEvent>>,
+    pub clicks_by_query_and_file: &'a FxHashMap<(String, String), Vec<ClickEvent>>,
     pub current_timestamp: i64,
     pub session: Option<&'a Session>,
     pub is_from_walker: bool,

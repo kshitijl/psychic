@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use csv::Writer;
 use rusqlite::Connection;
+use rustc_hash::FxHashMap;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -34,11 +35,11 @@ pub enum OutputFormat {
 
 // Accumulator for fold-based processing
 struct Accumulator {
-    clicks_by_file: HashMap<String, Vec<ClickEvent>>,
-    clicks_by_parent_dir: HashMap<std::path::PathBuf, Vec<ClickEvent>>,
-    clicks_by_query_and_file: HashMap<(String, String), Vec<ClickEvent>>,
+    clicks_by_file: FxHashMap<String, Vec<ClickEvent>>,
+    clicks_by_parent_dir: FxHashMap<std::path::PathBuf, Vec<ClickEvent>>,
+    clicks_by_query_and_file: FxHashMap<(String, String), Vec<ClickEvent>>,
     // Key: (session_id, subsession_id, full_path)
-    pending_impressions: HashMap<(String, u64, String), PendingImpression>,
+    pending_impressions: FxHashMap<(String, u64, String), PendingImpression>,
     output_rows: Vec<HashMap<String, String>>,
     // Track current group ID - increments with each click/scroll and session change
     current_group_id: u64,
@@ -55,10 +56,10 @@ struct PendingImpression {
 impl Accumulator {
     fn new() -> Self {
         Self {
-            clicks_by_file: HashMap::new(),
-            clicks_by_parent_dir: HashMap::new(),
-            clicks_by_query_and_file: HashMap::new(),
-            pending_impressions: HashMap::new(),
+            clicks_by_file: FxHashMap::default(),
+            clicks_by_parent_dir: FxHashMap::default(),
+            clicks_by_query_and_file: FxHashMap::default(),
+            pending_impressions: FxHashMap::default(),
             output_rows: Vec::new(),
             current_group_id: 0,
             last_session_id: None,

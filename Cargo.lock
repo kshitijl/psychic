@@ -914,6 +914,7 @@ dependencies = [
  "rayon",
  "regex",
  "rusqlite",
+ "rustc-hash",
  "serde",
  "serde_json",
  "timeago",

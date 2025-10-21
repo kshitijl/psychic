@@ -3,7 +3,7 @@ use jiff::Timestamp;
 use lightgbm3::Booster;
 use rayon::prelude::*;
 use rusqlite::Connection;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
@@ -48,9 +48,9 @@ pub struct FeatureImportance {
 }
 
 pub struct ClickData {
-    pub clicks_by_file: HashMap<String, Vec<ClickEvent>>,
-    pub clicks_by_parent_dir: HashMap<PathBuf, Vec<ClickEvent>>,
-    pub clicks_by_query_and_file: HashMap<(String, String), Vec<ClickEvent>>,
+    pub clicks_by_file: FxHashMap<String, Vec<ClickEvent>>,
+    pub clicks_by_parent_dir: FxHashMap<PathBuf, Vec<ClickEvent>>,
+    pub clicks_by_query_and_file: FxHashMap<(String, String), Vec<ClickEvent>>,
 }
 
 pub struct Ranker {
@@ -89,9 +89,9 @@ impl Ranker {
         Ok(Ranker {
             model: None,
             clicks: ClickData {
-                clicks_by_file: HashMap::new(),
-                clicks_by_parent_dir: HashMap::new(),
-                clicks_by_query_and_file: HashMap::new(),
+                clicks_by_file: FxHashMap::default(),
+                clicks_by_parent_dir: FxHashMap::default(),
+                clicks_by_query_and_file: FxHashMap::default(),
             },
             stats: None,
         })
@@ -129,8 +129,8 @@ impl Ranker {
         log::info!("TIMING {{\"op\":\"timestamp_calc\",\"ms\":{}}}", timestamp_calc_start.elapsed().as_secs_f64() * 1000.0);
 
         // Pre-allocate with reasonable capacity to avoid rehashing
-        let mut clicks_by_file: HashMap<String, Vec<ClickEvent>> = HashMap::with_capacity(128);
-        let mut clicks_by_query_and_file: HashMap<(String, String), Vec<ClickEvent>> = HashMap::with_capacity(256);
+        let mut clicks_by_file: FxHashMap<String, Vec<ClickEvent>> = FxHashMap::with_capacity_and_hasher(128, Default::default());
+        let mut clicks_by_query_and_file: FxHashMap<(String, String), Vec<ClickEvent>> = FxHashMap::with_capacity_and_hasher(256, Default::default());
 
         let db_open_start = std::time::Instant::now();
         let conn =
@@ -177,7 +177,7 @@ impl Ranker {
 
         // Build parent directory index
         let parent_dir_start = std::time::Instant::now();
-        let mut clicks_by_parent_dir: HashMap<PathBuf, Vec<ClickEvent>> = HashMap::new();
+        let mut clicks_by_parent_dir: FxHashMap<PathBuf, Vec<ClickEvent>> = FxHashMap::default();
         for (path, clicks) in &clicks_by_file {
             if let Some(parent) = Path::new(path).parent() {
                 clicks_by_parent_dir
@@ -317,7 +317,7 @@ impl Ranker {
 }
 
 /// Convert feature vector to HashMap (for display purposes)
-pub fn features_to_map(features: &[f64]) -> HashMap<String, f64> {
+pub fn features_to_map(features: &[f64]) -> FxHashMap<String, f64> {
     feature_names()
         .iter()
         .zip(features.iter())
@@ -331,9 +331,9 @@ fn compute_features(
     file: &FileCandidate,
     current_timestamp: i64,
     cwd: &Path,
-    clicks_by_file: &HashMap<String, Vec<ClickEvent>>,
-    clicks_by_parent_dir: &HashMap<PathBuf, Vec<ClickEvent>>,
-    clicks_by_query_and_file: &HashMap<(String, String), Vec<ClickEvent>>,
+    clicks_by_file: &FxHashMap<String, Vec<ClickEvent>>,
+    clicks_by_parent_dir: &FxHashMap<PathBuf, Vec<ClickEvent>>,
+    clicks_by_query_and_file: &FxHashMap<(String, String), Vec<ClickEvent>>,
 ) -> Result<Vec<f64>> {
     let (features, _timings) = compute_features_with_timing(
         query,
@@ -353,10 +353,10 @@ fn compute_features_with_timing(
     file: &FileCandidate,
     current_timestamp: i64,
     cwd: &Path,
-    clicks_by_file: &HashMap<String, Vec<ClickEvent>>,
-    clicks_by_parent_dir: &HashMap<PathBuf, Vec<ClickEvent>>,
-    clicks_by_query_and_file: &HashMap<(String, String), Vec<ClickEvent>>,
-) -> Result<(Vec<f64>, HashMap<String, Duration>)> {
+    clicks_by_file: &FxHashMap<String, Vec<ClickEvent>>,
+    clicks_by_parent_dir: &FxHashMap<PathBuf, Vec<ClickEvent>>,
+    clicks_by_query_and_file: &FxHashMap<(String, String), Vec<ClickEvent>>,
+) -> Result<(Vec<f64>, FxHashMap<String, Duration>)> {
     // Create FeatureInputs for inference
     let inputs = FeatureInputs {
         query,
@@ -375,7 +375,7 @@ fn compute_features_with_timing(
 
     // Compute all features using the registry, tracking time for each
     let mut features = Vec::with_capacity(FEATURE_REGISTRY.len());
-    let mut timings = HashMap::new();
+    let mut timings = FxHashMap::default();
 
     for feature in FEATURE_REGISTRY.iter() {
         let start = Instant::now();
@@ -639,7 +639,7 @@ mod tests {
         };
 
         // Create synthetic click data
-        let mut clicks_by_file = HashMap::new();
+        let mut clicks_by_file = FxHashMap::default();
         // Add 3 clicks to bar.txt
         clicks_by_file.insert(
             "/tmp/foo/bar.txt".to_string(),
@@ -664,7 +664,7 @@ mod tests {
         );
 
         // Build parent directory index
-        let mut clicks_by_parent_dir = HashMap::new();
+        let mut clicks_by_parent_dir = FxHashMap::default();
         for (path, clicks) in &clicks_by_file {
             if let Some(parent) = Path::new(path).parent() {
                 clicks_by_parent_dir
@@ -675,7 +675,7 @@ mod tests {
         }
 
         // Build (query, file) index - add 2 query-specific clicks
-        let mut clicks_by_query_and_file = HashMap::new();
+        let mut clicks_by_query_and_file = FxHashMap::default();
         clicks_by_query_and_file.insert(
             (query.to_string(), "/tmp/foo/bar.txt".to_string()),
             vec![
