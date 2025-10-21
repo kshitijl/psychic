@@ -39,6 +39,7 @@ Helix file picker is a lot faster. Maybe implement a mode that doesn't sort or r
 
 ## now
 
+- ctrl-left and right arrow for moving forward and back in history. ctrl-up for going up one dir.
 - audit the whole codebase for modularity. can we refactor extract something into a module, which can then be expect tested? right now its a big ball of very IO heavy code that makes it difficult to test. maybe the overall state logic and keypress logic? maybe the page caching logic? maybe the logic that when walker is finished it sends an AllDone message? maybe the logic that historical files in cwd still need to shown in filter view?
 - when history is filtered, suppose number of items becomes less than selected index, then selected index should become 0 so the top item is automatically becomes selected.
 - display is broken if we scroll past a binary file and it gets previewed
@@ -54,7 +55,6 @@ Helix file picker is a lot faster. Maybe implement a mode that doesn't sort or r
 - make sure that subnet and gateway are being logged properly. generally, look at the db and see what's up, is it missing important data?
 - is_in_dotdir would need to be logged at query time i think. can't be done at feature gen time because what if FS changes
 - maybe try random forests?
-- implement directory selection
 
 ## not now, maybe never
 - use tracing subscriber crate so we can have nice spans of time and we can maybe visualize and optimize idk

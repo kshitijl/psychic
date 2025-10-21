@@ -462,8 +462,11 @@ pub fn render_normal_mode(
                 // Adjust file_width to account for cwd suffix
                 let adjusted_file_width = file_width.saturating_sub(cwd_suffix_len);
 
-                // For historical files, use absolute path truncation
-                let truncated_path = if display_info.is_historical {
+                // Detect whether historical item lives outside current cwd
+                let is_outside_cwd = display_info.is_historical && !display_info.is_under_cwd;
+
+                // Use absolute truncation only for historical items outside cwd
+                let truncated_path = if is_outside_cwd {
                     truncate_absolute_path(&display_name, adjusted_file_width)
                 } else {
                     truncate_path(&display_name, adjusted_file_width)
@@ -481,9 +484,9 @@ pub fn render_normal_mode(
                     Style::default()
                 };
 
-                // Rank number color: different for historical files
-                let rank_style = if display_info.is_historical {
-                    // Historical files: gray rank number
+                // Decide rank number color
+                let rank_style = if is_outside_cwd {
+                    // Historical outside cwd: gray rank number
                     Style::default().fg(Color::DarkGray)
                 } else if i == ctx.selected_index {
                     // Selected: match base style

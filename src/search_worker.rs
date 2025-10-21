@@ -56,6 +56,7 @@ pub struct DisplayFileInfo {
     pub is_dir: bool,
     pub is_cwd: bool,
     pub is_historical: bool, // From UserClickedInEventsDb, not current CwdWalker
+    pub is_under_cwd: bool,
 }
 
 pub struct UpdateQueryRequest {
@@ -114,6 +115,7 @@ struct FileInfo {
     file_size: Option<i64>,
     origin: FileOrigin,
     is_dir: bool,
+    is_under_cwd: bool,
 }
 
 impl FileInfo {
@@ -145,6 +147,8 @@ impl FileInfo {
             }
         };
 
+        let is_under_cwd = full_path.starts_with(root);
+
         FileInfo {
             full_path,
             display_name,
@@ -153,6 +157,7 @@ impl FileInfo {
             file_size,
             origin: FileOrigin::UserClickedInEventsDb,
             is_dir,
+            is_under_cwd,
         }
     }
 }
@@ -311,6 +316,7 @@ impl WorkerState {
                 file_size: metadata.file_size,
                 origin: FileOrigin::CwdWalker,
                 is_dir: true,
+                is_under_cwd: true,
             };
 
             let file_id = FileId(file_registry.len());
@@ -379,6 +385,7 @@ impl WorkerState {
                 file_size,
                 origin: FileOrigin::CwdWalker,
                 is_dir,
+                is_under_cwd: true,
             };
 
             let file_id = FileId(self.file_registry.len());
@@ -413,7 +420,7 @@ impl WorkerState {
                     FilterType::OnlyCwd => {
                         // Show files that are under current root, regardless of origin
                         // This includes both files from CwdWalker and historical files that happen to be in cwd
-                        file_info.full_path.starts_with(&self.root)
+                        file_info.is_under_cwd
                     }
                     FilterType::OnlyDirs => file_info.is_dir,
                     FilterType::OnlyFiles => !file_info.is_dir,
@@ -516,6 +523,7 @@ impl WorkerState {
                     is_dir: file_info.is_dir,
                     is_cwd,
                     is_historical,
+                    is_under_cwd: file_info.is_under_cwd,
                 }
             })
             .collect()
@@ -589,6 +597,7 @@ impl WorkerState {
                     file.full_path.to_string_lossy().to_string()
                 }
             };
+            file.is_under_cwd = file.full_path.starts_with(&self.root);
         }
 
         // Rebuild path_to_id map (only keep historical files)
@@ -858,52 +867,58 @@ mod tests {
 
         let cwd = PathBuf::from("/home/user/project");
 
+        let walker_path = PathBuf::from("/home/user/project/src/main.rs");
         // File from CwdWalker
         let file_from_walker = FileInfo {
-            full_path: PathBuf::from("/home/user/project/src/main.rs"),
+            full_path: walker_path.clone(),
             display_name: "src/main.rs".to_string(),
             mtime: Some(1000),
             atime: None,
             file_size: Some(100),
             origin: FileOrigin::CwdWalker,
             is_dir: false,
+            is_under_cwd: walker_path.starts_with(&cwd),
         };
 
+        let history_in_cwd_path = PathBuf::from("/home/user/project/README.md");
         // File from history but also in current directory
         let file_from_history_in_cwd = FileInfo {
-            full_path: PathBuf::from("/home/user/project/README.md"),
+            full_path: history_in_cwd_path.clone(),
             display_name: "/home/user/project/README.md".to_string(),
             mtime: Some(900),
             atime: None,
             file_size: Some(50),
             origin: FileOrigin::UserClickedInEventsDb,
             is_dir: false,
+            is_under_cwd: history_in_cwd_path.starts_with(&cwd),
         };
 
+        let history_outside_path = PathBuf::from("/home/user/other/file.txt");
         // File from history outside current directory
         let file_from_history_elsewhere = FileInfo {
-            full_path: PathBuf::from("/home/user/other/file.txt"),
+            full_path: history_outside_path.clone(),
             display_name: "/home/user/other/file.txt".to_string(),
             mtime: Some(800),
             atime: None,
             file_size: Some(25),
             origin: FileOrigin::UserClickedInEventsDb,
             is_dir: false,
+            is_under_cwd: history_outside_path.starts_with(&cwd),
         };
 
         // Test OnlyCwd filter
         assert!(
-            file_from_walker.full_path.starts_with(&cwd),
+            file_from_walker.is_under_cwd,
             "File from walker in cwd should pass OnlyCwd filter"
         );
 
         assert!(
-            file_from_history_in_cwd.full_path.starts_with(&cwd),
+            file_from_history_in_cwd.is_under_cwd,
             "File from history but in cwd should pass OnlyCwd filter"
         );
 
         assert!(
-            !file_from_history_elsewhere.full_path.starts_with(&cwd),
+            !file_from_history_elsewhere.is_under_cwd,
             "File from history outside cwd should NOT pass OnlyCwd filter"
         );
     }
@@ -918,6 +933,7 @@ mod tests {
             file_size: None,
             origin: FileOrigin::CwdWalker,
             is_dir: true,
+            is_under_cwd: true,
         };
 
         let file_regular = FileInfo {
@@ -928,6 +944,7 @@ mod tests {
             file_size: None,
             origin: FileOrigin::CwdWalker,
             is_dir: false,
+            is_under_cwd: true,
         };
 
         // OnlyDirs filter: is_dir == true
