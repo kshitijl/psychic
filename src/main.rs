@@ -552,6 +552,9 @@ struct App {
     worker_tx: mpsc::Sender<WorkerRequest>,
     worker_handle: Option<JoinHandle<()>>,
 
+    // Crossterm thread control (for pausing when launching child processes)
+    input_control_tx: crossbeam::channel::Sender<bool>,
+
     // Startup tracking
     walker_done: bool,
     startup_complete_logged: bool,
@@ -570,6 +573,7 @@ impl App {
         no_model: bool,
         no_click_logging: bool,
         event_tx: mpsc::Sender<AppEvent>,
+        input_control_tx: crossbeam::channel::Sender<bool>,
     ) -> Result<Self> {
         let start_time = Instant::now();
         log::debug!("App::new() started");
@@ -626,6 +630,7 @@ impl App {
             no_click_logging,
             worker_tx: worker_tx.clone(),
             worker_handle: Some(worker_handle),
+            input_control_tx,
             walker_done: false,
             startup_complete_logged: false,
         };
@@ -1100,18 +1105,46 @@ fn main() -> Result<()> {
     // Create unified event channel - all events (worker, input, tick) flow through this
     let (event_tx, event_rx) = mpsc::channel::<AppEvent>();
 
-    // Thread 1: Crossterm event forwarder
+    // Create control channel for pausing/resuming crossterm thread
+    let (input_control_tx, input_control_rx) = crossbeam::channel::unbounded::<bool>();
+
+    // Thread 1: Pauseable crossterm event forwarder
     let input_tx = event_tx.clone();
     std::thread::spawn(move || {
         loop {
-            // Block until keyboard/mouse event arrives, then forward to unified channel
-            match event::read() {
-                Ok(evt) => {
-                    if input_tx.send(AppEvent::Input(evt)).is_err() {
-                        break; // Main thread died, exit
+            // Use crossbeam::select! to wait on both control channel and check for events
+            crossbeam::select! {
+                recv(input_control_rx) -> msg => {
+                    match msg {
+                        Ok(false) => {
+                            // Paused - wait for resume signal
+                            loop {
+                                match input_control_rx.recv() {
+                                    Ok(true) => break,  // Resumed
+                                    Ok(false) => continue,  // Still paused
+                                    Err(_) => return,  // Channel closed, exit thread
+                                }
+                            }
+                        }
+                        Ok(true) => {
+                            // Already running, continue
+                        }
+                        Err(_) => break,  // Channel closed, exit thread
                     }
                 }
-                Err(_) => break, // Error reading events, exit thread
+                default(Duration::from_millis(10)) => {
+                    // Check for crossterm events (non-blocking poll)
+                    if event::poll(Duration::ZERO).unwrap_or(false) {
+                        match event::read() {
+                            Ok(evt) => {
+                                if input_tx.send(AppEvent::Input(evt)).is_err() {
+                                    break;  // Main thread died, exit
+                                }
+                            }
+                            Err(_) => break,  // Error reading events, exit
+                        }
+                    }
+                }
             }
         }
     });
@@ -1169,6 +1202,7 @@ fn main() -> Result<()> {
         cli.no_model,
         cli.no_click_logging,
         event_tx.clone(),
+        input_control_tx.clone(),
     )?;
     log::info!(
         "TIMING {{\"op\":\"app_new\",\"ms\":{}}}",
@@ -2145,6 +2179,9 @@ fn run_app(
                                         // Open shell in CWD
                                         log::info!("Opening shell in cwd: {:?}", app.cwd);
 
+                                        // Pause crossterm thread so it doesn't steal stdin from shell
+                                        let _ = app.input_control_tx.send(false);
+
                                         // Suspend TUI
                                         disable_raw_mode()?;
                                         terminal
@@ -2181,6 +2218,9 @@ fn run_app(
                                             .backend_mut()
                                             .execute(crossterm::event::EnableMouseCapture)?;
                                         terminal.clear()?;
+
+                                        // Resume crossterm thread
+                                        let _ = app.input_control_tx.send(true);
 
                                         if let Err(e) = status {
                                             log::error!("Failed to launch shell: {}", e);
@@ -2469,6 +2509,9 @@ fn run_app(
                                                         dir_path
                                                     );
 
+                                                    // Pause crossterm thread so it doesn't steal stdin from shell
+                                                    let _ = app.input_control_tx.send(false);
+
                                                     disable_raw_mode()?;
                                                     terminal.backend_mut().execute(
                                                         crossterm::event::DisableMouseCapture,
@@ -2508,6 +2551,9 @@ fn run_app(
                                                     )?;
                                                     terminal.clear()?;
 
+                                                    // Resume crossterm thread
+                                                    let _ = app.input_control_tx.send(true);
+
                                                     if let Err(e) = status {
                                                         log::error!(
                                                             "Failed to launch shell: {}",
@@ -2518,6 +2564,9 @@ fn run_app(
                                             }
                                         } else {
                                             // On a file, suspend TUI and open editor
+                                            // Pause crossterm thread so it doesn't steal stdin from editor
+                                            let _ = app.input_control_tx.send(false);
+
                                             disable_raw_mode()?;
                                             terminal
                                                 .backend_mut()
@@ -2552,6 +2601,9 @@ fn run_app(
                                                 .backend_mut()
                                                 .execute(crossterm::event::EnableMouseCapture)?;
                                             terminal.clear()?;
+
+                                            // Resume crossterm thread
+                                            let _ = app.input_control_tx.send(true);
 
                                             if let Err(e) = status {
                                                 log::error!("Failed to launch editor: {}", e);
