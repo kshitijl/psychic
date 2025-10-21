@@ -154,12 +154,14 @@ impl Ranker {
         })?;
         log::info!("TIMING {{\"op\":\"db_query_prepare\",\"ms\":{}}}", query_start.elapsed().as_secs_f64() * 1000.0);
 
+        let collect_start = std::time::Instant::now();
+        let rows: Vec<(String, i64, String)> = rows.collect::<Result<Vec<_>, _>>()?;
+        log::info!("TIMING {{\"op\":\"collect_rows\",\"ms\":{},\"count\":{}}}", collect_start.elapsed().as_secs_f64() * 1000.0, rows.len());
+
         let indexing_start = std::time::Instant::now();
-        let mut row_count = 0;
-        for row in rows {
-            let (path, timestamp, query) = row?;
+        let row_count = rows.len();
+        for (path, timestamp, query) in rows {
             let click_event = ClickEvent { timestamp };
-            row_count += 1;
 
             // Index by (query, file_path) first
             clicks_by_query_and_file
