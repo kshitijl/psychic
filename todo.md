@@ -1,5 +1,20 @@
 ## notes on performance
 
+### could maybe do click aggregation in SQL rather than in the rust code
+
+```
+SELECT
+    full_path,
+    COUNT(*) AS clicks_last_30_days
+  FROM events
+  WHERE action = 'click'
+    AND timestamp >= strftime('%s','now') - 30 * 24 * 60 * 60
+  GROUP BY full_path
+  ORDER BY clicks_last_30_days DESC;`
+```
+
+And cache these in sqlite as a table. Would need to refresh this table at startup, and also lock the table to do the refresh. sqlite doesn't have materialized views. Or just have all this be a view, maybe it's still worth it, idk, haven't measured.
+
 ### 2025-10-20
 
 Trying to make startup faster. Time to fully rendered initial screen.
@@ -24,7 +39,6 @@ Helix file picker is a lot faster. Maybe implement a mode that doesn't sort or r
 
 ## now
 
-- break main.rs into multiple files. definitely one for that preview caching logic.
 - audit the whole codebase for modularity. can we refactor extract something into a module, which can then be expect tested? right now its a big ball of very IO heavy code that makes it difficult to test. maybe the overall state logic and keypress logic? maybe the page caching logic? maybe the logic that when walker is finished it sends an AllDone message? maybe the logic that historical files in cwd still need to shown in filter view?
 - when history is filtered, suppose number of items becomes less than selected index, then selected index should become 0 so the top item is automatically becomes selected.
 - display is broken if we scroll past a binary file and it gets previewed
