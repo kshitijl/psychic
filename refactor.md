@@ -1,6 +1,11 @@
 # Refactor Plan: Extract Deep Modules from main.rs
 
-**Current state:** main.rs is 2,866 lines with too many concerns mixed together.
+**Original state:** main.rs was 2,866 lines with too many concerns mixed together.
+
+**Current progress:**
+- ✅ Phase 1 completed: path_display.rs (271 lines) and cli.rs (116 lines) extracted
+- ✅ Phase 2 completed: app.rs (556 lines) extracted
+- **main.rs reduced from 2,866 → 1,928 lines (938 lines extracted, 32% reduction)**
 
 **Deep Modules Strategy** (per John Ousterhout):
 - **Small interface** = minimal public API, few functions/types exposed
@@ -63,7 +68,7 @@ pub fn render_filter_picker(f: &mut Frame, area: Rect);
 
 ---
 
-### 3. **`src/path_display.rs`** - Path Formatting Module
+### 3. **`src/path_display.rs`** - Path Formatting Module ✅ COMPLETED
 
 **Interface (small):**
 ```rust
@@ -80,70 +85,76 @@ pub fn get_time_ago(mtime: Option<i64>) -> String;
 
 **Why deep:** Path formatting has tricky edge cases but ultra-simple interface (string in, string out).
 
+**Status:** ✅ Extracted to `src/path_display.rs` (271 lines including 12 tests)
+
 ---
 
-### 4. **`src/cli.rs`** - CLI Argument Parsing Module
+### 4. **`src/cli.rs`** - CLI Argument Parsing Module ✅ COMPLETED
 
 **Interface (small):**
 ```rust
-pub struct CliConfig {
-    pub data_dir: PathBuf,
-    pub on_dir_click: OnDirClickAction,
-    pub on_cwd_visit: OnCwdVisitAction,
-    pub initial_filter: FilterType,
-    // ... other config
-}
-
-pub enum CliCommand {
-    Run(CliConfig),
-    GenerateFeatures { format: OutputFormat },
-    Retrain,
-    Zsh,
-    Internal(InternalCommands),
-}
-
-pub fn parse_cli() -> Result<CliCommand>;
+pub struct Cli { /* clap-derived fields */ }
+pub enum Commands { GenerateFeatures, Retrain, Zsh, Internal }
+pub enum InternalCommands { AnalyzePerf }
+pub fn get_default_data_dir() -> Result<PathBuf>;
 ```
 
 **Deep implementation inside:**
 - All clap structs (Cli, Commands, InternalCommands, etc.)
 - Argument validation
 - Default value logic
-- Enum conversions
+- Enum conversions (FilterArg, OnDirClickAction, etc.)
 
 **Why deep:** CLI parsing has many options but interface is just "give me a command".
 
+**Status:** ✅ Extracted to `src/cli.rs` (116 lines)
+
 ---
 
-### 5. **`src/app.rs`** - Application State Module
+### 5. **`src/app.rs`** - Application State Module ✅ COMPLETED
 
-**Interface (small):**
+**Interface (public API):**
 ```rust
-pub struct App { /* fields */ }
+pub struct App { /* 25+ public fields */ }
+pub struct Page { pub start_index, pub end_index, pub files }
+pub struct Subsession { pub id, pub query, pub created_at, ... }
+pub enum PreviewCache { None, Light, Full, Directory }
+pub const PAGE_SIZE: usize = 128;
+pub const PREFETCH_MARGIN: usize = 32;
 
 impl App {
     pub fn new(...) -> Result<Self>;
-    pub fn handle_event(&mut self, event: AppEvent) -> Result<EventResult>;
-    pub fn render_state(&self) -> RenderState;  // Extract what renderer needs
+    pub fn reload_model(&mut self, query_id: u64) -> Result<()>;
+    pub fn reload_and_rerank(&mut self, query_id: u64) -> Result<()>;
+    pub fn get_file_at_index(&self, index: usize) -> Option<&DisplayFileInfo>;
+    pub fn check_and_log_impressions(&mut self, force: bool) -> Result<()>;
+    pub fn move_selection(&mut self, delta: isize);
+    pub fn get_filtered_history(&self) -> Vec<PathBuf>;
+    pub fn move_history_selection(&mut self, delta: isize);
+    pub fn handle_history_enter(&mut self) -> Result<()>;
+    pub fn log_preview_scroll(&mut self) -> Result<()>;
+    pub fn update_scroll(&mut self, visible_height: u16);
 }
 
-pub enum EventResult {
-    Continue,
-    Quit,
-    OpenEditor(PathBuf),
-    ChangeCwd(PathBuf),
+impl PreviewCache {
+    pub fn get_if_matches(&self, path: &str) -> Option<(Text<'static>, bool)>;
+    pub fn get_dir_if_matches(&self, path: &str, extra_flags: &str) -> Option<Text<'static>>;
 }
 ```
 
 **Deep implementation inside:**
-- All App state (query, page_cache, selected_index, etc.)
-- Worker communication
-- Page cache management
-- Analytics logging
-- Selection movement
-- Query management
+- All App state (query, page_cache, selected_index, preview_cache, etc.)
+- Worker communication (worker_tx)
+- Page cache management with prefetching logic
+- Analytics logging (impressions, scrolls, clicks)
+- Selection movement with wrap-around
+- History navigation
+- Preview cache management (Light/Full/Directory variants)
+- Subsession tracking
 
-**Why deep:** App has tons of state but external code just sends events and gets results.
+**Why deep:** App has tons of state and complex prefetching/caching logic, but provides clear methods for each operation.
+
+**Status:** ✅ Extracted to `src/app.rs` (556 lines including Page, Subsession, PreviewCache)
 
 ---
 
