@@ -258,7 +258,7 @@ Why origin tracking: Historical files (from other directories) show as ".../file
 **Current Working Directory Display:**
 The current working directory itself appears in search results as just its directory name (not the full path) with a " (cwd)" suffix in magenta (or yellow when selected). This makes it easy to navigate into the current directory for exploration. Clicking on it is properly logged in the events database for ML training.
 
-On startup, psychic automatically logs a click event for the initial directory (with an empty query string), ensuring that directories you browse to via psychic will appear in your historical files in future sessions.
+On startup, psychic automatically logs a startup_visit event for the initial directory (with an empty query string). This ensures directories you begin in will show up in history without being treated as positive click signals for ranking.
 
 **Historical files:** Loads previously clicked/scrolled files from events.db at startup.
 Why: User can find files from other projects they've accessed before.

@@ -26,6 +26,7 @@ pub enum UserInteraction {
     Click,
     Scroll,
     Impression,
+    StartupVisit,
 }
 
 pub struct EventData<'a> {
@@ -126,6 +127,7 @@ impl Database {
             UserInteraction::Click => "click",
             UserInteraction::Scroll => "scroll",
             UserInteraction::Impression => "impression",
+            UserInteraction::StartupVisit => "startup_visit",
         };
 
         self.conn.execute(
@@ -180,11 +182,11 @@ impl Database {
     }
 
     pub fn get_previously_interacted_files(&self) -> Result<Vec<String>> {
-        // Get all unique full_paths that have been clicked or scrolled
+        // Get all unique full_paths that have been clicked, scrolled, or auto-visited at startup
         let mut stmt = self.conn.prepare(
             "SELECT DISTINCT full_path
              FROM events
-             WHERE action IN ('click', 'scroll')
+             WHERE action IN ('click', 'scroll', 'startup_visit')
              ORDER BY timestamp DESC",
         )?;
 

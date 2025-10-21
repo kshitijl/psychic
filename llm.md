@@ -17,11 +17,13 @@ See `refactor.md` for planned module extractions following this philosophy.
 Read src/main.rs to understand the entrypoint. Read train.py to understand how the model is made.
 
 After adding a fair amount of new code to implement a feature or fix a bug:
-* run `cargo build --release`
+* run `just build`. You can see the justfile to understand what this does
 * run `cargo test`
 * also `cargo clippy`.
 * add new tests for the feature just added, if possible
 * update how-it-works.md so that it reflects current state.
+
+Do not run `cargo build`. I have a symlink to the RELEASE binary under target. That's what I use every day, and that's what I test as a user. It must reflect the current latest code. You must run `just build`, which will build a release binary and also other tasks that I need done in order to read and understand the code.
 
 When running the binary, always use `cargo run --release -- <args>` instead of running the binary directly. This prevents running an outdated binary.
 

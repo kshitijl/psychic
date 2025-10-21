@@ -316,7 +316,7 @@ fn main() -> Result<()> {
     std::thread::spawn(move || {
         let context = context::gather_context();
         if let Ok(db) = db::Database::new(&data_dir_clone) {
-            // Log the initial directory as a click event (with empty query)
+            // Log the initial directory as a startup visit (with empty query)
             // This happens in background thread so it doesn't block startup
             let dir_name = root_clone
                 .file_name()
@@ -349,7 +349,7 @@ fn main() -> Result<()> {
                 atime,
                 file_size,
                 subsession_id: 0, // Initial event, before any query
-                action: db::UserInteraction::Click,
+                action: db::UserInteraction::StartupVisit,
                 session_id: &session_id_clone,
             });
 

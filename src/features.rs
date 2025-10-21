@@ -195,6 +195,9 @@ pub fn generate_features(
             "scroll" => {
                 acc.mark_impressions_as_engaged(event);
             }
+            "startup_visit" => {
+                // Startup visits prime history without affecting labels or click stats
+            }
             _ => {} // Ignore unknown actions
         }
     }
@@ -424,6 +427,12 @@ mod tests {
                 "click" => {
                     acc.record_click(event);
                     acc.mark_impressions_as_engaged(event);
+                }
+                "scroll" => {
+                    acc.mark_impressions_as_engaged(event);
+                }
+                "startup_visit" => {
+                    // Ignore for training labels
                 }
                 _ => {}
             }
