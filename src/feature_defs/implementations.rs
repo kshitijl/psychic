@@ -171,6 +171,26 @@ impl Feature for IsHidden {
 }
 
 // ============================================================================
+// Feature: file_size_bytes
+// ============================================================================
+
+pub struct FileSizeBytes;
+
+impl Feature for FileSizeBytes {
+    fn name(&self) -> &'static str {
+        "file_size_bytes"
+    }
+
+    fn feature_type(&self) -> FeatureType {
+        FeatureType::Numeric
+    }
+
+    fn compute(&self, inputs: &FeatureInputs) -> Result<f64> {
+        Ok(inputs.file_size.unwrap_or(0) as f64)
+    }
+}
+
+// ============================================================================
 // Feature: clicks_last_week_parent_dir
 // ============================================================================
 

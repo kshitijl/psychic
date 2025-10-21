@@ -23,6 +23,7 @@ struct Event {
     full_path: String,
     timestamp: i64,
     mtime: Option<i64>,
+    file_size: Option<i64>,
     action: String,
 }
 
@@ -225,7 +226,7 @@ pub fn generate_features(
 
 fn fetch_all_events(conn: &Connection) -> Result<Vec<Event>> {
     let mut stmt = conn.prepare(
-        "SELECT session_id, subsession_id, query, file_path, full_path, timestamp, mtime, action FROM events ORDER BY timestamp, id",
+        "SELECT session_id, subsession_id, query, file_path, full_path, timestamp, mtime, file_size, action FROM events ORDER BY timestamp, id",
     )?;
     let event_iter = stmt.query_map([], |row| {
         Ok(Event {
@@ -236,7 +237,8 @@ fn fetch_all_events(conn: &Connection) -> Result<Vec<Event>> {
             full_path: row.get(4)?,
             timestamp: row.get(5)?,
             mtime: row.get(6)?,
-            action: row.get(7)?,
+            file_size: row.get(7)?,
+            action: row.get(8)?,
         })
     })?;
 
@@ -302,6 +304,7 @@ fn compute_features_from_accumulator(
         file_path: &impression.file_path,
         full_path,
         mtime: impression.mtime,
+        file_size: impression.file_size,
         cwd,
         clicks_by_file: &acc.clicks_by_file,
         clicks_by_parent_dir: &acc.clicks_by_parent_dir,
@@ -372,6 +375,7 @@ mod tests {
                 full_path: "/test.rs".to_string(),
                 timestamp: now,
                 mtime: Some(now - 100),
+                file_size: Some(100),
                 action: "impression".to_string(),
             },
             Event {
@@ -382,6 +386,7 @@ mod tests {
                 full_path: "/test.rs".to_string(),
                 timestamp: now + 200, // Future click
                 mtime: None,
+                file_size: Some(100),
                 action: "click".to_string(),
             },
             Event {
@@ -392,6 +397,7 @@ mod tests {
                 full_path: "/test.rs".to_string(),
                 timestamp: now + 400, // Another impression after the click
                 mtime: Some(now - 100),
+                file_size: Some(100),
                 action: "impression".to_string(),
             },
         ];

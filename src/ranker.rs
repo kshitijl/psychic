@@ -19,6 +19,7 @@ pub struct FileCandidate {
     pub relative_path: String,
     pub full_path: PathBuf,
     pub mtime: Option<i64>,
+    pub file_size: Option<i64>,
     pub is_from_walker: bool,
     pub is_dir: bool,
 }
@@ -411,6 +412,7 @@ fn compute_features_with_timing(
         file_path: &file.relative_path,
         full_path: &file.full_path,
         mtime: file.mtime,
+        file_size: file.file_size,
         cwd,
         clicks_by_file,
         clicks_by_parent_dir,
@@ -636,6 +638,7 @@ mod tests {
             relative_path: "test.md".to_string(),
             full_path: PathBuf::from("/tmp/test.md"),
             mtime: Some(1234567890),
+            file_size: Some(2048),
             is_from_walker: true,
             is_dir: false,
         }];
@@ -682,6 +685,7 @@ mod tests {
             relative_path: "foo/bar.txt".to_string(),
             full_path: PathBuf::from("/tmp/foo/bar.txt"),
             mtime: Some(1700000000i64), // Nov 14, 2023
+            file_size: Some(12_288),
             is_from_walker: true,
             is_dir: false,
         };
@@ -751,12 +755,13 @@ mod tests {
         // Format as string for expect-test style comparison
         let actual = format!("{:?}", features);
 
-        // Expected output: [filename_starts_with_query, clicks_last_30_days, modified_today, is_under_cwd, is_hidden, clicks_last_week_parent_dir, clicks_last_hour, clicks_today, clicks_last_7_days, modified_age, clicks_for_this_query, is_dir]
+        // Expected output: [filename_starts_with_query, clicks_last_30_days, modified_today, is_under_cwd, is_hidden, file_size_bytes, clicks_last_week_parent_dir, clicks_last_hour, clicks_today, clicks_last_7_days, modified_age, clicks_for_this_query, is_dir]
         // filename_starts_with_query=0 (bar.txt doesn't start with "test")
         // clicks_last_30_days=3 (3 clicks on bar.txt itself)
         // modified_today=0 (mtime is old - Nov 2023, test runs in 2025)
         // is_under_cwd=1 (is_from_walker=true, so guaranteed to be under cwd)
         // is_hidden=0 (no dot-prefixed components)
+        // file_size_bytes=12288 (12 KB file)
         // clicks_last_week_parent_dir=4 (3 clicks on bar.txt + 1 click on other.txt in /tmp/foo/)
         // clicks_last_hour=0 (clicks are old)
         // clicks_today=0 (clicks are old)
@@ -764,7 +769,7 @@ mod tests {
         // modified_age=86400 (1 day in seconds)
         // clicks_for_this_query=2 (2 query-specific clicks for "test" + bar.txt)
         // is_dir=0 (this is a file, not a directory)
-        let expected = "[0.0, 3.0, 0.0, 1.0, 0.0, 4.0, 0.0, 0.0, 3.0, 86400.0, 2.0, 0.0]";
+        let expected = "[0.0, 3.0, 0.0, 1.0, 0.0, 12288.0, 4.0, 0.0, 0.0, 3.0, 86400.0, 2.0, 0.0]";
 
         assert_eq!(actual, expected, "Feature vector mismatch");
     }

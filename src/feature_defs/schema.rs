@@ -24,6 +24,7 @@ pub struct FeatureInputs<'a> {
     pub file_path: &'a str,
     pub full_path: &'a Path,
     pub mtime: Option<i64>,
+    pub file_size: Option<i64>,
     pub cwd: &'a Path,
     pub clicks_by_file: &'a FxHashMap<String, Vec<ClickEvent>>,
     pub clicks_by_parent_dir: &'a FxHashMap<PathBuf, Vec<ClickEvent>>,

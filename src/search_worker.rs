@@ -431,6 +431,7 @@ impl WorkerState {
                     relative_path: file_info.display_name.clone(),
                     full_path: file_info.full_path.clone(),
                     mtime: file_info.mtime,
+                    file_size: file_info.file_size,
                     is_from_walker: file_info.origin == FileOrigin::CwdWalker,
                     is_dir: file_info.is_dir,
                 }
