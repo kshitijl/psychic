@@ -25,7 +25,6 @@ Helix file picker is a lot faster. Maybe implement a mode that doesn't sort or r
 ## now
 
 - break main.rs into multiple files. definitely one for that preview caching logic.
-- change layout. if columns getting narrow then do a vertical stack layout so we can see file paths more clearly.
 - audit the whole codebase for modularity. can we refactor extract something into a module, which can then be expect tested? right now its a big ball of very IO heavy code that makes it difficult to test. maybe the overall state logic and keypress logic? maybe the page caching logic? maybe the logic that when walker is finished it sends an AllDone message? maybe the logic that historical files in cwd still need to shown in filter view?
 - when history is filtered, suppose number of items becomes less than selected index, then selected index should become 0 so the top item is automatically becomes selected.
 - display is broken if we scroll past a binary file and it gets previewed
