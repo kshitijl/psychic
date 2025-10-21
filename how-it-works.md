@@ -12,18 +12,35 @@ This document describes the current state of the code, with a brief description 
 
 ### Core Components
 
-1. **`db.rs`** - SQLite event logging
-2. **`walker.rs`** - Background file discovery
-3. **`context.rs`** - System context gathering
+The codebase follows John Ousterhout's "deep modules" philosophy: small interfaces hiding substantial complexity.
+
+**Data & Analytics:**
+1. **`db.rs`** - SQLite event logging (clicks, scrolls, impressions)
+
+**File Discovery & Ranking:**
+2. **`walker.rs`** - Background file discovery via walkdir
+3. **`context.rs`** - System context gathering for ML features
 4. **`features.rs`** - ML feature generation for training
 5. **`feature_defs/`** - Trait-based feature registry
 6. **`ranker.rs`** - LightGBM model inference
+
+**Worker Thread:**
 7. **`search_worker.rs`** - Async worker thread for filtering/ranking
+
+**UI & State:**
 8. **`ui_state.rs`** - UI state machine (history mode, filter picker, debug pane)
 9. **`history.rs`** - Directory navigation history with branch-point semantics
-10. **`main.rs`** - TUI event loop and rendering
+10. **`app.rs`** - Application state (App struct, page cache, preview cache, analytics)
+11. **`path_display.rs`** - Path formatting utilities (truncation, abbreviation)
+12. **`cli.rs`** - CLI argument parsing with clap
 
-Why: Worker thread architecture prevents UI lag during expensive filtering/ranking operations.
+**Main Entry Point:**
+13. **`main.rs`** - TUI event loop, rendering, and application glue code
+
+**Development Tools:**
+14. **`analyze_perf.rs`** - Performance analysis for timing logs
+
+Why: Worker thread architecture prevents UI lag during expensive filtering/ranking operations. Module extraction keeps main.rs focused on event handling and rendering.
 
 ### Thread Architecture
 

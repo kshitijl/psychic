@@ -2,7 +2,7 @@ use crate::db::Database;
 use crate::ranker;
 use crate::walker::start_file_walker;
 use anyhow::Result;
-use mpsc::{Receiver, Sender};
+use mpsc::Sender;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},

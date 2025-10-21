@@ -12,7 +12,7 @@ mod search_worker;
 mod ui_state;
 mod walker;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::Parser;
 use crossterm::{
     ExecutableCommand,
@@ -21,7 +21,7 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use db::{Database, EventData, FileMetadata};
+use db::EventData;
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
@@ -30,13 +30,11 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
 };
-use search_worker::{DisplayFileInfo, WorkerRequest, WorkerResponse};
+use search_worker::{WorkerRequest, WorkerResponse};
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
     env,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::mpsc::{self, Receiver},
-    thread::JoinHandle,
     time::{Duration, Instant},
 };
 
@@ -65,7 +63,7 @@ impl From<WorkerResponse> for AppEvent {
 use path_display::{get_time_ago, truncate_absolute_path, truncate_path};
 
 // Import app types from dedicated module
-use app::{App, Page, PreviewCache, Subsession, PAGE_SIZE, PREFETCH_MARGIN};
+use app::{App, Page, PreviewCache, Subsession, PAGE_SIZE};
 
 fn render_history_mode(f: &mut Frame, app: &App) {
     use ratatui::widgets::{List, ListItem, Paragraph};

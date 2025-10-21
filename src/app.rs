@@ -10,7 +10,7 @@ use std::{
 
 use crate::cli::{OnCwdVisitAction, OnDirClickAction};
 use crate::db::{Database, EventData, FileMetadata};
-use crate::search_worker::{self, DisplayFileInfo, WorkerRequest, WorkerResponse};
+use crate::search_worker::{self, DisplayFileInfo, WorkerRequest};
 use crate::{history, ranker, ui_state};
 
 /// A page of DisplayFileInfo for caching
