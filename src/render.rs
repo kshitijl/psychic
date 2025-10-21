@@ -176,7 +176,7 @@ pub fn render_history_mode(f: &mut Frame, app: &App) {
 
     let preview_para = Paragraph::new(preview_text)
         .block(Block::default().borders(Borders::ALL).title("Preview"))
-        .scroll((app.preview_scroll as u16, 0));
+        .scroll((app.preview.scroll_position() as u16, 0));
     f.render_widget(preview_para, top_chunks[1]);
 
     // Search input at bottom
@@ -198,7 +198,7 @@ pub fn render_history_mode(f: &mut Frame, app: &App) {
 /// State updates computed during rendering that need to be applied to App after rendering
 pub struct RenderUpdates {
     pub file_list_scroll: Option<usize>,
-    pub preview_cache: Option<crate::preview::PreviewCache>,
+    pub preview: Option<crate::preview::PreviewManager>,
     pub path_bar_scroll: Option<u16>,
     pub path_bar_scroll_direction: Option<i8>,
     pub last_path_bar_update: Option<std::time::Instant>,
@@ -208,7 +208,7 @@ impl RenderUpdates {
     pub fn new() -> Self {
         Self {
             file_list_scroll: None,
-            preview_cache: None,
+            preview: None,
             path_bar_scroll: None,
             path_bar_scroll_direction: None,
             last_path_bar_update: None,
@@ -220,8 +220,8 @@ impl RenderUpdates {
         if let Some(scroll) = self.file_list_scroll {
             app.file_list_scroll = scroll;
         }
-        if let Some(cache) = self.preview_cache {
-            app.preview_cache = cache;
+        if let Some(preview) = self.preview {
+            app.preview = preview;
         }
         if let Some(scroll) = self.path_bar_scroll {
             app.path_bar_scroll = scroll;
@@ -248,10 +248,9 @@ pub fn render_normal_mode(
     use ratatui::widgets::Clear;
     use std::path::PathBuf;
     
-    use crate::{feature_defs, preview, ranker, search_worker, ui_state};
+    use crate::{feature_defs, ranker, search_worker, ui_state};
     use crate::app::PAGE_SIZE;
     use crate::path_display::{get_time_ago, truncate_path};
-    use crate::preview::PreviewCache;
 
     // Check terminal width to decide layout direction
     let terminal_width = f.area().width;
@@ -496,18 +495,16 @@ pub fn render_normal_mode(
         if let Some(current_file_path) = &current_file_path {
             let preview_width = top_chunks[1].width;
             let preview_height = top_chunks[1].height.saturating_sub(2);
-            let extra_flags = app.ui_state.get_eza_flags(preview_width);
 
-            // Use preview module to get/generate preview with caching
-            let (text, new_cache) = preview::get_preview_with_cache(
-                &app.preview_cache,
-                current_file_path,
+            // Use preview manager to render preview
+            let mut preview_clone = app.preview.clone();
+            let text = preview_clone.render(
+                std::path::Path::new(current_file_path),
                 is_dir,
+                preview_width,
                 preview_height,
-                app.preview_scroll,
-                extra_flags,
             );
-            updates.preview_cache = Some(new_cache);
+            updates.preview = Some(preview_clone);
             text
         } else {
             Text::from("[Loading preview...]")
@@ -524,7 +521,7 @@ pub fn render_normal_mode(
         .unwrap_or("No file selected".to_string());
 
     let preview = Paragraph::new(preview_text)
-        .scroll((app.preview_scroll as u16, 0))
+        .scroll((app.preview.scroll_position() as u16, 0))
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -604,21 +601,7 @@ pub fn render_normal_mode(
     // Add preview cache status
     if let Some((file_path, _, _)) = &current_file_info {
         let full_path_str = file_path.to_string_lossy().to_string();
-        let cache_status = match &app.preview_cache {
-            PreviewCache::None => "Not cached",
-            PreviewCache::Light { path, .. } if path == &full_path_str => "Cached (light)",
-            PreviewCache::Full { path, .. } if path == &full_path_str => "Cached (full)",
-            PreviewCache::Directory {
-                path, extra_flags, ..
-            } if path == &full_path_str => {
-                if extra_flags.is_empty() {
-                    "Cached (dir)"
-                } else {
-                    "Cached (dir+flags)"
-                }
-            }
-            _ => "Not cached",
-        };
+        let cache_status = app.preview.status(&full_path_str);
         debug_lines.push(format!("Preview: {}", cache_status));
     } else {
         debug_lines.push(String::from("Preview: N/A"));

@@ -19,7 +19,6 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use crate::app::App;
 use crate::cli::{OnCwdVisitAction, OnDirClickAction};
 use crate::db::{EventData, UserInteraction};
-use crate::preview::PreviewCache;
 use crate::search_worker::{FilterType, UpdateQueryRequest, WorkerRequest};
 
 /// Action to take after handling input
@@ -45,11 +44,11 @@ pub fn handle_input(
             use crossterm::event::MouseEventKind;
             match mouse_event.kind {
                 MouseEventKind::ScrollDown => {
-                    app.preview_scroll = app.preview_scroll.saturating_add(3);
+                    app.preview.scroll(3);
                     let _ = app.log_preview_scroll();
                 }
                 MouseEventKind::ScrollUp => {
-                    app.preview_scroll = app.preview_scroll.saturating_sub(3);
+                    app.preview.scroll(-3);
                     let _ = app.log_preview_scroll();
                 }
                 _ => {}
@@ -164,7 +163,7 @@ fn handle_ctrl_h(app: &mut App) {
         app.ui_state.history_mode = true;
         app.history_selected = app.history.current_display_index();
         app.query.clear();
-        app.preview_cache = PreviewCache::None;
+        app.preview.clear();
     }
 }
 

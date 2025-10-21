@@ -10,7 +10,7 @@ use std::{
 use crate::analytics::Analytics;
 use crate::cli::{OnCwdVisitAction, OnDirClickAction};
 use crate::db::{EventData, FileMetadata};
-use crate::preview::PreviewCache;
+use crate::preview::PreviewManager;
 use crate::search_worker::{self, DisplayFileInfo, WorkerRequest};
 use crate::{history, ranker, ui_state};
 
@@ -33,8 +33,7 @@ pub struct App {
     pub total_files: usize,               // Total number of files in index
     pub selected_index: usize,
     pub file_list_scroll: usize, // Scroll offset for file list
-    pub preview_scroll: usize,
-    pub preview_cache: PreviewCache,
+    pub preview: PreviewManager,
     pub cwd: PathBuf, // Current working directory
     pub history: history::History,
     pub history_selected: usize, // Selected item in history mode UI
@@ -127,8 +126,7 @@ impl App {
             total_files: 0,
             selected_index: 0,
             file_list_scroll: 0,
-            preview_scroll: 0,
-            preview_cache: PreviewCache::None,
+            preview: PreviewManager::new(),
             cwd: root.clone(),
             history: history::History::new(root),
             history_selected: 0,
@@ -252,8 +250,7 @@ impl App {
         self.selected_index = new_index as usize;
 
         // Reset preview scroll and clear cache when changing selection
-        self.preview_scroll = 0;
-        self.preview_cache = PreviewCache::None;
+        self.preview.clear();
 
         // Reset marquee scroll
         self.path_bar_scroll = 0;
@@ -288,8 +285,7 @@ impl App {
         self.history_selected = new_index as usize;
 
         // Clear preview cache when selection changes
-        self.preview_cache = PreviewCache::None;
-        self.preview_scroll = 0;
+        self.preview.clear();
     }
 
     pub fn handle_history_enter(&mut self) -> Result<()> {
