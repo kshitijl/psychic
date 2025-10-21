@@ -33,12 +33,13 @@ The codebase follows John Ousterhout's "deep modules" philosophy: small interfac
 10. **`app.rs`** - Application state (App struct, page cache, preview cache, analytics)
 11. **`path_display.rs`** - Path formatting utilities (truncation, abbreviation)
 12. **`cli.rs`** - CLI argument parsing with clap
+13. **`render.rs`** - History mode rendering (directory list + preview)
 
 **Main Entry Point:**
-13. **`main.rs`** - TUI event loop, rendering, and application glue code
+14. **`main.rs`** - TUI event loop, normal mode rendering, and application glue code
 
 **Development Tools:**
-14. **`analyze_perf.rs`** - Performance analysis for timing logs
+15. **`analyze_perf.rs`** - Performance analysis for timing logs
 
 Why: Worker thread architecture prevents UI lag during expensive filtering/ranking operations. Module extraction keeps main.rs focused on event handling and rendering.
 

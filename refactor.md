@@ -3,9 +3,12 @@
 **Original state:** main.rs was 2,866 lines with too many concerns mixed together.
 
 **Current progress:**
-- ✅ Phase 1 completed: path_display.rs (271 lines) and cli.rs (116 lines) extracted
-- ✅ Phase 2 completed: app.rs (556 lines) extracted
-- **main.rs reduced from 2,866 → 1,928 lines (938 lines extracted, 32% reduction)**
+- ✅ Phase 1: path_display.rs (271 lines) and cli.rs (116 lines) extracted
+- ✅ Phase 2: app.rs (556 lines) extracted
+- ✅ Phase 3: render.rs (155 lines) extracted
+- **main.rs reduced from 2,866 → 1,782 lines (1,084 lines extracted, 38% reduction)**
+
+**All tests passing:** 35/35 ✅
 
 **Deep Modules Strategy** (per John Ousterhout):
 - **Small interface** = minimal public API, few functions/types exposed
@@ -46,25 +49,28 @@ impl PreviewManager {
 
 ---
 
-### 2. **`src/render.rs`** - UI Rendering Module
+### 2. **`src/render.rs`** - UI Rendering Module ✅ PARTIALLY COMPLETED
 
-**Interface (small):**
+**Interface (actual):**
 ```rust
-pub fn render_normal_mode(f: &mut Frame, app: &RenderState);
-pub fn render_history_mode(f: &mut Frame, app: &HistoryRenderState);
-pub fn render_filter_picker(f: &mut Frame, area: Rect);
+pub fn render_history_mode(f: &mut Frame, app: &App);
 ```
 
 **Deep implementation inside:**
-- All layout logic (horizontal vs vertical based on width)
-- Path truncation functions (`truncate_path`, `truncate_absolute_path`, `abbreviate_component`)
-- File list rendering with styling
-- Path bar with marquee animation
-- Debug pane rendering
-- Input field rendering
-- All ratatui widget construction
+- History mode layout logic (dir list + preview split)
+- Directory list rendering with rank numbers
+- Path truncation for display (uses path_display module)
+- Eza command execution for directory previews
+- Fallback to ls if eza unavailable
+- ANSI-to-TUI conversion
+- Timing instrumentation
+- Search input rendering
 
-**Why deep:** Rendering has complex layout calculations, truncation logic, styling, but simple interface (just render given state).
+**Why deep:** History rendering has complex layout, command execution, ANSI parsing, but simple interface (just render).
+
+**Status:** ✅ Extracted `render_history_mode` to `src/render.rs` (155 lines)
+
+**Note:** Normal mode rendering remains in main.rs as it's tightly coupled with preview cache mutation. Could be extracted in future with further refactoring.
 
 ---
 
