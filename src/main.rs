@@ -1416,6 +1416,10 @@ fn run_app(
                 return;
             }
 
+            // Check terminal width to decide layout direction
+            let terminal_width = f.area().width;
+            let use_vertical_stack = terminal_width < 100;
+
             // Split vertically: top for results/preview, bottom for input
             let main_chunks = Layout::default()
                 .direction(Direction::Vertical)
@@ -1426,8 +1430,21 @@ fn run_app(
                 ])
                 .split(f.area());
 
-            // Split top area horizontally: left for file list, middle for preview, right for debug
-            let top_chunks = match app.ui_state.debug_pane_mode {
+            // Split top area: horizontal (wide) or vertical (narrow)
+            let top_chunks = if use_vertical_stack {
+                // Vertical stack layout for narrow terminals: File list → Preview
+                // Hide debug pane in vertical mode (too cramped)
+                Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Percentage(40), // File list
+                        Constraint::Percentage(60), // Preview
+                        Constraint::Percentage(0),  // Debug (hidden)
+                    ])
+                    .split(main_chunks[0])
+            } else {
+                // Horizontal layout for wide terminals
+                match app.ui_state.debug_pane_mode {
                 ui_state::DebugPaneMode::Expanded => {
                     // Debug expanded: give it most of the space
                     Layout::default()
@@ -1460,6 +1477,7 @@ fn run_app(
                             Constraint::Percentage(0),  // Debug (hidden)
                         ])
                         .split(main_chunks[0])
+                }
                 }
             };
 

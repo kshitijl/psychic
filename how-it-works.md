@@ -459,6 +459,8 @@ TUI event loop using ratatui + crossterm.
 Why: Fresh model on every launch ensures ranking improves as you use the tool. Background execution means no startup delay.
 
 **Layout:**
+
+**Wide terminals (≥100 columns):** Horizontal layout
 ```
 ┌─────────────┬─────────────┬──────────────┐
 │  File List  │   Preview   │ Debug/Stats  │
@@ -473,11 +475,29 @@ Why: Fresh model on every launch ensures ranking improves as you use the tool. B
 └──────────────────────────────────────────┘
 ```
 
-**Debug pane modes:** Ctrl-O cycles through three states:
+**Narrow terminals (<100 columns):** Vertical stack layout
+```
+┌──────────────────────────────────────────┐
+│  File List (40%)                         │
+│                                          │
+│ 1. file.rs                               │
+│ 2. main.rs                               │
+├──────────────────────────────────────────┤
+│  Preview (60%)                           │
+│                                          │
+│  [bat output]                            │
+│                                          │
+├──────────────────────────────────────────┤
+│   Search Input                           │
+└──────────────────────────────────────────┘
+```
+Why adaptive layout: Narrow terminals benefit from vertical stacking (file list + preview stacked) for better readability. Debug pane is automatically hidden in narrow mode to save space.
+
+**Debug pane modes (wide terminals only):** Ctrl-O cycles through three states:
 - Hidden (default): No debug pane visible
 - Small: Debug pane at 20% width
 - Expanded: Debug pane at 75% width, file list at 25%, preview hidden
-Why: Progressive disclosure - hide when not needed, expand for detailed debugging.
+Why: Progressive disclosure - hide when not needed, expand for detailed debugging. Not available in narrow mode (<100 columns) where space is limited.
 
 **App structure:**
 ```rust
