@@ -41,6 +41,7 @@ pub enum InternalCommands {
 pub enum FilterArg {
     None,
     Cwd,
+    Direct,
     Dirs,
     Files,
 }

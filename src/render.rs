@@ -548,6 +548,7 @@ pub fn render_normal_mode(
     let filter_name = match ctx.current_filter {
         search_worker::FilterType::None => "All",
         search_worker::FilterType::OnlyCwd => "CWD",
+        search_worker::FilterType::DirectCwd => "Direct",
         search_worker::FilterType::OnlyDirs => "Dirs",
         search_worker::FilterType::OnlyFiles => "Files",
     };
@@ -829,6 +830,7 @@ pub fn render_normal_mode(
     let filter_indicator = match ctx.current_filter {
         search_worker::FilterType::None => "",
         search_worker::FilterType::OnlyCwd => " [CWD]",
+        search_worker::FilterType::DirectCwd => " [DIRECT]",
         search_worker::FilterType::OnlyDirs => " [DIRS]",
         search_worker::FilterType::OnlyFiles => " [FILES]",
     };
@@ -840,8 +842,8 @@ pub fn render_normal_mode(
     // Filter picker overlay (rendered on top if visible)
     if ctx.ui_state.filter_picker_visible {
         // Create a popup in the bottom-right
-        let popup_width = 30;
-        let popup_height = 6; // 4 options + top/bottom borders
+        let popup_width = 35;
+        let popup_height = 7; // 5 options + top/bottom borders
         let area = f.area();
 
         // Position in bottom-right corner with some margin
@@ -863,7 +865,11 @@ pub fn render_normal_mode(
 
         let options = [
             (search_worker::FilterType::None, "0: No filter"),
-            (search_worker::FilterType::OnlyCwd, "c: Only CWD"),
+            (
+                search_worker::FilterType::OnlyCwd,
+                "c: Only CWD (recursive)",
+            ),
+            (search_worker::FilterType::DirectCwd, "i: Direct CWD only"),
             (search_worker::FilterType::OnlyDirs, "d: Only directories"),
             (search_worker::FilterType::OnlyFiles, "f: Only files"),
         ];
@@ -880,7 +886,7 @@ pub fn render_normal_mode(
         let filter_popup = Paragraph::new(filter_text).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Filters (Ctrl-F)"),
+                .title("Filters (Tab/Shift-Tab)"),
         );
 
         f.render_widget(filter_popup, popup_area);

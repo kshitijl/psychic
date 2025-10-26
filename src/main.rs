@@ -272,6 +272,7 @@ fn main() -> Result<()> {
     let initial_filter = match cli.filter {
         Some(FilterArg::None) | None => search_worker::FilterType::None,
         Some(FilterArg::Cwd) => search_worker::FilterType::OnlyCwd,
+        Some(FilterArg::Direct) => search_worker::FilterType::DirectCwd,
         Some(FilterArg::Dirs) => search_worker::FilterType::OnlyDirs,
         Some(FilterArg::Files) => search_worker::FilterType::OnlyFiles,
     };

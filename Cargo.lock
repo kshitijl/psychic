@@ -917,6 +917,8 @@ dependencies = [
  "rustc-hash",
  "serde",
  "serde_json",
+ "strum",
+ "strum_macros",
  "timeago",
  "walkdir",
 ]

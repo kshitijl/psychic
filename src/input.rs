@@ -103,12 +103,24 @@ fn handle_key_press(
             set_filter(app, FilterType::OnlyCwd);
             Ok(InputAction::Continue)
         }
+        KeyCode::Char('i') if app.ui_state.filter_picker_visible => {
+            set_filter(app, FilterType::DirectCwd);
+            Ok(InputAction::Continue)
+        }
         KeyCode::Char('d') if app.ui_state.filter_picker_visible => {
             set_filter(app, FilterType::OnlyDirs);
             Ok(InputAction::Continue)
         }
         KeyCode::Char('f') if app.ui_state.filter_picker_visible => {
             set_filter(app, FilterType::OnlyFiles);
+            Ok(InputAction::Continue)
+        }
+        KeyCode::BackTab => {
+            cycle_filter(app, false);
+            Ok(InputAction::Continue)
+        }
+        KeyCode::Tab => {
+            cycle_filter(app, true);
             Ok(InputAction::Continue)
         }
         KeyCode::Esc => handle_escape(app),
@@ -318,6 +330,17 @@ fn handle_file_click(
 fn set_filter(app: &mut App, filter: FilterType) {
     app.current_filter = filter;
     app.ui_state.filter_picker_visible = false;
+    send_query_update(app);
+}
+
+/// Cycle to next or previous filter
+fn cycle_filter(app: &mut App, forward: bool) {
+    let new_filter = if forward {
+        app.current_filter.next()
+    } else {
+        app.current_filter.prev()
+    };
+    app.current_filter = new_filter;
     send_query_update(app);
 }
 

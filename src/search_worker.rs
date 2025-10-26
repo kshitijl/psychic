@@ -10,6 +10,7 @@ use std::{
     thread::JoinHandle,
     time::Duration,
 };
+use strum::EnumCount;
 
 // Metadata sent from walker to worker
 #[derive(Debug, Clone)]
@@ -35,12 +36,26 @@ pub enum WalkerMessage {
 }
 
 // Filter types
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum_macros::FromRepr, strum_macros::EnumCount)]
+#[repr(u8)]
 pub enum FilterType {
-    None,      // 0 - no filter
-    OnlyCwd,   // 1 - only things in cwd
-    OnlyDirs,  // 2 - only directories
-    OnlyFiles, // 3 - only files
+    None = 0,      // no filter
+    OnlyCwd = 1,   // only things in cwd (recursive)
+    DirectCwd = 2, // only things directly in cwd (non-recursive)
+    OnlyDirs = 3,  // only directories
+    OnlyFiles = 4, // only files
+}
+
+impl FilterType {
+    /// Get the next filter in the cycle
+    pub fn next(self) -> Self {
+        Self::from_repr((self as u8 + 1) % Self::COUNT as u8).unwrap()
+    }
+
+    /// Get the previous filter in the cycle
+    pub fn prev(self) -> Self {
+        Self::from_repr((self as u8 + Self::COUNT as u8 - 1) % Self::COUNT as u8).unwrap()
+    }
 }
 
 // These next three are types for communicating with the UI thread.
@@ -421,6 +436,11 @@ impl WorkerState {
                         // Show files that are under current root, regardless of origin
                         // This includes both files from CwdWalker and historical files that happen to be in cwd
                         file_info.is_under_cwd
+                    }
+                    FilterType::DirectCwd => {
+                        // Show only files directly in cwd (non-recursive)
+                        file_info.is_under_cwd
+                            && file_info.full_path.parent() == Some(self.root.as_path())
                     }
                     FilterType::OnlyDirs => file_info.is_dir,
                     FilterType::OnlyFiles => !file_info.is_dir,
