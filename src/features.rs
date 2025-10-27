@@ -42,8 +42,8 @@ struct Accumulator {
     // Key: (session_id, subsession_id, full_path)
     pending_impressions: FxHashMap<(String, u64, String), PendingImpression>,
     output_rows: Vec<HashMap<String, String>>,
-    // Track current group ID - increments with each click/scroll and session change
-    current_group_id: u64,
+    // Track current episode ID - increments with each click/scroll and session change
+    current_episode_id: u64,
     // Track last session to detect session boundaries
     last_session_id: Option<String>,
 }
@@ -62,7 +62,7 @@ impl Accumulator {
             clicks_by_query_and_file: FxHashMap::default(),
             pending_impressions: FxHashMap::default(),
             output_rows: Vec::new(),
-            current_group_id: 0,
+            current_episode_id: 0,
             last_session_id: None,
         }
     }
@@ -92,16 +92,16 @@ impl Accumulator {
     }
 
     fn add_impression(&mut self, event: &Event, mut features: HashMap<String, String>) {
-        // Check if this is a new session - if so, increment group_id
+        // Check if this is a new session - if so, increment episode_id
         if let Some(ref last_session) = self.last_session_id
             && last_session != &event.session_id
         {
-            self.current_group_id += 1;
+            self.current_episode_id += 1;
         }
         self.last_session_id = Some(event.session_id.clone());
 
-        // Add group_id to features
-        features.insert("group_id".to_string(), self.current_group_id.to_string());
+        // Add episode_id to features
+        features.insert("episode_id".to_string(), self.current_episode_id.to_string());
 
         let key = (
             event.session_id.clone(),
@@ -122,7 +122,7 @@ impl Accumulator {
         if let Some(ref last_session) = self.last_session_id
             && last_session != &event.session_id
         {
-            self.current_group_id += 1;
+            self.current_episode_id += 1;
         }
         self.last_session_id = Some(event.session_id.clone());
 
@@ -141,9 +141,9 @@ impl Accumulator {
                 .insert("label".to_string(), "1".to_string());
         }
 
-        // Increment group_id after each engagement event (click or scroll)
-        // This creates a new group for the next sequence of impressions
-        self.current_group_id += 1;
+        // Increment episode_id after each engagement event (click or scroll)
+        // This creates a new episode for the next sequence of impressions
+        self.current_episode_id += 1;
     }
 
     fn finalize(mut self) -> Vec<HashMap<String, String>> {
@@ -462,11 +462,11 @@ mod tests {
             Some(&"1".to_string()),
             "First impression should have label=1 from future click in same subsession"
         );
-        // Group ID should be 0 (first group)
+        // Episode ID should be 0 (first episode)
         assert_eq!(
-            first_impression.get("group_id"),
+            first_impression.get("episode_id"),
             Some(&"0".to_string()),
-            "First impression should be in group 0"
+            "First impression should be in episode 0"
         );
 
         // Second impression at T=1400 SHOULD see click at T=1200
@@ -481,11 +481,11 @@ mod tests {
             Some(&"0".to_string()),
             "Second impression in different subsession should have label=0"
         );
-        // Group ID should be 1 (second group, after the click)
+        // Episode ID should be 1 (second episode, after the click)
         assert_eq!(
-            second_impression.get("group_id"),
+            second_impression.get("episode_id"),
             Some(&"1".to_string()),
-            "Second impression should be in group 1 (after click)"
+            "Second impression should be in episode 1 (after click)"
         );
     }
 

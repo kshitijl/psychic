@@ -20,7 +20,7 @@ import sys
 import pandas as pd
 import numpy as np
 import lightgbm as lgb
-from sklearn.model_selection import GroupShuffleSplit
+from sklearn.model_selection import GroupShuffleSplit  # Groups episodes together during splits
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 import seaborn as sns
@@ -75,45 +75,45 @@ def load_data(csv_path):
     print(f"  CSV file hash: {csv_hash}")
     print(f"Label distribution:\n{df['label'].value_counts()}")
     print(
-        f"\nFeatures: {[c for c in df.columns if c not in ['label', 'group_id', 'subsession_id', 'session_id']]}"
+        f"\nFeatures: {[c for c in df.columns if c not in ['label', 'episode_id', 'subsession_id', 'session_id']]}"
     )
 
-    # Use group_id as query groups (each group spans from one click/scroll to the next)
-    df["query_group"] = df["group_id"].astype(int)
+    # Use episode_id for LambdaRank grouping (each episode spans from one action to the next)
+    df["episode"] = df["episode_id"].astype(int)
 
-    # Filter out query groups with no positive labels (no clicks/scrolls)
-    # LambdaRank needs at least one positive example per query group
-    groups_with_positives = df.groupby("query_group")["label"].sum()
-    valid_groups = groups_with_positives[groups_with_positives > 0].index
+    # Filter out episodes with no positive labels (no clicks/scrolls)
+    # LambdaRank needs at least one positive example per episode
+    episodes_with_positives = df.groupby("episode")["label"].sum()
+    valid_episodes = episodes_with_positives[episodes_with_positives > 0].index
 
     original_samples = len(df)
-    original_groups = df["query_group"].nunique()
+    original_episodes = df["episode"].nunique()
 
-    df = df[df["query_group"].isin(valid_groups)].reset_index(drop=True)
+    df = df[df["episode"].isin(valid_episodes)].reset_index(drop=True)
 
     filtered_samples = original_samples - len(df)
-    filtered_groups = original_groups - df["query_group"].nunique()
+    filtered_episodes = original_episodes - df["episode"].nunique()
 
-    print(f"Loaded {df['query_group'].nunique()} query groups (click/scroll sequences)")
+    print(f"Loaded {df['episode'].nunique()} episodes (impression-to-action sequences)")
     print(
-        f"  Filtered out {filtered_groups} groups ({filtered_samples} samples) with no positive labels"
+        f"  Filtered out {filtered_episodes} episodes ({filtered_samples} samples) with no positive labels"
     )
     return df
 
 
 def prepare_features(df, feature_names, binary_features, monotonicity_map):
-    """Convert features to numeric and prepare X, y, query_groups."""
-    # Separate label and query_group from features
+    """Convert features to numeric and prepare X, y, episodes."""
+    # Separate label and episode from features
     y = df["label"].astype(int)
-    query_groups = df["query_group"]
+    episodes = df["episode"]
 
     # Drop categorical features (query, file_path) since Rust lightgbm3 doesn't support them
-    # Also drop metadata columns (including group_id since it's used as query_group)
+    # Also drop metadata columns (including episode_id since it's used as episode)
     X = df.drop(
         columns=[
             "label",
-            "query_group",
-            "group_id",
+            "episode",
+            "episode_id",
             "subsession_id",
             "session_id",
             "query",
@@ -140,11 +140,11 @@ def prepare_features(df, feature_names, binary_features, monotonicity_map):
     # Create the monotonicity constraints list from the map
     constraints = [monotonicity_map.get(f, 0) or 0 for f in X.columns]
 
-    return X, y, query_groups, [], constraints  # No categorical features
+    return X, y, episodes, [], constraints  # No categorical features
 
 
 def train_model(
-    X_train, y_train, groups_train, X_val, y_val, groups_val, categorical_features, monotone_constraints
+    X_train, y_train, episodes_train, X_val, y_val, episodes_val, categorical_features, monotone_constraints
 ):
     """Train LightGBM binary classification model with class weights and constraints."""
     # This function assumes X_train is a pandas DataFrame to get column names
@@ -207,10 +207,10 @@ def create_visualizations(
     model,
     X_train,
     y_train,
-    groups_train,
+    episodes_train,
     X_test,
     y_test,
-    groups_test,
+    episodes_test,
     evals_result,
     output_pdf,
 ):
@@ -518,20 +518,20 @@ def main():
     df = load_data(csv_path)
 
     # Prepare features
-    X, y, query_groups, categorical_features, monotone_constraints = prepare_features(
+    X, y, episodes, categorical_features, monotone_constraints = prepare_features(
         df, feature_names, binary_features, monotonicity_map
     )
 
-    # Split data by query groups (so each query stays together)
+    # Split data by episodes (so each episode stays together)
     splitter = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
-    train_idx, test_idx = next(splitter.split(X, y, groups=query_groups))
+    train_idx, test_idx = next(splitter.split(X, y, groups=episodes))
 
     X_train = X.iloc[train_idx].reset_index(drop=True)
     X_test = X.iloc[test_idx].reset_index(drop=True)
     y_train = y.iloc[train_idx].reset_index(drop=True)
     y_test = y.iloc[test_idx].reset_index(drop=True)
-    groups_train = query_groups.iloc[train_idx].reset_index(drop=True)
-    groups_test = query_groups.iloc[test_idx].reset_index(drop=True)
+    episodes_train = episodes.iloc[train_idx].reset_index(drop=True)
+    episodes_test = episodes.iloc[test_idx].reset_index(drop=True)
 
     # Compute hashes to verify deterministic splits
     import hashlib
@@ -540,38 +540,38 @@ def main():
     test_hash = hashlib.md5(str(sorted(test_idx)).encode()).hexdigest()[:8]
 
     print(
-        f"\nTrain set: {len(X_train)} samples, {groups_train.nunique()} query groups ({y_train.sum()} positive)"
+        f"\nTrain set: {len(X_train)} samples, {episodes_train.nunique()} episodes ({y_train.sum()} positive)"
     )
     print(f"  Train split hash: {train_hash}")
     print(
-        f"Test set: {len(X_test)} samples, {groups_test.nunique()} query groups ({y_test.sum()} positive)"
+        f"Test set: {len(X_test)} samples, {episodes_test.nunique()} episodes ({y_test.sum()} positive)"
     )
     print(f"  Test split hash: {test_hash}")
 
     # Further split train into train/val for early stopping
     splitter_val = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
     train_idx2, val_idx = next(
-        splitter_val.split(X_train, y_train, groups=groups_train)
+        splitter_val.split(X_train, y_train, groups=episodes_train)
     )
 
     X_val = X_train.iloc[val_idx].reset_index(drop=True)
     y_val = y_train.iloc[val_idx].reset_index(drop=True)
-    groups_val = groups_train.iloc[val_idx].reset_index(drop=True)
+    episodes_val = episodes_train.iloc[val_idx].reset_index(drop=True)
 
     X_train = X_train.iloc[train_idx2].reset_index(drop=True)
     y_train = y_train.iloc[train_idx2].reset_index(drop=True)
-    groups_train = groups_train.iloc[train_idx2].reset_index(drop=True)
+    episodes_train = episodes_train.iloc[train_idx2].reset_index(drop=True)
 
     # Print validation split hash
     val_hash = hashlib.md5(str(sorted(val_idx)).encode()).hexdigest()[:8]
     print(
-        f"Validation set: {len(X_val)} samples, {groups_val.nunique()} query groups ({y_val.sum()} positive)"
+        f"Validation set: {len(X_val)} samples, {episodes_val.nunique()} episodes ({y_val.sum()} positive)"
     )
     print(f"  Validation split hash: {val_hash}")
 
     # Train model
     model, evals_result = train_model(
-        X_train, y_train, groups_train, X_val, y_val, groups_val, categorical_features, monotone_constraints
+        X_train, y_train, episodes_train, X_val, y_val, episodes_val, categorical_features, monotone_constraints
     )
 
     # Save model
@@ -582,10 +582,10 @@ def main():
         model,
         X_train,
         y_train,
-        groups_train,
+        episodes_train,
         X_test,
         y_test,
-        groups_test,
+        episodes_test,
         evals_result,
         output_pdf,
     )

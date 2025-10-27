@@ -5,7 +5,7 @@ distribution:
 - do something about when the db is new and there's no model
 
 - fuzzy search
-- new feature: define bucket as "from one click to the next". then, "num clicks when this query was in the bucket". so, if we begin with query "tc" and then later modify to "todo" and end up clicking on "todo-current.md", then that's +1 count for "tc". ought to make it feel more magical
+- new feature: define episode as "from one click to the next". then, "num clicks when this query was in the episode". so, if we begin with query "tc" and then later modify to "todo" and end up clicking on "todo-current.md", then that's +1 count for "tc". ought to make it feel more magical
 
 - full text search mode using rg.
 

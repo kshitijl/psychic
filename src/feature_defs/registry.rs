@@ -36,7 +36,7 @@ pub fn feature_names() -> Vec<&'static str> {
 pub fn csv_columns() -> Vec<&'static str> {
     let mut cols = vec![
         "label",
-        "group_id",
+        "episode_id",
         "subsession_id",
         "session_id",
         "query",

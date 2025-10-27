@@ -321,7 +321,7 @@ struct Accumulator {
     scrolls_by_file: HashMap<String, Vec<ScrollEvent>>,
     pending_impressions: HashMap<(String, u64, String), PendingImpression>,
     output_rows: Vec<HashMap<String, String>>,
-    current_group_id: u64,
+    current_episode_id: u64,
 }
 ```
 
@@ -330,13 +330,13 @@ struct Accumulator {
 2. Sort by timestamp (critical for temporal correctness)
 3. Single forward pass:
    - Impression: Compute features from accumulator (only past data), store as pending
-   - Click/Scroll: Record in accumulator, mark matching pending impressions as label=1, increment group_id
+   - Click/Scroll: Record in accumulator, mark matching pending impressions as label=1, increment episode_id
 4. Output all pending impressions as CSV rows
 
 Why single-pass: O(n) instead of O(n²). No future data leakage (features only see past events).
 
-**Group-based ranking:** Each group spans from one engagement event to the next.
-Why: LambdaRank needs groups. Each group = impressions leading to an action. More meaningful than subsession-based grouping.
+**Episode-based ranking:** Each episode spans from one engagement event to the next.
+Why: LambdaRank needs episodes (groups of impressions). Each episode = impressions leading to an action. More meaningful than subsession-based grouping.
 
 **Features computed:** See `feature_defs/implementations.rs` for full list. Examples:
 - Query matching: filename_starts_with_query
@@ -432,7 +432,7 @@ Trains LightGBM LambdaRank model from features CSV.
 **Key parameters:**
 - Objective: `lambdarank`
 - Metric: NDCG (Normalized Discounted Cumulative Gain)
-- Grouping: `group_id` (engagement-based sequences)
+- Grouping: `episode_id` (engagement-based sequences)
 
 **Usage:**
 ```bash
