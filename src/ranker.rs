@@ -322,10 +322,16 @@ impl Ranker {
         }
 
         // Compute simple scores for all files (used for cold-start or blending)
+        let simple_start = Instant::now();
         let simple_scores: Vec<f64> = files
             .iter()
             .map(|file| self.compute_simple_score(file, current_timestamp))
             .collect();
+        log::info!(
+            "TIMING {{\"op\":\"simple_score_compute\",\"ms\":{},\"count\":{}}}",
+            simple_start.elapsed().as_secs_f64() * 1000.0,
+            files.len()
+        );
 
         // If no model, use only simple scores
         if self.model.is_none() {
@@ -426,6 +432,7 @@ impl Ranker {
         );
 
         // Compute blend weights using softmax
+        let blend_start = Instant::now();
         let (w_simple, w_lightgbm) = Self::compute_blend_weights(self.total_clicks);
         log::debug!(
             "Hybrid ranking weights: simple={:.4}, lightgbm={:.4} (total_clicks={})",
@@ -449,6 +456,11 @@ impl Ranker {
                 ml_score: Some(ml_score),
             });
         }
+        log::info!(
+            "TIMING {{\"op\":\"hybrid_blend\",\"ms\":{},\"count\":{}}}",
+            blend_start.elapsed().as_secs_f64() * 1000.0,
+            files.len()
+        );
 
         // Sort by score descending (higher scores first)
         scored_files.sort_by(|a, b| {
