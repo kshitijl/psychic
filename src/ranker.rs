@@ -147,6 +147,14 @@ impl Ranker {
         let db_open_start = std::time::Instant::now();
         let conn =
             Connection::open(db_path).context("Failed to open database for preloading clicks")?;
+
+        // Configure SQLite for better concurrency
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA busy_timeout = 5000;
+             PRAGMA synchronous = NORMAL;",
+        )?;
+
         log::info!(
             "TIMING {{\"op\":\"db_open\",\"ms\":{}}}",
             db_open_start.elapsed().as_secs_f64() * 1000.0

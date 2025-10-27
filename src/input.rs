@@ -469,6 +469,9 @@ fn suspend_tui_and_run_shell(
     // Pause crossterm thread
     let _ = app.input_control_tx.send(false);
 
+    // Give the input thread time to enter paused state to avoid race condition
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
     // Suspend TUI
     disable_raw_mode()?;
     execute!(
@@ -493,12 +496,21 @@ fn suspend_tui_and_run_shell(
         .status();
 
     // Resume TUI
+    log::info!("Resuming TUI after editor/shell");
     enable_raw_mode()?;
     execute!(terminal.backend_mut(), EnterAlternateScreen)?;
     execute!(terminal.backend_mut(), crossterm::event::EnableMouseCapture)?;
+    // Re-enable enhanced keyboard protocol
+    execute!(
+        terminal.backend_mut(),
+        crossterm::event::PushKeyboardEnhancementFlags(
+            crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        )
+    )?;
     terminal.clear()?;
 
     // Resume crossterm thread
+    log::info!("Sending resume signal to input thread");
     let _ = app.input_control_tx.send(true);
 
     if let Err(e) = status {
@@ -516,6 +528,9 @@ fn suspend_tui_for_editor(
 ) -> Result<()> {
     // Pause crossterm thread
     let _ = app.input_control_tx.send(false);
+
+    // Give the input thread time to enter paused state to avoid race condition
+    std::thread::sleep(std::time::Duration::from_millis(50));
 
     // Suspend TUI
     disable_raw_mode()?;
@@ -540,12 +555,21 @@ fn suspend_tui_for_editor(
         .status();
 
     // Resume TUI
+    log::info!("Resuming TUI after editor/shell");
     enable_raw_mode()?;
     execute!(terminal.backend_mut(), EnterAlternateScreen)?;
     execute!(terminal.backend_mut(), crossterm::event::EnableMouseCapture)?;
+    // Re-enable enhanced keyboard protocol
+    execute!(
+        terminal.backend_mut(),
+        crossterm::event::PushKeyboardEnhancementFlags(
+            crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        )
+    )?;
     terminal.clear()?;
 
     // Resume crossterm thread
+    log::info!("Sending resume signal to input thread");
     let _ = app.input_control_tx.send(true);
 
     if let Err(e) = status {
