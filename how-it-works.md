@@ -728,6 +728,7 @@ loop {
 - Type → send UpdateQuery to worker
 - Up/Down → move selection, request new visible slice if needed
 - Ctrl-P/Ctrl-N → move selection up/down (same as Up/Down)
+- Alt-Up → navigate to parent directory
 - Left/Right → navigate directory history (back/forward, like browser)
 - Enter → log click, launch editor (files) or execute on-dir-click action (directories)
 - Ctrl-Enter → execute on-cwd-visit action for selected directory (drop into shell or print path)

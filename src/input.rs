@@ -124,6 +124,7 @@ fn handle_key_press(
             Ok(InputAction::Continue)
         }
         KeyCode::Esc => handle_escape(app),
+        KeyCode::Up if modifiers.contains(KeyModifiers::ALT) => handle_parent_dir(app),
         KeyCode::Up => {
             handle_navigation(app, -1);
             Ok(InputAction::Continue)
@@ -243,7 +244,25 @@ fn handle_ctrl_h(app: &mut App) {
     }
 }
 
-/// Handle Ctrl-Left (go back in history)
+/// Handle Alt-Up (navigate to parent directory)
+fn handle_parent_dir(app: &mut App) -> Result<InputAction> {
+    if let Some(parent) = app.cwd.parent() {
+        let parent = parent.to_path_buf();
+        log::info!("Navigating to parent directory: {:?}", parent);
+        app.history.navigate_to(parent.clone());
+        app.cwd = parent.clone();
+        app.query.clear();
+
+        let query_id = app.analytics.next_subsession_id();
+        let _ = app.worker_tx.send(WorkerRequest::ChangeCwd {
+            new_cwd: parent,
+            query_id,
+        });
+    }
+    Ok(InputAction::Continue)
+}
+
+/// Handle Left arrow (go back in history)
 fn handle_history_back(app: &mut App) -> Result<InputAction> {
     if let Some(dir) = app.history.go_back() {
         log::info!("Navigating back in history to: {:?}", dir);
