@@ -637,10 +637,18 @@ pub fn render_normal_mode(
         debug_lines.push(String::from("Scores:"));
         debug_lines.push(format!("  Final: {:.4}", display_info.score));
         if let Some(simple) = display_info.simple_score {
-            debug_lines.push(format!("  Simple: {:.4}", simple));
+            let weight_str = display_info
+                .simple_weight
+                .map(|w| format!(" (w={:.3})", w))
+                .unwrap_or_default();
+            debug_lines.push(format!("  Simple: {:.4}{}", simple, weight_str));
         }
         if let Some(ml) = display_info.ml_score {
-            debug_lines.push(format!("  ML: {:.4}", ml));
+            let weight_str = display_info
+                .ml_weight
+                .map(|w| format!(" (w={:.3})", w))
+                .unwrap_or_default();
+            debug_lines.push(format!("  ML: {:.4}{}", ml, weight_str));
         }
         debug_lines.push(String::from(""));
         debug_lines.push(String::from("Features:"));

@@ -76,6 +76,8 @@ pub struct DisplayFileInfo {
     pub is_under_cwd: bool,
     pub simple_score: Option<f64>, // For debug pane: score from simple model
     pub ml_score: Option<f64>,     // For debug pane: score from ML model
+    pub simple_weight: Option<f64>, // For debug pane: weight assigned to simple model
+    pub ml_weight: Option<f64>,    // For debug pane: weight assigned to ML model
 }
 
 pub struct UpdateQueryRequest {
@@ -252,18 +254,9 @@ impl WorkerState {
 
         let ranker = if no_click_loading || _no_model {
             // Skip loading model and clicks if either flag is set
-            ranker::Ranker::new_empty(&db_path).unwrap()
-        } else if !model_path.exists() {
-            // Model file doesn't exist yet (fresh install or not trained yet)
-            log::info!(
-                "Model file not found at {:?}, using empty ranker",
-                model_path
-            );
-            ranker::Ranker::new_empty(&db_path).unwrap()
+            ranker::Ranker::new_empty(&db_path)?
         } else {
-            let r = ranker::Ranker::new(&model_path, &db_path).unwrap();
-            log::info!("Loaded ranking model from {:?}", model_path);
-            r
+            Self::load_ranker(&model_path, &db_path)?
         };
         log::info!(
             "TIMING {{\"op\":\"ranker_init\",\"ms\":{}}}",
@@ -544,6 +537,8 @@ impl WorkerState {
                 let features = file_score.map(|fs| fs.features.clone()).unwrap_or_default();
                 let simple_score = file_score.and_then(|fs| fs.simple_score);
                 let ml_score = file_score.and_then(|fs| fs.ml_score);
+                let simple_weight = file_score.and_then(|fs| fs.simple_weight);
+                let ml_weight = file_score.and_then(|fs| fs.ml_weight);
 
                 // Check if this is the current working directory
                 let is_cwd = file_info.full_path == self.root;
@@ -563,6 +558,8 @@ impl WorkerState {
                     is_under_cwd: file_info.is_under_cwd,
                     simple_score,
                     ml_score,
+                    simple_weight,
+                    ml_weight,
                 }
             })
             .collect()
@@ -599,9 +596,24 @@ impl WorkerState {
         }
     }
 
+    /// Load ranker from disk, falling back to empty ranker if model file doesn't exist
+    fn load_ranker(model_path: &Path, db_path: &Path) -> Result<ranker::Ranker> {
+        if !model_path.exists() {
+            log::info!(
+                "Model file not found at {:?}, using empty ranker",
+                model_path
+            );
+            ranker::Ranker::new_empty(db_path)
+        } else {
+            let ranker = ranker::Ranker::new(model_path, db_path)?;
+            log::info!("Loaded ranking model from {:?}", model_path);
+            Ok(ranker)
+        }
+    }
+
     fn reload_model(&mut self) -> Result<()> {
         log::info!("Worker: Reloading model from disk");
-        self.ranker = ranker::Ranker::new(&self.model_path, &self.db_path)?;
+        self.ranker = Self::load_ranker(&self.model_path, &self.db_path)?;
         log::info!("Worker: Model reloaded successfully");
         Ok(())
     }

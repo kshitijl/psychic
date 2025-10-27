@@ -10,7 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 // Import features module
-use crate::feature_defs::{ClickEvent, FEATURE_REGISTRY, FeatureInputs, feature_names};
+use crate::feature_defs::{feature_names, ClickEvent, FeatureInputs, FEATURE_REGISTRY};
 use crate::{db, features};
 
 #[derive(Debug, Clone)]
@@ -28,9 +28,11 @@ pub struct FileCandidate {
 pub struct FileScore {
     pub file_id: usize, // Index into main.rs file registry
     pub score: f64,
-    pub features: Vec<f64>,        // Feature vector in registry order
-    pub simple_score: Option<f64>, // For debugging: score from simple model
-    pub ml_score: Option<f64>,     // For debugging: score from ML model
+    pub features: Vec<f64>,         // Feature vector in registry order
+    pub simple_score: Option<f64>,  // For debugging: score from simple model
+    pub ml_score: Option<f64>,      // For debugging: score from ML model
+    pub simple_weight: Option<f64>, // For debugging: weight assigned to simple model
+    pub ml_weight: Option<f64>,     // For debugging: weight assigned to ML model
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -297,7 +299,7 @@ impl Ranker {
     /// Returns: (w_simple, w_lightgbm) where weights sum to 1.0
     fn compute_blend_weights(total_clicks: usize) -> (f64, f64) {
         let logit_simple: f64 = 1.0;
-        let logit_lightgbm: f64 = (total_clicks as f64) / CLICK_SCALE;
+        let logit_lightgbm: f64 = (total_clicks as f64 - CLICK_SCALE) / CLICK_SCALE;
 
         // Softmax
         let exp_simple = logit_simple.exp();
@@ -344,6 +346,8 @@ impl Ranker {
                     features: Vec::new(),
                     simple_score: Some(simple_scores[idx]),
                     ml_score: None,
+                    simple_weight: Some(1.0), // 100% simple model when no ML model
+                    ml_weight: Some(0.0),
                 })
                 .collect();
             scored_files.sort_by(|a, b| {
@@ -454,6 +458,8 @@ impl Ranker {
                 features: all_features[idx].clone(),
                 simple_score: Some(simple_score),
                 ml_score: Some(ml_score),
+                simple_weight: Some(w_simple),
+                ml_weight: Some(w_lightgbm),
             });
         }
         log::info!(
