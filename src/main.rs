@@ -20,7 +20,10 @@ use anyhow::Result;
 use clap::Parser;
 use crossterm::{
     cursor::Show,
-    event::{self, Event},
+    event::{
+        self, Event, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -374,6 +377,11 @@ fn main() -> Result<()> {
     enable_raw_mode()?;
     execute!(tty, EnterAlternateScreen)?;
     execute!(tty, crossterm::event::EnableMouseCapture)?;
+    // Enable enhanced keyboard protocol for better modifier key detection
+    execute!(
+        tty,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    )?;
     let backend = CrosstermBackend::new(tty);
     let mut terminal = Terminal::new(backend)?;
     log::info!(
@@ -406,6 +414,7 @@ fn main() -> Result<()> {
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
+        PopKeyboardEnhancementFlags,
         crossterm::event::DisableMouseCapture,
         LeaveAlternateScreen,
         Show

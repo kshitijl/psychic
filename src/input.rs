@@ -132,6 +132,8 @@ fn handle_key_press(
             handle_navigation(app, 1);
             Ok(InputAction::Continue)
         }
+        KeyCode::Left => handle_history_back(app),
+        KeyCode::Right => handle_history_forward(app),
         KeyCode::Char('p') if modifiers.contains(KeyModifiers::CONTROL) => {
             handle_navigation(app, -1);
             Ok(InputAction::Continue)
@@ -148,26 +150,84 @@ fn handle_key_press(
             handle_backspace(app);
             Ok(InputAction::Continue)
         }
+        KeyCode::Enter if modifiers.contains(KeyModifiers::CONTROL) => {
+            handle_ctrl_enter(app, terminal)
+        }
         KeyCode::Enter => handle_enter(app, terminal),
         _ => Ok(InputAction::Continue),
     }
 }
 
-/// Handle Ctrl-J (print CWD or drop into shell)
-fn handle_ctrl_j(
+/// Execute on-cwd-visit action for a given directory
+fn execute_cwd_visit_action(
     app: &App,
+    dir_path: &std::path::Path,
     terminal: &mut Terminal<CrosstermBackend<std::fs::File>>,
 ) -> Result<InputAction> {
     match app.on_cwd_visit {
         OnCwdVisitAction::PrintToStdout => {
             cleanup_terminal(terminal)?;
-            Ok(InputAction::PrintAndExit(app.cwd.display().to_string()))
+            Ok(InputAction::PrintAndExit(dir_path.display().to_string()))
         }
         OnCwdVisitAction::DropIntoShell => {
-            suspend_tui_and_run_shell(app, &app.cwd, terminal)?;
+            suspend_tui_and_run_shell(app, dir_path, terminal)?;
             Ok(InputAction::Continue)
         }
     }
+}
+
+/// Handle Ctrl-J (execute on-cwd-visit action for current directory)
+fn handle_ctrl_j(
+    app: &App,
+    terminal: &mut Terminal<CrosstermBackend<std::fs::File>>,
+) -> Result<InputAction> {
+    execute_cwd_visit_action(app, &app.cwd, terminal)
+}
+
+/// Handle Ctrl-Enter (execute on-cwd-visit action for selected directory)
+fn handle_ctrl_enter(
+    app: &mut App,
+    terminal: &mut Terminal<CrosstermBackend<std::fs::File>>,
+) -> Result<InputAction> {
+    if app.ui_state.history_mode {
+        // In history mode, same as regular Enter
+        app.handle_history_enter()?;
+        return Ok(InputAction::Continue);
+    }
+
+    if app.total_results == 0 {
+        return Ok(InputAction::Continue);
+    }
+
+    // Log impressions before action
+    app.check_and_log_impressions(true)?;
+
+    let Some(display_info) = app.get_file_at_index(app.selected_index) else {
+        return Ok(InputAction::Continue);
+    };
+
+    // Only handle directories
+    if !display_info.is_dir {
+        return Ok(InputAction::Continue);
+    }
+
+    // Log the click event
+    let subsession_id = app.analytics.current_subsession_id();
+    let session_id = app.analytics.session_id().to_string();
+    app.analytics.log_click(EventData {
+        query: &app.query,
+        file_path: &display_info.display_name,
+        full_path: &display_info.full_path.to_string_lossy(),
+        mtime: display_info.mtime,
+        atime: display_info.atime,
+        file_size: display_info.file_size,
+        subsession_id,
+        action: UserInteraction::Click,
+        session_id: &session_id,
+    })?;
+
+    // Execute the on-cwd-visit action for the selected directory
+    execute_cwd_visit_action(app, &display_info.full_path, terminal)
 }
 
 /// Handle Ctrl-H (toggle history mode)
@@ -181,6 +241,38 @@ fn handle_ctrl_h(app: &mut App) {
         app.query.clear();
         app.preview.clear();
     }
+}
+
+/// Handle Ctrl-Left (go back in history)
+fn handle_history_back(app: &mut App) -> Result<InputAction> {
+    if let Some(dir) = app.history.go_back() {
+        log::info!("Navigating back in history to: {:?}", dir);
+        app.cwd = dir.clone();
+        app.query.clear();
+
+        let query_id = app.analytics.next_subsession_id();
+        let _ = app.worker_tx.send(WorkerRequest::ChangeCwd {
+            new_cwd: dir,
+            query_id,
+        });
+    }
+    Ok(InputAction::Continue)
+}
+
+/// Handle Ctrl-Right (go forward in history)
+fn handle_history_forward(app: &mut App) -> Result<InputAction> {
+    if let Some(dir) = app.history.go_forward() {
+        log::info!("Navigating forward in history to: {:?}", dir);
+        app.cwd = dir.clone();
+        app.query.clear();
+
+        let query_id = app.analytics.next_subsession_id();
+        let _ = app.worker_tx.send(WorkerRequest::ChangeCwd {
+            new_cwd: dir,
+            query_id,
+        });
+    }
+    Ok(InputAction::Continue)
 }
 
 /// Handle Ctrl-U (clear search query)

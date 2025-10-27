@@ -728,13 +728,17 @@ loop {
 - Type → send UpdateQuery to worker
 - Up/Down → move selection, request new visible slice if needed
 - Ctrl-P/Ctrl-N → move selection up/down (same as Up/Down)
-- Enter → log click, launch editor, resume TUI
-- Ctrl-J → open shell in CWD (or print path and exit in shell integration mode)
+- Left/Right → navigate directory history (back/forward, like browser)
+- Enter → log click, launch editor (files) or execute on-dir-click action (directories)
+- Ctrl-Enter → execute on-cwd-visit action for selected directory (drop into shell or print path)
+- Ctrl-J → execute on-cwd-visit action for current working directory (drop into shell or print path)
 - Ctrl-H → toggle history navigation mode
 - Ctrl-U → clear query
 - Ctrl-O → toggle debug pane
+- Tab → cycle to next filter
+- Shift-Tab → cycle to previous filter
 - Ctrl-F → toggle filter picker
-- 0/c/d/f (when filter picker visible) → select filter (0=none, c=cwd, d=dirs, f=files)
+- 0/c/i/d/f (when filter picker visible) → select filter (0=none, c=cwd recursive, i=direct cwd only, d=dirs, f=files)
 - Ctrl-C/Ctrl-D/Esc → quit (Esc also closes filter picker or history mode if open)
 
 **Mouse:**

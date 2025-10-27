@@ -114,6 +114,28 @@ impl History {
     pub fn current_index(&self) -> usize {
         self.current_index
     }
+
+    /// Go back in history (like browser back button)
+    /// Returns Some(PathBuf) if we can go back, None if already at oldest
+    pub fn go_back(&mut self) -> Option<PathBuf> {
+        if self.current_index > 0 {
+            self.current_index -= 1;
+            Some(self.dirs[self.current_index].clone())
+        } else {
+            None
+        }
+    }
+
+    /// Go forward in history (like browser forward button)
+    /// Returns Some(PathBuf) if we can go forward, None if already at newest
+    pub fn go_forward(&mut self) -> Option<PathBuf> {
+        if self.current_index + 1 < self.dirs.len() {
+            self.current_index += 1;
+            Some(self.dirs[self.current_index].clone())
+        } else {
+            None
+        }
+    }
 }
 
 #[cfg(test)]
