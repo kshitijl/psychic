@@ -634,7 +634,14 @@ pub fn render_normal_mode(
 
     // Show current selection info - need another lookup to get score/features
     if let Some(display_info) = ctx.get_file_at_index(ctx.selected_index) {
-        debug_lines.push(format!("Score: {:.4}", display_info.score));
+        debug_lines.push(String::from("Scores:"));
+        debug_lines.push(format!("  Final: {:.4}", display_info.score));
+        if let Some(simple) = display_info.simple_score {
+            debug_lines.push(format!("  Simple: {:.4}", simple));
+        }
+        if let Some(ml) = display_info.ml_score {
+            debug_lines.push(format!("  ML: {:.4}", ml));
+        }
         debug_lines.push(String::from(""));
         debug_lines.push(String::from("Features:"));
         debug_lines.push(String::from(""));

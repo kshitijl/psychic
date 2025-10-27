@@ -347,13 +347,14 @@ Why: LambdaRank needs groups. Each group = impressions leading to an action. Mor
 
 ### Module: `ranker.rs`
 
-LightGBM model inference for scoring files.
+Hybrid ranking system that blends simple linear model with LightGBM model inference.
 
 ```rust
 pub struct Ranker {
-    model: Booster,
+    model: Option<Booster>,
     clicks: ClickData,
     stats: Option<ModelStats>,
+    total_clicks: usize,
 }
 
 pub struct ClickData {
@@ -367,13 +368,38 @@ pub struct ClickData {
 - `clicks_by_file`: Indexed by full file path
 - `clicks_by_parent_dir`: Indexed by parent directory path
 - `clicks_by_query_and_file`: Indexed by (query, full_path) tuple for query-specific click tracking
+- `total_clicks`: Total number of clicks across all files (used for weighting)
 
 Why: O(1) lookup per file vs O(n) query per file. Database query runs once with composite index. Multiple indices enable different features without re-querying the database.
+
+**Hybrid Ranking Approach:**
+
+The ranker uses a two-model hybrid system to handle cold-start scenarios (new installations or few clicks):
+
+1. **Simple Linear Model:**
+   - Formula: `3.0 * clicks_last_7_days + 1.0 / (1 + modified_age_in_days)`
+   - Prioritizes recently clicked files and recently modified files
+   - Fast to compute, works with zero training data
+   - Always computed for all files
+
+2. **LightGBM Model:**
+   - Sophisticated ML model trained on full feature set
+   - Requires training data (model file may not exist on first run)
+   - More accurate but only useful with sufficient click history
+
+3. **Softmax Blending:**
+   - Weights computed via softmax on logits `[1.0, total_clicks / 100.0]`
+   - At 0 clicks: `w_simple ≈ 0.73, w_lightgbm ≈ 0.27`
+   - At 100 clicks: `w_simple = 0.50, w_lightgbm = 0.50` (balanced)
+   - At 1000+ clicks: `w_simple ≈ 0.0001, w_lightgbm ≈ 0.9999` (ML dominates)
+   - Final score: `w_simple * simple_score + w_lightgbm * ml_score`
+
+Why hybrid approach: On new installations, the ML model either doesn't exist or has no meaningful data to learn from. The simple model provides reasonable ranking based on recency and basic click counts, then smoothly transitions to ML-based ranking as usage data accumulates.
 
 **Ranking:**
 ```rust
 pub fn rank_files(
-    &self,
+    &mut self,
     query: &str,
     file_candidates: &[FileCandidate],
     current_timestamp: i64,
@@ -387,8 +413,10 @@ Returns `Vec<FileScore>` sorted by predicted relevance (descending).
 ```rust
 pub struct FileScore {
     pub file_id: usize,  // Index into file registry
-    pub score: f64,
+    pub score: f64,      // Blended score from hybrid system
     pub features: Vec<f64>,  // For debug display
+    pub simple_score: Option<f64>,  // Debug: score from simple model
+    pub ml_score: Option<f64>,      // Debug: score from ML model
 }
 ```
 

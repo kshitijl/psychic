@@ -72,6 +72,8 @@ pub struct DisplayFileInfo {
     pub is_cwd: bool,
     pub is_historical: bool, // From UserClickedInEventsDb, not current CwdWalker
     pub is_under_cwd: bool,
+    pub simple_score: Option<f64>, // For debug pane: score from simple model
+    pub ml_score: Option<f64>,     // For debug pane: score from ML model
 }
 
 pub struct UpdateQueryRequest {
@@ -527,6 +529,8 @@ impl WorkerState {
 
                 let score = file_score.map(|fs| fs.score).unwrap_or(0.0);
                 let features = file_score.map(|fs| fs.features.clone()).unwrap_or_default();
+                let simple_score = file_score.and_then(|fs| fs.simple_score);
+                let ml_score = file_score.and_then(|fs| fs.ml_score);
 
                 // Check if this is the current working directory
                 let is_cwd = file_info.full_path == self.root;
@@ -544,6 +548,8 @@ impl WorkerState {
                     is_cwd,
                     is_historical,
                     is_under_cwd: file_info.is_under_cwd,
+                    simple_score,
+                    ml_score,
                 }
             })
             .collect()
@@ -589,8 +595,13 @@ impl WorkerState {
 
     fn reload_clicks(&mut self) -> Result<()> {
         log::info!("Worker: Reloading click data");
-        self.ranker.clicks = ranker::Ranker::load_clicks(&self.db_path)?;
-        log::info!("Worker: Click data reloaded successfully");
+        let (clicks, total_clicks) = ranker::Ranker::load_clicks(&self.db_path)?;
+        self.ranker.clicks = clicks;
+        self.ranker.total_clicks = total_clicks;
+        log::info!(
+            "Worker: Click data reloaded successfully (total_clicks={})",
+            total_clicks
+        );
         Ok(())
     }
 

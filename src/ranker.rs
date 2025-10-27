@@ -28,7 +28,9 @@ pub struct FileCandidate {
 pub struct FileScore {
     pub file_id: usize, // Index into main.rs file registry
     pub score: f64,
-    pub features: Vec<f64>, // Feature vector in registry order
+    pub features: Vec<f64>,        // Feature vector in registry order
+    pub simple_score: Option<f64>, // For debugging: score from simple model
+    pub ml_score: Option<f64>,     // For debugging: score from ML model
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -58,7 +60,13 @@ pub struct Ranker {
     model: Option<Booster>,
     pub clicks: ClickData,
     pub stats: Option<ModelStats>,
+    pub total_clicks: usize,
 }
+
+// Tunable constants for hybrid ranking
+const CLICKS_WEIGHT: f64 = 3.0; // Weight for clicks in simple model
+const RECENCY_WEIGHT: f64 = 1.0; // Weight for recency in simple model
+const CLICK_SCALE: f64 = 100.0; // Denominator for softmax logit (controls transition speed)
 
 impl Ranker {
     pub fn new(model_path: &Path, db_path: &Path) -> Result<Self> {
@@ -71,7 +79,7 @@ impl Ranker {
         );
 
         let clicks_load_start = std::time::Instant::now();
-        let clicks = Self::load_clicks(db_path)?;
+        let (clicks, total_clicks) = Self::load_clicks(db_path)?;
         log::info!(
             "TIMING {{\"op\":\"load_clicks\",\"ms\":{}}}",
             clicks_load_start.elapsed().as_secs_f64() * 1000.0
@@ -88,6 +96,7 @@ impl Ranker {
             model: Some(model),
             clicks,
             stats,
+            total_clicks,
         })
     }
 
@@ -101,6 +110,7 @@ impl Ranker {
                 clicks_by_query_and_file: FxHashMap::default(),
             },
             stats: None,
+            total_clicks: 0,
         })
     }
 
@@ -125,7 +135,8 @@ impl Ranker {
     }
 
     /// Load click events from last 30 days from database
-    pub fn load_clicks(db_path: &Path) -> Result<ClickData> {
+    /// Returns (ClickData, total_clicks)
+    pub fn load_clicks(db_path: &Path) -> Result<(ClickData, usize)> {
         let total_start = std::time::Instant::now();
 
         let timestamp_calc_start = std::time::Instant::now();
@@ -190,6 +201,7 @@ impl Ranker {
 
         let indexing_start = std::time::Instant::now();
         let row_count = rows.len();
+        let total_clicks = row_count; // Total number of clicks
         for (path, timestamp, query) in rows {
             let click_event = ClickEvent { timestamp };
 
@@ -228,6 +240,7 @@ impl Ranker {
             "TIMING {{\"op\":\"load_clicks_total\",\"ms\":{}}}",
             total_start.elapsed().as_secs_f64() * 1000.0
         );
+        log::debug!("Loaded {} total clicks from last 30 days", total_clicks);
         log::debug!(
             "Loaded {} files with click history from last 30 days",
             clicks_by_file.len()
@@ -238,11 +251,63 @@ impl Ranker {
             clicks_by_query_and_file.len()
         );
 
-        Ok(ClickData {
-            clicks_by_file,
-            clicks_by_parent_dir,
-            clicks_by_query_and_file,
-        })
+        Ok((
+            ClickData {
+                clicks_by_file,
+                clicks_by_parent_dir,
+                clicks_by_query_and_file,
+            },
+            total_clicks,
+        ))
+    }
+
+    /// Compute simple score for cold-start ranking
+    /// Formula: CLICKS_WEIGHT * clicks_last_7_days + RECENCY_WEIGHT / (1 + modified_age_in_days)
+    fn compute_simple_score(&self, file: &FileCandidate, current_timestamp: i64) -> f64 {
+        // Count clicks in last 7 days
+        let seven_days_ago = current_timestamp - (7 * 24 * 60 * 60);
+        let full_path_str = file.full_path.to_string_lossy().to_string();
+        let clicks_last_7_days = self
+            .clicks
+            .clicks_by_file
+            .get(&full_path_str)
+            .map(|clicks| {
+                clicks
+                    .iter()
+                    .filter(|c| c.timestamp >= seven_days_ago && c.timestamp <= current_timestamp)
+                    .count()
+            })
+            .unwrap_or(0) as f64;
+
+        // Compute modified age in days
+        let modified_age_in_days = if let Some(mtime) = file.mtime {
+            let seconds_since_mod = current_timestamp - mtime;
+            (seconds_since_mod as f64) / (24.0 * 60.0 * 60.0)
+        } else {
+            // Large age for files with no mtime
+            365.0
+        };
+
+        // Combine: clicks are weighted 3x more than recency
+        CLICKS_WEIGHT * clicks_last_7_days + RECENCY_WEIGHT / (1.0 + modified_age_in_days)
+    }
+
+    /// Compute blend weights using softmax
+    /// Logits: [1.0, total_clicks / CLICK_SCALE]
+    /// Returns: (w_simple, w_lightgbm) where weights sum to 1.0
+    fn compute_blend_weights(total_clicks: usize) -> (f64, f64) {
+        let logit_simple: f64 = 1.0;
+        let logit_lightgbm: f64 = (total_clicks as f64) / CLICK_SCALE;
+
+        // Softmax
+        let exp_simple = logit_simple.exp();
+        let exp_lightgbm = logit_lightgbm.exp();
+        let sum = exp_simple + exp_lightgbm;
+
+        let w_simple = exp_simple / sum;
+        let w_lightgbm = exp_lightgbm / sum;
+
+        (w_simple, w_lightgbm)
     }
 
     pub fn rank_files(
@@ -256,14 +321,23 @@ impl Ranker {
             return Ok(Vec::new());
         }
 
-        // If no model, just sort by mtime (most recent first)
+        // Compute simple scores for all files (used for cold-start or blending)
+        let simple_scores: Vec<f64> = files
+            .iter()
+            .map(|file| self.compute_simple_score(file, current_timestamp))
+            .collect();
+
+        // If no model, use only simple scores
         if self.model.is_none() {
             let mut scored_files: Vec<FileScore> = files
                 .iter()
-                .map(|file| FileScore {
+                .enumerate()
+                .map(|(idx, file)| FileScore {
                     file_id: file.file_id,
-                    score: file.mtime.unwrap_or(0) as f64,
+                    score: simple_scores[idx],
                     features: Vec::new(),
+                    simple_score: Some(simple_scores[idx]),
+                    ml_score: None,
                 })
                 .collect();
             scored_files.sort_by(|a, b| {
@@ -351,13 +425,28 @@ impl Ranker {
             files.len()
         );
 
-        // Build scored files
+        // Compute blend weights using softmax
+        let (w_simple, w_lightgbm) = Self::compute_blend_weights(self.total_clicks);
+        log::debug!(
+            "Hybrid ranking weights: simple={:.4}, lightgbm={:.4} (total_clicks={})",
+            w_simple,
+            w_lightgbm,
+            self.total_clicks
+        );
+
+        // Build scored files with hybrid blending
         let mut scored_files = Vec::with_capacity(files.len());
         for (idx, file) in files.iter().enumerate() {
+            let simple_score = simple_scores[idx];
+            let ml_score = prediction_results[idx];
+            let blended_score = w_simple * simple_score + w_lightgbm * ml_score;
+
             scored_files.push(FileScore {
                 file_id: file.file_id,
-                score: prediction_results[idx],
+                score: blended_score,
                 features: all_features[idx].clone(),
+                simple_score: Some(simple_score),
+                ml_score: Some(ml_score),
             });
         }
 
@@ -780,5 +869,196 @@ mod tests {
         let expected = "[0.0, 3.0, 0.0, 1.0, 0.0, 12288.0, 4.0, 0.0, 0.0, 3.0, 86400.0, 2.0, 0.0]";
 
         assert_eq!(actual, expected, "Feature vector mismatch");
+    }
+
+    #[test]
+    fn test_compute_blend_weights() {
+        // Test softmax blend weights at different click counts
+
+        // 0 clicks: simple model should dominate
+        let (w_simple, w_lightgbm) = Ranker::compute_blend_weights(0);
+        assert!(
+            w_simple > 0.7 && w_simple < 0.75,
+            "At 0 clicks, w_simple should be ~0.73, got {}",
+            w_simple
+        );
+        assert!(
+            w_lightgbm > 0.25 && w_lightgbm < 0.3,
+            "At 0 clicks, w_lightgbm should be ~0.27, got {}",
+            w_lightgbm
+        );
+        assert!(
+            (w_simple + w_lightgbm - 1.0).abs() < 0.0001,
+            "Weights should sum to 1.0, got {}",
+            w_simple + w_lightgbm
+        );
+
+        // 100 clicks: balanced blend
+        let (w_simple, w_lightgbm) = Ranker::compute_blend_weights(100);
+        assert!(
+            (w_simple - 0.5).abs() < 0.01,
+            "At 100 clicks, w_simple should be ~0.5, got {}",
+            w_simple
+        );
+        assert!(
+            (w_lightgbm - 0.5).abs() < 0.01,
+            "At 100 clicks, w_lightgbm should be ~0.5, got {}",
+            w_lightgbm
+        );
+
+        // 1000 clicks: ML model should dominate
+        let (w_simple, w_lightgbm) = Ranker::compute_blend_weights(1000);
+        assert!(
+            w_simple < 0.001,
+            "At 1000 clicks, w_simple should be ~0.0001, got {}",
+            w_simple
+        );
+        assert!(
+            w_lightgbm > 0.999,
+            "At 1000 clicks, w_lightgbm should be ~0.9999, got {}",
+            w_lightgbm
+        );
+    }
+
+    #[test]
+    fn test_compute_simple_score() {
+        // Create a ranker with some synthetic click data
+        let mut clicks_by_file = FxHashMap::default();
+        clicks_by_file.insert(
+            "/tmp/foo.txt".to_string(),
+            vec![
+                ClickEvent {
+                    timestamp: 1700000000, // ~7 days ago
+                },
+                ClickEvent {
+                    timestamp: 1700100000, // Recent
+                },
+            ],
+        );
+
+        let ranker = Ranker {
+            model: None,
+            clicks: ClickData {
+                clicks_by_file,
+                clicks_by_parent_dir: FxHashMap::default(),
+                clicks_by_query_and_file: FxHashMap::default(),
+            },
+            stats: None,
+            total_clicks: 2,
+        };
+
+        let current_timestamp = 1700604800; // Nov 22, 2023
+        let file = FileCandidate {
+            file_id: 0,
+            relative_path: "foo.txt".to_string(),
+            full_path: PathBuf::from("/tmp/foo.txt"),
+            mtime: Some(1700500000), // Recent (1 day ago)
+            file_size: Some(1024),
+            is_from_walker: true,
+            is_dir: false,
+        };
+
+        let score = ranker.compute_simple_score(&file, current_timestamp);
+
+        // Score should be: 3.0 * 2 (clicks) + 1.0 / (1 + ~1.2 days)
+        // = 6.0 + ~0.45 = ~6.45
+        assert!(
+            score > 6.0 && score < 7.0,
+            "Simple score should be ~6.45, got {}",
+            score
+        );
+
+        // Test file with no clicks and old mtime
+        let old_file = FileCandidate {
+            file_id: 1,
+            relative_path: "bar.txt".to_string(),
+            full_path: PathBuf::from("/tmp/bar.txt"),
+            mtime: Some(1600000000), // Very old
+            file_size: Some(2048),
+            is_from_walker: true,
+            is_dir: false,
+        };
+
+        let score = ranker.compute_simple_score(&old_file, current_timestamp);
+
+        // Score should be: 3.0 * 0 (no clicks) + 1.0 / (1 + many days)
+        // = 0.0 + very small positive number
+        assert!(
+            score > 0.0 && score < 0.1,
+            "Old file with no clicks should have very low score, got {}",
+            score
+        );
+    }
+
+    #[test]
+    fn test_simple_scoring_without_model() {
+        // Test ranking with no model (cold start)
+        let mut clicks_by_file = FxHashMap::default();
+        clicks_by_file.insert(
+            "/tmp/popular.txt".to_string(),
+            vec![
+                ClickEvent {
+                    timestamp: 1700500000,
+                },
+                ClickEvent {
+                    timestamp: 1700510000,
+                },
+                ClickEvent {
+                    timestamp: 1700520000,
+                },
+            ],
+        );
+
+        let mut ranker = Ranker {
+            model: None,
+            clicks: ClickData {
+                clicks_by_file,
+                clicks_by_parent_dir: FxHashMap::default(),
+                clicks_by_query_and_file: FxHashMap::default(),
+            },
+            stats: None,
+            total_clicks: 3,
+        };
+
+        let current_timestamp = 1700604800;
+        let files = vec![
+            FileCandidate {
+                file_id: 0,
+                relative_path: "popular.txt".to_string(),
+                full_path: PathBuf::from("/tmp/popular.txt"),
+                mtime: Some(1700000000),
+                file_size: Some(1024),
+                is_from_walker: true,
+                is_dir: false,
+            },
+            FileCandidate {
+                file_id: 1,
+                relative_path: "recent.txt".to_string(),
+                full_path: PathBuf::from("/tmp/recent.txt"),
+                mtime: Some(1700600000), // Very recent
+                file_size: Some(2048),
+                is_from_walker: true,
+                is_dir: false,
+            },
+        ];
+
+        let result = ranker
+            .rank_files("", &files, current_timestamp, &PathBuf::from("/tmp"))
+            .expect("Ranking should succeed");
+
+        assert_eq!(result.len(), 2, "Should have 2 ranked files");
+
+        // popular.txt should rank first due to clicks (3 * 3 = 9 points)
+        assert_eq!(
+            result[0].file_id, 0,
+            "Popular file should rank first in cold start"
+        );
+
+        // Verify debug fields are populated
+        assert!(
+            result[0].simple_score.is_some(),
+            "Simple score should be present"
+        );
+        assert!(result[0].ml_score.is_none(), "ML score should be None");
     }
 }
