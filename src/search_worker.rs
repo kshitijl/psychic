@@ -251,6 +251,13 @@ impl WorkerState {
         let ranker = if no_click_loading || _no_model {
             // Skip loading model and clicks if either flag is set
             ranker::Ranker::new_empty(&db_path).unwrap()
+        } else if !model_path.exists() {
+            // Model file doesn't exist yet (fresh install or not trained yet)
+            log::info!(
+                "Model file not found at {:?}, using empty ranker",
+                model_path
+            );
+            ranker::Ranker::new_empty(&db_path).unwrap()
         } else {
             let r = ranker::Ranker::new(&model_path, &db_path).unwrap();
             log::info!("Loaded ranking model from {:?}", model_path);

@@ -101,7 +101,10 @@ impl Accumulator {
         self.last_session_id = Some(event.session_id.clone());
 
         // Add episode_id to features
-        features.insert("episode_id".to_string(), self.current_episode_id.to_string());
+        features.insert(
+            "episode_id".to_string(),
+            self.current_episode_id.to_string(),
+        );
 
         let key = (
             event.session_id.clone(),
