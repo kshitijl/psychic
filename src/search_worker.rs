@@ -2,6 +2,8 @@ use crate::db::Database;
 use crate::ranker;
 use crate::walker::start_file_walker;
 use anyhow::Result;
+use fuzzy_matcher::FuzzyMatcher;
+use fuzzy_matcher::skim::SkimMatcherV2;
 use mpsc::Sender;
 use std::{
     collections::HashMap,
@@ -421,7 +423,9 @@ impl WorkerState {
     fn filter_and_rank(&mut self, query: &str) -> Result<()> {
         let filter_rank_start = std::time::Instant::now();
         self.current_query = query.to_string();
-        let query_lower = query.to_lowercase();
+
+        // Create fuzzy matcher
+        let matcher = SkimMatcherV2::default();
 
         // Filter files that match the query
         let filter_start = std::time::Instant::now();
@@ -430,9 +434,11 @@ impl WorkerState {
             .filter(|&file_id| {
                 let file_info = &self.file_registry[file_id.0];
 
-                // Apply text query filter
-                let matches_query = query_lower.is_empty()
-                    || file_info.display_name.to_lowercase().contains(&query_lower);
+                // Apply text query filter using fuzzy matching
+                let matches_query = query.is_empty()
+                    || matcher
+                        .fuzzy_match(&file_info.display_name, query)
+                        .is_some();
 
                 if !matches_query {
                     return false;
