@@ -537,8 +537,14 @@ fn run_app(
         })?;
 
         // Apply render updates to app state after rendering is complete
-        if let Some(updates) = render_updates {
+        if let Some(mut updates) = render_updates {
+            let visible_height = updates.visible_list_height;
+            let scroll_override = updates.file_list_scroll;
+            updates.visible_list_height = None;
             updates.apply_to(app);
+            if let Some(height) = visible_height {
+                app.update_scroll(height, scroll_override);
+            }
         }
 
         // Log draw time and check for first full render (with data)

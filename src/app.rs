@@ -370,8 +370,14 @@ impl App {
         Ok(())
     }
 
-    pub fn update_scroll(&mut self, visible_height: u16) {
+    pub fn update_scroll(&mut self, visible_height: u16, override_scroll: Option<usize>) {
         let visible_height = visible_height as usize;
+
+        // If we can't render any rows, skip scroll updates but keep selection.
+        if visible_height == 0 {
+            return;
+        }
+
         if self.total_results == 0 {
             return;
         }
@@ -379,6 +385,11 @@ impl App {
         // If all results fit on screen, don't scroll at all
         if self.total_results <= visible_height {
             self.file_list_scroll = 0;
+            // Even if everything fits, still ensure current page is cached.
+        } else if let Some(scroll) = override_scroll {
+            // Render pass already computed desired scroll position.
+            let max_scroll = self.total_results.saturating_sub(1);
+            self.file_list_scroll = scroll.min(max_scroll);
         } else {
             // Auto-scroll the file list when selection is near top or bottom
             let selected = self.selected_index;

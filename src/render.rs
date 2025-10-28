@@ -299,6 +299,7 @@ pub struct RenderUpdates {
     pub path_bar_scroll: Option<u16>,
     pub path_bar_scroll_direction: Option<i8>,
     pub last_path_bar_update: Option<std::time::Instant>,
+    pub visible_list_height: Option<u16>,
 }
 
 impl RenderUpdates {
@@ -309,6 +310,7 @@ impl RenderUpdates {
             path_bar_scroll: None,
             path_bar_scroll_direction: None,
             last_path_bar_update: None,
+            visible_list_height: None,
         }
     }
 
@@ -416,6 +418,7 @@ pub fn render_normal_mode(
 
     // Compute scroll position based on selection and visible height
     let visible_height = top_chunks[0].height.saturating_sub(2); // subtract border
+    updates.visible_list_height = Some(visible_height);
     let file_list_scroll = compute_scroll(
         ctx.selected_index,
         ctx.file_list_scroll,
