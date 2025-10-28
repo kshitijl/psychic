@@ -207,4 +207,21 @@ impl Database {
 
         Ok(paths)
     }
+
+    pub fn summarize_events(&self) -> Result<Vec<(String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT action, COUNT(*) as count
+             FROM events
+             GROUP BY action
+             ORDER BY count DESC",
+        )?;
+
+        let summary = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<Result<Vec<(String, i64)>, _>>()?;
+
+        Ok(summary)
+    }
 }

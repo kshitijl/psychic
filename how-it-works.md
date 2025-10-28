@@ -983,6 +983,12 @@ psychic retrain
 psychic zsh > ~/.psychic.zsh
 # Then add to ~/.zshrc: source ~/.psychic.zsh
 
+# Internal commands (development/debugging)
+psychic internal analyze-perf
+psychic internal print-log
+psychic internal clear-log
+psychic internal summarize-events
+
 # Train model (standalone Python script)
 python train.py features.csv output
 # Outputs: output.txt + ~/.local/share/psychic/model.txt + output_viz.pdf

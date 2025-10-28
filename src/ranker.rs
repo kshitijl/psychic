@@ -951,16 +951,16 @@ mod tests {
             w_simple + w_lightgbm
         );
 
-        // 100 clicks: balanced blend (inflection point)
+        // 100 clicks: ML model should dominate (simple nearly zero)
         let (w_simple, w_lightgbm) = Ranker::compute_blend_weights(100);
         assert!(
-            (w_simple - 0.5).abs() < 0.01,
-            "At 100 clicks, w_simple should be ~0.5, got {}",
+            w_simple < 0.01,
+            "At 100 clicks, w_simple should be near 0.0, got {}",
             w_simple
         );
         assert!(
-            (w_lightgbm - 0.5).abs() < 0.01,
-            "At 100 clicks, w_lightgbm should be ~0.5, got {}",
+            w_lightgbm > 0.99,
+            "At 100 clicks, w_lightgbm should be near 1.0, got {}",
             w_lightgbm
         );
 

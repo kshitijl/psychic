@@ -17,7 +17,7 @@ mod search_worker;
 mod ui_state;
 mod walker;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use crossterm::{
     cursor::Show,
@@ -173,6 +173,38 @@ fn main() -> Result<()> {
                 InternalCommands::AnalyzePerf => {
                     let log_path = data_dir.join("app.log");
                     analyze_perf::analyze_perf(&log_path)?;
+                    return Ok(());
+                }
+                InternalCommands::PrintLog => {
+                    let log_path = data_dir.join("app.log");
+                    let contents =
+                        std::fs::read_to_string(&log_path).context("Failed to read log file")?;
+                    print!("{}", contents);
+                    return Ok(());
+                }
+                InternalCommands::ClearLog => {
+                    let log_path = data_dir.join("app.log");
+                    if log_path.exists() {
+                        std::fs::remove_file(&log_path).with_context(|| {
+                            format!("Failed to delete log file {}", log_path.display())
+                        })?;
+                        println!("Deleted log file {}", log_path.display());
+                    } else {
+                        println!("No log file found at {}", log_path.display());
+                    }
+                    return Ok(());
+                }
+                InternalCommands::SummarizeEvents => {
+                    let db_path = db::Database::get_db_path(&data_dir);
+                    let db = db::Database::new(&db_path)?;
+                    let summary = db.summarize_events()?;
+
+                    println!("Event Summary:");
+                    println!("{:<20} {:>10}", "Action", "Count");
+                    println!("{}", "-".repeat(32));
+                    for (action, count) in summary {
+                        println!("{:<20} {:>10}", action, count);
+                    }
                     return Ok(());
                 }
             },

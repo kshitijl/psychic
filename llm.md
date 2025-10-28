@@ -18,7 +18,7 @@ Read src/main.rs to understand the entrypoint. Read train.py to understand how t
 
 ## Development workflow
 
-After adding a fair amount of new code to implement a feature or fix a bug:
+After adding implementing a feature or fixing a bug:
 * run `just build`. You can see the justfile to understand what this does
 * run `cargo test`
 * also `cargo clippy`.
@@ -26,6 +26,8 @@ After adding a fair amount of new code to implement a feature or fix a bug:
 * update how-it-works.md so that it reflects current state.
 
 Do not run `cargo build`. I have a symlink to the RELEASE binary under target. That's what I use every day, and that's what I test as a user. It must reflect the current latest code. You must run `just build`, which will build a release binary and also other tasks that I need done in order to read and understand the code.
+
+You MUST ensure that `just build`, `cargo test` and `cargo clippy` produce clean output! No warnings or broken tests! No documentation link warnings!
 
 ## Running the binary
 

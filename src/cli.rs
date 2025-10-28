@@ -34,6 +34,12 @@ pub enum Commands {
 pub enum InternalCommands {
     /// Analyze performance timings from the latest psychic run
     AnalyzePerf,
+    /// Print the application log file
+    PrintLog,
+    /// Delete the current application log file
+    ClearLog,
+    /// Summarize events in the database by action type
+    SummarizeEvents,
 }
 
 /// Filter type for initial filter
