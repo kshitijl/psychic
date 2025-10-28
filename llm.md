@@ -33,6 +33,10 @@ Write tests instead of trying to run the binary. It is a TUI application. It doe
 
 When running the binary, always use `cargo run --release -- <args>` instead of running the binary directly. This prevents running an outdated binary.
 
+## Debug, error and log output
+
+Do not eprintln! This is a terminal UI app. Printing to stderr messes up the UI. Instead, use the standard logging functions. This will go in the log file.
+
 ## Testing Guidelines
 
 **Prefer expect-style tests:** Tests should be written in an "expect test" style where the expected output is explicitly written in the test code itself, not computed or hidden. This makes it easy to inspect the expected behavior at a glance.
