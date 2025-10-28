@@ -26,6 +26,22 @@ pub struct Page {
 pub const PAGE_SIZE: usize = 128;
 pub const PREFETCH_MARGIN: usize = 32;
 
+pub struct AppOptions {
+    pub on_dir_click: OnDirClickAction,
+    pub on_cwd_visit: OnCwdVisitAction,
+    pub initial_filter: search_worker::FilterType,
+    pub no_preview: bool,
+    pub no_click_loading: bool,
+    pub no_model: bool,
+    pub no_click_logging: bool,
+}
+
+pub struct AppBootstrap {
+    pub log_receiver: Receiver<String>,
+    pub event_tx: mpsc::Sender<crate::AppEvent>,
+    pub input_control_tx: crossbeam::channel::Sender<bool>,
+}
+
 pub struct App {
     pub query: String,
     pub page_cache: HashMap<usize, Page>, // Page-based cache
@@ -83,19 +99,26 @@ impl App {
     pub fn new(
         root: PathBuf,
         data_dir: &Path,
-        log_receiver: Receiver<String>,
-        on_dir_click: OnDirClickAction,
-        on_cwd_visit: OnCwdVisitAction,
-        initial_filter: search_worker::FilterType,
-        no_preview: bool,
-        no_click_loading: bool,
-        no_model: bool,
-        no_click_logging: bool,
-        event_tx: mpsc::Sender<crate::AppEvent>,
-        input_control_tx: crossbeam::channel::Sender<bool>,
+        bootstrap: AppBootstrap,
+        options: AppOptions,
     ) -> Result<Self> {
         let start_time = Instant::now();
         log::debug!("App::new() started");
+
+        let AppBootstrap {
+            log_receiver,
+            event_tx,
+            input_control_tx,
+        } = bootstrap;
+        let AppOptions {
+            on_dir_click,
+            on_cwd_visit,
+            initial_filter,
+            no_preview,
+            no_click_loading,
+            no_model,
+            no_click_logging,
+        } = options;
 
         // Get session ID from environment (set in main())
         let session_id =

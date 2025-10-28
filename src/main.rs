@@ -58,7 +58,7 @@ impl From<WorkerResponse> for AppEvent {
 }
 
 // Import app types from dedicated module
-use app::{App, Page};
+use app::{App, AppBootstrap, AppOptions, Page};
 
 // Import CLI types from dedicated module
 use cli::{Cli, Commands, FilterArg, InternalCommands, OutputFormat};
@@ -315,20 +315,23 @@ fn main() -> Result<()> {
 
     // Initialize app
     let app_new_start = Instant::now();
-    let mut app = App::new(
-        root.clone(),
-        &data_dir,
-        log_rx,
-        cli.on_dir_click.clone(),
-        cli.on_cwd_visit.clone(),
+    let bootstrap = AppBootstrap {
+        log_receiver: log_rx,
+        event_tx: event_tx.clone(),
+        input_control_tx: input_control_tx.clone(),
+    };
+
+    let options = AppOptions {
+        on_dir_click: cli.on_dir_click.clone(),
+        on_cwd_visit: cli.on_cwd_visit.clone(),
         initial_filter,
-        cli.no_preview,
-        cli.no_click_loading,
-        cli.no_model,
-        cli.no_click_logging,
-        event_tx.clone(),
-        input_control_tx.clone(),
-    )?;
+        no_preview: cli.no_preview,
+        no_click_loading: cli.no_click_loading,
+        no_model: cli.no_model,
+        no_click_logging: cli.no_click_logging,
+    };
+
+    let mut app = App::new(root.clone(), &data_dir, bootstrap, options)?;
     log::info!(
         "TIMING {{\"op\":\"app_new\",\"ms\":{}}}",
         app_new_start.elapsed().as_secs_f64() * 1000.0

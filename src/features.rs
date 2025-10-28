@@ -94,14 +94,14 @@ impl Accumulator {
             .push(click);
 
         // Build episode query index if episode_queries is present
-        if let Some(ref episode_json) = event.episode_queries {
-            if let Ok(episode_queries) = serde_json::from_str::<Vec<String>>(episode_json) {
-                for episode_query in episode_queries {
-                    self.engagements_by_episode_query_and_file
-                        .entry((episode_query, event.full_path.clone()))
-                        .or_default()
-                        .push(click);
-                }
+        if let Some(ref episode_json) = event.episode_queries
+            && let Ok(episode_queries) = serde_json::from_str::<Vec<String>>(episode_json)
+        {
+            for episode_query in episode_queries {
+                self.engagements_by_episode_query_and_file
+                    .entry((episode_query, event.full_path.clone()))
+                    .or_default()
+                    .push(click);
             }
         }
     }

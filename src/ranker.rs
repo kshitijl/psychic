@@ -229,14 +229,14 @@ impl Ranker {
                 .push(click_event);
 
             // Build episode query index if episode_queries is present
-            if let Some(episode_json) = episode_queries_json {
-                if let Ok(episode_queries) = serde_json::from_str::<Vec<String>>(&episode_json) {
-                    for episode_query in episode_queries {
-                        engagements_by_episode_query_and_file
-                            .entry((episode_query, path.clone()))
-                            .or_default()
-                            .push(click_event);
-                    }
+            if let Some(episode_json) = episode_queries_json
+                && let Ok(episode_queries) = serde_json::from_str::<Vec<String>>(&episode_json)
+            {
+                for episode_query in episode_queries {
+                    engagements_by_episode_query_and_file
+                        .entry((episode_query, path.clone()))
+                        .or_default()
+                        .push(click_event);
                 }
             }
         }
@@ -372,20 +372,18 @@ impl Ranker {
         let engagements_by_episode_query_and_file =
             &self.clicks.engagements_by_episode_query_and_file;
 
+        let click_indexes = FeatureClickIndexes {
+            clicks_by_file,
+            clicks_by_parent_dir,
+            clicks_by_query_and_file,
+            engagements_by_episode_query_and_file,
+        };
+
         let results: Vec<(Vec<f64>, FxHashMap<String, Duration>)> = files
             .par_iter()
             .map(|file| {
-                compute_features_with_timing(
-                    query,
-                    file,
-                    current_timestamp,
-                    cwd,
-                    clicks_by_file,
-                    clicks_by_parent_dir,
-                    clicks_by_query_and_file,
-                    engagements_by_episode_query_and_file,
-                )
-                .expect("Feature computation failed")
+                compute_features_with_timing(query, file, current_timestamp, cwd, &click_indexes)
+                    .expect("Feature computation failed")
             })
             .collect();
 
@@ -518,6 +516,13 @@ pub fn features_to_map(features: &[f64]) -> FxHashMap<String, f64> {
         .collect()
 }
 
+struct FeatureClickIndexes<'a> {
+    clicks_by_file: &'a FxHashMap<String, Vec<ClickEvent>>,
+    clicks_by_parent_dir: &'a FxHashMap<PathBuf, Vec<ClickEvent>>,
+    clicks_by_query_and_file: &'a FxHashMap<(String, String), Vec<ClickEvent>>,
+    engagements_by_episode_query_and_file: &'a FxHashMap<(String, String), Vec<ClickEvent>>,
+}
+
 #[cfg(test)]
 /// Compute features for a file (for tests, no timing)
 fn compute_features(
@@ -530,16 +535,14 @@ fn compute_features(
     clicks_by_query_and_file: &FxHashMap<(String, String), Vec<ClickEvent>>,
     engagements_by_episode_query_and_file: &FxHashMap<(String, String), Vec<ClickEvent>>,
 ) -> Result<Vec<f64>> {
-    let (features, _timings) = compute_features_with_timing(
-        query,
-        file,
-        current_timestamp,
-        cwd,
+    let indexes = FeatureClickIndexes {
         clicks_by_file,
         clicks_by_parent_dir,
         clicks_by_query_and_file,
         engagements_by_episode_query_and_file,
-    )?;
+    };
+    let (features, _timings) =
+        compute_features_with_timing(query, file, current_timestamp, cwd, &indexes)?;
     Ok(features)
 }
 
@@ -549,10 +552,7 @@ fn compute_features_with_timing(
     file: &FileCandidate,
     current_timestamp: i64,
     cwd: &Path,
-    clicks_by_file: &FxHashMap<String, Vec<ClickEvent>>,
-    clicks_by_parent_dir: &FxHashMap<PathBuf, Vec<ClickEvent>>,
-    clicks_by_query_and_file: &FxHashMap<(String, String), Vec<ClickEvent>>,
-    engagements_by_episode_query_and_file: &FxHashMap<(String, String), Vec<ClickEvent>>,
+    click_indexes: &FeatureClickIndexes<'_>,
 ) -> Result<(Vec<f64>, FxHashMap<String, Duration>)> {
     // Create FeatureInputs for inference
     let inputs = FeatureInputs {
@@ -562,10 +562,10 @@ fn compute_features_with_timing(
         mtime: file.mtime,
         file_size: file.file_size,
         cwd,
-        clicks_by_file,
-        clicks_by_parent_dir,
-        clicks_by_query_and_file,
-        engagements_by_episode_query_and_file,
+        clicks_by_file: click_indexes.clicks_by_file,
+        clicks_by_parent_dir: click_indexes.clicks_by_parent_dir,
+        clicks_by_query_and_file: click_indexes.clicks_by_query_and_file,
+        engagements_by_episode_query_and_file: click_indexes.engagements_by_episode_query_and_file,
         current_timestamp,
         session: None,
         is_from_walker: file.is_from_walker,

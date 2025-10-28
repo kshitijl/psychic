@@ -47,11 +47,11 @@ impl PreviewManager {
                 text,
                 extra_flags: cached_flags,
             } = &self.cache
+                && cached_path == &path_str
+                && cached_flags == &extra_flags
             {
-                if cached_path == &path_str && cached_flags == &extra_flags {
-                    // FAST PATH: Directory listing is cached with matching flags
-                    return text.clone();
-                }
+                // FAST PATH: Directory listing is cached with matching flags
+                return text.clone();
             }
 
             // SLOW PATH: Generate directory listing
@@ -72,7 +72,7 @@ impl PreviewManager {
                     // We have light cached
                     if self.scroll == 0 {
                         // FAST PATH: Light cached and unscrolled
-                        return text.clone();
+                        text.clone()
                     } else {
                         // User scrolled - need to upgrade to full
                         let full_text = Self::generate_full_file_preview(path);
@@ -80,7 +80,7 @@ impl PreviewManager {
                             path: path_str,
                             text: full_text.clone(),
                         };
-                        return full_text;
+                        full_text
                     }
                 }
                 CachedPreview::Full {
@@ -88,7 +88,7 @@ impl PreviewManager {
                     text,
                 } if cached_path == &path_str => {
                     // FAST PATH: Full preview cached
-                    return text.clone();
+                    text.clone()
                 }
                 _ => {
                     // No cache - generate light preview
