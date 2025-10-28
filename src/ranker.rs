@@ -10,7 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 // Import features module
-use crate::feature_defs::{feature_names, ClickEvent, FeatureInputs, FEATURE_REGISTRY};
+use crate::feature_defs::{ClickEvent, FEATURE_REGISTRY, FeatureInputs, feature_names};
 use crate::{db, features};
 
 #[derive(Debug, Clone)]
@@ -68,7 +68,6 @@ pub struct Ranker {
 // Tunable constants for hybrid ranking
 const CLICKS_WEIGHT: f64 = 3.0; // Weight for clicks in simple model
 const RECENCY_WEIGHT: f64 = 1.0; // Weight for recency in simple model
-const CLICK_SCALE: f64 = 100.0; // Denominator for softmax logit (controls transition speed)
 
 impl Ranker {
     pub fn new(model_path: &Path, db_path: &Path) -> Result<Self> {
@@ -294,22 +293,17 @@ impl Ranker {
         CLICKS_WEIGHT * clicks_last_7_days + RECENCY_WEIGHT / (1.0 + modified_age_in_days)
     }
 
-    /// Compute blend weights using softmax
-    /// Logits: [1.0, total_clicks / CLICK_SCALE]
+    /// Compute blend weights using sigmoid function
     /// Returns: (w_simple, w_lightgbm) where weights sum to 1.0
     fn compute_blend_weights(total_clicks: usize) -> (f64, f64) {
-        let logit_simple: f64 = 1.0;
-        let logit_lightgbm: f64 = (total_clicks as f64 - CLICK_SCALE) / CLICK_SCALE;
+        let k = 20f64;
+        let l = 2f64;
 
-        // Softmax
-        let exp_simple = logit_simple.exp();
-        let exp_lightgbm = logit_lightgbm.exp();
-        let sum = exp_simple + exp_lightgbm;
+        let x = total_clicks as f64;
+        let ml_weight = (1.0 + (x / k - l).tanh()) / 2.0;
 
-        let w_simple = exp_simple / sum;
-        let w_lightgbm = exp_lightgbm / sum;
-
-        (w_simple, w_lightgbm)
+        let simple_weight = 1.0 - ml_weight;
+        (simple_weight, ml_weight)
     }
 
     pub fn rank_files(
@@ -335,30 +329,7 @@ impl Ranker {
             files.len()
         );
 
-        // If no model, use only simple scores
-        if self.model.is_none() {
-            let mut scored_files: Vec<FileScore> = files
-                .iter()
-                .enumerate()
-                .map(|(idx, file)| FileScore {
-                    file_id: file.file_id,
-                    score: simple_scores[idx],
-                    features: Vec::new(),
-                    simple_score: Some(simple_scores[idx]),
-                    ml_score: None,
-                    simple_weight: Some(1.0), // 100% simple model when no ML model
-                    ml_weight: Some(0.0),
-                })
-                .collect();
-            scored_files.sort_by(|a, b| {
-                b.score
-                    .partial_cmp(&a.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            return Ok(scored_files);
-        }
-
-        // Compute features for all files in parallel
+        // Always compute features for all files in parallel (for debugging visibility)
         let compute_start = Instant::now();
 
         // Capture what we need for parallel computation
@@ -413,7 +384,30 @@ impl Ranker {
             );
         }
 
-        // Batch predict all files at once
+        // If no model, use only simple scores (but keep the computed features for debugging)
+        if self.model.is_none() {
+            let mut scored_files: Vec<FileScore> = files
+                .iter()
+                .enumerate()
+                .map(|(idx, file)| FileScore {
+                    file_id: file.file_id,
+                    score: simple_scores[idx],
+                    features: all_features[idx].clone(),
+                    simple_score: Some(simple_scores[idx]),
+                    ml_score: None,
+                    simple_weight: Some(1.0), // 100% simple model when no ML model
+                    ml_weight: Some(0.0),
+                })
+                .collect();
+            scored_files.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            return Ok(scored_files);
+        }
+
+        // Batch predict all files at once (we have a model)
         // Flatten features into a single vector for batch prediction
         let num_features = if all_features.is_empty() {
             0
@@ -891,18 +885,18 @@ mod tests {
 
     #[test]
     fn test_compute_blend_weights() {
-        // Test softmax blend weights at different click counts
+        // Test sigmoid blend weights at different click counts
 
-        // 0 clicks: simple model should dominate
+        // 0 clicks: simple model should dominate (ML ≈ 2%)
         let (w_simple, w_lightgbm) = Ranker::compute_blend_weights(0);
         assert!(
-            w_simple > 0.7 && w_simple < 0.75,
-            "At 0 clicks, w_simple should be ~0.73, got {}",
+            w_simple > 0.97 && w_simple < 0.99,
+            "At 0 clicks, w_simple should be ~0.98, got {}",
             w_simple
         );
         assert!(
-            w_lightgbm > 0.25 && w_lightgbm < 0.3,
-            "At 0 clicks, w_lightgbm should be ~0.27, got {}",
+            w_lightgbm > 0.01 && w_lightgbm < 0.03,
+            "At 0 clicks, w_lightgbm should be ~0.02, got {}",
             w_lightgbm
         );
         assert!(
@@ -911,7 +905,7 @@ mod tests {
             w_simple + w_lightgbm
         );
 
-        // 100 clicks: balanced blend
+        // 100 clicks: balanced blend (inflection point)
         let (w_simple, w_lightgbm) = Ranker::compute_blend_weights(100);
         assert!(
             (w_simple - 0.5).abs() < 0.01,
@@ -924,16 +918,16 @@ mod tests {
             w_lightgbm
         );
 
-        // 1000 clicks: ML model should dominate
+        // 1000 clicks: ML model should dominate completely
         let (w_simple, w_lightgbm) = Ranker::compute_blend_weights(1000);
         assert!(
             w_simple < 0.001,
-            "At 1000 clicks, w_simple should be ~0.0001, got {}",
+            "At 1000 clicks, w_simple should be ~0.0, got {}",
             w_simple
         );
         assert!(
             w_lightgbm > 0.999,
-            "At 1000 clicks, w_lightgbm should be ~0.9999, got {}",
+            "At 1000 clicks, w_lightgbm should be ~1.0, got {}",
             w_lightgbm
         );
     }
