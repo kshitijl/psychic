@@ -320,47 +320,58 @@ fn main() -> Result<()> {
     let root_clone = root.clone();
     std::thread::spawn(move || {
         let context = context::gather_context();
-        if let Ok(db) = db::Database::new(&data_dir_clone) {
-            // Log the initial directory as a startup visit (with empty query)
-            // This happens in background thread so it doesn't block startup
-            let dir_name = root_clone
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(".");
+        let db_path = db::Database::get_db_path(&data_dir_clone);
+        match db::Database::new(&db_path) {
+            Ok(db) => {
+                // Log the initial directory as a startup visit (with empty query)
+                // This happens in background thread so it doesn't block startup
+                let dir_name = root_clone
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(".");
 
-            // Get metadata for the directory
-            let metadata = std::fs::metadata(&root_clone).ok();
-            let mtime = metadata.as_ref().and_then(|m| {
-                m.modified().ok().and_then(|t| {
-                    t.duration_since(std::time::UNIX_EPOCH)
-                        .ok()
-                        .map(|d| d.as_secs() as i64)
-                })
-            });
-            let atime = metadata.as_ref().and_then(|m| {
-                m.accessed().ok().and_then(|t| {
-                    t.duration_since(std::time::UNIX_EPOCH)
-                        .ok()
-                        .map(|d| d.as_secs() as i64)
-                })
-            });
-            let file_size = metadata.as_ref().map(|m| m.len() as i64);
+                // Get metadata for the directory
+                let metadata = std::fs::metadata(&root_clone).ok();
+                let mtime = metadata.as_ref().and_then(|m| {
+                    m.modified().ok().and_then(|t| {
+                        t.duration_since(std::time::UNIX_EPOCH)
+                            .ok()
+                            .map(|d| d.as_secs() as i64)
+                    })
+                });
+                let atime = metadata.as_ref().and_then(|m| {
+                    m.accessed().ok().and_then(|t| {
+                        t.duration_since(std::time::UNIX_EPOCH)
+                            .ok()
+                            .map(|d| d.as_secs() as i64)
+                    })
+                });
+                let file_size = metadata.as_ref().map(|m| m.len() as i64);
 
-            let _ = db.log_event(EventData {
-                query: "",
-                file_path: dir_name,
-                full_path: &root_clone.to_string_lossy(),
-                mtime,
-                atime,
-                file_size,
-                subsession_id: 0, // Initial event, before any query
-                action: db::UserInteraction::StartupVisit,
-                session_id: &session_id_clone,
-                episode_queries: None,
-            });
+                match db.log_event(EventData {
+                    query: "",
+                    file_path: dir_name,
+                    full_path: &root_clone.to_string_lossy(),
+                    mtime,
+                    atime,
+                    file_size,
+                    subsession_id: 0, // Initial event, before any query
+                    action: db::UserInteraction::StartupVisit,
+                    session_id: &session_id_clone,
+                    episode_queries: None,
+                }) {
+                    Ok(_) => log::info!("Logged startup visit for {}", root_clone.display()),
+                    Err(e) => log::error!("Failed to log startup visit: {:?}", e),
+                }
 
-            // Continue with context logging
-            let _ = db.log_session(&session_id_clone, &context);
+                // Continue with context logging
+                if let Err(e) = db.log_session(&session_id_clone, &context) {
+                    log::error!("Failed to log session context: {:?}", e);
+                }
+            }
+            Err(e) => {
+                log::error!("Failed to open database for startup visit: {:?}", e);
+            }
         }
     });
     log::info!(
