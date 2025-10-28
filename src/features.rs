@@ -25,6 +25,7 @@ struct Event {
     mtime: Option<i64>,
     file_size: Option<i64>,
     action: String,
+    episode_queries: Option<String>, // JSON array of queries in this episode
 }
 
 // Output format enum
@@ -39,6 +40,7 @@ struct Accumulator {
     clicks_by_file: FxHashMap<String, Vec<ClickEvent>>,
     clicks_by_parent_dir: FxHashMap<std::path::PathBuf, Vec<ClickEvent>>,
     clicks_by_query_and_file: FxHashMap<(String, String), Vec<ClickEvent>>,
+    engagements_by_episode_query_and_file: FxHashMap<(String, String), Vec<ClickEvent>>,
     // Key: (session_id, subsession_id, full_path)
     pending_impressions: FxHashMap<(String, u64, String), PendingImpression>,
     output_rows: Vec<HashMap<String, String>>,
@@ -60,6 +62,7 @@ impl Accumulator {
             clicks_by_file: FxHashMap::default(),
             clicks_by_parent_dir: FxHashMap::default(),
             clicks_by_query_and_file: FxHashMap::default(),
+            engagements_by_episode_query_and_file: FxHashMap::default(),
             pending_impressions: FxHashMap::default(),
             output_rows: Vec::new(),
             current_episode_id: 0,
@@ -89,6 +92,18 @@ impl Accumulator {
             .entry((event.query.clone(), event.full_path.clone()))
             .or_default()
             .push(click);
+
+        // Build episode query index if episode_queries is present
+        if let Some(ref episode_json) = event.episode_queries {
+            if let Ok(episode_queries) = serde_json::from_str::<Vec<String>>(episode_json) {
+                for episode_query in episode_queries {
+                    self.engagements_by_episode_query_and_file
+                        .entry((episode_query, event.full_path.clone()))
+                        .or_default()
+                        .push(click);
+                }
+            }
+        }
     }
 
     fn add_impression(&mut self, event: &Event, mut features: HashMap<String, String>) {
@@ -232,7 +247,7 @@ pub fn generate_features(
 
 fn fetch_all_events(conn: &Connection) -> Result<Vec<Event>> {
     let mut stmt = conn.prepare(
-        "SELECT session_id, subsession_id, query, file_path, full_path, timestamp, mtime, file_size, action FROM events ORDER BY timestamp, id",
+        "SELECT session_id, subsession_id, query, file_path, full_path, timestamp, mtime, file_size, action, episode_queries FROM events ORDER BY timestamp, id",
     )?;
     let event_iter = stmt.query_map([], |row| {
         Ok(Event {
@@ -245,6 +260,7 @@ fn fetch_all_events(conn: &Connection) -> Result<Vec<Event>> {
             mtime: row.get(6)?,
             file_size: row.get(7)?,
             action: row.get(8)?,
+            episode_queries: row.get(9)?,
         })
     })?;
 
@@ -315,6 +331,7 @@ fn compute_features_from_accumulator(
         clicks_by_file: &acc.clicks_by_file,
         clicks_by_parent_dir: &acc.clicks_by_parent_dir,
         clicks_by_query_and_file: &acc.clicks_by_query_and_file,
+        engagements_by_episode_query_and_file: &acc.engagements_by_episode_query_and_file,
         current_timestamp: impression.timestamp,
         session,
         is_from_walker,
@@ -383,6 +400,7 @@ mod tests {
                 mtime: Some(now - 100),
                 file_size: Some(100),
                 action: "impression".to_string(),
+                episode_queries: None,
             },
             Event {
                 session_id: "s1".to_string(),
@@ -394,6 +412,7 @@ mod tests {
                 mtime: None,
                 file_size: Some(100),
                 action: "click".to_string(),
+                episode_queries: None,
             },
             Event {
                 session_id: "s1".to_string(),
@@ -405,6 +424,7 @@ mod tests {
                 mtime: Some(now - 100),
                 file_size: Some(100),
                 action: "impression".to_string(),
+                episode_queries: None,
             },
         ];
 

@@ -451,6 +451,39 @@ impl Feature for ClicksForThisQuery {
 }
 
 // ============================================================================
+// Feature: engagements_in_episode_with_query
+// ============================================================================
+
+pub struct EngagementsInEpisodeWithQuery;
+
+impl Feature for EngagementsInEpisodeWithQuery {
+    fn name(&self) -> &'static str {
+        "engagements_in_episode_with_query"
+    }
+
+    fn feature_type(&self) -> FeatureType {
+        FeatureType::Numeric
+    }
+
+    fn monotonicity(&self) -> Option<Monotonicity> {
+        Some(Monotonicity::Increasing)
+    }
+
+    fn compute(&self, inputs: &FeatureInputs) -> Result<f64> {
+        let full_path_str = inputs.full_path.to_string_lossy().to_string();
+        let key = (inputs.query.to_string(), full_path_str);
+
+        let engagements = inputs
+            .engagements_by_episode_query_and_file
+            .get(&key)
+            .map(|engagements| engagements.len())
+            .unwrap_or(0);
+
+        Ok(engagements as f64)
+    }
+}
+
+// ============================================================================
 // Feature: is_dir
 // ============================================================================
 

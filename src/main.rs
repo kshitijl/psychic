@@ -4,6 +4,7 @@ mod app;
 mod cli;
 mod context;
 mod db;
+mod episode;
 mod feature_defs;
 mod features;
 mod history;
@@ -355,6 +356,7 @@ fn main() -> Result<()> {
                 subsession_id: 0, // Initial event, before any query
                 action: db::UserInteraction::StartupVisit,
                 session_id: &session_id_clone,
+                episode_queries: None,
             });
 
             // Continue with context logging

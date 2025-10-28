@@ -56,6 +56,7 @@ pub struct ClickData {
     pub clicks_by_file: FxHashMap<String, Vec<ClickEvent>>,
     pub clicks_by_parent_dir: FxHashMap<PathBuf, Vec<ClickEvent>>,
     pub clicks_by_query_and_file: FxHashMap<(String, String), Vec<ClickEvent>>,
+    pub engagements_by_episode_query_and_file: FxHashMap<(String, String), Vec<ClickEvent>>,
 }
 
 pub struct Ranker {
@@ -101,17 +102,20 @@ impl Ranker {
         })
     }
 
-    pub fn new_empty(_db_path: &Path) -> Result<Self> {
-        // Empty ranker with no model and no click data
+    pub fn new_empty(db_path: &Path) -> Result<Self> {
+        // Load clicks even when there's no model (needed for simple scoring)
+        let clicks_load_start = std::time::Instant::now();
+        let (clicks, total_clicks) = Self::load_clicks(db_path)?;
+        log::info!(
+            "TIMING {{\"op\":\"load_clicks\",\"ms\":{}}}",
+            clicks_load_start.elapsed().as_secs_f64() * 1000.0
+        );
+
         Ok(Ranker {
             model: None,
-            clicks: ClickData {
-                clicks_by_file: FxHashMap::default(),
-                clicks_by_parent_dir: FxHashMap::default(),
-                clicks_by_query_and_file: FxHashMap::default(),
-            },
+            clicks,
             stats: None,
-            total_clicks: 0,
+            total_clicks,
         })
     }
 
@@ -155,6 +159,10 @@ impl Ranker {
             FxHashMap::with_capacity_and_hasher(128, Default::default());
         let mut clicks_by_query_and_file: FxHashMap<(String, String), Vec<ClickEvent>> =
             FxHashMap::with_capacity_and_hasher(256, Default::default());
+        let mut engagements_by_episode_query_and_file: FxHashMap<
+            (String, String),
+            Vec<ClickEvent>,
+        > = FxHashMap::with_capacity_and_hasher(256, Default::default());
 
         let db_open_start = std::time::Instant::now();
         let conn =
@@ -174,9 +182,9 @@ impl Ranker {
 
         let query_start = std::time::Instant::now();
         let mut stmt = conn.prepare(
-            "SELECT full_path, timestamp, query
+            "SELECT full_path, timestamp, query, episode_queries
              FROM events
-             WHERE action = 'click'
+             WHERE action IN ('click', 'scroll')
              AND timestamp >= ?1",
         )?;
 
@@ -185,6 +193,7 @@ impl Ranker {
                 row.get::<_, String>(0)?,
                 row.get::<_, i64>(1)?,
                 row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
             ))
         })?;
         log::info!(
@@ -193,7 +202,8 @@ impl Ranker {
         );
 
         let collect_start = std::time::Instant::now();
-        let rows: Vec<(String, i64, String)> = rows.collect::<Result<Vec<_>, _>>()?;
+        let rows: Vec<(String, i64, String, Option<String>)> =
+            rows.collect::<Result<Vec<_>, _>>()?;
         log::info!(
             "TIMING {{\"op\":\"collect_rows\",\"ms\":{},\"count\":{}}}",
             collect_start.elapsed().as_secs_f64() * 1000.0,
@@ -202,8 +212,8 @@ impl Ranker {
 
         let indexing_start = std::time::Instant::now();
         let row_count = rows.len();
-        let total_clicks = row_count; // Total number of clicks
-        for (path, timestamp, query) in rows {
+        let total_clicks = row_count; // Total number of engagement events (clicks + scrolls)
+        for (path, timestamp, query, episode_queries_json) in rows {
             let click_event = ClickEvent { timestamp };
 
             // Index by (query, file_path) first
@@ -213,7 +223,22 @@ impl Ranker {
                 .push(click_event);
 
             // Index by file path only (reuse path without clone)
-            clicks_by_file.entry(path).or_default().push(click_event);
+            clicks_by_file
+                .entry(path.clone())
+                .or_default()
+                .push(click_event);
+
+            // Build episode query index if episode_queries is present
+            if let Some(episode_json) = episode_queries_json {
+                if let Ok(episode_queries) = serde_json::from_str::<Vec<String>>(&episode_json) {
+                    for episode_query in episode_queries {
+                        engagements_by_episode_query_and_file
+                            .entry((episode_query, path.clone()))
+                            .or_default()
+                            .push(click_event);
+                    }
+                }
+            }
         }
         log::info!(
             "TIMING {{\"op\":\"process_click_rows\",\"ms\":{},\"count\":{}}}",
@@ -241,9 +266,12 @@ impl Ranker {
             "TIMING {{\"op\":\"load_clicks_total\",\"ms\":{}}}",
             total_start.elapsed().as_secs_f64() * 1000.0
         );
-        log::debug!("Loaded {} total clicks from last 30 days", total_clicks);
         log::debug!(
-            "Loaded {} files with click history from last 30 days",
+            "Loaded {} total engagements from last 30 days",
+            total_clicks
+        );
+        log::debug!(
+            "Loaded {} files with engagement history from last 30 days",
             clicks_by_file.len()
         );
         log::debug!("Indexed {} parent directories", clicks_by_parent_dir.len());
@@ -251,12 +279,17 @@ impl Ranker {
             "Indexed {} (query, file) pairs",
             clicks_by_query_and_file.len()
         );
+        log::debug!(
+            "Indexed {} (episode_query, file) pairs",
+            engagements_by_episode_query_and_file.len()
+        );
 
         Ok((
             ClickData {
                 clicks_by_file,
                 clicks_by_parent_dir,
                 clicks_by_query_and_file,
+                engagements_by_episode_query_and_file,
             },
             total_clicks,
         ))
@@ -336,6 +369,8 @@ impl Ranker {
         let clicks_by_file = &self.clicks.clicks_by_file;
         let clicks_by_parent_dir = &self.clicks.clicks_by_parent_dir;
         let clicks_by_query_and_file = &self.clicks.clicks_by_query_and_file;
+        let engagements_by_episode_query_and_file =
+            &self.clicks.engagements_by_episode_query_and_file;
 
         let results: Vec<(Vec<f64>, FxHashMap<String, Duration>)> = files
             .par_iter()
@@ -348,6 +383,7 @@ impl Ranker {
                     clicks_by_file,
                     clicks_by_parent_dir,
                     clicks_by_query_and_file,
+                    engagements_by_episode_query_and_file,
                 )
                 .expect("Feature computation failed")
             })
@@ -492,6 +528,7 @@ fn compute_features(
     clicks_by_file: &FxHashMap<String, Vec<ClickEvent>>,
     clicks_by_parent_dir: &FxHashMap<PathBuf, Vec<ClickEvent>>,
     clicks_by_query_and_file: &FxHashMap<(String, String), Vec<ClickEvent>>,
+    engagements_by_episode_query_and_file: &FxHashMap<(String, String), Vec<ClickEvent>>,
 ) -> Result<Vec<f64>> {
     let (features, _timings) = compute_features_with_timing(
         query,
@@ -501,6 +538,7 @@ fn compute_features(
         clicks_by_file,
         clicks_by_parent_dir,
         clicks_by_query_and_file,
+        engagements_by_episode_query_and_file,
     )?;
     Ok(features)
 }
@@ -514,6 +552,7 @@ fn compute_features_with_timing(
     clicks_by_file: &FxHashMap<String, Vec<ClickEvent>>,
     clicks_by_parent_dir: &FxHashMap<PathBuf, Vec<ClickEvent>>,
     clicks_by_query_and_file: &FxHashMap<(String, String), Vec<ClickEvent>>,
+    engagements_by_episode_query_and_file: &FxHashMap<(String, String), Vec<ClickEvent>>,
 ) -> Result<(Vec<f64>, FxHashMap<String, Duration>)> {
     // Create FeatureInputs for inference
     let inputs = FeatureInputs {
@@ -526,6 +565,7 @@ fn compute_features_with_timing(
         clicks_by_file,
         clicks_by_parent_dir,
         clicks_by_query_and_file,
+        engagements_by_episode_query_and_file,
         current_timestamp,
         session: None,
         is_from_walker: file.is_from_walker,
@@ -849,6 +889,9 @@ mod tests {
             ],
         );
 
+        // Build episode engagement index
+        let engagements_by_episode_query_and_file = FxHashMap::default();
+
         // Compute features using the standalone function
         let features = compute_features(
             query,
@@ -858,13 +901,14 @@ mod tests {
             &clicks_by_file,
             &clicks_by_parent_dir,
             &clicks_by_query_and_file,
+            &engagements_by_episode_query_and_file,
         )
         .expect("Failed to compute features");
 
         // Format as string for expect-test style comparison
         let actual = format!("{:?}", features);
 
-        // Expected output: [filename_starts_with_query, clicks_last_30_days, modified_today, is_under_cwd, is_hidden, file_size_bytes, clicks_last_week_parent_dir, clicks_last_hour, clicks_today, clicks_last_7_days, modified_age, clicks_for_this_query, is_dir]
+        // Expected output: [filename_starts_with_query, clicks_last_30_days, modified_today, is_under_cwd, is_hidden, file_size_bytes, clicks_last_week_parent_dir, clicks_last_hour, clicks_today, clicks_last_7_days, modified_age, clicks_for_this_query, engagements_in_episode_with_query, is_dir]
         // filename_starts_with_query=0 (bar.txt doesn't start with "test")
         // clicks_last_30_days=3 (3 clicks on bar.txt itself)
         // modified_today=0 (mtime is old - Nov 2023, test runs in 2025)
@@ -877,8 +921,10 @@ mod tests {
         // clicks_last_7_days=3 (all 3 clicks are within the last 7 days of the test timestamp)
         // modified_age=86400 (1 day in seconds)
         // clicks_for_this_query=2 (2 query-specific clicks for "test" + bar.txt)
+        // engagements_in_episode_with_query=0 (no episode engagement data in test)
         // is_dir=0 (this is a file, not a directory)
-        let expected = "[0.0, 3.0, 0.0, 1.0, 0.0, 12288.0, 4.0, 0.0, 0.0, 3.0, 86400.0, 2.0, 0.0]";
+        let expected =
+            "[0.0, 3.0, 0.0, 1.0, 0.0, 12288.0, 4.0, 0.0, 0.0, 3.0, 86400.0, 2.0, 0.0, 0.0]";
 
         assert_eq!(actual, expected, "Feature vector mismatch");
     }
@@ -954,6 +1000,7 @@ mod tests {
                 clicks_by_file,
                 clicks_by_parent_dir: FxHashMap::default(),
                 clicks_by_query_and_file: FxHashMap::default(),
+                engagements_by_episode_query_and_file: FxHashMap::default(),
             },
             stats: None,
             total_clicks: 2,
@@ -1027,6 +1074,7 @@ mod tests {
                 clicks_by_file,
                 clicks_by_parent_dir: FxHashMap::default(),
                 clicks_by_query_and_file: FxHashMap::default(),
+                engagements_by_episode_query_and_file: FxHashMap::default(),
             },
             stats: None,
             total_clicks: 3,

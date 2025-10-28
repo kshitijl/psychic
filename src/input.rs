@@ -212,23 +212,32 @@ fn handle_ctrl_enter(
         return Ok(InputAction::Continue);
     }
 
+    // Clone data we need before mutable borrow
+    let display_name = display_info.display_name.clone();
+    let full_path = display_info.full_path.clone();
+    let full_path_str = full_path.to_string_lossy().to_string();
+    let mtime = display_info.mtime;
+    let atime = display_info.atime;
+    let file_size = display_info.file_size;
+
     // Log the click event
     let subsession_id = app.analytics.current_subsession_id();
     let session_id = app.analytics.session_id().to_string();
     app.analytics.log_click(EventData {
         query: &app.query,
-        file_path: &display_info.display_name,
-        full_path: &display_info.full_path.to_string_lossy(),
-        mtime: display_info.mtime,
-        atime: display_info.atime,
-        file_size: display_info.file_size,
+        file_path: &display_name,
+        full_path: &full_path_str,
+        mtime,
+        atime,
+        file_size,
         subsession_id,
         action: UserInteraction::Click,
         session_id: &session_id,
+        episode_queries: None,
     })?;
 
     // Execute the on-cwd-visit action for the selected directory
-    execute_cwd_visit_action(app, &display_info.full_path, terminal)
+    execute_cwd_visit_action(app, &full_path, terminal)
 }
 
 /// Handle Ctrl-H (toggle history mode)
@@ -356,25 +365,35 @@ fn handle_enter(
         return Ok(InputAction::Continue);
     };
 
+    // Clone data we need before mutable borrow
+    let display_name = display_info.display_name.clone();
+    let full_path = display_info.full_path.clone();
+    let full_path_str = full_path.to_string_lossy().to_string();
+    let mtime = display_info.mtime;
+    let atime = display_info.atime;
+    let file_size = display_info.file_size;
+    let is_dir = display_info.is_dir;
+
     // Log the click event (analytics module handles no_logging flag)
     let subsession_id = app.analytics.current_subsession_id();
     let session_id = app.analytics.session_id().to_string();
     app.analytics.log_click(EventData {
         query: &app.query,
-        file_path: &display_info.display_name,
-        full_path: &display_info.full_path.to_string_lossy(),
-        mtime: display_info.mtime,
-        atime: display_info.atime,
-        file_size: display_info.file_size,
+        file_path: &display_name,
+        full_path: &full_path_str,
+        mtime,
+        atime,
+        file_size,
         subsession_id,
         action: UserInteraction::Click,
         session_id: &session_id,
+        episode_queries: None,
     })?;
 
-    if display_info.is_dir {
-        handle_directory_click(app, display_info.full_path.clone(), terminal)
+    if is_dir {
+        handle_directory_click(app, full_path.clone(), terminal)
     } else {
-        handle_file_click(app, display_info.full_path.clone(), terminal)?;
+        handle_file_click(app, full_path, terminal)?;
         Ok(InputAction::Continue)
     }
 }

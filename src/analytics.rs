@@ -14,6 +14,7 @@ use anyhow::Result;
 use std::collections::HashSet;
 
 use crate::db::{Database, EventData, FileMetadata};
+use crate::episode::Episode;
 
 /// Every time the query changes, as the user types, corresponds to a new
 /// subsession. Subsession id is logged to the db.
@@ -32,6 +33,8 @@ pub struct Analytics {
     pub next_subsession_id: u64,
     /// Tracks which files we've logged scroll events for (to avoid duplicates)
     scrolled_files: HashSet<(String, String)>, // (query, full_path)
+    /// Current episode (tracks all queries until engagement event)
+    episode: Episode,
     /// Session ID for this app instance
     session_id: String,
     /// Database handle
@@ -46,6 +49,7 @@ impl Analytics {
             current_subsession: None,
             next_subsession_id: 1, // Start with 1, 0 is for initial query
             scrolled_files: HashSet::new(),
+            episode: Episode::new(),
             session_id,
             db,
             no_logging,
@@ -86,6 +90,9 @@ impl Analytics {
                 None => return Ok(()),
             };
 
+        // Add query to episode (deduplicates automatically)
+        self.episode.add_query(&subsession_query);
+
         // Skip if already logged
         if already_logged {
             return Ok(());
@@ -117,7 +124,19 @@ impl Analytics {
         Ok(())
     }
 
-    /// Log a scroll event for a file (deduplicated by query + full_path)
+    /// Helper: Log an engagement event (click or scroll) with episode queries
+    /// This serializes the current episode queries, logs the event, and clears the episode
+    fn log_engagement<'a>(
+        &mut self,
+        mut event_data: EventData<'a>,
+        episode_json: &'a str,
+    ) -> Result<()> {
+        event_data.episode_queries = Some(episode_json);
+        self.db.log_event(event_data)?;
+        self.episode.clear();
+        Ok(())
+    }
+
     pub fn log_scroll(&mut self, query: &str, event_data: EventData) -> Result<()> {
         if self.no_logging {
             return Ok(());
@@ -126,7 +145,8 @@ impl Analytics {
         let key = (query.to_string(), event_data.full_path.to_string());
 
         if !self.scrolled_files.contains(&key) {
-            self.db.log_event(event_data)?;
+            let episode_json = self.episode.to_json()?;
+            self.log_engagement(event_data, &episode_json)?;
             self.scrolled_files.insert(key);
         }
 
@@ -134,12 +154,13 @@ impl Analytics {
     }
 
     /// Log a click event
-    pub fn log_click(&self, event_data: EventData) -> Result<()> {
+    pub fn log_click(&mut self, event_data: EventData) -> Result<()> {
         if self.no_logging {
             return Ok(());
         }
 
-        self.db.log_event(event_data)
+        let episode_json = self.episode.to_json()?;
+        self.log_engagement(event_data, &episode_json)
     }
 
     /// Create a new subsession (when query changes)

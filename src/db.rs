@@ -39,6 +39,7 @@ pub struct EventData<'a> {
     pub subsession_id: u64,
     pub action: UserInteraction,
     pub session_id: &'a str,
+    pub episode_queries: Option<&'a str>, // JSON array of queries in this episode
 }
 
 pub struct Database {
@@ -69,7 +70,8 @@ impl Database {
                 file_size INTEGER,
                 subsession_id INTEGER,
                 action TEXT NOT NULL,
-                session_id TEXT NOT NULL
+                session_id TEXT NOT NULL,
+                episode_queries TEXT
             )",
             [],
         )?;
@@ -138,8 +140,8 @@ impl Database {
         };
 
         self.conn.execute(
-            "INSERT INTO events (timestamp, query, file_path, full_path, mtime, atime, file_size, subsession_id, action, session_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO events (timestamp, query, file_path, full_path, mtime, atime, file_size, subsession_id, action, session_id, episode_queries)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 timestamp,
                 event.query,
@@ -150,7 +152,8 @@ impl Database {
                 event.file_size,
                 event.subsession_id,
                 action,
-                event.session_id
+                event.session_id,
+                event.episode_queries
             ],
         )?;
 
@@ -182,6 +185,7 @@ impl Database {
                 subsession_id,
                 action: UserInteraction::Impression,
                 session_id,
+                episode_queries: None,
             })?;
         }
 

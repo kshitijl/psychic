@@ -362,6 +362,7 @@ impl App {
                     subsession_id,
                     action: crate::db::UserInteraction::Scroll,
                     session_id: &session_id,
+                    episode_queries: None,
                 },
             )?;
         }
