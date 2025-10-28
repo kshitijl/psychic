@@ -2,12 +2,12 @@
 //!
 //! Manages directory navigation history with branch-point semantics.
 //!
-//! ## Model - Invariant: cwd == dirs[current_index]
-//! - `dirs` is a Vec<PathBuf> where dirs[i+1] came after dirs[i] in time
+//! ## Model — Invariant: `cwd == dirs[current_index]`
+//! - `dirs` is a `Vec<PathBuf>` where `dirs[i + 1]` came after `dirs[i]` in time
 //! - `current_index` is our position in history
 //! - **Invariant**: The current working directory is ALWAYS `dirs[current_index]`
-//! - At startup: dirs = [starting_dir], current_index = 0
-//! - Display shows: [dirs[len-1], dirs[len-2], ..., dirs[0]] (most recent first)
+//! - At startup: `dirs = [starting_dir]`, `current_index = 0`
+//! - Display shows: `[dirs[len - 1], dirs[len - 2], ..., dirs[0]]` (most recent first)
 
 use std::path::PathBuf;
 
@@ -16,7 +16,7 @@ pub struct History {
     /// Directory history, last item is most recent
     dirs: Vec<PathBuf>,
     /// Current position in history
-    /// Invariant: cwd == dirs[current_index]
+    /// Invariant: `cwd == dirs[current_index]`
     current_index: usize,
 }
 
