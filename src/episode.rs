@@ -41,7 +41,8 @@ impl Episode {
         self.queries.clear();
     }
 
-    /// Get reference to queries (for testing)
+    /// Get reference to queries (testing only)
+    #[cfg(test)]
     pub fn queries(&self) -> &[String] {
         &self.queries
     }
