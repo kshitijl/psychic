@@ -69,6 +69,7 @@ pub struct Ranker {
 // Tunable constants for hybrid ranking
 const CLICKS_WEIGHT: f64 = 3.0; // Weight for clicks in simple model
 const RECENCY_WEIGHT: f64 = 1.0; // Weight for recency in simple model
+const TRAIN_PY_SOURCE: &str = include_str!("../train.py");
 
 impl Ranker {
     pub fn new(model_path: &Path, db_path: &Path) -> Result<Self> {
@@ -588,40 +589,52 @@ fn compute_features_with_timing(
     Ok((features, timings))
 }
 
-/// Find train.py by searching: binary dir -> parent dir -> grandparent dir
-fn find_train_py() -> Result<PathBuf> {
-    let exe_path = std::env::current_exe().context("Failed to get current executable path")?;
+/// Ensure train.py is materialized in the data directory and return its path.
+fn ensure_train_py(data_dir: &Path) -> Result<PathBuf> {
+    std::fs::create_dir_all(data_dir)
+        .with_context(|| format!("Failed to create data directory {}", data_dir.display()))?;
 
-    // Canonicalize to resolve symlinks
-    let exe_path = exe_path
-        .canonicalize()
-        .context("Failed to canonicalize executable path")?;
+    let train_py_path = data_dir.join("train.py");
+    let needs_write = match std::fs::read_to_string(&train_py_path) {
+        Ok(existing) => existing != TRAIN_PY_SOURCE,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "Failed to read existing train.py at {}",
+                    train_py_path.display()
+                )
+            });
+        }
+    };
 
-    let exe_dir = exe_path
-        .parent()
-        .context("Failed to get executable directory")?;
+    if needs_write {
+        std::fs::write(&train_py_path, TRAIN_PY_SOURCE).with_context(|| {
+            format!(
+                "Failed to write embedded train.py to {}",
+                train_py_path.display()
+            )
+        })?;
 
-    // Search in 3 levels: exe_dir, parent, grandparent
-    for level in 0..3 {
-        let mut search_dir = exe_dir.to_path_buf();
-        for _ in 0..level {
-            search_dir = search_dir
-                .parent()
-                .context("No parent directory")?
-                .to_path_buf();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&train_py_path)
+                .with_context(|| format!("Failed to stat {}", train_py_path.display()))?
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&train_py_path, perms).with_context(|| {
+                format!(
+                    "Failed to set executable permissions on {}",
+                    train_py_path.display()
+                )
+            })?;
         }
 
-        let train_py = search_dir.join("train.py");
-        if train_py.exists() {
-            log::debug!("Found train.py at {:?}", train_py);
-            return Ok(train_py);
-        }
+        log::info!("Wrote embedded train.py to {:?}", train_py_path);
     }
 
-    anyhow::bail!(
-        "train.py not found in binary directory or 2 levels above. Binary directory: {:?}",
-        exe_dir
-    )
+    Ok(train_py_path)
 }
 
 /// Retrain the model by generating features and running train.py
@@ -658,9 +671,9 @@ pub fn retrain_model(data_dir: &Path, training_log_path: Option<PathBuf>) -> Res
             feature_duration.as_secs_f64()
         );
 
-        // Step 2: Find train.py
-        let train_py = find_train_py()?;
-        log::info!("Found train.py at {:?}", train_py);
+        // Step 2: Ensure train.py is available
+        let train_py = ensure_train_py(&data_dir)?;
+        log::info!("Using train.py at {:?}", train_py);
 
         // Step 3: Run training
         log::info!("Training model...");

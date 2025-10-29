@@ -429,6 +429,8 @@ Why: LightGBM Booster contains raw pointers (not Send by default). Safe because 
 
 Trains LightGBM LambdaRank model from features CSV.
 
+`cargo install --path .` users don't need to copy ancillary files manually—the `psychic` binary embeds `train.py` and writes it into the data directory on demand (default `~/.local/share/psychic/train.py`) whenever training runs, overwriting stale copies if the script changed.
+
 **Key parameters:**
 - Objective: `lambdarank`
 - Metric: NDCG (Normalized Discounted Cumulative Gain)

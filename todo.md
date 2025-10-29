@@ -1,10 +1,13 @@
 ## now
 
+
 distribution:
 - test on linux computer
 - do something about when the db is new and there's no model
 
 - new feature: define episode as "from one click to the next". then, "num clicks when this query was in the episode". so, if we begin with query "tc" and then later modify to "todo" and end up clicking on "todo-current.md", then that's +1 count for "tc". ought to make it feel more magical
+
+- respect .gitignore instead of hardcoding dirs to ignore
 
 - full text search mode using rg.
 
