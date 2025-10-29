@@ -273,17 +273,6 @@ fn main() -> Result<()> {
         }
     });
 
-    // Thread 2: Tick timer for periodic tasks
-    let tick_tx = event_tx.clone();
-    std::thread::spawn(move || {
-        loop {
-            std::thread::sleep(Duration::from_millis(200));
-            if tick_tx.send(AppEvent::Tick).is_err() {
-                break; // Main thread died, exit
-            }
-        }
-    });
-
     // Start background retraining in a new thread
     let retrain_start = Instant::now();
     let data_dir_clone = data_dir.clone();
@@ -336,6 +325,22 @@ fn main() -> Result<()> {
         "TIMING {{\"op\":\"app_new\",\"ms\":{}}}",
         app_new_start.elapsed().as_secs_f64() * 1000.0
     );
+
+    // Thread 2: Tick timer for periodic tasks (spawned after app creation to access tick_paused)
+    let tick_tx = event_tx.clone();
+    let tick_paused = app.tick_paused.clone();
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(Duration::from_millis(200));
+
+            // Skip sending tick if paused (e.g., during editor/shell suspension)
+            if !tick_paused.load(std::sync::atomic::Ordering::Relaxed)
+                && tick_tx.send(AppEvent::Tick).is_err()
+            {
+                break; // Main thread died, exit
+            }
+        }
+    });
 
     let log_session_start = Instant::now();
     log::info!(

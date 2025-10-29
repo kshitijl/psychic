@@ -2,7 +2,11 @@ use anyhow::{Context, Result};
 use std::{
     collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
-    sync::mpsc::{self, Receiver},
+    sync::{
+        Arc,
+        atomic::AtomicBool,
+        mpsc::{self, Receiver},
+    },
     thread::JoinHandle,
     time::Instant,
 };
@@ -90,6 +94,9 @@ pub struct App {
     // Crossterm thread control (for pausing when launching child processes)
     pub input_control_tx: crossbeam::channel::Sender<bool>,
 
+    // Tick thread control (for pausing when launching child processes)
+    pub tick_paused: Arc<AtomicBool>,
+
     // Startup tracking
     pub walker_done: bool,
     pub startup_complete_logged: bool,
@@ -170,6 +177,7 @@ impl App {
             worker_tx: worker_tx.clone(),
             worker_handle: Some(worker_handle),
             input_control_tx,
+            tick_paused: Arc::new(AtomicBool::new(false)),
             walker_done: false,
             startup_complete_logged: false,
         };

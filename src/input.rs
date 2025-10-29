@@ -507,6 +507,10 @@ fn suspend_tui_and_run_shell(
     // Pause crossterm thread
     let _ = app.input_control_tx.send(false);
 
+    // Pause tick thread to prevent event queue buildup
+    app.tick_paused
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+
     // Give the input thread time to enter paused state to avoid race condition
     std::thread::sleep(std::time::Duration::from_millis(50));
 
@@ -551,6 +555,10 @@ fn suspend_tui_and_run_shell(
     log::info!("Sending resume signal to input thread");
     let _ = app.input_control_tx.send(true);
 
+    // Resume tick thread
+    app.tick_paused
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+
     if let Err(e) = status {
         log::error!("Failed to launch shell: {}", e);
     }
@@ -566,6 +574,10 @@ fn suspend_tui_for_editor(
 ) -> Result<()> {
     // Pause crossterm thread
     let _ = app.input_control_tx.send(false);
+
+    // Pause tick thread to prevent event queue buildup
+    app.tick_paused
+        .store(true, std::sync::atomic::Ordering::Relaxed);
 
     // Give the input thread time to enter paused state to avoid race condition
     std::thread::sleep(std::time::Duration::from_millis(50));
@@ -609,6 +621,10 @@ fn suspend_tui_for_editor(
     // Resume crossterm thread
     log::info!("Sending resume signal to input thread");
     let _ = app.input_control_tx.send(true);
+
+    // Resume tick thread
+    app.tick_paused
+        .store(false, std::sync::atomic::Ordering::Relaxed);
 
     if let Err(e) = status {
         log::error!("Failed to launch editor: {}", e);
