@@ -30,8 +30,7 @@ pub fn start_file_walker(
                     // Continue to next iteration of outer loop
                 }
                 Err(_) => {
-                    // Channel closed, exit thread
-                    log::info!("Walker: Command channel closed, exiting");
+                    // Channel closed, exit thread (don't log - this is expected during shutdown)
                     break 'outer;
                 }
             }
