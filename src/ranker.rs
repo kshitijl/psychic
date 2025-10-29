@@ -69,6 +69,16 @@ pub struct Ranker {
 // Tunable constants for hybrid ranking
 const CLICKS_WEIGHT: f64 = 3.0; // Weight for clicks in simple model
 const RECENCY_WEIGHT: f64 = 1.0; // Weight for recency in simple model
+
+// Sigmoid parameters for normalizing simple scores to [0, 1] range
+// With k=0.1, x0=10.0:
+//   raw_score=0  → sigmoid ≈ 0.27
+//   raw_score=10 → sigmoid = 0.50
+//   raw_score=20 → sigmoid ≈ 0.73
+//   raw_score=50 → sigmoid ≈ 0.98
+const SIGMOID_K: f64 = 0.1; // Steepness of sigmoid curve
+const SIGMOID_X0: f64 = 10.0; // Midpoint (where sigmoid = 0.5)
+
 const TRAIN_PY_SOURCE: &str = include_str!("../train.py");
 
 impl Ranker {
@@ -296,8 +306,15 @@ impl Ranker {
         ))
     }
 
+    /// Apply sigmoid function to normalize raw scores to [0, 1] range
+    /// Formula: 1 / (1 + exp(-k * (x - x0)))
+    fn sigmoid(x: f64) -> f64 {
+        1.0 / (1.0 + (-SIGMOID_K * (x - SIGMOID_X0)).exp())
+    }
+
     /// Compute simple score for cold-start ranking
-    /// Formula: CLICKS_WEIGHT * clicks_last_7_days + RECENCY_WEIGHT / (1 + modified_age_in_days)
+    /// Raw formula: CLICKS_WEIGHT * clicks_last_7_days + RECENCY_WEIGHT / (1 + modified_age_in_days)
+    /// Then normalized to [0, 1] using sigmoid function
     fn compute_simple_score(&self, file: &FileCandidate, current_timestamp: i64) -> f64 {
         // Count clicks in last 7 days
         let seven_days_ago = current_timestamp - (7 * 24 * 60 * 60);
@@ -324,13 +341,17 @@ impl Ranker {
         };
 
         // Combine: clicks are weighted 3x more than recency
-        CLICKS_WEIGHT * clicks_last_7_days + RECENCY_WEIGHT / (1.0 + modified_age_in_days)
+        let raw_score =
+            CLICKS_WEIGHT * clicks_last_7_days + RECENCY_WEIGHT / (1.0 + modified_age_in_days);
+
+        // Normalize to [0, 1] using sigmoid
+        Self::sigmoid(raw_score)
     }
 
     /// Compute blend weights using sigmoid function
     /// Returns: (w_simple, w_lightgbm) where weights sum to 1.0
     fn compute_blend_weights(total_clicks: usize) -> (f64, f64) {
-        let k = 20f64;
+        let k = 15f64;
         let l = 2f64;
 
         let x = total_clicks as f64;
@@ -475,10 +496,11 @@ impl Ranker {
         );
 
         // Build scored files with hybrid blending
+        // Both simple_score and ml_score are now in [0, 1] range
         let mut scored_files = Vec::with_capacity(files.len());
         for (idx, file) in files.iter().enumerate() {
-            let simple_score = simple_scores[idx];
-            let ml_score = prediction_results[idx];
+            let simple_score = simple_scores[idx]; // Already normalized via sigmoid
+            let ml_score = prediction_results[idx]; // Binary classification probability [0, 1]
             let blended_score = w_simple * simple_score + w_lightgbm * ml_score;
 
             scored_files.push(FileScore {
@@ -992,6 +1014,200 @@ mod tests {
     }
 
     #[test]
+    fn test_sigmoid_function() {
+        // Test that sigmoid function produces expected values in [0, 1] range
+        // With k=0.1, x0=10.0
+
+        // Raw score = 0 (no clicks, old file)
+        let score_0 = Ranker::sigmoid(0.0);
+        assert!(
+            score_0 > 0.26 && score_0 < 0.28,
+            "sigmoid(0) should be ~0.27, got {}",
+            score_0
+        );
+
+        // Raw score = 10 (midpoint, should be exactly 0.5)
+        let score_10 = Ranker::sigmoid(10.0);
+        assert!(
+            (score_10 - 0.5).abs() < 0.0001,
+            "sigmoid(10) should be 0.5, got {}",
+            score_10
+        );
+
+        // Raw score = 20 (moderately popular file)
+        let score_20 = Ranker::sigmoid(20.0);
+        assert!(
+            score_20 > 0.73 && score_20 < 0.74,
+            "sigmoid(20) should be ~0.73, got {}",
+            score_20
+        );
+
+        // Raw score = 50 (very popular file)
+        let score_50 = Ranker::sigmoid(50.0);
+        assert!(
+            score_50 > 0.98 && score_50 < 0.99,
+            "sigmoid(50) should be ~0.98, got {}",
+            score_50
+        );
+
+        // Raw score = 100 (extremely popular file)
+        let score_100 = Ranker::sigmoid(100.0);
+        assert!(
+            score_100 > 0.9998 && score_100 < 1.0,
+            "sigmoid(100) should be ~0.9999, got {}",
+            score_100
+        );
+
+        // Negative raw score (should still be > 0, approaches lower asymptote)
+        let score_neg = Ranker::sigmoid(-5.0);
+        assert!(
+            score_neg > 0.18 && score_neg < 0.19,
+            "sigmoid(-5) should be ~0.182, got {}",
+            score_neg
+        );
+    }
+
+    #[test]
+    fn test_simple_score_with_sigmoid_normalization() {
+        // Test that compute_simple_score returns values in [0, 1] range
+        // and show actual numeric values for different scenarios
+
+        let mut clicks_by_file = FxHashMap::default();
+
+        // Scenario 1: Popular file with 10 clicks in last week
+        clicks_by_file.insert(
+            "/tmp/popular.txt".to_string(),
+            vec![
+                ClickEvent {
+                    timestamp: 1700500000,
+                },
+                ClickEvent {
+                    timestamp: 1700510000,
+                },
+                ClickEvent {
+                    timestamp: 1700520000,
+                },
+                ClickEvent {
+                    timestamp: 1700530000,
+                },
+                ClickEvent {
+                    timestamp: 1700540000,
+                },
+                ClickEvent {
+                    timestamp: 1700550000,
+                },
+                ClickEvent {
+                    timestamp: 1700560000,
+                },
+                ClickEvent {
+                    timestamp: 1700570000,
+                },
+                ClickEvent {
+                    timestamp: 1700580000,
+                },
+                ClickEvent {
+                    timestamp: 1700590000,
+                },
+            ],
+        );
+
+        let ranker = Ranker {
+            model: None,
+            clicks: ClickData {
+                clicks_by_file,
+                clicks_by_parent_dir: FxHashMap::default(),
+                clicks_by_query_and_file: FxHashMap::default(),
+                engagements_by_episode_query_and_file: FxHashMap::default(),
+            },
+            stats: None,
+            total_clicks: 10,
+        };
+
+        let current_timestamp = 1700604800; // Nov 22, 2023
+
+        // Popular file: 10 clicks + recent mtime
+        // Raw score = 3.0 * 10 + 1.0 / (1 + 1.2) ≈ 30.45
+        // sigmoid(30.45) with k=0.1, x0=10 ≈ 0.88
+        let popular_file = FileCandidate {
+            file_id: 0,
+            relative_path: "popular.txt".to_string(),
+            full_path: PathBuf::from("/tmp/popular.txt"),
+            mtime: Some(1700500000), // Recent (1.2 days ago)
+            file_size: Some(1024),
+            is_from_walker: true,
+            is_dir: false,
+        };
+        let popular_score = ranker.compute_simple_score(&popular_file, current_timestamp);
+        assert!(
+            popular_score > 0.0 && popular_score < 1.0,
+            "Popular file score should be in [0, 1], got {}",
+            popular_score
+        );
+        assert!(
+            popular_score > 0.87 && popular_score < 0.89,
+            "Popular file (raw≈30.45) should have score ~0.88, got {}",
+            popular_score
+        );
+
+        // Recent file with no clicks
+        // Raw score = 3.0 * 0 + 1.0 / (1 + 1.2) ≈ 0.45
+        // sigmoid(0.45) ≈ 0.278
+        let recent_file = FileCandidate {
+            file_id: 1,
+            relative_path: "recent.txt".to_string(),
+            full_path: PathBuf::from("/tmp/recent.txt"),
+            mtime: Some(1700500000), // Recent
+            file_size: Some(2048),
+            is_from_walker: true,
+            is_dir: false,
+        };
+        let recent_score = ranker.compute_simple_score(&recent_file, current_timestamp);
+        assert!(
+            recent_score > 0.0 && recent_score < 1.0,
+            "Recent file score should be in [0, 1], got {}",
+            recent_score
+        );
+        assert!(
+            recent_score > 0.27 && recent_score < 0.29,
+            "Recent file with no clicks (raw≈0.45) should have score ~0.278, got {}",
+            recent_score
+        );
+
+        // Old file with no clicks
+        // Raw score = 3.0 * 0 + 1.0 / (1 + 365) ≈ 0.0027
+        // sigmoid(0.0027) ≈ 0.27
+        let old_file = FileCandidate {
+            file_id: 2,
+            relative_path: "old.txt".to_string(),
+            full_path: PathBuf::from("/tmp/old.txt"),
+            mtime: Some(1600000000), // Very old
+            file_size: Some(512),
+            is_from_walker: true,
+            is_dir: false,
+        };
+        let old_score = ranker.compute_simple_score(&old_file, current_timestamp);
+        assert!(
+            old_score > 0.0 && old_score < 1.0,
+            "Old file score should be in [0, 1], got {}",
+            old_score
+        );
+        assert!(
+            old_score > 0.26 && old_score < 0.28,
+            "Old file with no clicks (raw≈0.003) should have score ~0.27, got {}",
+            old_score
+        );
+
+        // Verify ordering is preserved: popular > recent > old
+        assert!(
+            popular_score > recent_score && recent_score > old_score,
+            "Score ordering should be preserved: popular({}) > recent({}) > old({})",
+            popular_score,
+            recent_score,
+            old_score
+        );
+    }
+
+    #[test]
     fn test_compute_simple_score() {
         // Create a ranker with some synthetic click data
         let mut clicks_by_file = FxHashMap::default();
@@ -1032,11 +1248,16 @@ mod tests {
 
         let score = ranker.compute_simple_score(&file, current_timestamp);
 
-        // Score should be: 3.0 * 2 (clicks) + 1.0 / (1 + ~1.2 days)
-        // = 6.0 + ~0.45 = ~6.45
+        // Raw score: 3.0 * 2 (clicks) + 1.0 / (1 + ~1.2 days) ≈ 6.45
+        // sigmoid(6.45) with k=0.1, x0=10 ≈ 0.412
         assert!(
-            score > 6.0 && score < 7.0,
-            "Simple score should be ~6.45, got {}",
+            score > 0.0 && score < 1.0,
+            "Sigmoid-normalized score should be in [0, 1], got {}",
+            score
+        );
+        assert!(
+            score > 0.41 && score < 0.42,
+            "Sigmoid(6.45) should be ~0.412, got {}",
             score
         );
 
@@ -1053,11 +1274,16 @@ mod tests {
 
         let score = ranker.compute_simple_score(&old_file, current_timestamp);
 
-        // Score should be: 3.0 * 0 (no clicks) + 1.0 / (1 + many days)
-        // = 0.0 + very small positive number
+        // Raw score: 3.0 * 0 (no clicks) + 1.0 / (1 + ~1160 days) ≈ 0.0009
+        // sigmoid(0.0009) ≈ 0.27 (approaches lower asymptote)
         assert!(
-            score > 0.0 && score < 0.1,
-            "Old file with no clicks should have very low score, got {}",
+            score > 0.0 && score < 1.0,
+            "Sigmoid-normalized score should be in [0, 1], got {}",
+            score
+        );
+        assert!(
+            score > 0.26 && score < 0.28,
+            "Sigmoid(~0) should be ~0.27 (lower asymptote), got {}",
             score
         );
     }
@@ -1121,7 +1347,11 @@ mod tests {
 
         assert_eq!(result.len(), 2, "Should have 2 ranked files");
 
-        // popular.txt should rank first due to clicks (3 * 3 = 9 points)
+        // popular.txt should rank first due to clicks
+        // Raw: 3 * 3 clicks ≈ 9 → sigmoid(9) ≈ 0.48
+        // recent.txt has 0 clicks but very recent mtime
+        // Raw: 0 + 1/(1+0.05) ≈ 0.95 → sigmoid(0.95) ≈ 0.29
+        // So popular should still rank higher
         assert_eq!(
             result[0].file_id, 0,
             "Popular file should rank first in cold start"
