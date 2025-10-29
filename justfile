@@ -1,3 +1,5 @@
+all: build test lint
+
 # Run psychic in release mode
 run *ARGS:
     cargo run --release -- {{ARGS}}
