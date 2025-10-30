@@ -1,8 +1,12 @@
 ## psychic
 
-`psychic` is a terminal-based file browser with ML-powered ranking, built in Rust using ratatui. It learns from user behavior (clicks, scrolls) to improve search relevance over time. Inspired by `fzf` and `zoxide`, `psychic` helps you navigate the filesystem and open the files you need, *fast*.
+`psychic` is a terminal-based file browser with ML-powered ranking, built in Rust using ratatui. It learns from your behavior (clicks, scrolls) to improve search relevance over time. Inspired by `fzf` and `zoxide`, `psychic` helps you navigate the filesystem and open the files you need, *fast*.
 
 [![asciicast](https://asciinema.org/a/752725.svg)](https://asciinema.org/a/752725)
+
+## What kind of ML does it use?
+
+`psychic` trains a tiny gradient-boosted tree model using the excellent LightGBM library. The model lives on your computer, using data collected from your actions within psychic. It makes no API calls, and your data never leaves your computer. No transformers, deep learning, and definitely no LLMs. All that stuff would be, at least in 2025, too slow for this use-case.
 
 ## Supported systems
 
