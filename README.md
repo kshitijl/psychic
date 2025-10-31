@@ -72,3 +72,13 @@ Otherwise, type `psychic` to open the TUI. By default, it will explore both file
 * `Alt-Up` to navigate to the parent directory.
 * `Ctrl-J` to get dropped in a shell in the current directory.
 * `Ctrl-O` will open a debug pane showing you the values of each ML feature for the currently selected file or directory.
+
+## LLM use disclosure
+
+This was my first project where I used LLMs to generate a substantial portion of the code. That being said, I stand behind the quality of this code. The design and architecture are my own creation. I exercised substantial creative control in how the tests and types are set up, which constrain the rest of the code. You can read `llm.md` and `how-it-works.md` to see how the LLMs were instructed, but they are only a small part of the story. Every single commit is here because I decided that change was necessary, and many initial drafts were rejected before getting to the commits you see in this repository. 
+
+At least as that term was defined in Karpathy's original tweet, this is not a vibe-coded project.
+
+## License
+
+MIT
