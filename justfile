@@ -4,6 +4,9 @@ all: build test lint
 run *ARGS:
     cargo run --release -- {{ARGS}}
 
+jupyter:
+    uv run jupyter
+
 # Build release binary
 build:
     cargo build --release && cargo doc && cargo fmt
