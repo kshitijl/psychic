@@ -1,17 +1,13 @@
 ## now
 
-
 distribution:
-- test on linux computer
-- do something about when the db is new and there's no model
-
-- new feature: define episode as "from one click to the next". then, "num clicks when this query was in the episode". so, if we begin with query "tc" and then later modify to "todo" and end up clicking on "todo-current.md", then that's +1 count for "tc". ought to make it feel more magical
-
 - respect .gitignore instead of hardcoding dirs to ignore
 
 - full text search mode using rg.
 
-- debug weird long hang when it's been open for a long time
+- use the fuzzy match score as input to sorting. right now, even things that only fuzzy match very vaguely are included. we should at least include that as an input to the simple model, but probably also the ML model.
+
+
 - audit the whole codebase for modularity. can we refactor extract something into a module, which can then be expect tested? right now its a big ball of very IO heavy code that makes it difficult to test. maybe the overall state logic and keypress logic? maybe the page caching logic? maybe the logic that when walker is finished it sends an AllDone message? maybe the logic that historical files in cwd still need to shown in filter view?
 - when history is filtered, suppose number of items becomes less than selected index, then selected index should become 0 so the top item is automatically becomes selected.
 - display is broken if we scroll past a binary file and it gets previewed
