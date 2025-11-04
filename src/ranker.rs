@@ -22,6 +22,7 @@ pub struct FileCandidate {
     pub file_size: Option<i64>,
     pub is_from_walker: bool,
     pub is_dir: bool,
+    pub fuzzy_score: i64, // Score from fuzzy matcher (higher = better match)
 }
 
 #[derive(Debug, Clone)]
@@ -33,6 +34,7 @@ pub struct FileScore {
     pub ml_score: Option<f64>,      // For debugging: score from ML model
     pub simple_weight: Option<f64>, // For debugging: weight assigned to simple model
     pub ml_weight: Option<f64>,     // For debugging: weight assigned to ML model
+    pub fuzzy_score: i64,           // For debugging: fuzzy match score from skim matcher
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -80,6 +82,30 @@ const SIGMOID_K: f64 = 0.1; // Steepness of sigmoid curve
 const SIGMOID_X0: f64 = 10.0; // Midpoint (where sigmoid = 0.5)
 
 const TRAIN_PY_SOURCE: &str = include_str!("../train.py");
+
+/// Convert fuzzy score for ML use
+/// Maps i64::MAX (empty query) to 0.0, otherwise returns as f64
+pub fn fuzzy_score_for_ml(fuzzy_score: i64) -> f64 {
+    if fuzzy_score == i64::MAX {
+        0.0 // Empty query - no match signal
+    } else {
+        fuzzy_score as f64
+    }
+}
+
+/// Normalize fuzzy score for simple model scoring
+/// Applies basic normalization + sigmoid to map to [0, 1] range
+fn fuzzy_score_for_simple_model(fuzzy_score: i64) -> f64 {
+    let basic = fuzzy_score_for_ml(fuzzy_score); // Reuses i64::MAX → 0 logic
+
+    if basic == 0.0 {
+        0.0 // Don't sigmoid-normalize zero (empty query or no match)
+    } else {
+        // Sigmoid normalization: x0=100 (midpoint), k=0.02 (steepness)
+        // Maps: score 0 → ~0, score 100 → 0.5, score 200+ → ~1.0
+        1.0 / (1.0 + (-0.02 * (basic - 100.0)).exp())
+    }
+}
 
 impl Ranker {
     pub fn new(model_path: &Path, db_path: &Path) -> Result<Self> {
@@ -340,9 +366,14 @@ impl Ranker {
             365.0
         };
 
-        // Combine: clicks are weighted 3x more than recency
-        let raw_score =
-            CLICKS_WEIGHT * clicks_last_7_days + RECENCY_WEIGHT / (1.0 + modified_age_in_days);
+        // Normalize fuzzy score to [0, 1] range using helper function
+        let fuzzy_score_normalized = fuzzy_score_for_simple_model(file.fuzzy_score);
+
+        // Combine: clicks weighted 3x, recency 1x, fuzzy match 2x
+        // Fuzzy match gets weight of 2.0 to make it significant but not dominating
+        let raw_score = CLICKS_WEIGHT * clicks_last_7_days
+            + RECENCY_WEIGHT / (1.0 + modified_age_in_days)
+            + 2.0 * fuzzy_score_normalized;
 
         // Normalize to [0, 1] using sigmoid
         Self::sigmoid(raw_score)
@@ -453,6 +484,7 @@ impl Ranker {
                     ml_score: None,
                     simple_weight: Some(1.0), // 100% simple model when no ML model
                     ml_weight: Some(0.0),
+                    fuzzy_score: file.fuzzy_score,
                 })
                 .collect();
             scored_files.sort_by(|a, b| {
@@ -511,6 +543,7 @@ impl Ranker {
                 ml_score: Some(ml_score),
                 simple_weight: Some(w_simple),
                 ml_weight: Some(w_lightgbm),
+                fuzzy_score: file.fuzzy_score,
             });
         }
         log::info!(
@@ -825,6 +858,7 @@ mod tests {
             file_size: Some(2048),
             is_from_walker: true,
             is_dir: false,
+            fuzzy_score: 100,
         }];
 
         let result = ranker.rank_files(
@@ -872,6 +906,7 @@ mod tests {
             file_size: Some(12_288),
             is_from_walker: true,
             is_dir: false,
+            fuzzy_score: 100,
         };
 
         // Create synthetic click data
@@ -943,7 +978,7 @@ mod tests {
         // Format as string for expect-test style comparison
         let actual = format!("{:?}", features);
 
-        // Expected output: [filename_starts_with_query, clicks_last_30_days, modified_today, is_under_cwd, is_hidden, file_size_bytes, clicks_last_week_parent_dir, clicks_last_hour, clicks_today, clicks_last_7_days, modified_age, clicks_for_this_query, engagements_in_episode_with_query, is_dir]
+        // Expected output: [filename_starts_with_query, clicks_last_30_days, modified_today, is_under_cwd, is_hidden, file_size_bytes, clicks_last_week_parent_dir, clicks_last_hour, clicks_today, clicks_last_7_days, modified_age, clicks_for_this_query, engagements_in_episode_with_query, is_dir, fuzzy_score]
         // filename_starts_with_query=0 (bar.txt doesn't start with "test")
         // clicks_last_30_days=3 (3 clicks on bar.txt itself)
         // modified_today=0 (mtime is old - Nov 2023, test runs in 2025)
@@ -958,8 +993,9 @@ mod tests {
         // clicks_for_this_query=2 (2 query-specific clicks for "test" + bar.txt)
         // engagements_in_episode_with_query=0 (no episode engagement data in test)
         // is_dir=0 (this is a file, not a directory)
+        // fuzzy_score=0 (foo/bar.txt doesn't match "test" - fuzzy matcher returns None)
         let expected =
-            "[0.0, 3.0, 0.0, 1.0, 0.0, 12288.0, 4.0, 0.0, 0.0, 3.0, 86400.0, 2.0, 0.0, 0.0]";
+            "[0.0, 3.0, 0.0, 1.0, 0.0, 12288.0, 4.0, 0.0, 0.0, 3.0, 86400.0, 2.0, 0.0, 0.0, 0.0]";
 
         assert_eq!(actual, expected, "Feature vector mismatch");
     }
@@ -1125,9 +1161,9 @@ mod tests {
 
         let current_timestamp = 1700604800; // Nov 22, 2023
 
-        // Popular file: 10 clicks + recent mtime
-        // Raw score = 3.0 * 10 + 1.0 / (1 + 1.2) ≈ 30.45
-        // sigmoid(30.45) with k=0.1, x0=10 ≈ 0.88
+        // Popular file: 10 clicks + recent mtime + fuzzy score
+        // Raw score = 3.0 * 10 + 1.0 / (1 + 1.2) + 2.0 * 0.5 ≈ 31.45
+        // sigmoid(31.45) with k=0.1, x0=10 ≈ 0.895
         let popular_file = FileCandidate {
             file_id: 0,
             relative_path: "popular.txt".to_string(),
@@ -1136,6 +1172,7 @@ mod tests {
             file_size: Some(1024),
             is_from_walker: true,
             is_dir: false,
+            fuzzy_score: 100,
         };
         let popular_score = ranker.compute_simple_score(&popular_file, current_timestamp);
         assert!(
@@ -1144,14 +1181,14 @@ mod tests {
             popular_score
         );
         assert!(
-            popular_score > 0.87 && popular_score < 0.89,
-            "Popular file (raw≈30.45) should have score ~0.88, got {}",
+            popular_score > 0.89 && popular_score < 0.90,
+            "Popular file (raw≈31.45) should have score ~0.895, got {}",
             popular_score
         );
 
-        // Recent file with no clicks
-        // Raw score = 3.0 * 0 + 1.0 / (1 + 1.2) ≈ 0.45
-        // sigmoid(0.45) ≈ 0.278
+        // Recent file with no clicks + fuzzy score
+        // Raw score = 3.0 * 0 + 1.0 / (1 + 1.2) + 2.0 * 0.5 ≈ 1.45
+        // sigmoid(1.45) ≈ 0.304
         let recent_file = FileCandidate {
             file_id: 1,
             relative_path: "recent.txt".to_string(),
@@ -1160,6 +1197,7 @@ mod tests {
             file_size: Some(2048),
             is_from_walker: true,
             is_dir: false,
+            fuzzy_score: 100,
         };
         let recent_score = ranker.compute_simple_score(&recent_file, current_timestamp);
         assert!(
@@ -1168,14 +1206,14 @@ mod tests {
             recent_score
         );
         assert!(
-            recent_score > 0.27 && recent_score < 0.29,
-            "Recent file with no clicks (raw≈0.45) should have score ~0.278, got {}",
+            recent_score > 0.298 && recent_score < 0.305,
+            "Recent file with no clicks (raw≈1.45) should have score ~0.304, got {}",
             recent_score
         );
 
-        // Old file with no clicks
-        // Raw score = 3.0 * 0 + 1.0 / (1 + 365) ≈ 0.0027
-        // sigmoid(0.0027) ≈ 0.27
+        // Old file with no clicks + fuzzy score
+        // Raw score = 3.0 * 0 + 1.0 / (1 + 365) + 2.0 * 0.5 ≈ 1.003
+        // sigmoid(1.003) ≈ 0.295
         let old_file = FileCandidate {
             file_id: 2,
             relative_path: "old.txt".to_string(),
@@ -1184,6 +1222,7 @@ mod tests {
             file_size: Some(512),
             is_from_walker: true,
             is_dir: false,
+            fuzzy_score: 100,
         };
         let old_score = ranker.compute_simple_score(&old_file, current_timestamp);
         assert!(
@@ -1192,8 +1231,8 @@ mod tests {
             old_score
         );
         assert!(
-            old_score > 0.26 && old_score < 0.28,
-            "Old file with no clicks (raw≈0.003) should have score ~0.27, got {}",
+            old_score > 0.288 && old_score < 0.296,
+            "Old file with no clicks (raw≈1.003) should have score ~0.295, got {}",
             old_score
         );
 
@@ -1244,20 +1283,21 @@ mod tests {
             file_size: Some(1024),
             is_from_walker: true,
             is_dir: false,
+            fuzzy_score: 100,
         };
 
         let score = ranker.compute_simple_score(&file, current_timestamp);
 
-        // Raw score: 3.0 * 2 (clicks) + 1.0 / (1 + ~1.2 days) ≈ 6.45
-        // sigmoid(6.45) with k=0.1, x0=10 ≈ 0.412
+        // Raw score: 3.0 * 2 (clicks) + 1.0 / (1 + ~1.2 days) + 2.0 * 0.5 (fuzzy) ≈ 7.45
+        // sigmoid(7.45) with k=0.1, x0=10 ≈ 0.437
         assert!(
             score > 0.0 && score < 1.0,
             "Sigmoid-normalized score should be in [0, 1], got {}",
             score
         );
         assert!(
-            score > 0.41 && score < 0.42,
-            "Sigmoid(6.45) should be ~0.412, got {}",
+            score > 0.43 && score < 0.44,
+            "Sigmoid(7.45) should be ~0.437, got {}",
             score
         );
 
@@ -1270,20 +1310,21 @@ mod tests {
             file_size: Some(2048),
             is_from_walker: true,
             is_dir: false,
+            fuzzy_score: 100,
         };
 
         let score = ranker.compute_simple_score(&old_file, current_timestamp);
 
-        // Raw score: 3.0 * 0 (no clicks) + 1.0 / (1 + ~1160 days) ≈ 0.0009
-        // sigmoid(0.0009) ≈ 0.27 (approaches lower asymptote)
+        // Raw score: 3.0 * 0 (no clicks) + 1.0 / (1 + ~1160 days) + 2.0 * 0.5 (fuzzy) ≈ 1.001
+        // sigmoid(1.001) ≈ 0.289
         assert!(
             score > 0.0 && score < 1.0,
             "Sigmoid-normalized score should be in [0, 1], got {}",
             score
         );
         assert!(
-            score > 0.26 && score < 0.28,
-            "Sigmoid(~0) should be ~0.27 (lower asymptote), got {}",
+            score > 0.288 && score < 0.291,
+            "Sigmoid(~1.001) should be ~0.289, got {}",
             score
         );
     }
@@ -1329,6 +1370,7 @@ mod tests {
                 file_size: Some(1024),
                 is_from_walker: true,
                 is_dir: false,
+                fuzzy_score: 100,
             },
             FileCandidate {
                 file_id: 1,
@@ -1338,6 +1380,7 @@ mod tests {
                 file_size: Some(2048),
                 is_from_walker: true,
                 is_dir: false,
+                fuzzy_score: 100,
             },
         ];
 

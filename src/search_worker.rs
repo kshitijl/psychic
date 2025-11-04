@@ -78,6 +78,7 @@ pub struct DisplayFileInfo {
     pub ml_score: Option<f64>,     // For debug pane: score from ML model
     pub simple_weight: Option<f64>, // For debug pane: weight assigned to simple model
     pub ml_weight: Option<f64>,    // For debug pane: weight assigned to ML model
+    pub fuzzy_score: i64,          // For debug pane: fuzzy match score from skim matcher
 }
 
 pub struct UpdateQueryRequest {
@@ -420,25 +421,23 @@ impl WorkerState {
         // Create fuzzy matcher
         let matcher = SkimMatcherV2::default();
 
-        // Filter files that match the query
+        // Filter files that match the query and capture fuzzy scores
         let filter_start = std::time::Instant::now();
-        let matching_file_ids: Vec<FileId> = (0..self.file_registry.len())
+        let matching_files: Vec<(FileId, i64)> = (0..self.file_registry.len())
             .map(FileId)
-            .filter(|&file_id| {
+            .filter_map(|file_id| {
                 let file_info = &self.file_registry[file_id.0];
 
                 // Apply text query filter using fuzzy matching
-                let matches_query = query.is_empty()
-                    || matcher
-                        .fuzzy_match(&file_info.display_name, query)
-                        .is_some();
-
-                if !matches_query {
-                    return false;
-                }
+                let fuzzy_score = if query.is_empty() {
+                    // Empty query matches everything with max score
+                    i64::MAX
+                } else {
+                    matcher.fuzzy_match(&file_info.display_name, query)?
+                };
 
                 // Apply type filter
-                match self.current_filter {
+                let passes_type_filter = match self.current_filter {
                     FilterType::None => true,
                     FilterType::OnlyCwd => {
                         // Show files that are under current root, regardless of origin
@@ -452,14 +451,20 @@ impl WorkerState {
                     }
                     FilterType::OnlyDirs => file_info.is_dir,
                     FilterType::OnlyFiles => !file_info.is_dir,
+                };
+
+                if passes_type_filter {
+                    Some((file_id, fuzzy_score))
+                } else {
+                    None
                 }
             })
             .collect();
 
         // Convert to FileCandidate structs
-        let file_candidates: Vec<ranker::FileCandidate> = matching_file_ids
+        let file_candidates: Vec<ranker::FileCandidate> = matching_files
             .iter()
-            .map(|&file_id| {
+            .map(|&(file_id, fuzzy_score)| {
                 let file_info = &self.file_registry[file_id.0];
                 ranker::FileCandidate {
                     file_id: file_id.0,
@@ -469,6 +474,7 @@ impl WorkerState {
                     file_size: file_info.file_size,
                     is_from_walker: file_info.origin == FileOrigin::CwdWalker,
                     is_dir: file_info.is_dir,
+                    fuzzy_score,
                 }
             })
             .collect();
@@ -497,7 +503,7 @@ impl WorkerState {
             Err(e) => {
                 log::warn!("Ranking failed: {}, falling back to simple filtering", e);
                 self.file_scores.clear();
-                self.filtered_files = matching_file_ids;
+                self.filtered_files = matching_files.iter().map(|&(file_id, _)| file_id).collect();
             }
         }
 
@@ -539,6 +545,7 @@ impl WorkerState {
                 let ml_score = file_score.and_then(|fs| fs.ml_score);
                 let simple_weight = file_score.and_then(|fs| fs.simple_weight);
                 let ml_weight = file_score.and_then(|fs| fs.ml_weight);
+                let fuzzy_score = file_score.map(|fs| fs.fuzzy_score).unwrap_or(0);
 
                 // Check if this is the current working directory
                 let is_cwd = file_info.full_path == self.root;
@@ -560,6 +567,7 @@ impl WorkerState {
                     ml_score,
                     simple_weight,
                     ml_weight,
+                    fuzzy_score,
                 }
             })
             .collect()

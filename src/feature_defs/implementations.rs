@@ -1,5 +1,7 @@
 use super::schema::{Feature, FeatureInputs, FeatureType, Monotonicity};
 use anyhow::Result;
+use fuzzy_matcher::FuzzyMatcher;
+use fuzzy_matcher::skim::SkimMatcherV2;
 use jiff::{Span, Timestamp};
 use std::path::Path;
 
@@ -500,5 +502,40 @@ impl Feature for IsDir {
 
     fn compute(&self, inputs: &FeatureInputs) -> Result<f64> {
         Ok(if inputs.is_dir { 1.0 } else { 0.0 })
+    }
+}
+
+// ============================================================================
+// Feature: fuzzy_score
+// ============================================================================
+
+pub struct FuzzyScore;
+
+impl Feature for FuzzyScore {
+    fn name(&self) -> &'static str {
+        "fuzzy_score"
+    }
+
+    fn feature_type(&self) -> FeatureType {
+        FeatureType::Numeric
+    }
+
+    fn monotonicity(&self) -> Option<Monotonicity> {
+        Some(Monotonicity::Increasing) // Higher fuzzy score = better match
+    }
+
+    fn compute(&self, inputs: &FeatureInputs) -> Result<f64> {
+        // Return 0.0 for empty queries (no fuzzy match signal)
+        if inputs.query.is_empty() {
+            return Ok(0.0);
+        }
+
+        // Compute fuzzy match score using SkimMatcherV2
+        let matcher = SkimMatcherV2::default();
+        let score = matcher
+            .fuzzy_match(inputs.file_path, inputs.query)
+            .unwrap_or(0); // Return 0 if no match
+
+        Ok(score as f64)
     }
 }

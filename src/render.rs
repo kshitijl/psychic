@@ -654,6 +654,17 @@ pub fn render_normal_mode(
             debug_lines.push(format!("  ML: {:.4}{}", ml, weight_str));
         }
         debug_lines.push(String::from(""));
+        debug_lines.push(String::from("Simple Score Inputs:"));
+
+        // Display fuzzy score (what goes into ML model)
+        let ml_score = ranker::fuzzy_score_for_ml(display_info.fuzzy_score);
+        if display_info.fuzzy_score == i64::MAX {
+            debug_lines.push(String::from("  Fuzzy score: 0.0 (empty query)"));
+        } else {
+            debug_lines.push(format!("  Fuzzy score: {:.1}", ml_score));
+        }
+
+        debug_lines.push(String::from(""));
         debug_lines.push(String::from("Features:"));
         debug_lines.push(String::from(""));
 
