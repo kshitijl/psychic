@@ -2,6 +2,27 @@
 # Add this to your ~/.zshrc:
 #   eval "$(psychic zsh)"
 
+# =============================================================================
+# Hook to track directory changes
+# =============================================================================
+
+# Hook function that runs after every directory change
+function __psychic_hook() {
+    \command psychic track-visit "$(\builtin pwd)" 2>/dev/null &!
+}
+
+# Initialize hook (add to chpwd_functions array)
+\builtin typeset -ga chpwd_functions
+# Remove any existing instances of our hook (avoid duplicates)
+# shellcheck disable=SC2034,SC2296
+chpwd_functions=("${(@)chpwd_functions:#__psychic_hook}")
+# Add our hook
+chpwd_functions+=(__psychic_hook)
+
+# =============================================================================
+# Navigation commands
+# =============================================================================
+
 # Jump to a directory using psychic
 # Ctrl-J in psychic will print the directory and exit
 p() {

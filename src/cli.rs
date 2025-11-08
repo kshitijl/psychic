@@ -23,6 +23,11 @@ pub enum Commands {
     Retrain,
     /// Output shell integration script for zsh
     Zsh,
+    /// Track a directory visit (for shell integration hooks)
+    TrackVisit {
+        /// Directory path to track
+        path: PathBuf,
+    },
     /// Internal development and debugging commands
     Internal {
         #[command(subcommand)]

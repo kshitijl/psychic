@@ -5,9 +5,8 @@ distribution:
 
 - full text search mode using rg.
 
-- use the fuzzy match score as input to sorting. right now, even things that only fuzzy match very vaguely are included. we should at least include that as an input to the simple model, but probably also the ML model.
-
-
+- do something about the size of the events db
+- if a historical file or dir no longer exists then filter it out
 - audit the whole codebase for modularity. can we refactor extract something into a module, which can then be expect tested? right now its a big ball of very IO heavy code that makes it difficult to test. maybe the overall state logic and keypress logic? maybe the page caching logic? maybe the logic that when walker is finished it sends an AllDone message? maybe the logic that historical files in cwd still need to shown in filter view?
 - when history is filtered, suppose number of items becomes less than selected index, then selected index should become 0 so the top item is automatically becomes selected.
 - display is broken if we scroll past a binary file and it gets previewed

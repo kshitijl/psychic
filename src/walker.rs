@@ -1,3 +1,4 @@
+use crate::metadata_ext::MetadataExt;
 use crate::search_worker::{WalkerCommand, WalkerFileMetadata, WalkerMessage};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
@@ -108,18 +109,8 @@ fn walk_directory(
                     }
                     let is_dir = entry.file_type().is_dir();
                     let metadata = entry.metadata().ok();
-                    let mtime = metadata
-                        .as_ref()
-                        .and_then(|m| m.modified().ok())
-                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|d| d.as_secs() as i64);
-
-                    let atime = metadata
-                        .as_ref()
-                        .and_then(|m| m.accessed().ok())
-                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|d| d.as_secs() as i64);
-
+                    let mtime = metadata.as_ref().and_then(|m| m.mtime_as_secs());
+                    let atime = metadata.as_ref().and_then(|m| m.atime_as_secs());
                     let file_size = metadata.as_ref().map(|m| m.len() as i64);
 
                     let _ = tx.send(WalkerMessage::FileMetadata(WalkerFileMetadata {
@@ -139,18 +130,8 @@ fn walk_directory(
         if item_count < MAX_FILES {
             let is_dir = entry.file_type().is_dir();
             let metadata = entry.metadata().ok();
-            let mtime = metadata
-                .as_ref()
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64);
-
-            let atime = metadata
-                .as_ref()
-                .and_then(|m| m.accessed().ok())
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64);
-
+            let mtime = metadata.as_ref().and_then(|m| m.mtime_as_secs());
+            let atime = metadata.as_ref().and_then(|m| m.atime_as_secs());
             let file_size = metadata.as_ref().map(|m| m.len() as i64);
 
             items.push(WalkerFileMetadata {

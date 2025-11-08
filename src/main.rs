@@ -9,6 +9,7 @@ mod feature_defs;
 mod features;
 mod history;
 mod input;
+mod metadata_ext;
 mod path_display;
 mod preview;
 mod ranker;
@@ -29,6 +30,7 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use db::EventData;
+use metadata_ext::MetadataExt;
 use ratatui::{Terminal, backend::CrosstermBackend};
 use search_worker::{WorkerRequest, WorkerResponse};
 use std::{
@@ -63,17 +65,17 @@ use app::{App, AppBootstrap, AppOptions, Page};
 // Import CLI types from dedicated module
 use cli::{Cli, Commands, FilterArg, InternalCommands, OutputFormat};
 
+/// Generate a unique session ID using a random u64.
+fn create_session_id() -> String {
+    rand::random::<u64>().to_string()
+}
+
 fn main() -> Result<()> {
     // Start global timer at the very beginning
     let main_start = Instant::now();
 
     // Generate session ID early so we can include it in all logs
-    use std::collections::hash_map::RandomState;
-    use std::hash::{BuildHasher, Hash, Hasher};
-    let mut hasher = RandomState::new().build_hasher();
-    Instant::now().hash(&mut hasher);
-    std::process::id().hash(&mut hasher);
-    let session_id = hasher.finish().to_string();
+    let session_id = create_session_id();
 
     // Set as environment variable so all threads can access it
     // SAFETY: We set this once at the very beginning of main() before any other threads exist
@@ -167,6 +169,49 @@ fn main() -> Result<()> {
             Commands::Zsh => {
                 // Output zsh integration script
                 print!("{}", include_str!("../shell/psychic.zsh"));
+                return Ok(());
+            }
+            Commands::TrackVisit { path } => {
+                // Canonicalize the path to get the absolute path
+                let full_path = path
+                    .canonicalize()
+                    .with_context(|| format!("Failed to resolve path: {}", path.display()))?;
+
+                // Only track directories
+                if !full_path.is_dir() {
+                    anyhow::bail!("Path is not a directory: {}", full_path.display());
+                }
+
+                // Open database
+                let db_path = db::Database::get_db_path(&data_dir);
+                let db = db::Database::new(&db_path)?;
+
+                // Generate a session ID for this tracking event
+                let session_id = create_session_id();
+
+                // Get file metadata
+                let metadata = std::fs::metadata(&full_path)?;
+                let mtime = metadata.mtime_as_secs();
+                let atime = metadata.atime_as_secs();
+
+                // Log the directory visit
+                db.log_event(db::EventData {
+                    query: "",
+                    file_path: full_path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .as_ref(),
+                    full_path: full_path.to_string_lossy().as_ref(),
+                    mtime,
+                    atime,
+                    file_size: None, // directories don't have meaningful sizes
+                    subsession_id: 0,
+                    action: db::UserInteraction::StartupVisit,
+                    session_id: &session_id,
+                    episode_queries: None,
+                })?;
+
                 return Ok(());
             }
             Commands::Internal { command } => match command {
@@ -372,20 +417,8 @@ fn main() -> Result<()> {
 
                 // Get metadata for the directory
                 let metadata = std::fs::metadata(&root_clone).ok();
-                let mtime = metadata.as_ref().and_then(|m| {
-                    m.modified().ok().and_then(|t| {
-                        t.duration_since(std::time::UNIX_EPOCH)
-                            .ok()
-                            .map(|d| d.as_secs() as i64)
-                    })
-                });
-                let atime = metadata.as_ref().and_then(|m| {
-                    m.accessed().ok().and_then(|t| {
-                        t.duration_since(std::time::UNIX_EPOCH)
-                            .ok()
-                            .map(|d| d.as_secs() as i64)
-                    })
-                });
+                let mtime = metadata.as_ref().and_then(|m| m.mtime_as_secs());
+                let atime = metadata.as_ref().and_then(|m| m.atime_as_secs());
                 let file_size = metadata.as_ref().map(|m| m.len() as i64);
 
                 match db.log_event(EventData {

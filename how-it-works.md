@@ -778,10 +778,15 @@ loop {
 Why mouse scrolls preview: Keyboard for navigation (fast), mouse for exploration (natural). Most users don't use mouse for results list.
 
 **Shell Integration:**
-Run `eval "$(psychic zsh)"` in your ~/.zshrc to enable the `p` and `pd` commands:
+Run `eval "$(psychic zsh)"` in your ~/.zshrc to enable the `p`, `pd`, and `pc` commands, plus automatic directory tracking:
 - `p` - launch psychic, press Ctrl-J to cd your shell to the selected directory
-- `pd` - launch psychic in directories-only mode (same as `psychic --shell-integration --filter=dirs`)
+- `pd` - launch psychic in directories-only mode (same as `psychic --filter=dirs --on-dir-click=print-to-stdout`)
+- `pc` - launch psychic in current-directory-only mode (same as `psychic --filter=cwd --on-cwd-visit=print-to-stdout`)
+- **Automatic directory tracking**: The shell integration adds a `chpwd` hook that automatically tracks every directory you visit via `cd`. This allows psychic to learn which directories you frequently visit without requiring explicit clicks.
 - Without shell integration, Ctrl-J spawns a new shell in the selected directory (old behavior)
+
+**How automatic tracking works:**
+The shell integration installs a `__psychic_hook()` function that runs after every directory change. This hook calls `psychic track-visit <directory>` in the background, which logs a `startup_visit` event to the database. These visits appear in search results and help the ML model learn your directory preferences, but they don't count as positive click signals (unlike actual clicks), preventing bias in the ranking.
 
 **Filters:**
 Filter picker appears as a popup overlay in the bottom-right when Ctrl-F is pressed. Four filter options:
@@ -949,6 +954,7 @@ Why this order: Worker can log its shutdown message before logging channel close
 - `log` - Logging facade
 - `once_cell` - Lazy static for feature registry
 - `timeago` - Human-readable relative timestamps
+- `rand` - Random number generation (session IDs)
 - External: `bat` - Syntax highlighting (optional, has fallback)
 
 ## CLI Commands
@@ -982,8 +988,12 @@ psychic generate-features
 psychic retrain
 
 # Output shell integration script
-psychic zsh > ~/.psychic.zsh
-# Then add to ~/.zshrc: source ~/.psychic.zsh
+psychic zsh
+# Add to ~/.zshrc: eval "$(psychic zsh)"
+
+# Track a directory visit (used by shell integration hook)
+psychic track-visit /path/to/directory
+# Logs a startup_visit event for the directory
 
 # Internal commands (development/debugging)
 psychic internal analyze-perf

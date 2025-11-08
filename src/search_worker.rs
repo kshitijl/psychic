@@ -1,4 +1,5 @@
 use crate::db::Database;
+use crate::metadata_ext::MetadataExt;
 use crate::ranker;
 use crate::walker::start_file_walker;
 use anyhow::Result;
@@ -889,18 +890,8 @@ struct FileMetadata {
 
 fn get_file_metadata(path: &PathBuf) -> FileMetadata {
     if let Ok(metadata) = std::fs::metadata(path) {
-        let mtime = metadata
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs() as i64);
-
-        let atime = metadata
-            .accessed()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs() as i64);
-
+        let mtime = metadata.mtime_as_secs();
+        let atime = metadata.atime_as_secs();
         let file_size = Some(metadata.len() as i64);
         let is_dir = metadata.is_dir();
 
