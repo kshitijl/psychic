@@ -165,7 +165,7 @@ fn execute_cwd_visit_action(
     dir_path: &std::path::Path,
     terminal: &mut Terminal<CrosstermBackend<std::fs::File>>,
 ) -> Result<InputAction> {
-    match app.on_cwd_visit {
+    match app.options.on_cwd_visit {
         OnCwdVisitAction::PrintToStdout => {
             cleanup_terminal(terminal)?;
             Ok(InputAction::PrintAndExit(dir_path.display().to_string()))
@@ -404,7 +404,7 @@ fn handle_directory_click(
     dir_path: std::path::PathBuf,
     terminal: &mut Terminal<CrosstermBackend<std::fs::File>>,
 ) -> Result<InputAction> {
-    match app.on_dir_click {
+    match app.options.on_dir_click {
         OnDirClickAction::Navigate => {
             if dir_path == app.cwd {
                 log::info!("Already in {:?}, not navigating", dir_path);
@@ -597,7 +597,7 @@ fn suspend_tui_for_editor(
     let tty_out = std::fs::OpenOptions::new().write(true).open("/dev/tty")?;
     let tty_err = std::fs::OpenOptions::new().write(true).open("/dev/tty")?;
 
-    let status = std::process::Command::new("hx")
+    let status = std::process::Command::new(&app.options.editor)
         .arg(file_path)
         .stdin(Stdio::from(tty_in))
         .stdout(Stdio::from(tty_out))

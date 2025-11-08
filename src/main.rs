@@ -355,6 +355,11 @@ fn main() -> Result<()> {
         input_control_tx: input_control_tx.clone(),
     };
 
+    // Detect editor from environment, with fallback chain
+    let editor = env::var("EDITOR")
+        .or_else(|_| env::var("VISUAL"))
+        .unwrap_or_else(|_| "vi".to_string());
+
     let options = AppOptions {
         on_dir_click: cli.on_dir_click.clone(),
         on_cwd_visit: cli.on_cwd_visit.clone(),
@@ -363,6 +368,7 @@ fn main() -> Result<()> {
         no_click_loading: cli.no_click_loading,
         no_model: cli.no_model,
         no_click_logging: cli.no_click_logging,
+        editor,
     };
 
     let mut app = App::new(root.clone(), &data_dir, bootstrap, options)?;
@@ -560,7 +566,7 @@ fn run_app(
                 total_results: app.total_results,
                 total_files: app.total_files,
                 current_filter: app.current_filter,
-                no_preview: app.no_preview,
+                no_preview: app.options.no_preview,
                 preview: &app.preview,
                 currently_retraining: app.currently_retraining,
                 model_stats_cache: app.model_stats_cache.as_ref(),

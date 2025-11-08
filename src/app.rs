@@ -38,6 +38,7 @@ pub struct AppOptions {
     pub no_click_loading: bool,
     pub no_model: bool,
     pub no_click_logging: bool,
+    pub editor: String,
 }
 
 pub struct AppBootstrap {
@@ -77,12 +78,8 @@ pub struct App {
     // UI state machine
     pub ui_state: ui_state::UiState,
 
-    // Action configuration
-    pub on_dir_click: OnDirClickAction,
-    pub on_cwd_visit: OnCwdVisitAction,
-
-    // Performance flags
-    pub no_preview: bool,
+    // Configuration options
+    pub options: AppOptions,
 
     // Analytics tracking (subsessions, impressions, scrolls)
     pub analytics: Analytics,
@@ -117,15 +114,7 @@ impl App {
             event_tx,
             input_control_tx,
         } = bootstrap;
-        let AppOptions {
-            on_dir_click,
-            on_cwd_visit,
-            initial_filter,
-            no_preview,
-            no_click_loading,
-            no_model,
-            no_click_logging,
-        } = options;
+        let initial_filter = options.initial_filter;
 
         // Get session ID from environment (set in main())
         let session_id =
@@ -137,14 +126,14 @@ impl App {
         log::debug!("Database initialization took {:?}", db_start.elapsed());
 
         // Create analytics tracker
-        let analytics = Analytics::new(session_id, db, no_click_logging);
+        let analytics = Analytics::new(session_id, db, options.no_click_logging);
 
         let (worker_tx, worker_handle) = search_worker::spawn(
             root.clone(),
             data_dir,
             event_tx.clone(),
-            no_click_loading,
-            no_model,
+            options.no_click_loading,
+            options.no_model,
         )?;
 
         log::debug!("App::new() total time: {:?}", start_time.elapsed());
@@ -170,9 +159,7 @@ impl App {
             recent_logs: VecDeque::with_capacity(50),
             current_filter: initial_filter,
             ui_state: ui_state::UiState::new(),
-            on_dir_click,
-            on_cwd_visit,
-            no_preview,
+            options,
             analytics,
             worker_tx: worker_tx.clone(),
             worker_handle: Some(worker_handle),
