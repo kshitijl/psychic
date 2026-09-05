@@ -68,10 +68,11 @@ Otherwise, type `psychic` to open the TUI. By default, it will explore both file
 * Hit enter on a file to open it in my favorite editor, Helix (note to self: respect the user's `$EDITOR` environment variable).
 * Hit enter on a directory to navigate into it.
 * `Tab` and `Shift-Tab` to cycle through different filters: all files, just directories, just items under the current cwd, just direct descendants of the cwd.
-* `Alt-Left/Right` to go back and forward in history.
+* `Left/Right` to go back and forward in history.
 * `Alt-Up` to navigate to the parent directory.
 * `Ctrl-J` to get dropped in a shell in the current directory.
 * `Ctrl-O` will open a debug pane showing you the values of each ML feature for the currently selected file or directory.
+* `Ctrl-G` (or `F1`) shows a help screen with every key and command. The list above is the short version; the help screen is generated from the keybinding registry, so it is never out of date. There is a reminder of this in the bottom right of the search box.
 
 ## LLM use disclosure
 

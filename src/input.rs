@@ -9,6 +9,11 @@
 //!
 //! Deep implementation hiding complexity of terminal management, event dispatching,
 //! and state updates behind a simple `handle_input` function.
+//!
+//! Which key does what is not decided here. Events are resolved to a
+//! `keymap::Action` by the registry in `keymap.rs`, and this module only says
+//! what each action does. That keeps the keys, their help text, and their
+//! behaviour in one place: see the module docs in `keymap.rs`.
 
 use anyhow::Result;
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -23,6 +28,7 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use crate::app::App;
 use crate::cli::{OnCwdVisitAction, OnDirClickAction};
 use crate::db::{EventData, UserInteraction};
+use crate::keymap::{self, Action, Context};
 use crate::search_worker::{FilterType, UpdateQueryRequest, WorkerRequest};
 
 /// Action to take after handling input
@@ -45,19 +51,22 @@ pub fn handle_input(
 ) -> Result<InputAction> {
     match event {
         Event::Mouse(mouse_event) => {
-            use crossterm::event::MouseEventKind;
-            match mouse_event.kind {
-                MouseEventKind::ScrollDown => {
-                    app.preview.scroll(3);
-                    let _ = app.log_preview_scroll();
+            let Some(action) = keymap::lookup_mouse(mouse_event.kind) else {
+                return Ok(InputAction::Continue);
+            };
+
+            // The help screen covers the preview, so the wheel scrolls what the
+            // user can actually see.
+            if app.ui_state.help_visible {
+                match action {
+                    Action::ScrollPreviewUp => app.ui_state.scroll_help(-3),
+                    Action::ScrollPreviewDown => app.ui_state.scroll_help(3),
+                    _ => {}
                 }
-                MouseEventKind::ScrollUp => {
-                    app.preview.scroll(-3);
-                    let _ = app.log_preview_scroll();
-                }
-                _ => {}
+                return Ok(InputAction::Continue);
             }
-            Ok(InputAction::Continue)
+
+            dispatch(app, action, KeyCode::Null, terminal)
         }
         Event::Key(key) if key.kind == KeyEventKind::Press => {
             handle_key_press(app, key.code, key.modifiers, terminal)
@@ -73,90 +82,151 @@ fn handle_key_press(
     modifiers: KeyModifiers,
     terminal: &mut Terminal<CrosstermBackend<std::fs::File>>,
 ) -> Result<InputAction> {
-    match code {
-        KeyCode::Char('j') if modifiers.contains(KeyModifiers::CONTROL) => {
-            handle_ctrl_j(app, terminal)
-        }
-        KeyCode::Char('h') if modifiers.contains(KeyModifiers::CONTROL) => {
-            handle_ctrl_h(app);
+    // The help screen is a cheat sheet, not a mode: it scrolls, and anything
+    // else dismisses it rather than acting on whatever was underneath.
+    if app.ui_state.help_visible {
+        return Ok(handle_help_key(app, code, modifiers));
+    }
+
+    let context = if app.ui_state.filter_picker_visible {
+        Context::FilterPicker
+    } else {
+        Context::Global
+    };
+
+    let Some(action) = keymap::lookup(code, modifiers, context) else {
+        return Ok(InputAction::Continue);
+    };
+
+    dispatch(app, action, code, terminal)
+}
+
+/// Do what an action says.
+///
+/// `code` is the key that produced the action, needed only by
+/// `AppendToQuery`, which has to know which character was typed.
+///
+/// This match is exhaustive on purpose: adding an action to the keymap without
+/// implementing it here does not compile.
+fn dispatch(
+    app: &mut App,
+    action: Action,
+    code: KeyCode,
+    terminal: &mut Terminal<CrosstermBackend<std::fs::File>>,
+) -> Result<InputAction> {
+    match action {
+        Action::AppendToQuery => {
+            if let KeyCode::Char(c) = code {
+                handle_char_input(app, c);
+            }
             Ok(InputAction::Continue)
         }
-        KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => Ok(InputAction::Exit),
-        KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => Ok(InputAction::Exit),
-        KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
-            handle_ctrl_u(app);
-            Ok(InputAction::Continue)
-        }
-        KeyCode::Char('o') if modifiers.contains(KeyModifiers::CONTROL) => {
-            app.ui_state.cycle_debug_pane_mode();
-            Ok(InputAction::Continue)
-        }
-        KeyCode::Char('f') if modifiers.contains(KeyModifiers::CONTROL) => {
-            app.ui_state.filter_picker_visible = !app.ui_state.filter_picker_visible;
-            Ok(InputAction::Continue)
-        }
-        KeyCode::Char('0') if app.ui_state.filter_picker_visible => {
-            set_filter(app, FilterType::None);
-            Ok(InputAction::Continue)
-        }
-        KeyCode::Char('c') if app.ui_state.filter_picker_visible => {
-            set_filter(app, FilterType::OnlyCwd);
-            Ok(InputAction::Continue)
-        }
-        KeyCode::Char('i') if app.ui_state.filter_picker_visible => {
-            set_filter(app, FilterType::DirectCwd);
-            Ok(InputAction::Continue)
-        }
-        KeyCode::Char('d') if app.ui_state.filter_picker_visible => {
-            set_filter(app, FilterType::OnlyDirs);
-            Ok(InputAction::Continue)
-        }
-        KeyCode::Char('f') if app.ui_state.filter_picker_visible => {
-            set_filter(app, FilterType::OnlyFiles);
-            Ok(InputAction::Continue)
-        }
-        KeyCode::BackTab => {
-            cycle_filter(app, false);
-            Ok(InputAction::Continue)
-        }
-        KeyCode::Tab => {
-            cycle_filter(app, true);
-            Ok(InputAction::Continue)
-        }
-        KeyCode::Esc => handle_escape(app),
-        KeyCode::Up if modifiers.contains(KeyModifiers::ALT) => handle_parent_dir(app),
-        KeyCode::Up => {
-            handle_navigation(app, -1);
-            Ok(InputAction::Continue)
-        }
-        KeyCode::Down => {
-            handle_navigation(app, 1);
-            Ok(InputAction::Continue)
-        }
-        KeyCode::Left => handle_history_back(app),
-        KeyCode::Right => handle_history_forward(app),
-        KeyCode::Char('p') if modifiers.contains(KeyModifiers::CONTROL) => {
-            handle_navigation(app, -1);
-            Ok(InputAction::Continue)
-        }
-        KeyCode::Char('n') if modifiers.contains(KeyModifiers::CONTROL) => {
-            handle_navigation(app, 1);
-            Ok(InputAction::Continue)
-        }
-        KeyCode::Char(c) => {
-            handle_char_input(app, c);
-            Ok(InputAction::Continue)
-        }
-        KeyCode::Backspace => {
+        Action::DeleteFromQuery => {
             handle_backspace(app);
             Ok(InputAction::Continue)
         }
-        KeyCode::Enter if modifiers.contains(KeyModifiers::CONTROL) => {
-            handle_ctrl_enter(app, terminal)
+        Action::ClearQuery => {
+            handle_ctrl_u(app);
+            Ok(InputAction::Continue)
         }
-        KeyCode::Enter => handle_enter(app, terminal),
-        _ => Ok(InputAction::Continue),
+        Action::MoveUp => {
+            handle_navigation(app, -1);
+            Ok(InputAction::Continue)
+        }
+        Action::MoveDown => {
+            handle_navigation(app, 1);
+            Ok(InputAction::Continue)
+        }
+        Action::Activate => handle_enter(app, terminal),
+        Action::ParentDir => handle_parent_dir(app),
+        Action::HistoryBack => handle_history_back(app),
+        Action::HistoryForward => handle_history_forward(app),
+        Action::ToggleHistoryMode => {
+            handle_ctrl_h(app);
+            Ok(InputAction::Continue)
+        }
+        Action::VisitCurrentDir => handle_ctrl_j(app, terminal),
+        Action::VisitSelectedDir => handle_ctrl_enter(app, terminal),
+        Action::CycleFilterForward => {
+            cycle_filter(app, true);
+            Ok(InputAction::Continue)
+        }
+        Action::CycleFilterBackward => {
+            cycle_filter(app, false);
+            Ok(InputAction::Continue)
+        }
+        Action::ToggleFilterPicker => {
+            app.ui_state.filter_picker_visible = !app.ui_state.filter_picker_visible;
+            Ok(InputAction::Continue)
+        }
+        Action::SetFilterNone => {
+            set_filter(app, FilterType::None);
+            Ok(InputAction::Continue)
+        }
+        Action::SetFilterCwd => {
+            set_filter(app, FilterType::OnlyCwd);
+            Ok(InputAction::Continue)
+        }
+        Action::SetFilterDirectCwd => {
+            set_filter(app, FilterType::DirectCwd);
+            Ok(InputAction::Continue)
+        }
+        Action::SetFilterDirs => {
+            set_filter(app, FilterType::OnlyDirs);
+            Ok(InputAction::Continue)
+        }
+        Action::SetFilterFiles => {
+            set_filter(app, FilterType::OnlyFiles);
+            Ok(InputAction::Continue)
+        }
+        Action::CycleDebugPane => {
+            app.ui_state.cycle_debug_pane_mode();
+            // The pane shows database counts; fetch them the first time it opens
+            // rather than making every launch pay for them.
+            if app.ui_state.debug_pane_mode != crate::ui_state::DebugPaneMode::Hidden {
+                app.request_db_stats();
+            }
+            Ok(InputAction::Continue)
+        }
+        Action::ScrollPreviewUp => {
+            app.preview.scroll(-3);
+            let _ = app.log_preview_scroll();
+            Ok(InputAction::Continue)
+        }
+        Action::ScrollPreviewDown => {
+            app.preview.scroll(3);
+            let _ = app.log_preview_scroll();
+            Ok(InputAction::Continue)
+        }
+        Action::ToggleHelp => {
+            app.ui_state.toggle_help();
+            Ok(InputAction::Continue)
+        }
+        Action::Escape => handle_escape(app),
+        Action::Quit => Ok(InputAction::Exit),
     }
+}
+
+/// Handle a key while the help screen is up.
+///
+/// Scroll keys scroll it, quitting still quits, and everything else closes it -
+/// so no key can act on the UI hidden behind the help screen.
+fn handle_help_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> InputAction {
+    match keymap::lookup(code, modifiers, Context::Global) {
+        Some(Action::Quit) => return InputAction::Exit,
+        Some(Action::MoveUp) => {
+            app.ui_state.scroll_help(-1);
+            return InputAction::Continue;
+        }
+        Some(Action::MoveDown) => {
+            app.ui_state.scroll_help(1);
+            return InputAction::Continue;
+        }
+        _ => {}
+    }
+
+    app.ui_state.hide_help();
+    InputAction::Continue
 }
 
 /// Execute on-cwd-visit action for a given directory
@@ -262,7 +332,7 @@ fn handle_parent_dir(app: &mut App) -> Result<InputAction> {
         app.cwd = parent.clone();
         app.query.clear();
 
-        let query_id = app.analytics.next_subsession_id();
+        let query_id = app.next_query_id();
         let _ = app.worker_tx.send(WorkerRequest::ChangeCwd {
             new_cwd: parent,
             query_id,
@@ -278,7 +348,7 @@ fn handle_history_back(app: &mut App) -> Result<InputAction> {
         app.cwd = dir.clone();
         app.query.clear();
 
-        let query_id = app.analytics.next_subsession_id();
+        let query_id = app.next_query_id();
         let _ = app.worker_tx.send(WorkerRequest::ChangeCwd {
             new_cwd: dir,
             query_id,
@@ -294,7 +364,7 @@ fn handle_history_forward(app: &mut App) -> Result<InputAction> {
         app.cwd = dir.clone();
         app.query.clear();
 
-        let query_id = app.analytics.next_subsession_id();
+        let query_id = app.next_query_id();
         let _ = app.worker_tx.send(WorkerRequest::ChangeCwd {
             new_cwd: dir,
             query_id,
@@ -416,7 +486,7 @@ fn handle_directory_click(
             app.cwd = dir_path.clone();
             app.query.clear();
 
-            let query_id = app.analytics.next_subsession_id();
+            let query_id = app.next_query_id();
             let _ = app.worker_tx.send(WorkerRequest::ChangeCwd {
                 new_cwd: dir_path,
                 query_id,
@@ -443,12 +513,12 @@ fn handle_file_click(
     suspend_tui_for_editor(app, &file_path, terminal)?;
 
     // Reload model and rerank after editing
-    let query_id_model = app.analytics.next_subsession_id();
+    let query_id_model = app.next_query_id();
     if let Err(e) = app.reload_model(query_id_model) {
         log::error!("Failed to reload model: {}", e);
     }
 
-    let query_id_clicks = app.analytics.next_subsession_id();
+    let query_id_clicks = app.next_query_id();
     if let Err(e) = app.reload_and_rerank(query_id_clicks) {
         log::error!("Failed to reload and rerank: {}", e);
     }
@@ -476,7 +546,7 @@ fn cycle_filter(app: &mut App, forward: bool) {
 
 /// Send query update to worker
 fn send_query_update(app: &mut App) {
-    let query_id = app.analytics.next_subsession_id();
+    let query_id = app.next_query_id();
     let _ = app
         .worker_tx
         .send(WorkerRequest::UpdateQuery(UpdateQueryRequest {

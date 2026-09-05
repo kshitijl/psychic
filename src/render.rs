@@ -1,9 +1,9 @@
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
 };
 use std::{
     collections::{HashMap, VecDeque},
@@ -11,7 +11,61 @@ use std::{
     time::Instant,
 };
 
+use crate::help::{self, HelpLine};
+use crate::keymap::{self, Action};
 use crate::path_display::truncate_absolute_path;
+
+/// Group digits so six-figure counts stay readable in a narrow pane.
+fn thousands(n: i64) -> String {
+    let digits = n.abs().to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(c);
+    }
+
+    if n < 0 {
+        format!("-{}", grouped)
+    } else {
+        grouped
+    }
+}
+
+/// Human-readable byte count, at most one decimal place.
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [(&str, u64); 3] = [("GB", 1 << 30), ("MB", 1 << 20), ("KB", 1 << 10)];
+
+    for (unit, scale) in UNITS {
+        if bytes >= scale {
+            return format!("{:.1} {}", bytes as f64 / scale as f64, unit);
+        }
+    }
+    format!("{} B", bytes)
+}
+
+/// One latency line, or a placeholder while we are still waiting for it.
+///
+/// Sized to fit the narrow debug pane: 24 columns, which is what a 20% pane on a
+/// 140-column terminal leaves inside its borders.
+fn latency_line(label: &str, ms: Option<f64>) -> String {
+    match ms {
+        Some(ms) => format!("  {:<13} {:>6.1}ms", label, ms),
+        None => format!("  {:<13} {:>8}", label, "-"),
+    }
+}
+
+/// The hint that tells the user how to reach the help screen.
+///
+/// Derived from the keymap, so rebinding help changes what the main screen says.
+fn help_hint() -> String {
+    match keymap::primary_trigger(Action::ToggleHelp) {
+        Some(keys) => format!(" {}: help ", keys),
+        None => String::new(),
+    }
+}
 
 /// Input data required to render the history mode UI.
 pub struct HistoryRenderContext<'a> {
@@ -33,6 +87,8 @@ pub struct NormalRenderContext<'a> {
     pub preview: &'a crate::preview::PreviewManager,
     pub currently_retraining: bool,
     pub model_stats_cache: Option<&'a crate::ranker::ModelStats>,
+    pub timings: &'a crate::app::Timings,
+    pub db_stats: Option<&'a crate::db::DbStats>,
     pub page_cache: &'a HashMap<usize, crate::app::Page>,
     pub ui_state: &'a crate::ui_state::UiState,
     pub recent_logs: &'a VecDeque<String>,
@@ -283,14 +339,149 @@ pub fn render_history_mode(f: &mut Frame, ctx: HistoryRenderContext<'_>) {
     } else {
         ctx.query
     };
+    let exit_keys = keymap::primary_trigger(Action::ToggleHistoryMode).unwrap_or_default();
     let input_para = Paragraph::new(input_text)
         .style(Style::default().fg(Color::Gray))
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Search (Ctrl-H/Esc to exit)"),
+                .title(format!("Search ({}/Esc to exit)", exit_keys))
+                .title_bottom(
+                    Line::from(Span::styled(
+                        help_hint(),
+                        Style::default().fg(Color::DarkGray),
+                    ))
+                    .right_aligned(),
+                ),
         );
     f.render_widget(input_para, input_area);
+}
+
+/// Draw the help screen on top of whatever is behind it.
+///
+/// Returns the largest useful scroll offset for the content as laid out, which
+/// the caller stores so scrolling can be clamped to it.
+pub fn render_help_overlay(f: &mut Frame, help_scroll: u16) -> u16 {
+    let screen = f.area();
+
+    // Leave a margin, then take off the borders and a space of padding a side.
+    let outer_width = screen.width.saturating_sub(4);
+    let layout = help::lay_out(
+        &help::blocks(),
+        outer_width.saturating_sub(4).max(1) as usize,
+    );
+
+    let content_height = layout.height() as u16;
+    let width = (layout.width() as u16 + 4).min(screen.width);
+    let height = (content_height + 2).min(screen.height); // 2 for the borders
+
+    let area = Rect {
+        x: screen.width.saturating_sub(width) / 2,
+        y: screen.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+
+    f.render_widget(Clear, area);
+
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            " Keys and commands ",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .title_bottom(
+            Line::from(Span::styled(
+                " any other key closes this ",
+                Style::default().fg(Color::DarkGray),
+            ))
+            .right_aligned(),
+        );
+    let inner = outer.inner(area);
+    f.render_widget(outer, area);
+
+    // Give up a line for the "more below" footer only when there is more below.
+    let needs_footer = content_height > inner.height;
+    let visible_height = inner
+        .height
+        .saturating_sub(if needs_footer { 1 } else { 0 });
+    let max_scroll = content_height.saturating_sub(visible_height);
+    let scroll = help_scroll.min(max_scroll);
+
+    let text_area = Rect {
+        x: inner.x + 1,
+        width: inner.width.saturating_sub(2),
+        height: visible_height,
+        ..inner
+    };
+
+    let mut constraints = Vec::new();
+    for i in 0..layout.columns.len() {
+        if i > 0 {
+            constraints.push(Constraint::Length(layout.gutter as u16));
+        }
+        constraints.push(Constraint::Length(layout.column_width as u16));
+    }
+    let column_areas = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(constraints)
+        .split(text_area);
+
+    for (i, column) in layout.columns.iter().enumerate() {
+        // Gutters sit between columns, so every other chunk is a column.
+        let paragraph = Paragraph::new(styled_help_lines(column)).scroll((scroll, 0));
+        f.render_widget(paragraph, column_areas[i * 2]);
+    }
+
+    if needs_footer {
+        let remaining = max_scroll.saturating_sub(scroll);
+        let footer = Paragraph::new(Line::from(Span::styled(
+            if remaining > 0 {
+                format!(
+                    "{} more lines - {} to scroll",
+                    remaining,
+                    keymap::primary_trigger(Action::MoveDown).unwrap_or_default()
+                )
+            } else {
+                format!(
+                    "end - {} to scroll back",
+                    keymap::primary_trigger(Action::MoveUp).unwrap_or_default()
+                )
+            },
+            Style::default().fg(Color::DarkGray),
+        )));
+        let footer_area = Rect {
+            y: inner.y + visible_height,
+            height: 1,
+            ..text_area
+        };
+        f.render_widget(footer, footer_area);
+    }
+
+    max_scroll
+}
+
+/// Style laid-out help lines: headings stand out, keys are cyan like directories.
+fn styled_help_lines(lines: &[HelpLine]) -> Vec<Line<'static>> {
+    lines
+        .iter()
+        .map(|line| match line {
+            HelpLine::Title(title) => Line::from(Span::styled(
+                title.clone(),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            HelpLine::Entry { keys, description } => Line::from(vec![
+                Span::styled(keys.clone(), Style::default().fg(Color::Cyan)),
+                Span::raw("  "),
+                Span::raw(description.clone()),
+            ]),
+            HelpLine::Blank => Line::from(""),
+        })
+        .collect()
 }
 /// State updates computed during rendering that need to be applied to App after rendering
 pub struct RenderUpdates {
@@ -343,8 +534,6 @@ pub fn render_normal_mode(
     marquee_speed: std::time::Duration,
 ) -> RenderUpdates {
     let mut updates = RenderUpdates::new();
-    use ratatui::layout::Rect;
-    use ratatui::widgets::Clear;
     use std::path::PathBuf;
 
     use crate::app::PAGE_SIZE;
@@ -725,6 +914,48 @@ pub fn render_normal_mode(
         debug_lines.push(String::from("")); // Separator
     }
 
+    // Latency: a few numbers that say how snappy this is, right now.
+    // The first three are measured once from process start; the last two are
+    // replaced on every query, so they describe the search just performed.
+    debug_lines.push(String::from("Latency:"));
+    debug_lines.push(latency_line("first paint", ctx.timings.first_paint_ms));
+    debug_lines.push(latency_line("first results", ctx.timings.first_results_ms));
+    debug_lines.push(latency_line("fs walk", ctx.timings.walk_complete_ms));
+    debug_lines.push(latency_line("this search", ctx.timings.last_search_ms));
+    debug_lines.push(latency_line("  of it, rank", ctx.timings.last_rank_ms));
+    debug_lines.push(String::from(""));
+
+    // Database contents, loaded in the background the first time this pane opens.
+    match ctx.db_stats {
+        Some(stats) => {
+            let history = match stats.history_days {
+                Some(days) => format!(", {}d", days),
+                None => String::new(),
+            };
+            debug_lines.push(format!(
+                "Database ({}{}):",
+                human_bytes(stats.file_size_bytes),
+                history
+            ));
+            for (label, count) in [
+                ("events", stats.total_events),
+                ("impressions", stats.impressions),
+                ("clicks", stats.clicks),
+                ("scrolls", stats.scrolls),
+                ("visits", stats.startup_visits),
+                ("sessions", stats.sessions),
+            ] {
+                debug_lines.push(format!("  {:<14} {:>7}", label, thousands(count)));
+            }
+        }
+        None => {
+            debug_lines.push(String::from("Database:"));
+            debug_lines.push(String::from("  counting..."));
+        }
+    }
+
+    debug_lines.push(String::from("")); // Separator
+
     // Add preview cache status
     if let Some((file_path, _, _)) = &current_file_info {
         let full_path_str = file_path.to_string_lossy().to_string();
@@ -864,8 +1095,18 @@ pub fn render_normal_mode(
         search_worker::FilterType::OnlyFiles => " [FILES]",
     };
     let search_title = format!("Search: {}{}", cwd_str, filter_indicator);
-    let input =
-        Paragraph::new(ctx.query).block(Block::default().borders(Borders::ALL).title(search_title));
+    let input = Paragraph::new(ctx.query).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(search_title)
+            .title_bottom(
+                Line::from(Span::styled(
+                    help_hint(),
+                    Style::default().fg(Color::DarkGray),
+                ))
+                .right_aligned(),
+            ),
+    );
     f.render_widget(input, main_chunks[2]);
 
     // Filter picker overlay (rendered on top if visible)
@@ -922,10 +1163,14 @@ pub fn render_normal_mode(
     }
 
     // Position cursor in the search input at the end of the query text
-    // Account for border (1 char) + query length
-    let cursor_x = main_chunks[2].x + 1 + ctx.query.len() as u16;
-    let cursor_y = main_chunks[2].y + 1; // 1 for top border
-    f.set_cursor_position((cursor_x, cursor_y));
+    // Account for border (1 char) + query length.
+    // The help screen covers the input, so leaving a cursor on it would be a
+    // stray block floating over the help text.
+    if !ctx.ui_state.help_visible {
+        let cursor_x = main_chunks[2].x + 1 + ctx.query.len() as u16;
+        let cursor_y = main_chunks[2].y + 1; // 1 for top border
+        f.set_cursor_position((cursor_x, cursor_y));
+    }
 
     updates
 }
@@ -949,6 +1194,57 @@ fn get_eza_flags(width: u16) -> &'static str {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn test_thousands() {
+        assert_eq!(thousands(0), "0");
+        assert_eq!(thousands(7), "7");
+        assert_eq!(thousands(999), "999");
+        assert_eq!(thousands(1_000), "1,000");
+        assert_eq!(thousands(80_855), "80,855");
+        assert_eq!(thousands(1_234_567), "1,234,567");
+        assert_eq!(thousands(-4_200), "-4,200");
+    }
+
+    #[test]
+    fn test_human_bytes() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(2048), "2.0 KB");
+        assert_eq!(human_bytes(62_914_560), "60.0 MB");
+        assert_eq!(human_bytes(3 << 30), "3.0 GB");
+    }
+
+    #[test]
+    fn test_latency_line_aligns_and_handles_missing_values() {
+        assert_eq!(
+            latency_line("first paint", Some(1.44)),
+            "  first paint      1.4ms"
+        );
+        assert_eq!(
+            latency_line("first results", Some(12.28)),
+            "  first results   12.3ms"
+        );
+        assert_eq!(
+            latency_line("fs walk", None),
+            "  fs walk              -",
+            "A measurement that has not happened yet shows a dash, not 0.0"
+        );
+
+        // Every line fits the narrow pane, including an implausibly slow one.
+        for line in [
+            latency_line("first results", Some(1234.5)),
+            latency_line("  of it, rank", Some(0.04)),
+            latency_line("fs walk", None),
+        ] {
+            assert!(
+                line.len() <= 24,
+                "Line {:?} is {} columns",
+                line,
+                line.len()
+            );
+        }
+    }
 
     #[test]
     fn test_get_eza_flags_wide_screen() {
@@ -976,5 +1272,116 @@ mod test {
             " --no-user --no-permissions",
             "40 width should use compact eza"
         );
+    }
+}
+
+#[cfg(test)]
+mod help_overlay_tests {
+    use super::*;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    /// Draw the help screen and read the terminal back as text.
+    fn render_help(width: u16, height: u16, scroll: u16) -> (Vec<String>, u16) {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let mut max_scroll = 0;
+        terminal
+            .draw(|f| max_scroll = render_help_overlay(f, scroll))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let lines = (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+
+        (lines, max_scroll)
+    }
+
+    /// Rows of the overlay box, without their borders or padding.
+    fn boxed_rows(lines: &[String]) -> Vec<String> {
+        lines
+            .iter()
+            .filter(|line| line.contains('│'))
+            .map(|line| {
+                let start = line.find('│').unwrap() + '│'.len_utf8();
+                let end = line.rfind('│').unwrap();
+                line[start..end].to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_hint_on_the_main_screen_names_the_help_key() {
+        assert_eq!(
+            help_hint(),
+            " Ctrl-G: help ",
+            "This is the only thing telling the user the help screen exists"
+        );
+    }
+
+    #[test]
+    fn test_wide_terminal_shows_every_binding_without_scrolling() {
+        let (lines, max_scroll) = render_help(120, 40, 0);
+        assert_eq!(max_scroll, 0, "A 120x40 terminal should not have to scroll");
+
+        let rows = boxed_rows(&lines);
+        let has = |keys: &str, description: &str| {
+            rows.iter()
+                .any(|row| row.contains(keys) && row.contains(description))
+        };
+
+        assert!(has("Ctrl-U", "clear the query"), "rows: {:#?}", rows);
+        assert!(has("Ctrl-G / F1", "show this help"));
+        assert!(has("Wheel up", "scroll the preview up"));
+        assert!(has("retrain", "retrain the ranking model"));
+        assert!(has("p ", "jump to a directory"));
+    }
+
+    #[test]
+    fn test_content_never_runs_into_the_border() {
+        for width in [50, 60, 80, 100, 120, 140, 200] {
+            let (lines, _) = render_help(width, 50, 0);
+            for row in boxed_rows(&lines) {
+                assert!(
+                    row.ends_with(' '),
+                    "Text reaches the border at width {}: {:?}",
+                    width,
+                    row
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_short_terminal_scrolls_and_says_so() {
+        let (top, max_scroll) = render_help(80, 24, 0);
+        assert!(max_scroll > 0, "Everything cannot fit in 24 rows");
+        assert!(
+            top.iter().any(|line| line.contains("more lines")),
+            "The user needs to be told there is more below"
+        );
+        assert!(
+            boxed_rows(&top).iter().any(|row| row.contains("Search")),
+            "Unscrolled, the screen starts at the top"
+        );
+
+        // Scrolling past the end is clamped rather than showing blank space.
+        let (bottom, _) = render_help(80, 24, 999);
+        assert!(
+            boxed_rows(&bottom)
+                .iter()
+                .any(|row| row.contains("Command line")),
+            "Scrolled to the end, the last block is on screen"
+        );
+    }
+
+    #[test]
+    fn test_tiny_terminal_does_not_panic() {
+        for (width, height) in [(20, 5), (10, 3), (1, 1), (200, 2)] {
+            render_help(width, height, 0);
+        }
     }
 }

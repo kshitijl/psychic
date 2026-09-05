@@ -1,7 +1,7 @@
 use super::implementations::{
-    ClicksForThisQuery, ClicksLast7Days, ClicksLast30Days, ClicksLastHour, ClicksLastWeekParentDir,
-    ClicksToday, EngagementsInEpisodeWithQuery, FileSizeBytes, FilenameStartsWithQuery, FuzzyScore,
-    IsDir, IsHidden, IsUnderCwd, ModifiedAge, ModifiedToday,
+    ClicksForThisQuery, ClicksLast7Days, ClicksLast24h, ClicksLast30Days, ClicksLastHour,
+    ClicksLastWeekParentDir, EngagementsInEpisodeWithQuery, FileSizeBytes, FilenameStartsWithQuery,
+    FuzzyScore, IsDir, IsHidden, IsUnderCwd, ModifiedAge, ModifiedLast24h,
 };
 use super::schema::{Feature, FeatureType};
 use once_cell::sync::Lazy;
@@ -13,13 +13,13 @@ pub static FEATURE_REGISTRY: Lazy<Vec<Box<dyn Feature>>> = Lazy::new(|| {
     vec![
         Box::new(FilenameStartsWithQuery),
         Box::new(ClicksLast30Days),
-        Box::new(ModifiedToday),
+        Box::new(ModifiedLast24h),
         Box::new(IsUnderCwd),
         Box::new(IsHidden),
         Box::new(FileSizeBytes),
         Box::new(ClicksLastWeekParentDir),
         Box::new(ClicksLastHour),
-        Box::new(ClicksToday),
+        Box::new(ClicksLast24h),
         Box::new(ClicksLast7Days),
         Box::new(ModifiedAge),
         Box::new(ClicksForThisQuery),

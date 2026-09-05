@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 # /// script
+# requires-python = ">=3.12"
 # dependencies = [
 #   "lightgbm>=4.6.0",
 #   "matplotlib>=3.10.6",
+#   "numpy>=1.26",
 #   "pandas>=2.3.3",
 #   "scikit-learn>=1.7.2",
 #   "seaborn>=0.13.2",
@@ -14,6 +16,18 @@ Train LightGBM ranking model on features generated from events.db, and generate 
 
 Usage:
     python train.py features.csv output_prefix [--data-dir DIR]
+    uv run train.py features.csv output_prefix [--data-dir DIR]
+
+This is a PEP 723 script: the block above lists everything it needs, so
+`uv run train.py` builds its own environment on any machine with uv, with no
+virtualenv to set up and no dependence on the psychic checkout. That matters
+because psychic embeds this file, writes it into the data directory, and runs it
+from whatever directory the user happened to launch from - which may be an
+unrelated project with its own pyproject.toml. Inline metadata takes precedence
+over a surrounding project, so that case works too.
+
+Every module imported below is listed above, including ones that would otherwise
+arrive transitively (numpy), so a resolver change upstream cannot break this.
 """
 
 import sys
@@ -28,6 +42,7 @@ import shap
 import json
 from pathlib import Path
 import os
+import tempfile
 import argparse
 
 sns.set_style("whitegrid")
@@ -468,22 +483,57 @@ def create_visualizations(
         print(f"  R²:   {r2:.4f}")
 
 
+def atomic_write(target_path, write_file):
+    """Write a file by writing a temp file beside it and renaming over the target.
+
+    psychic retrains in the background while the TUI is running, and the worker
+    reloads model.txt and model_stats.json on its own schedule. A plain write
+    truncates the file first, so a reload landing in that window reads an empty or
+    half-written file - which looks exactly like "no model" and silently drops
+    ranking back to the simple model until the next launch.
+
+    os.replace is atomic on POSIX when source and destination are on the same
+    filesystem, which is why the temp file goes in the target's own directory. A
+    reader sees either the whole old file or the whole new one.
+    """
+    target_path = Path(target_path)
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+
+    fd, tmp_path = tempfile.mkstemp(
+        dir=target_path.parent, prefix=target_path.name + ".", suffix=".tmp"
+    )
+    os.close(fd)
+
+    # mkstemp creates the file 0600. Match what a plain open() would have made it,
+    # so writing atomically does not quietly turn the model owner-only.
+    umask = os.umask(0o022)
+    os.umask(umask)
+    os.chmod(tmp_path, 0o666 & ~umask)
+
+    try:
+        write_file(tmp_path)
+        os.replace(tmp_path, target_path)
+    except BaseException:
+        # Do not leave a stray temp file in the data directory on failure.
+        try:
+            os.unlink(tmp_path)
+        except FileNotFoundError:
+            pass
+        raise
+
+
 def save_model(model, output_prefix):
-    """Save LightGBM model to file."""
-    import os
+    """Save the LightGBM model where psychic will look for it.
 
-    # Save to current directory with given prefix
+    `output_prefix` is `<data_dir>/model`, so this writes `<data_dir>/model.txt`.
+    It used to also write a second copy to a hardcoded ~/.local/share/psychic,
+    which was the same file in the default case (writing 640KB twice, and widening
+    the window where the model was truncated) and the *wrong* file whenever
+    --data-dir pointed somewhere else.
+    """
     model_path = f"{output_prefix}.txt"
-    model.save_model(model_path)
+    atomic_write(model_path, model.save_model)
     print(f"Model saved to: {model_path}")
-
-    # Also save to ~/.local/share/psychic/model.txt
-    home = os.path.expanduser("~")
-    psychic_dir = os.path.join(home, ".local", "share", "psychic")
-    os.makedirs(psychic_dir, exist_ok=True)
-    sg_model_path = os.path.join(psychic_dir, "model.txt")
-    model.save_model(sg_model_path)
-    print(f"Model also saved to: {sg_model_path}")
 
 
 def main():
@@ -617,8 +667,13 @@ def main():
     }
 
     stats_path = Path(args.data_dir) / "model_stats.json"
-    with open(stats_path, "w") as f:
-        json.dump(stats, f, indent=2)
+
+    def write_stats(path):
+        with open(path, "w") as f:
+            json.dump(stats, f, indent=2)
+
+    # Same reasoning as the model: the TUI reads this while training runs.
+    atomic_write(stats_path, write_stats)
     print(f"  - Stats: {stats_path}")
 
     print("\n✓ Training complete!")

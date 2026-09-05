@@ -20,6 +20,12 @@ pub struct UiState {
     pub filter_picker_visible: bool,
     /// Debug pane mode
     pub debug_pane_mode: DebugPaneMode,
+    /// Is the help screen covering everything else?
+    pub help_visible: bool,
+    /// First visible line of the help screen, for terminals too short to show it all
+    pub help_scroll: u16,
+    /// Largest useful `help_scroll`, measured while rendering the last frame
+    pub help_scroll_max: u16,
 }
 
 impl UiState {
@@ -28,7 +34,29 @@ impl UiState {
             history_mode: false,
             filter_picker_visible: false,
             debug_pane_mode: DebugPaneMode::Hidden,
+            help_visible: false,
+            help_scroll: 0,
+            help_scroll_max: 0,
         }
+    }
+
+    /// Show or hide the help screen. Always reopens at the top.
+    pub fn toggle_help(&mut self) {
+        self.help_visible = !self.help_visible;
+        self.help_scroll = 0;
+    }
+
+    pub fn hide_help(&mut self) {
+        self.help_visible = false;
+        self.help_scroll = 0;
+    }
+
+    /// Scroll the help screen, clamped to the content measured while rendering.
+    pub fn scroll_help(&mut self, delta: i16) {
+        self.help_scroll = self
+            .help_scroll
+            .saturating_add_signed(delta)
+            .min(self.help_scroll_max);
     }
 
     /// Cycle debug pane mode: Small -> Expanded -> Hidden -> Small
@@ -103,6 +131,55 @@ mod tests {
         state.cycle_debug_pane_mode();
         assert_eq!(state.debug_pane_mode, DebugPaneMode::Hidden);
         assert_eq!(state.is_debug_pane_expanded(), false);
+    }
+
+    #[test]
+    fn test_toggle_help() {
+        let mut state = UiState::new();
+        assert_eq!(state.help_visible, false);
+
+        state.toggle_help();
+        assert_eq!(state.help_visible, true);
+
+        state.toggle_help();
+        assert_eq!(state.help_visible, false);
+    }
+
+    #[test]
+    fn test_help_reopens_at_the_top() {
+        let mut state = UiState::new();
+        state.help_scroll_max = 10;
+
+        state.toggle_help();
+        state.scroll_help(4);
+        assert_eq!(state.help_scroll, 4);
+
+        state.toggle_help(); // close
+        state.toggle_help(); // reopen
+        assert_eq!(state.help_scroll, 0, "Reopening starts from the top again");
+    }
+
+    #[test]
+    fn test_scroll_help_is_clamped_both_ways() {
+        let mut state = UiState::new();
+        state.help_scroll_max = 3;
+
+        state.scroll_help(-1);
+        assert_eq!(state.help_scroll, 0, "Cannot scroll above the first line");
+
+        state.scroll_help(10);
+        assert_eq!(state.help_scroll, 3, "Cannot scroll past the last line");
+
+        state.scroll_help(-1);
+        assert_eq!(state.help_scroll, 2);
+    }
+
+    #[test]
+    fn test_scroll_help_with_nothing_to_scroll() {
+        let mut state = UiState::new();
+        // help_scroll_max stays 0 when the whole screen fits.
+        state.scroll_help(5);
+        assert_eq!(state.help_scroll, 0);
     }
 
     #[test]

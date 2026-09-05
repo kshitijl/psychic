@@ -18,6 +18,22 @@ struct TimingEvent {
     count: Option<usize>,
 }
 
+/// Pull the session id out of a log line.
+///
+/// Format: `[2025-10-21 05:03:10 INFO psychic 3517040894769903083] message`
+fn session_id_of(line: &str) -> Option<&str> {
+    let end = line.find(']')?;
+    let before_bracket = &line[..end];
+    let start = before_bracket.rfind(' ')?;
+    let candidate = &before_bracket[start + 1..];
+
+    if !candidate.is_empty() && candidate.chars().all(|c| c.is_ascii_digit()) {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
 /// Analyze performance timings from the log file
 pub fn analyze_perf(log_path: &Path) -> Result<()> {
     // Read the log file
@@ -26,27 +42,22 @@ pub fn analyze_perf(log_path: &Path) -> Result<()> {
     let reader = BufReader::new(file);
     let lines: Vec<String> = reader.lines().collect::<Result<_, _>>()?;
 
-    // Extract latest session ID
-    // Format: [2025-10-21 05:03:10 INFO psychic 3517040894769903083]
+    // Extract the latest session ID that actually started the TUI.
+    //
+    // Every psychic invocation logs under its own session id, including CLI
+    // subcommands like `retrain` and `generate-features`, which emit no startup
+    // timings at all. Taking the last session id in the file therefore produced an
+    // empty report whenever the most recent run was a CLI one. Anchor on
+    // `first_render` instead: it is logged exactly once, only by the TUI.
     let session_id = lines
         .iter()
         .rev()
-        .find_map(|line| {
-            // Find the closing bracket
-            if let Some(end) = line.find(']') {
-                // Work backwards from ] to find the space before the session ID
-                let before_bracket = &line[..end];
-                if let Some(start) = before_bracket.rfind(' ') {
-                    let potential_id = &before_bracket[start + 1..];
-                    // Verify it's a number
-                    if potential_id.chars().all(|c| c.is_ascii_digit()) {
-                        return Some(potential_id);
-                    }
-                }
-            }
-            None
-        })
-        .context("Could not find session ID in log file")?;
+        .find(|line| line.contains("TIMING") && line.contains("\"first_render\""))
+        .and_then(|line| session_id_of(line))
+        .context(
+            "No TUI session found in the log file. Startup timings are only recorded \
+             when psychic runs as a TUI, not for CLI subcommands.",
+        )?;
 
     println!("Latest session: {}", session_id);
     println!();

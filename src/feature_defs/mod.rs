@@ -17,9 +17,13 @@ pub struct ClickEvent {
     pub timestamp: i64,
 }
 
+/// The parts of a recorded session that feature generation replays.
+///
+/// The `sessions` table also stores a timezone, but no feature reads it: every
+/// time window is a rolling one (see `implementations.rs`), so it is session
+/// context for analysis rather than a model input.
 #[derive(Debug, Clone)]
 pub struct Session {
     pub session_id: String,
-    pub timezone: String,
     pub cwd: String,
 }

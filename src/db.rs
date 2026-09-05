@@ -2,12 +2,47 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 use std::path::{Path, PathBuf};
 
+const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
+
+/// How far back `get_previously_interacted_files` looks.
+///
+/// A year: long enough that "the file I was working on last spring" is still
+/// findable, short enough that the query stays proportional to a year of use
+/// rather than to everything in the database. Events are never deleted, so
+/// without a cutoff this grows for the life of the installation.
+const HISTORY_LOOKBACK_DAYS: i64 = 365;
+
+/// Most paths `get_previously_interacted_files` will return.
+///
+/// Each one becomes a file registry entry that every subsequent search filters
+/// over, so this caps steady-state cost as well as startup cost. Results are
+/// ordered most-recent-first, so hitting the cap drops the stalest paths.
+const HISTORY_MAX_PATHS: usize = 2_000;
+
 pub struct FileMetadata {
     pub relative_path: String,
     pub full_path: String,
     pub mtime: Option<i64>,
     pub atime: Option<i64>,
     pub size: Option<i64>,
+}
+
+/// A snapshot of what the database holds, for the debug pane.
+///
+/// Counting rows means scanning the whole action index, so this is gathered off
+/// the UI thread and only when the debug pane is actually opened - see
+/// `App::request_db_stats`.
+#[derive(Debug, Clone, Default)]
+pub struct DbStats {
+    pub total_events: i64,
+    pub impressions: i64,
+    pub clicks: i64,
+    pub scrolls: i64,
+    pub startup_visits: i64,
+    pub sessions: i64,
+    pub file_size_bytes: u64,
+    /// Age of the oldest event, in days: how much history this represents.
+    pub history_days: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -192,20 +227,88 @@ impl Database {
         Ok(())
     }
 
+    /// Paths the user has clicked, scrolled, or visited, most recently
+    /// interacted with first.
+    ///
+    /// This runs on the startup critical path, so it carries two bounds:
+    ///
+    /// * `HISTORY_LOOKBACK_DAYS` bounds the **work**. `action` and `timestamp` are
+    ///   the first two columns of `idx_events_click_lookup`, so the cutoff turns
+    ///   this into a range seek over one year of history rather than a scan of
+    ///   everything ever recorded. Without it this was the only query on the
+    ///   startup path that grew forever.
+    /// * `HISTORY_MAX_PATHS` bounds the **result**. Every path returned becomes a
+    ///   file registry entry that each later query filters over, so the cap
+    ///   protects steady-state search cost, not just startup. The ordering means
+    ///   the cap keeps the most recently used paths and drops the stalest.
+    ///
+    /// Both bounds are generous enough that a normal history never reaches them;
+    /// they exist so that an unusual one degrades instead of getting slower.
+    ///
+    /// Why `GROUP BY` rather than `SELECT DISTINCT ... ORDER BY timestamp`: the
+    /// caller registers these in order and file registry order breaks ties between
+    /// equally scored results, so the order matters. `DISTINCT` does not define
+    /// one, because the sort key is not in the result, so which of a path's many
+    /// timestamps wins is up to SQLite. It comes out close to recency order, but
+    /// only close. `MAX(timestamp)` says what we mean, with the same query plan.
     pub fn get_previously_interacted_files(&self) -> Result<Vec<String>> {
-        // Get all unique full_paths that have been clicked, scrolled, or auto-visited at startup
+        let cutoff = jiff::Timestamp::now().as_second() - HISTORY_LOOKBACK_DAYS * SECONDS_PER_DAY;
+
         let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT full_path
+            "SELECT full_path
              FROM events
              WHERE action IN ('click', 'scroll', 'startup_visit')
-             ORDER BY timestamp DESC",
+               AND timestamp >= ?1
+             GROUP BY full_path
+             ORDER BY MAX(timestamp) DESC
+             LIMIT ?2",
         )?;
 
         let paths = stmt
-            .query_map([], |row| row.get::<_, String>(0))?
+            .query_map(params![cutoff, HISTORY_MAX_PATHS], |row| {
+                row.get::<_, String>(0)
+            })?
             .collect::<Result<Vec<String>, _>>()?;
 
         Ok(paths)
+    }
+
+    /// Count what is in the database, for the debug pane.
+    ///
+    /// The action histogram is a covering-index scan, so it is proportional to
+    /// total events - the only place psychic reads the whole table outside of
+    /// training. Fine for an on-demand debug view, not for the startup path.
+    pub fn stats(&self, db_path: &Path) -> Result<DbStats> {
+        let mut stats = DbStats {
+            file_size_bytes: std::fs::metadata(db_path).map(|m| m.len()).unwrap_or(0),
+            ..Default::default()
+        };
+
+        for (action, count) in self.summarize_events()? {
+            stats.total_events += count;
+            match action.as_str() {
+                "impression" => stats.impressions = count,
+                "click" => stats.clicks = count,
+                "scroll" => stats.scrolls = count,
+                "startup_visit" => stats.startup_visits = count,
+                // An action added later still counts toward the total.
+                _ => {}
+            }
+        }
+
+        stats.sessions = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+            .unwrap_or(0);
+
+        let oldest: Option<i64> = self
+            .conn
+            .query_row("SELECT MIN(timestamp) FROM events", [], |row| row.get(0))
+            .unwrap_or(None);
+        stats.history_days =
+            oldest.map(|oldest| (jiff::Timestamp::now().as_second() - oldest) / SECONDS_PER_DAY);
+
+        Ok(stats)
     }
 
     pub fn summarize_events(&self) -> Result<Vec<(String, i64)>> {
@@ -223,5 +326,122 @@ impl Database {
             .collect::<Result<Vec<(String, i64)>, _>>()?;
 
         Ok(summary)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An in-memory database with the real schema.
+    fn test_db() -> Database {
+        Database::new(Path::new(":memory:")).expect("Failed to open in-memory database")
+    }
+
+    /// Record an interaction with `path` a given number of days ago.
+    fn record(db: &Database, path: &str, days_ago: i64) {
+        record_seconds_ago(db, path, days_ago * SECONDS_PER_DAY);
+    }
+
+    /// Record an interaction at second granularity, for cases needing more
+    /// distinct timestamps than the lookback window has days.
+    fn record_seconds_ago(db: &Database, path: &str, seconds_ago: i64) {
+        let timestamp = jiff::Timestamp::now().as_second() - seconds_ago;
+        db.conn
+            .execute(
+                "INSERT INTO events (timestamp, query, file_path, full_path, action, session_id)
+                 VALUES (?1, '', ?2, ?2, 'click', 's')",
+                params![timestamp, path],
+            )
+            .expect("Failed to insert test event");
+    }
+
+    #[test]
+    fn test_history_is_ordered_by_most_recent_interaction() {
+        let db = test_db();
+        record(&db, "/old", 10);
+        record(&db, "/middle", 5);
+        record(&db, "/new", 1);
+        // An older touch of /old must not move it up; only its latest one counts.
+        record(&db, "/old", 9);
+
+        assert_eq!(
+            db.get_previously_interacted_files().unwrap(),
+            vec![
+                "/new".to_string(),
+                "/middle".to_string(),
+                "/old".to_string()
+            ],
+            "Most recently interacted with comes first"
+        );
+    }
+
+    #[test]
+    fn test_history_appears_once_however_often_it_was_used() {
+        let db = test_db();
+        for days_ago in 1..=20 {
+            record(&db, "/used/a/lot", days_ago);
+        }
+        record(&db, "/used/once", 2);
+
+        assert_eq!(
+            db.get_previously_interacted_files().unwrap(),
+            vec!["/used/a/lot".to_string(), "/used/once".to_string()],
+            "20 interactions still yield one entry, ranked by its latest"
+        );
+    }
+
+    #[test]
+    fn test_history_older_than_the_lookback_is_dropped() {
+        let db = test_db();
+        record(&db, "/just/inside", HISTORY_LOOKBACK_DAYS - 1);
+        record(&db, "/just/outside", HISTORY_LOOKBACK_DAYS + 1);
+        record(&db, "/ancient", 5 * HISTORY_LOOKBACK_DAYS);
+
+        assert_eq!(
+            db.get_previously_interacted_files().unwrap(),
+            vec!["/just/inside".to_string()],
+            "The lookback window is what keeps this query from growing forever"
+        );
+    }
+
+    #[test]
+    fn test_history_is_capped_and_keeps_the_most_recent() {
+        let db = test_db();
+        // One more path than the cap allows, all inside the window, oldest first.
+        for i in 0..=HISTORY_MAX_PATHS {
+            let seconds_ago = (HISTORY_MAX_PATHS - i) as i64;
+            record_seconds_ago(&db, &format!("/path/{:05}", i), seconds_ago);
+        }
+
+        let paths = db.get_previously_interacted_files().unwrap();
+        assert_eq!(
+            paths.len(),
+            HISTORY_MAX_PATHS,
+            "Result is capped no matter how much history exists"
+        );
+        assert!(
+            !paths.contains(&"/path/00000".to_string()),
+            "The stalest path is the one dropped"
+        );
+    }
+
+    #[test]
+    fn test_history_ignores_impressions() {
+        let db = test_db();
+        record(&db, "/clicked", 1);
+        db.conn
+            .execute(
+                "INSERT INTO events (timestamp, query, file_path, full_path, action, session_id)
+                 VALUES (?1, '', '/seen', '/seen', 'impression', 's')",
+                params![jiff::Timestamp::now().as_second()],
+            )
+            .unwrap();
+
+        assert_eq!(
+            db.get_previously_interacted_files().unwrap(),
+            vec!["/clicked".to_string()],
+            "Impressions are 96% of the table and none of them are history"
+        );
     }
 }

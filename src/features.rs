@@ -272,12 +272,11 @@ fn fetch_all_events(conn: &Connection) -> Result<Vec<Event>> {
 }
 
 fn fetch_all_sessions(conn: &Connection) -> Result<HashMap<String, Session>> {
-    let mut stmt = conn.prepare("SELECT session_id, timezone, cwd FROM sessions")?;
+    let mut stmt = conn.prepare("SELECT session_id, cwd FROM sessions")?;
     let session_iter = stmt.query_map([], |row| {
         Ok(Session {
             session_id: row.get(0)?,
-            timezone: row.get(1)?,
-            cwd: row.get(2)?,
+            cwd: row.get(1)?,
         })
     })?;
 
@@ -333,7 +332,6 @@ fn compute_features_from_accumulator(
         clicks_by_query_and_file: &acc.clicks_by_query_and_file,
         engagements_by_episode_query_and_file: &acc.engagements_by_episode_query_and_file,
         current_timestamp: impression.timestamp,
-        session,
         is_from_walker,
         is_dir,
     };
@@ -433,7 +431,6 @@ mod tests {
             "s1".to_string(),
             Session {
                 session_id: "s1".to_string(),
-                timezone: "UTC".to_string(),
                 cwd: "/".to_string(),
             },
         );

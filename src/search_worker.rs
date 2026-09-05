@@ -111,13 +111,22 @@ pub enum WorkerResponse {
         total_files: usize,
         initial_page: PageData,
         model_stats: Option<ranker::ModelStats>,
+        /// How long filtering and ranking took, in milliseconds. The UI shows this
+        /// next to the round trip so the two can be told apart: this is the work,
+        /// the difference is the channel hop and scheduling.
+        rank_ms: f64,
     },
     Page {
         query_id: u64,
         page_data: PageData,
     },
     FilesChanged,
-    WalkerDone,
+    /// The filesystem walk finished. Carries the same elapsed time that goes into
+    /// the `walker_complete` TIMING line, so the debug pane and the log report one
+    /// number rather than two measured a channel hop apart.
+    WalkerDone {
+        walk_ms: f64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -238,6 +247,8 @@ struct WorkerState {
     model_path: PathBuf,
     db_path: PathBuf,
     walker_command_tx: Sender<WalkerCommand>,
+    /// How long the last filter-and-rank took, reported back with its results.
+    last_rank_ms: f64,
 }
 
 impl WorkerState {
@@ -367,6 +378,7 @@ impl WorkerState {
             model_path,
             db_path,
             walker_command_tx,
+            last_rank_ms: 0.0,
         })
     }
 
@@ -508,9 +520,10 @@ impl WorkerState {
             }
         }
 
+        self.last_rank_ms = filter_rank_start.elapsed().as_secs_f64() * 1000.0;
         log::info!(
             "TIMING {{\"op\":\"filter_and_rank_total\",\"ms\":{}}}",
-            filter_rank_start.elapsed().as_secs_f64() * 1000.0
+            self.last_rank_ms
         );
         Ok(())
     }
@@ -605,18 +618,38 @@ impl WorkerState {
         }
     }
 
-    /// Load ranker from disk, falling back to empty ranker if model file doesn't exist
+    /// Load ranker from disk, falling back to an empty ranker if the model is
+    /// missing or unreadable.
+    ///
+    /// An unusable model must never stop psychic from starting: ranking degrades
+    /// to the simple model, which is what a fresh install runs on anyway, and the
+    /// retrain kicked off at launch replaces the bad file. Training writes the
+    /// model atomically so a half-written file should not arise, but a model
+    /// truncated by a killed older build, a full disk, or an interrupted copy
+    /// would otherwise brick startup until the user knew to delete it.
     fn load_ranker(model_path: &Path, db_path: &Path) -> Result<ranker::Ranker> {
         if !model_path.exists() {
             log::info!(
                 "Model file not found at {:?}, using empty ranker",
                 model_path
             );
-            ranker::Ranker::new_empty(db_path)
-        } else {
-            let ranker = ranker::Ranker::new(model_path, db_path)?;
-            log::info!("Loaded ranking model from {:?}", model_path);
-            Ok(ranker)
+            return ranker::Ranker::new_empty(db_path);
+        }
+
+        match ranker::Ranker::new(model_path, db_path) {
+            Ok(ranker) => {
+                log::info!("Loaded ranking model from {:?}", model_path);
+                Ok(ranker)
+            }
+            Err(e) => {
+                log::error!(
+                    "Failed to load model at {:?} ({}); falling back to the simple \
+                     model until the next retrain finishes",
+                    model_path,
+                    e
+                );
+                ranker::Ranker::new_empty(db_path)
+            }
         }
     }
 
@@ -691,7 +724,6 @@ fn worker_thread_loop<T>(
     use std::sync::mpsc::RecvTimeoutError;
     use std::time::Instant;
 
-    let worker_loop_start = Instant::now();
     let mut last_files_changed_notification = Instant::now();
 
     loop {
@@ -711,14 +743,15 @@ fn worker_thread_loop<T>(
                     files_changed = true;
                 }
                 WalkerMessage::AllDone => {
-                    log::info!(
-                        "TIMING {{\"op\":\"walker_complete\",\"ms\":{}}}",
-                        worker_loop_start.elapsed().as_secs_f64() * 1000.0
-                    );
+                    // Measured from process start, not from when this loop began,
+                    // so it lines up with first_render / first_query_complete /
+                    // startup_complete and with the debug pane.
+                    let walk_ms = crate::PROCESS_START.elapsed().as_secs_f64() * 1000.0;
+                    log::info!("TIMING {{\"op\":\"walker_complete\",\"ms\":{}}}", walk_ms);
                     walker_done = true;
                     files_changed = true;
                     // Notify UI that walker is done
-                    let _ = event_tx.send(WorkerResponse::WalkerDone.into());
+                    let _ = event_tx.send(WorkerResponse::WalkerDone { walk_ms }.into());
                 }
             }
         }
@@ -757,6 +790,7 @@ fn worker_thread_loop<T>(
                         total_files: state.file_registry.len(),
                         initial_page,
                         model_stats: state.ranker.stats.clone(),
+                        rank_ms: state.last_rank_ms,
                     }
                     .into(),
                 );
@@ -793,6 +827,7 @@ fn worker_thread_loop<T>(
                                 total_files: state.file_registry.len(),
                                 initial_page,
                                 model_stats: state.ranker.stats.clone(),
+                                rank_ms: state.last_rank_ms,
                             }
                             .into(),
                         );
@@ -817,6 +852,7 @@ fn worker_thread_loop<T>(
                                 total_files: state.file_registry.len(),
                                 initial_page,
                                 model_stats: state.ranker.stats.clone(),
+                                rank_ms: state.last_rank_ms,
                             }
                             .into(),
                         );
@@ -841,6 +877,7 @@ fn worker_thread_loop<T>(
                                 total_files: state.file_registry.len(),
                                 initial_page,
                                 model_stats: state.ranker.stats.clone(),
+                                rank_ms: state.last_rank_ms,
                             }
                             .into(),
                         );
@@ -1021,5 +1058,80 @@ mod tests {
             !file_regular.is_dir, true,
             "Regular file should pass OnlyFiles filter"
         );
+    }
+}
+
+#[cfg(test)]
+mod load_ranker_tests {
+    use super::*;
+
+    /// A scratch directory with a real (empty) events database in it.
+    struct TempDataDir {
+        path: PathBuf,
+    }
+
+    impl TempDataDir {
+        fn new(name: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("psychic-test-{}-{}", name, std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("Failed to create temp data dir");
+
+            // load_ranker reads click history, so the schema has to exist.
+            crate::db::Database::new(&path.join("events.db")).expect("Failed to create test db");
+
+            Self { path }
+        }
+
+        fn db_path(&self) -> PathBuf {
+            self.path.join("events.db")
+        }
+
+        fn model_path(&self) -> PathBuf {
+            self.path.join("model.txt")
+        }
+    }
+
+    impl Drop for TempDataDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn test_missing_model_falls_back_to_simple_ranking() {
+        let dir = TempDataDir::new("missing-model");
+
+        let ranker = WorkerState::load_ranker(&dir.model_path(), &dir.db_path())
+            .expect("A missing model must not stop psychic from starting");
+
+        assert!(
+            !ranker.has_model(),
+            "Nothing to load, so ranking runs on the simple model"
+        );
+    }
+
+    #[test]
+    fn test_truncated_model_falls_back_instead_of_failing_startup() {
+        let dir = TempDataDir::new("truncated-model");
+        // What a write interrupted partway through leaves behind.
+        std::fs::write(&dir.model_path(), "").expect("Failed to write empty model");
+
+        let ranker = WorkerState::load_ranker(&dir.model_path(), &dir.db_path())
+            .expect("An empty model file must not stop psychic from starting");
+
+        assert!(!ranker.has_model(), "The unusable model was not loaded");
+    }
+
+    #[test]
+    fn test_corrupt_model_falls_back_instead_of_failing_startup() {
+        let dir = TempDataDir::new("corrupt-model");
+        std::fs::write(&dir.model_path(), "this is not a LightGBM model")
+            .expect("Failed to write corrupt model");
+
+        let ranker = WorkerState::load_ranker(&dir.model_path(), &dir.db_path())
+            .expect("A corrupt model must not stop psychic from starting");
+
+        assert!(!ranker.has_model(), "The unusable model was not loaded");
     }
 }

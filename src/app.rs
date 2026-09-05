@@ -30,6 +30,25 @@ pub struct Page {
 pub const PAGE_SIZE: usize = 128;
 pub const PREFETCH_MARGIN: usize = 32;
 
+/// The handful of latencies worth watching, in milliseconds.
+///
+/// Startup numbers are measured once from process start; the search numbers are
+/// replaced on every query, so the pane shows how fast *this* search was rather
+/// than a historical average. `None` means it has not happened yet.
+#[derive(Debug, Clone, Default)]
+pub struct Timings {
+    /// Process start to the first frame drawn.
+    pub first_paint_ms: Option<f64>,
+    /// Process start to the first search results being ready to show.
+    pub first_results_ms: Option<f64>,
+    /// Process start to the filesystem walk finishing.
+    pub walk_complete_ms: Option<f64>,
+    /// Round trip for the most recent query: keystroke to results in hand.
+    pub last_search_ms: Option<f64>,
+    /// The worker's share of that: filtering and ranking, without the channel hop.
+    pub last_rank_ms: Option<f64>,
+}
+
 pub struct AppOptions {
     pub on_dir_click: OnDirClickAction,
     pub on_cwd_visit: OnCwdVisitAction,
@@ -97,6 +116,16 @@ pub struct App {
     // Startup tracking
     pub walker_done: bool,
     pub startup_complete_logged: bool,
+
+    // Debug pane: latencies, and database stats loaded on demand
+    pub timings: Timings,
+    pub db_stats: Option<crate::db::DbStats>,
+    /// Set once the background load is under way, so it is not started twice.
+    db_stats_requested: bool,
+    data_dir: PathBuf,
+    event_tx: mpsc::Sender<crate::AppEvent>,
+    /// When the query we are waiting on was sent, to time the round trip.
+    query_sent_at: Option<(u64, Instant)>,
 }
 
 impl App {
@@ -167,6 +196,12 @@ impl App {
             tick_paused: Arc::new(AtomicBool::new(false)),
             walker_done: false,
             startup_complete_logged: false,
+            timings: Timings::default(),
+            db_stats: None,
+            db_stats_requested: false,
+            data_dir: data_dir.to_path_buf(),
+            event_tx,
+            query_sent_at: None,
         };
 
         // Send initial query to worker with ID 0
@@ -179,6 +214,57 @@ impl App {
         ));
 
         Ok(app)
+    }
+
+    /// Take the next query id, remembering when we asked so the round trip can be
+    /// timed when the matching response arrives.
+    ///
+    /// Every path that sends work to the worker goes through here, which is what
+    /// keeps "last search" honest: it measures whatever the user just did, whether
+    /// that was typing, changing directory, or a filter change.
+    pub fn next_query_id(&mut self) -> u64 {
+        let query_id = self.analytics.next_subsession_id();
+        self.query_sent_at = Some((query_id, Instant::now()));
+        query_id
+    }
+
+    /// Record the round trip if `query_id` is the request we were waiting on.
+    pub fn note_query_completed(&mut self, query_id: u64) {
+        if let Some((pending_id, sent_at)) = self.query_sent_at
+            && pending_id == query_id
+        {
+            let round_trip_ms = sent_at.elapsed().as_secs_f64() * 1000.0;
+            log::info!(
+                "TIMING {{\"op\":\"query_round_trip\",\"ms\":{}}}",
+                round_trip_ms
+            );
+            self.timings.last_search_ms = Some(round_trip_ms);
+            self.query_sent_at = None;
+        }
+    }
+
+    /// Load database statistics in the background, once.
+    ///
+    /// Counting rows scans the whole action index, so this is deliberately not
+    /// done at startup: it happens the first time the debug pane is opened, off
+    /// the UI thread, and the result arrives as an event like any other.
+    pub fn request_db_stats(&mut self) {
+        if self.db_stats_requested {
+            return;
+        }
+        self.db_stats_requested = true;
+
+        let db_path = crate::db::Database::get_db_path(&self.data_dir);
+        let event_tx = self.event_tx.clone();
+        std::thread::spawn(move || {
+            let stats = crate::db::Database::new(&db_path).and_then(|db| db.stats(&db_path));
+            match stats {
+                Ok(stats) => {
+                    let _ = event_tx.send(crate::AppEvent::DbStats(Box::new(stats)));
+                }
+                Err(e) => log::error!("Failed to gather database stats: {}", e),
+            }
+        });
     }
 
     pub fn reload_model(&mut self, query_id: u64) -> Result<()> {
@@ -332,7 +418,7 @@ impl App {
             self.query.clear();
 
             // Send ChangeCwd request to worker
-            let query_id = self.analytics.next_subsession_id();
+            let query_id = self.next_query_id();
             let _ = self.worker_tx.send(WorkerRequest::ChangeCwd {
                 new_cwd: new_dir,
                 query_id,

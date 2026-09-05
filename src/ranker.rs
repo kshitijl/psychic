@@ -139,6 +139,15 @@ impl Ranker {
         })
     }
 
+    /// Is an ML model loaded, or is ranking running on the simple model alone?
+    ///
+    /// Only the fallback tests in `search_worker.rs` need to ask; production code
+    /// does not branch on it, since a missing model already means weight 0.
+    #[cfg(test)]
+    pub fn has_model(&self) -> bool {
+        self.model.is_some()
+    }
+
     pub fn new_empty(db_path: &Path) -> Result<Self> {
         // Load clicks even when there's no model (needed for simple scoring)
         let clicks_load_start = std::time::Instant::now();
@@ -340,6 +349,7 @@ impl Ranker {
 
     /// Compute simple score for cold-start ranking
     /// Raw formula: CLICKS_WEIGHT * clicks_last_7_days + RECENCY_WEIGHT / (1 + modified_age_in_days)
+    ///               + 2.0 * fuzzy_score
     /// Then normalized to [0, 1] using sigmoid function
     fn compute_simple_score(&self, file: &FileCandidate, current_timestamp: i64) -> f64 {
         // Count clicks in last 7 days
@@ -379,7 +389,13 @@ impl Ranker {
         Self::sigmoid(raw_score)
     }
 
-    /// Compute blend weights using sigmoid function
+    /// Compute blend weights with a tanh ramp over recent engagement.
+    ///
+    /// `total_clicks` counts clicks and scrolls from the **last 30 days only**, so
+    /// this is a rolling measure: a quiet month hands ranking back to the simple
+    /// model even on a long-lived installation. Crossover is at `k * l` = 30
+    /// events, saturating around 60.
+    ///
     /// Returns: (w_simple, w_lightgbm) where weights sum to 1.0
     fn compute_blend_weights(total_clicks: usize) -> (f64, f64) {
         let k = 15f64;
@@ -432,6 +448,15 @@ impl Ranker {
             engagements_by_episode_query_and_file,
         };
 
+        // Careful with lazily-initialized globals inside this loop. Feature code
+        // runs once per file across every core, so the *first* call after launch
+        // has ~170 threads arriving at any cold global at the same moment, all
+        // queueing on whatever lock guards its initialization. That is a startup
+        // cliff, not a per-call cost, and it does not show up in a warm benchmark:
+        // timezone lookups here once cost 4.4ms per file on the first ranking pass
+        // and 2us on every one after, which was 75ms of a 97ms time-to-first-result.
+        // If a feature needs something expensive to set up, resolve it once outside
+        // this loop and pass it in.
         let results: Vec<(Vec<f64>, FxHashMap<String, Duration>)> = files
             .par_iter()
             .map(|file| {
@@ -517,7 +542,7 @@ impl Ranker {
             files.len()
         );
 
-        // Compute blend weights using softmax
+        // Blend the two models by how much recent engagement we have
         let blend_start = Instant::now();
         let (w_simple, w_lightgbm) = Self::compute_blend_weights(self.total_clicks);
         log::debug!(
@@ -623,7 +648,6 @@ fn compute_features_with_timing(
         clicks_by_query_and_file: click_indexes.clicks_by_query_and_file,
         engagements_by_episode_query_and_file: click_indexes.engagements_by_episode_query_and_file,
         current_timestamp,
-        session: None,
         is_from_walker: file.is_from_walker,
         is_dir: file.is_dir,
     };
@@ -978,24 +1002,30 @@ mod tests {
         // Format as string for expect-test style comparison
         let actual = format!("{:?}", features);
 
-        // Expected output: [filename_starts_with_query, clicks_last_30_days, modified_today, is_under_cwd, is_hidden, file_size_bytes, clicks_last_week_parent_dir, clicks_last_hour, clicks_today, clicks_last_7_days, modified_age, clicks_for_this_query, engagements_in_episode_with_query, is_dir, fuzzy_score]
+        // Expected output: [filename_starts_with_query, clicks_last_30_days, modified_last_24h, is_under_cwd, is_hidden, file_size_bytes, clicks_last_week_parent_dir, clicks_last_hour, clicks_last_24h, clicks_last_7_days, modified_age, clicks_for_this_query, engagements_in_episode_with_query, is_dir, fuzzy_score]
         // filename_starts_with_query=0 (bar.txt doesn't start with "test")
         // clicks_last_30_days=3 (3 clicks on bar.txt itself)
-        // modified_today=0 (mtime is old - Nov 2023, test runs in 2025)
+        // modified_last_24h=0 (mtime is exactly 24h before current_timestamp, so outside)
         // is_under_cwd=1 (is_from_walker=true, so guaranteed to be under cwd)
         // is_hidden=0 (no dot-prefixed components)
         // file_size_bytes=12288 (12 KB file)
         // clicks_last_week_parent_dir=4 (3 clicks on bar.txt + 1 click on other.txt in /tmp/foo/)
-        // clicks_last_hour=0 (clicks are old)
-        // clicks_today=0 (clicks are old)
+        // clicks_last_hour=0 (oldest click is 18.4h before current_timestamp)
+        // clicks_last_24h=3 (all 3 clicks land in the window; the earliest sits exactly
+        //   on the 24h boundary, which counts - see test_window_boundary_is_inclusive)
         // clicks_last_7_days=3 (all 3 clicks are within the last 7 days of the test timestamp)
         // modified_age=86400 (1 day in seconds)
         // clicks_for_this_query=2 (2 query-specific clicks for "test" + bar.txt)
         // engagements_in_episode_with_query=0 (no episode engagement data in test)
         // is_dir=0 (this is a file, not a directory)
         // fuzzy_score=0 (foo/bar.txt doesn't match "test" - fuzzy matcher returns None)
+        //
+        // This expectation used to depend on the machine's timezone: when
+        // clicks_last_24h was "clicks_today" it counted clicks since local midnight,
+        // giving 0 in America/New_York, 2 in UTC and 3 in Asia/Kolkata for exactly
+        // this data. Rolling windows are the same number everywhere.
         let expected =
-            "[0.0, 3.0, 0.0, 1.0, 0.0, 12288.0, 4.0, 0.0, 0.0, 3.0, 86400.0, 2.0, 0.0, 0.0, 0.0]";
+            "[0.0, 3.0, 0.0, 1.0, 0.0, 12288.0, 4.0, 0.0, 3.0, 3.0, 86400.0, 2.0, 0.0, 0.0, 0.0]";
 
         assert_eq!(actual, expected, "Feature vector mismatch");
     }

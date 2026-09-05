@@ -7,8 +7,10 @@ mod db;
 mod episode;
 mod feature_defs;
 mod features;
+mod help;
 mod history;
 mod input;
+mod keymap;
 mod metadata_ext;
 mod path_display;
 mod preview;
@@ -51,6 +53,9 @@ enum AppEvent {
     Tick,
     /// Model retraining status update
     Retrain(bool),
+    /// Database statistics for the debug pane, gathered off the UI thread.
+    /// Boxed to keep the event enum small; this arrives at most once per run.
+    DbStats(Box<db::DbStats>),
 }
 
 impl From<WorkerResponse> for AppEvent {
@@ -65,14 +70,26 @@ use app::{App, AppBootstrap, AppOptions, Page};
 // Import CLI types from dedicated module
 use cli::{Cli, Commands, FilterArg, InternalCommands, OutputFormat};
 
+/// When this process started.
+///
+/// One shared zero point for every latency psychic reports, so numbers from the
+/// debug pane, the TIMING log lines and `internal analyze-perf` can be compared
+/// with each other. Threads other than main need it too - the worker times the
+/// filesystem walk - and a `Lazy` is the simplest way to give them all the same
+/// instant without threading it through every constructor.
+///
+/// Initialized by the first statement of `main`, so it really is process start.
+pub static PROCESS_START: once_cell::sync::Lazy<Instant> = once_cell::sync::Lazy::new(Instant::now);
+
 /// Generate a unique session ID using a random u64.
 fn create_session_id() -> String {
     rand::random::<u64>().to_string()
 }
 
 fn main() -> Result<()> {
-    // Start global timer at the very beginning
-    let main_start = Instant::now();
+    // Start global timer at the very beginning. Forcing the Lazy here is what
+    // pins it to process start rather than to whoever reads it first.
+    let main_start = *PROCESS_START;
 
     // Generate session ID early so we can include it in all logs
     let session_id = create_session_id();
@@ -522,6 +539,8 @@ fn run_app(
     main_start: Instant,
 ) -> Result<()> {
     let mut first_render_logged = false;
+    // Captured inside the draw closure, applied to app once the borrow ends.
+    let mut first_paint_ms: Option<f64> = None;
     let mut first_query_complete_logged = false;
     let mut first_full_render_logged = false;
 
@@ -535,13 +554,13 @@ fn run_app(
         // Draw UI
         let draw_start = Instant::now();
         let mut render_updates = None;
+        let mut help_scroll_max = None;
         terminal.draw(|f| {
             // Log first render
             if !first_render_logged {
-                log::info!(
-                    "TIMING {{\"op\":\"first_render\",\"ms\":{}}}",
-                    main_start.elapsed().as_secs_f64() * 1000.0
-                );
+                let elapsed = main_start.elapsed().as_secs_f64() * 1000.0;
+                log::info!("TIMING {{\"op\":\"first_render\",\"ms\":{}}}", elapsed);
+                first_paint_ms = Some(elapsed);
                 first_render_logged = true;
             }
 
@@ -556,6 +575,13 @@ fn run_app(
                     query: &app.query,
                 };
                 render::render_history_mode(f, history_ctx);
+
+                // The help screen is reachable from every mode, so it is drawn
+                // last, over whichever mode is underneath.
+                if app.ui_state.help_visible {
+                    help_scroll_max =
+                        Some(render::render_help_overlay(f, app.ui_state.help_scroll));
+                }
                 return;
             }
 
@@ -570,6 +596,8 @@ fn run_app(
                 preview: &app.preview,
                 currently_retraining: app.currently_retraining,
                 model_stats_cache: app.model_stats_cache.as_ref(),
+                timings: &app.timings,
+                db_stats: app.db_stats.as_ref(),
                 page_cache: &app.page_cache,
                 ui_state: &app.ui_state,
                 recent_logs: &app.recent_logs,
@@ -581,7 +609,22 @@ fn run_app(
             };
             let updates = render::render_normal_mode(f, normal_ctx, marquee_delay, marquee_speed);
             render_updates = Some(updates);
+
+            if app.ui_state.help_visible {
+                help_scroll_max = Some(render::render_help_overlay(f, app.ui_state.help_scroll));
+            }
         })?;
+
+        if let Some(ms) = first_paint_ms.take() {
+            app.timings.first_paint_ms = Some(ms);
+        }
+
+        // Scrolling the help screen is clamped to what actually overflowed the
+        // last frame, which only the renderer knows.
+        if let Some(max) = help_scroll_max {
+            app.ui_state.help_scroll_max = max;
+            app.ui_state.help_scroll = app.ui_state.help_scroll.min(max);
+        }
 
         // Apply render updates to app state after rendering is complete
         if let Some(mut updates) = render_updates {
@@ -635,6 +678,9 @@ fn run_app(
             AppEvent::Retrain(retraining_status) => {
                 app.currently_retraining = retraining_status;
             }
+            AppEvent::DbStats(stats) => {
+                app.db_stats = Some(*stats);
+            }
             AppEvent::Tick => {
                 // Tick event - just triggers a redraw for marquee animation
             }
@@ -647,6 +693,7 @@ fn run_app(
                         total_files,
                         initial_page,
                         model_stats,
+                        rank_ms,
                     } => {
                         let active_query_id = app.analytics.current_subsession_id();
 
@@ -675,12 +722,17 @@ fn run_app(
 
                             // Log first query completion
                             if !first_query_complete_logged {
+                                let elapsed = main_start.elapsed().as_secs_f64() * 1000.0;
                                 log::info!(
                                     "TIMING {{\"op\":\"first_query_complete\",\"ms\":{}}}",
-                                    main_start.elapsed().as_secs_f64() * 1000.0
+                                    elapsed
                                 );
+                                app.timings.first_results_ms = Some(elapsed);
                                 first_query_complete_logged = true;
                             }
+
+                            app.timings.last_rank_ms = Some(rank_ms);
+                            app.note_query_completed(query_id);
 
                             // Create subsession, using the query text from the app state
                             app.analytics.new_subsession(query_id, app.query.clone());
@@ -707,7 +759,7 @@ fn run_app(
                         // The worker detected file changes, so we trigger a refresh
                         // of the current query to get fresh results.
                         log::info!("Auto-refreshing query due to file changes.");
-                        let query_id = app.analytics.next_subsession_id();
+                        let query_id = app.next_query_id();
                         let _ = app.worker_tx.send(WorkerRequest::UpdateQuery(
                             search_worker::UpdateQueryRequest {
                                 query: app.query.clone(),
@@ -716,8 +768,11 @@ fn run_app(
                             },
                         ));
                     }
-                    WorkerResponse::WalkerDone => {
+                    WorkerResponse::WalkerDone { walk_ms } => {
                         app.walker_done = true;
+                        // The worker's own measurement, so the pane and the
+                        // walker_complete log line are the same number.
+                        app.timings.walk_complete_ms = Some(walk_ms);
                     }
                 }
             }

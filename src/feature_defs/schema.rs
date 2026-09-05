@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 // Re-export from parent features module
-use crate::features::{ClickEvent, Session};
+use crate::features::ClickEvent;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
 pub enum FeatureType {
@@ -18,7 +18,12 @@ pub enum Monotonicity {
     Decreasing = -1,
 }
 
-/// All inputs a feature might need to compute its value
+/// All inputs a feature might need to compute its value.
+///
+/// Everything here is already resolved: features do lookups and arithmetic, never
+/// setup. `compute` runs once per file across a parallel loop, so anything that
+/// needs initializing belongs on this struct, not inside a feature. See the note
+/// above the `par_iter` in `ranker.rs`.
 pub struct FeatureInputs<'a> {
     pub query: &'a str,
     pub file_path: &'a str,
@@ -31,7 +36,6 @@ pub struct FeatureInputs<'a> {
     pub clicks_by_query_and_file: &'a FxHashMap<(String, String), Vec<ClickEvent>>,
     pub engagements_by_episode_query_and_file: &'a FxHashMap<(String, String), Vec<ClickEvent>>,
     pub current_timestamp: i64,
-    pub session: Option<&'a Session>,
     pub is_from_walker: bool,
     pub is_dir: bool,
 }

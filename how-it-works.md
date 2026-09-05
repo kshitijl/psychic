@@ -29,24 +29,42 @@ The codebase follows John Ousterhout's "deep modules" philosophy: simple interfa
 8. **`search_worker.rs`** - Async worker thread for filtering/ranking
 
 **UI & Interaction:**
-9. **`ui_state.rs`** - UI state machine (history mode, filter picker, debug pane)
+9. **`ui_state.rs`** - UI state machine (history mode, filter picker, debug pane, help screen)
 10. **`history.rs`** - Directory navigation history with branch-point semantics
-11. **`input.rs`** - Keyboard and mouse event handling, terminal suspension
-12. **`render.rs`** - All UI rendering (normal mode, history mode, layouts)
-13. **`preview.rs`** - Preview generation with three-state caching (None/Light/Full)
+11. **`keymap.rs`** - Keybinding registry: every binding and its help text, once
+12. **`input.rs`** - Dispatches keymap actions, terminal suspension
+13. **`render.rs`** - All UI rendering (normal mode, history mode, help screen, layouts)
+14. **`help.rs`** - Help screen layout, derived from the keymap, clap and the zsh script
+15. **`preview.rs`** - Preview generation with three-state caching (None/Light/Full)
 
 **Application State:**
-14. **`app.rs`** - Application state (App struct, page cache management)
+16. **`app.rs`** - Application state (App struct, page cache management)
 
 **Utilities:**
-15. **`path_display.rs`** - Path formatting utilities (truncation, abbreviation)
-16. **`cli.rs`** - CLI argument parsing with clap
+17. **`path_display.rs`** - Path formatting utilities (truncation, abbreviation)
+18. **`cli.rs`** - CLI argument parsing with clap
 
 **Main Entry Point:**
-17. **`main.rs`** - Event loop glue (~600 lines, down from ~2000+)
+19. **`main.rs`** - Event loop glue (~600 lines, down from ~2000+)
 
 **Development Tools:**
-18. **`analyze_perf.rs`** - Performance analysis for timing logs
+20. **`analyze_perf.rs`** - Performance analysis for timing logs
+
+`internal analyze-perf` reports the most recent **TUI** session, found by looking
+for the last `first_render` line. Every invocation logs under its own session id,
+including CLI subcommands like `retrain`, which emit no startup timings; anchoring
+on the last session id in the file instead produced an empty report whenever the
+most recent run was a CLI one. It also stops reading at `startup_complete`, so
+per-query timings after startup (`filter_and_rank_total` for later searches,
+`query_round_trip`) reach the log but not this report - the debug pane is where
+those are meant to be read.
+
+**Timing convention:** every latency is measured from `PROCESS_START` (a `Lazy<Instant>`
+in `main.rs`, forced by the first statement of `main`). The worker uses it too, via
+`crate::PROCESS_START`, so `walker_complete` is comparable to `first_query_complete`
+and `startup_complete`. It previously measured from the worker loop's own start,
+which made it read ~10ms faster than it was and not comparable to the numbers printed
+beside it.
 
 **Why this architecture:** Each module has a simple, focused interface hiding complex implementation. Main.rs is now just the event loop and module coordination. All business logic is in focused modules that can be tested independently.
 
@@ -67,7 +85,7 @@ Walker → (path, mtime) → Worker
 Worker → AppEvent::Worker(QueryUpdated{...}) → Main
 Worker → AppEvent::Worker(Page{...}) → Main
 Worker → AppEvent::Worker(FilesChanged) → Main
-Worker → AppEvent::Worker(WalkerDone) → Main
+Worker → AppEvent::Worker(WalkerDone{walk_ms}) → Main
 
 // Crossterm thread forwards input events
 Crossterm → AppEvent::Input(Event) → Main
@@ -77,6 +95,9 @@ Tick → AppEvent::Tick → Main
 
 // Retrain thread sends status
 Retrain → AppEvent::Retrain(bool) → Main
+
+// One-shot: database counts for the debug pane, gathered on first open
+DbStats thread → AppEvent::DbStats(..) → Main
 
 // All events go through single unified channel
 Main blocks on event_rx.recv() → instant wake on ANY event
@@ -198,6 +219,10 @@ Gathers system context at startup in background thread:
 
 Why gather this: Network context (home/office/cafe), shell history (user intent), and running processes help analyze search patterns and could become ML features.
 
+**Note on `timezone`:** still recorded per session, but no feature reads it - all
+time windows are rolling (see "Time windows are rolling, not calendar days"). It is
+session context for later analysis, not a model input.
+
 **Error handling:** All fields fallback to "unknown" on error. Never crash due to missing tools.
 
 **Timezone detection:** Uses sophisticated fallback chain:
@@ -263,6 +288,38 @@ On startup, psychic automatically logs a startup_visit event for the initial dir
 **Historical files:** Loads previously clicked/scrolled files from events.db at startup.
 Why: User can find files from other projects they've accessed before.
 
+The query is bounded two ways, because this is the one query on the startup path
+whose cost grew with total history (events are never purged):
+
+```sql
+SELECT full_path FROM events
+WHERE action IN ('click', 'scroll', 'startup_visit')
+  AND timestamp >= ?          -- HISTORY_LOOKBACK_DAYS = 365
+GROUP BY full_path
+ORDER BY MAX(timestamp) DESC
+LIMIT ?                       -- HISTORY_MAX_PATHS = 2000
+```
+
+- The **time cutoff bounds the work.** `action` and `timestamp` are the first two
+  columns of `idx_events_click_lookup`, so this became a range seek over one year
+  instead of a scan of all history - the same shape as `load_clicks`. Startup is
+  now proportional to recent activity everywhere, not to database size.
+- The **limit bounds the result.** Each path returned becomes a file registry entry
+  that every later search filters over, so the cap protects steady-state search
+  cost too. Ordering by recency means the cap drops the stalest paths.
+
+Neither bound bites at present scale (207 paths from 3,174 rows, oldest 312 days),
+which is the point: they are there so an unusual history degrades rather than
+slows everything down.
+
+The ordering is load-bearing: the worker registers these paths in order and file
+registry order breaks ties between equally scored results. It was previously
+`SELECT DISTINCT full_path ... ORDER BY timestamp DESC`, which only approximates
+recency order - with `DISTINCT` the sort key is not in the result, so which of a
+path's timestamps wins is up to SQLite. It comes out close, but on this database
+the two orderings genuinely differ in a few places. `MAX(timestamp)` says what we
+mean, with the same query plan.
+
 ### Module: `feature_defs/`
 
 Trait-based feature registry - single source of truth for all features.
@@ -289,7 +346,7 @@ pub static FEATURE_REGISTRY: Lazy<Vec<Box<dyn Feature>>> = Lazy::new(|| {
     vec![
         Box::new(FilenameStartsWithQuery),
         Box::new(ClicksLast30Days),
-        Box::new(ModifiedToday),
+        Box::new(ModifiedLast24h),
         Box::new(IsUnderCwd),
         Box::new(IsHidden),
     ]
@@ -305,6 +362,65 @@ Why: Python training script reads schema to know feature order, types, and can a
 - `clicks_last_hour`: increasing (more clicks → higher relevance)
 - `modified_age`: decreasing (older files → lower relevance)
 - `filename_starts_with_query`: no monotonicity (binary feature)
+
+**Time windows are rolling, not calendar days.**
+
+Every time-based feature counts backwards from the moment being scored:
+`clicks_last_24h` means "in the 24 hours before this impression", not "since
+midnight". There is no timezone anywhere in feature computation, by choice.
+
+Why:
+
+- **Speed.** Resolving a timezone cost more than every other feature combined:
+  ~75ms of a 97ms time-to-first-results.
+
+  The reason is worth remembering, because it is not the obvious one. jiff caches
+  timezones, so "only the first lookup is expensive" is true - a warm lookup is
+  ~2µs. But features are computed per file across a rayon `par_iter`, so the first
+  ranking pass after launch had ~170 threads arrive at the cold cache at the same
+  moment and queue on its initialization lock. Every one of them paid: ~4.4ms per
+  file, ~740ms of CPU, ~75ms of wall clock. Measured directly (`jiff` 0.1, macOS):
+  one thread initializing costs ~12ms, 170 threads racing to initialize costs
+  ~52ms, and once warm the same work is ~2µs per file.
+
+  **A lazily-initialized global inside a parallel per-item loop is a startup
+  cliff, not a per-call cost, and a warm benchmark will not show it.** That is the
+  transferable lesson; the timezone was just where it happened to bite.
+- **One meaning everywhere.** A calendar day needs to know *whose* day. Feature
+  generation replays historical events, and sessions are recorded in whatever
+  zone the user was in at the time (this database has sessions in five zones,
+  28% of them 9.5 hours off the most common one). "Since midnight" therefore
+  meant different spans for different training rows. A rolling window is the
+  same number in every zone.
+- **Simpler code.** Each of these features is now one call to `clicks_for_file`
+  with a window length. The window helpers and their constants live at the top of
+  `implementations.rs`.
+
+The cost of the choice: a click at 11pm still counts as "recent" at 10pm the next
+day, and stops counting 24 hours later rather than at midnight. For a relevance
+signal that is arguably better - it decays smoothly instead of falling off a cliff
+when the date rolls over.
+
+Two of these features were renamed to say what they measure: `clicks_today` is now
+`clicks_last_24h`, and `modified_today` is now `modified_last_24h`. `modified_today`
+had *always* been a 24-hour check (`hours < 24`) despite its name, so only the name
+changed there. Feature names are positional in the model, so an existing `model.txt`
+keeps working and is replaced by the next automatic retrain.
+
+Measured effect, before -> after:
+
+| | before | after |
+|---|---|---|
+| `first_query_complete` (time to first results) | 96.85ms | **12.28ms** |
+| `rank_files` | 77.02ms | 1.72ms |
+| `ml_compute_features` (171 files) | 75.23ms | 0.69ms |
+| `clicks_last_30_days`, CPU across all files | 740.90ms | 0.02ms |
+| `generate-features` over 52,620 training rows | 0.90s | 0.73s |
+
+Feature computation is no longer the expensive part of ranking - at 0.69ms it now
+costs less than the model inference it feeds (0.71ms), and the most expensive
+single feature is `file_size_bytes` at 0.25ms total, which is a `stat` syscall
+doing real work.
 
 **Query-specific features:** The `clicks_for_this_query` feature tracks clicks for specific (query, file) pairs. This distinguishes between files clicked for different search contexts - e.g., a file clicked 10 times for query "config" vs 0 times for query "test" is more relevant for "config" searches.
 Why: General click counts don't capture query-specific relevance. A frequently clicked file for one query may be irrelevant for another.
@@ -340,9 +456,9 @@ Why: LambdaRank needs episodes (groups of impressions). Each episode = impressio
 
 **Features computed:** See `feature_defs/implementations.rs` for full list. Examples:
 - Query matching: filename_starts_with_query
-- Click history: clicks_last_30_days, clicks_last_7_days, clicks_last_hour, clicks_today, clicks_for_this_query
+- Click history: clicks_last_30_days, clicks_last_7_days, clicks_last_24h, clicks_last_hour, clicks_for_this_query
 - File properties: is_hidden, is_under_cwd
-- Temporal: modified_today, modified_age
+- Temporal: modified_last_24h, modified_age
 - Directory features: clicks_last_week_parent_dir
 
 ### Module: `ranker.rs`
@@ -364,11 +480,11 @@ pub struct ClickData {
 }
 ```
 
-**Preloading clicks:** All click events from last 30 days loaded at startup into multiple HashMaps:
+**Preloading clicks:** All click and scroll events from the last 30 days are loaded at startup into multiple HashMaps:
 - `clicks_by_file`: Indexed by full file path
 - `clicks_by_parent_dir`: Indexed by parent directory path
 - `clicks_by_query_and_file`: Indexed by (query, full_path) tuple for query-specific click tracking
-- `total_clicks`: Total number of clicks across all files (used for weighting)
+- `total_clicks`: How many of those events there were, used to weight the two models
 
 Why: O(1) lookup per file vs O(n) query per file. Database query runs once with composite index. Multiple indices enable different features without re-querying the database.
 
@@ -377,24 +493,60 @@ Why: O(1) lookup per file vs O(n) query per file. Database query runs once with 
 The ranker uses a two-model hybrid system to handle cold-start scenarios (new installations or few clicks):
 
 1. **Simple Linear Model:**
-   - Formula: `3.0 * clicks_last_7_days + 1.0 / (1 + modified_age_in_days)`
-   - Prioritizes recently clicked files and recently modified files
+   - Raw score: `3.0 * clicks_last_7_days + 1.0 / (1 + modified_age_in_days) + 2.0 * fuzzy_score`
+   - Normalized to [0, 1] with a sigmoid (`k = 0.1`, midpoint at raw score 10)
+   - Prioritizes recently clicked files, recently modified files, and query matches
    - Fast to compute, works with zero training data
    - Always computed for all files
 
 2. **LightGBM Model:**
-   - Sophisticated ML model trained on full feature set
+   - Sophisticated ML model trained on full feature set, predicting in [0, 1]
    - Requires training data (model file may not exist on first run)
    - More accurate but only useful with sufficient click history
+   - If there is no model at all, ranking is 100% simple score and blending is skipped
 
-3. **Softmax Blending:**
-   - Weights computed via softmax on logits `[1.0, total_clicks / 100.0]`
-   - At 0 clicks: `w_simple ≈ 0.73, w_lightgbm ≈ 0.27`
-   - At 100 clicks: `w_simple = 0.50, w_lightgbm = 0.50` (balanced)
-   - At 1000+ clicks: `w_simple ≈ 0.0001, w_lightgbm ≈ 0.9999` (ML dominates)
-   - Final score: `w_simple * simple_score + w_lightgbm * ml_score`
+3. **Blending:**
+   - Final score: `w_simple * simple_score + w_ml * ml_score`
+   - Weights come from a tanh ramp over `total_clicks`, with `k = 15` and `l = 2`:
 
-Why hybrid approach: On new installations, the ML model either doesn't exist or has no meaningful data to learn from. The simple model provides reasonable ranking based on recency and basic click counts, then smoothly transitions to ML-based ranking as usage data accumulates.
+```rust
+let ml_weight = (1.0 + (total_clicks as f64 / k - l).tanh()) / 2.0;
+let simple_weight = 1.0 - ml_weight;
+```
+
+| `total_clicks` | w_simple | w_ml |
+|---|---|---|
+| 0 | 0.982 | 0.018 |
+| 15 | 0.881 | 0.119 |
+| 30 | 0.500 | 0.500 |
+| 45 | 0.119 | 0.881 |
+| 60 | 0.018 | 0.982 |
+
+The ramp crosses over at `k * l` = 30 events and is effectively saturated by 60, so
+the interesting range is narrow. Near the midpoint each additional event moves the
+ML weight by about `1 / (2k)` = 3.3 percentage points, so the blend can shift
+noticeably within a single session.
+
+**The weighting is a rolling 30-day window, not a lifetime total.**
+
+`total_clicks` is a count of click and scroll events from the last 30 days only
+(see `load_clicks`), recomputed at every startup. It does not accumulate over the
+life of the installation. Consequences worth remembering:
+
+- A month of light use pushes the blend back toward the simple model, even on an
+  installation that has been used for years and has a well-trained model. The
+  model file is unaffected; only its weight drops.
+- Heavy use of one project does not carry over as "trust" once that month passes.
+- Scrolls count the same as clicks here, so scrolling through results raises the
+  ML weight even when nothing is opened.
+
+Why blend this way: on a new installation the ML model either doesn't exist or has
+nothing meaningful to learn from, so the simple model provides reasonable ranking
+from recency and click counts. The tanh ramp hands over to the ML model once there
+is recent evidence that it was trained on real usage. Tying that to a rolling window
+rather than a lifetime counter means a model trained on stale behaviour loses
+influence on its own, instead of being trusted forever on the strength of clicks
+from a year ago.
 
 **Ranking:**
 ```rust
@@ -429,6 +581,17 @@ Why: LightGBM Booster contains raw pointers (not Send by default). Safe because 
 
 Trains LightGBM LambdaRank model from features CSV.
 
+**PEP 723 inline metadata:** the script declares its own `requires-python` and
+dependencies in a `# /// script` block, so `uv run train.py` builds an isolated
+environment on any machine with uv - no virtualenv, and no dependence on this
+repository's `pyproject.toml`. That matters because psychic embeds this file,
+writes it into the data directory, and runs it from whatever directory the user
+launched from, which may be an unrelated project with its own `pyproject.toml`;
+inline metadata takes precedence over a surrounding project. Every directly
+imported module is listed, including ones that would otherwise arrive
+transitively (numpy), so an upstream resolver change cannot break it. Verified
+from a cold uv cache: ~10s to resolve, install and run.
+
 `cargo install --path .` users don't need to copy ancillary files manually—the `psychic` binary embeds `train.py` and writes it into the data directory on demand (default `~/.local/share/psychic/train.py`) whenever training runs, overwriting stale copies if the script changed.
 
 **Key parameters:**
@@ -449,6 +612,25 @@ python train.py features.csv output
 **Schema integration:** Reads `feature_schema.json` to get feature names and types. Errors if missing.
 Why: Ensures Rust and Python agree on feature order.
 
+**Atomic output:** `model.txt` and `model_stats.json` are written to a temp file in
+the same directory and then `os.replace`d over the target. Retraining runs in a
+background thread while the TUI is live, and the worker reloads the model on its
+own schedule, so a plain write exposed a window where a reader saw a truncated or
+empty file. `os.replace` is atomic on POSIX within a filesystem, so a reader gets
+either the whole old file or the whole new one. (The temp file's permissions are
+reset from `mkstemp`'s 0600 to what a normal write would produce.)
+
+`save_model` also used to write the model twice: once to `<output_prefix>.txt` and
+again to a hardcoded `~/.local/share/psychic/model.txt`. In the default case that
+was the same path written twice, doubling the window in which it was truncated; with
+`--data-dir` it silently wrote to the user's real data directory instead of the one
+requested. It now writes once, to the directory it was told to use.
+
+**Loading is fault-tolerant:** `load_ranker` falls back to the simple model if
+`model.txt` is missing *or* unreadable, rather than propagating the error. An
+unusable model must not stop psychic from starting - ranking degrades to what a
+fresh install runs on, and the retrain launched at startup replaces the bad file.
+
 **Visualizations:** Training curves, feature importance, SHAP analysis, score distributions, rank position analysis.
 
 ### Module: `ui_state.rs`
@@ -461,6 +643,9 @@ pub struct UiState {
     pub history_mode: bool,
     pub filter_picker_visible: bool,
     pub debug_pane_mode: DebugPaneMode,  // Hidden, Small, or Expanded
+    pub help_visible: bool,
+    pub help_scroll: u16,       // First visible line of the help screen
+    pub help_scroll_max: u16,   // Measured by the renderer, clamps help_scroll
 }
 ```
 
@@ -468,8 +653,13 @@ pub struct UiState {
 - `toggle_history_mode()`, `enter_history_mode()`, `exit_history_mode()`
 - `toggle_filter_picker()`, `hide_filter_picker()`
 - `cycle_debug_pane_mode()` - cycles through Hidden → Small → Expanded → Hidden
+- `toggle_help()`, `hide_help()`, `scroll_help(delta)` - help always reopens at the top
 - `get_eza_flags(width)` - returns compact flags for narrow screens (<80 cols)
 - `is_debug_pane_visible()`, `is_debug_pane_expanded()`
+
+Why `help_scroll_max` lives here: only the renderer knows how much of the help
+screen overflowed, so it measures during the draw and writes the limit back.
+Scrolling is then clamped without the state machine knowing about terminals.
 
 Why separate module: Testable pure functions. State transitions are tested with expect tests (no IO).
 Why DebugPaneMode enum: Prevents invalid states, makes cycling logic explicit.
@@ -542,7 +732,6 @@ pub fn handle_input(
 ```
 
 **Complex implementation:**
-- Keyboard shortcuts (Ctrl-C, Ctrl-H, Ctrl-J, Ctrl-U, Ctrl-O, Ctrl-F, etc.)
 - Mouse scrolling (wheel events)
 - Text input for search query
 - Directory navigation (Enter on files/dirs)
@@ -551,6 +740,81 @@ pub fn handle_input(
 - Input control channel management (pausing/resuming crossterm thread)
 
 **Why this module:** Hides all terminal management complexity. Main event loop just calls handle_input() and gets back a simple action to take.
+
+**What it does not decide:** which key does what. `handle_input` resolves the
+event to a `keymap::Action` and then dispatches on that action, so this module
+says what each action *does*, never which key triggers it. The dispatch `match`
+is exhaustive over `Action`, so a new binding cannot compile until it is handled.
+
+### Module: `keymap.rs`
+
+The single source of truth for input, in the same spirit as `feature_defs/registry.rs`.
+
+```rust
+pub static KEYMAP: &[Binding] = &[
+    Binding::new(
+        Action::ClearQuery,
+        &[ctrl('u')],
+        Context::Global,
+        Section::Search,
+        "clear the query",   // the help text the user reads
+    ),
+    // ...
+];
+
+pub fn lookup(code: KeyCode, modifiers: KeyModifiers, context: Context) -> Option<Action>
+pub fn lookup_mouse(kind: MouseEventKind) -> Option<Action>
+```
+
+**Why a registry:** a keybinding used to be a match arm in `input.rs` and a line
+of prose in the README, which drifted. Now the key, the behaviour and the help
+text are one row, and a binding that is not documented cannot be expressed:
+
+- `Binding::new` is the only constructor and asserts the description and trigger
+  list are non-empty. `KEYMAP` is a `static`, so those asserts are evaluated at
+  compile time - an undocumented binding fails the build.
+- `input.rs` never inspects a raw key, so behaviour cannot be attached to a key
+  without a row here.
+- The dispatch `match` is exhaustive over `Action`; `test_every_action_is_bound`
+  checks the other direction.
+- Every row names a `Section`, and the help screen renders all of `Section::ALL`.
+
+**Lookup order:** bindings in the active `Context` win over `Global` ones, and
+explicit chords win over the `AnyChar` catch-all. That lets the filter picker
+claim plain letters (`0 c i d f`) without swallowing `Ctrl-C`, and lets every
+other letter fall through into the search query.
+
+**Modifier matching:** ctrl and alt must match exactly; shift is ignored, because
+crossterm already reports it in the character itself (and as `BackTab`).
+
+**Key names are derived:** `Ctrl-J`, `Alt-Up`, `Shift-Tab` and `Wheel up` are
+generated from the triggers, so rebinding a key rewrites the help screen and the
+on-screen hint. Declaration order is preference order: `primary_trigger()` takes
+the first one, which is why `Ctrl-G` is advertised for help rather than `F1`
+(on macOS F1 is a brightness key unless the user has changed that setting).
+
+### Module: `help.rs`
+
+The help screen, opened with `Ctrl-G` (or `F1`) and advertised in the bottom
+right of the search box on every frame.
+
+It owns no content. It assembles what is already declared elsewhere:
+
+- keyboard and mouse bindings from `keymap::KEYMAP`
+- command line subcommands from the clap definition in `cli.rs`
+- shell functions (`p`, `pd`, `pc`) parsed out of the embedded `shell/psychic.zsh`,
+  taking each function's description from the comment above it
+
+**Layout:** `lay_out(&blocks, available_width)` returns equal-width columns:
+two when both would still be readable, otherwise one, never wider than the space
+given. Descriptions are truncated to the column (on a word boundary where that
+does not cost most of the line), so one long doc comment cannot stretch the
+screen. Everything is pure and tested without a terminal; `render.rs` styles the
+lines and handles scrolling for terminals too short to show it all.
+
+**Dismissal:** the help screen is a cheat sheet, not a mode. Up/Down scroll it,
+Ctrl-C/Ctrl-D still quit, and any other key closes it - so no keypress acts on
+the UI hidden behind it.
 
 ### Module: `render.rs`
 
@@ -657,6 +921,41 @@ Now a clean ~600-line event loop and application glue (down from 2000+ lines bef
 ```
 Why adaptive layout: Narrow terminals benefit from vertical stacking (file list + preview stacked) for better readability. Debug pane is automatically hidden in narrow mode to save space.
 
+**Debug pane contents:** selection scores and the full feature vector, then:
+
+- **Latency.** Five numbers: `first paint`, `first results` and `fs walk` are
+  measured once from process start; `this search` and `of it, rank` are replaced
+  on every query.
+
+  **These are the same measurements the TIMING log lines carry**, not a parallel
+  implementation. Each value is computed once and then both logged and displayed:
+  `first paint` and `first results` in the main loop, `fs walk` by the worker and
+  shipped back on `WalkerDone`, `of it, rank` by the worker as
+  `filter_and_rank_total` and shipped back on `QueryUpdated`. The two the worker
+  measures are passed through the response rather than re-measured on arrival,
+  which would have made the pane read a channel hop slower than the log. Every
+  latency in psychic - pane, log and `internal analyze-perf` - starts from the
+  single `PROCESS_START` instant in `main.rs`.
+
+  Two differences remain between the pane and `analyze-perf`, both by design:
+  `analyze-perf` stops reading at `startup_complete`, so the `filter_and_rank_total`
+  it prints is the one from startup while the pane's `of it, rank` is the most
+  recent query; and `query_round_trip` ("this search") happens after startup, so it
+  reaches the log but never the `analyze-perf` output. The last two are the interesting pair - `this search` is the
+  round trip the user actually feels (request sent to results in hand), and
+  `of it, rank` is the worker's share of that, so the gap between them is channel
+  hop and scheduling. Times are captured in `App::next_query_id` /
+  `App::note_query_completed`; every path that sends work to the worker takes its
+  query id from `next_query_id`, which is what keeps "this search" honest whether
+  the user typed, changed directory, or switched filters. The worker reports its
+  own `rank_ms` in `QueryUpdated` rather than the UI guessing.
+- **Database contents.** Event counts by action, sessions, file size, and how many
+  days of history that represents. Counting rows is a covering-index scan
+  proportional to total events, so it is loaded **lazily**: the first time the pane
+  is opened, on a background thread, arriving as `AppEvent::DbStats`. A launch that
+  never opens the pane never pays for it. Until it arrives the pane shows
+  "counting...".
+
 **Debug pane modes (wide terminals only):** Ctrl-O cycles through three states:
 - Hidden (default): No debug pane visible
 - Small: Debug pane at 20% width
@@ -691,6 +990,11 @@ struct App {
 
     // Worker communication
     worker_tx: mpsc::Sender<WorkerRequest>,
+
+    // Debug pane
+    timings: Timings,                  // Latencies shown in the pane
+    db_stats: Option<db::DbStats>,     // Loaded on first open, in the background
+    query_sent_at: Option<(u64, Instant)>,  // Times the round trip of the live query
 
     // ... (other fields)
 }
@@ -742,7 +1046,7 @@ loop {
         AppEvent::Input(event) => { /* handle keyboard/mouse */ }
         AppEvent::Tick => { /* trigger animation redraw */ }
         AppEvent::Retrain(status) => { /* update retraining status */ }
-        AppEvent::Log(msg) => { /* add to recent logs */ }
+        AppEvent::DbStats(stats) => { /* fill in the debug pane's database counts */ }
     }
 }
 ```
@@ -754,7 +1058,8 @@ loop {
 - All event sources wake main thread immediately via unified channel
 - Draw happens after each event to ensure UI stays responsive
 
-**Keyboard:**
+**Keyboard:** (declared in `keymap.rs`, which is also what the help screen shows)
+- Ctrl-G or F1 → show the help screen listing every binding and command
 - Type → send UpdateQuery to worker
 - Up/Down → move selection, request new visible slice if needed
 - Ctrl-P/Ctrl-N → move selection up/down (same as Up/Down)

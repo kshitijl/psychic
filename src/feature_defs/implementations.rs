@@ -1,9 +1,75 @@
+use super::ClickEvent;
 use super::schema::{Feature, FeatureInputs, FeatureType, Monotonicity};
 use anyhow::Result;
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
-use jiff::{Span, Timestamp};
+use jiff::Span;
 use std::path::Path;
+
+// ============================================================================
+// Time windows
+// ============================================================================
+//
+// Every window here is a plain rolling window counted backwards from the moment
+// being scored: "the last 24 hours", never "since midnight". Nothing in this
+// file is timezone aware, and that is deliberate - see "Time windows are
+// rolling, not calendar days" in how-it-works.md.
+//
+// The short version: a calendar day needs a timezone, and resolving one cost
+// more than every other feature combined (~50ms on the first ranking pass,
+// because 170 files hit a cold timezone cache in parallel). A rolling window
+// needs one subtraction, means the same thing in every timezone, and cannot
+// disagree with itself when a past session ran somewhere else.
+//
+// Consequence worth knowing: clicks from 11pm still count as "last 24 hours" at
+// 10pm the next day, and stop counting at midnight-plus-23-hours rather than at
+// midnight. For a relevance signal that is fine, arguably better - it degrades
+// smoothly instead of falling off a cliff when the date rolls over.
+
+const SECONDS_PER_HOUR: i64 = 60 * 60;
+const SECONDS_PER_DAY: i64 = 24 * SECONDS_PER_HOUR;
+
+/// Count events falling in `(now - window_seconds, now]`.
+fn count_in_window(events: Option<&Vec<ClickEvent>>, now: i64, window_seconds: i64) -> f64 {
+    assert!(
+        window_seconds > 0,
+        "A time window must be positive, got {}",
+        window_seconds
+    );
+
+    let cutoff = now - window_seconds;
+    events
+        .map(|events| {
+            events
+                .iter()
+                .filter(|event| event.timestamp >= cutoff && event.timestamp <= now)
+                .count()
+        })
+        .unwrap_or(0) as f64
+}
+
+/// Engagements with this exact file in the last `window_seconds`.
+fn clicks_for_file(inputs: &FeatureInputs, window_seconds: i64) -> f64 {
+    let full_path = inputs.full_path.to_string_lossy();
+    count_in_window(
+        inputs.clicks_by_file.get(full_path.as_ref()),
+        inputs.current_timestamp,
+        window_seconds,
+    )
+}
+
+/// Engagements with anything in this file's parent directory, same window.
+fn clicks_for_parent_dir(inputs: &FeatureInputs, window_seconds: i64) -> f64 {
+    let Some(parent_dir) = inputs.full_path.parent() else {
+        return 0.0;
+    };
+
+    count_in_window(
+        inputs.clicks_by_parent_dir.get(parent_dir),
+        inputs.current_timestamp,
+        window_seconds,
+    )
+}
 
 // ============================================================================
 // Feature: filename_starts_with_query
@@ -56,45 +122,19 @@ impl Feature for ClicksLast30Days {
     }
 
     fn compute(&self, inputs: &FeatureInputs) -> Result<f64> {
-        // Calculate 30 days ago timestamp
-        let now_ts = Timestamp::from_second(inputs.current_timestamp)?;
-        let session_tz = if let Some(session) = inputs.session {
-            jiff::tz::TimeZone::get(&session.timezone).unwrap_or(jiff::tz::TimeZone::system())
-        } else {
-            jiff::tz::TimeZone::system()
-        };
-        let now_zoned = now_ts.to_zoned(session_tz);
-        let thirty_days_ago = now_zoned.checked_sub(Span::new().days(30))?.timestamp();
-
-        // Count clicks in the time window
-        let full_path_str = inputs.full_path.to_string_lossy().to_string();
-        let clicks = inputs
-            .clicks_by_file
-            .get(&full_path_str)
-            .map(|clicks| {
-                clicks
-                    .iter()
-                    .filter(|c| {
-                        c.timestamp >= thirty_days_ago.as_second()
-                            && c.timestamp <= inputs.current_timestamp
-                    })
-                    .count()
-            })
-            .unwrap_or(0);
-
-        Ok(clicks as f64)
+        Ok(clicks_for_file(inputs, 30 * SECONDS_PER_DAY))
     }
 }
 
 // ============================================================================
-// Feature: modified_today
+// Feature: modified_last_24h
 // ============================================================================
 
-pub struct ModifiedToday;
+pub struct ModifiedLast24h;
 
-impl Feature for ModifiedToday {
+impl Feature for ModifiedLast24h {
     fn name(&self) -> &'static str {
-        "modified_today"
+        "modified_last_24h"
     }
 
     fn feature_type(&self) -> FeatureType {
@@ -102,13 +142,12 @@ impl Feature for ModifiedToday {
     }
 
     fn compute(&self, inputs: &FeatureInputs) -> Result<f64> {
-        if let Some(mtime) = inputs.mtime {
-            let seconds_since_mod = inputs.current_timestamp - mtime;
-            let hours = seconds_since_mod / 3600;
-            Ok(if hours < 24 { 1.0 } else { 0.0 })
-        } else {
-            Ok(0.0)
-        }
+        let Some(mtime) = inputs.mtime else {
+            return Ok(0.0);
+        };
+
+        let modified_within_a_day = inputs.current_timestamp - mtime < SECONDS_PER_DAY;
+        Ok(if modified_within_a_day { 1.0 } else { 0.0 })
     }
 }
 
@@ -212,40 +251,7 @@ impl Feature for ClicksLastWeekParentDir {
     }
 
     fn compute(&self, inputs: &FeatureInputs) -> Result<f64> {
-        // Calculate 7 days ago timestamp
-        let now_ts = Timestamp::from_second(inputs.current_timestamp)?;
-        let session_tz = if let Some(session) = inputs.session {
-            jiff::tz::TimeZone::get(&session.timezone).unwrap_or(jiff::tz::TimeZone::system())
-        } else {
-            jiff::tz::TimeZone::system()
-        };
-        let now_zoned = now_ts.to_zoned(session_tz);
-        let seven_days_ago = now_zoned.checked_sub(Span::new().days(7))?.timestamp();
-
-        // Get parent directory of the current file
-        let parent_dir = inputs.full_path.parent();
-
-        if parent_dir.is_none() {
-            return Ok(0.0);
-        }
-        let parent_dir = parent_dir.unwrap();
-
-        // Look up clicks in parent directory from precomputed index
-        let clicks = inputs
-            .clicks_by_parent_dir
-            .get(parent_dir)
-            .map(|clicks| {
-                clicks
-                    .iter()
-                    .filter(|c| {
-                        c.timestamp >= seven_days_ago.as_second()
-                            && c.timestamp <= inputs.current_timestamp
-                    })
-                    .count()
-            })
-            .unwrap_or(0);
-
-        Ok(clicks as f64)
+        Ok(clicks_for_parent_dir(inputs, 7 * SECONDS_PER_DAY))
     }
 }
 
@@ -269,42 +275,19 @@ impl Feature for ClicksLastHour {
     }
 
     fn compute(&self, inputs: &FeatureInputs) -> Result<f64> {
-        let now_ts = Timestamp::from_second(inputs.current_timestamp)?;
-        let session_tz = if let Some(session) = inputs.session {
-            jiff::tz::TimeZone::get(&session.timezone).unwrap_or(jiff::tz::TimeZone::system())
-        } else {
-            jiff::tz::TimeZone::system()
-        };
-        let now_zoned = now_ts.to_zoned(session_tz);
-        let one_hour_ago = now_zoned.checked_sub(Span::new().hours(1))?.timestamp();
-
-        let full_path_str = inputs.full_path.to_string_lossy().to_string();
-        let clicks = inputs
-            .clicks_by_file
-            .get(&full_path_str)
-            .map(|clicks| {
-                clicks
-                    .iter()
-                    .filter(|c| {
-                        c.timestamp >= one_hour_ago.as_second()
-                            && c.timestamp <= inputs.current_timestamp
-                    })
-                    .count()
-            })
-            .unwrap_or(0);
-        Ok(clicks as f64)
+        Ok(clicks_for_file(inputs, SECONDS_PER_HOUR))
     }
 }
 
 // ============================================================================
-// Feature: clicks_today
+// Feature: clicks_last_24h
 // ============================================================================
 
-pub struct ClicksToday;
+pub struct ClicksLast24h;
 
-impl Feature for ClicksToday {
+impl Feature for ClicksLast24h {
     fn name(&self) -> &'static str {
-        "clicks_today"
+        "clicks_last_24h"
     }
 
     fn feature_type(&self) -> FeatureType {
@@ -316,29 +299,7 @@ impl Feature for ClicksToday {
     }
 
     fn compute(&self, inputs: &FeatureInputs) -> Result<f64> {
-        let now_ts = Timestamp::from_second(inputs.current_timestamp)?;
-        let session_tz = if let Some(session) = inputs.session {
-            jiff::tz::TimeZone::get(&session.timezone).unwrap_or(jiff::tz::TimeZone::system())
-        } else {
-            jiff::tz::TimeZone::system()
-        };
-        let start_of_day = now_ts.to_zoned(session_tz).start_of_day()?.timestamp();
-
-        let full_path_str = inputs.full_path.to_string_lossy().to_string();
-        let clicks = inputs
-            .clicks_by_file
-            .get(&full_path_str)
-            .map(|clicks| {
-                clicks
-                    .iter()
-                    .filter(|c| {
-                        c.timestamp >= start_of_day.as_second()
-                            && c.timestamp <= inputs.current_timestamp
-                    })
-                    .count()
-            })
-            .unwrap_or(0);
-        Ok(clicks as f64)
+        Ok(clicks_for_file(inputs, SECONDS_PER_DAY))
     }
 }
 
@@ -362,30 +323,7 @@ impl Feature for ClicksLast7Days {
     }
 
     fn compute(&self, inputs: &FeatureInputs) -> Result<f64> {
-        let now_ts = Timestamp::from_second(inputs.current_timestamp)?;
-        let session_tz = if let Some(session) = inputs.session {
-            jiff::tz::TimeZone::get(&session.timezone).unwrap_or(jiff::tz::TimeZone::system())
-        } else {
-            jiff::tz::TimeZone::system()
-        };
-        let now_zoned = now_ts.to_zoned(session_tz);
-        let seven_days_ago = now_zoned.checked_sub(Span::new().days(7))?.timestamp();
-
-        let full_path_str = inputs.full_path.to_string_lossy().to_string();
-        let clicks = inputs
-            .clicks_by_file
-            .get(&full_path_str)
-            .map(|clicks| {
-                clicks
-                    .iter()
-                    .filter(|c| {
-                        c.timestamp >= seven_days_ago.as_second()
-                            && c.timestamp <= inputs.current_timestamp
-                    })
-                    .count()
-            })
-            .unwrap_or(0);
-        Ok(clicks as f64)
+        Ok(clicks_for_file(inputs, 7 * SECONDS_PER_DAY))
     }
 }
 
@@ -537,5 +475,87 @@ impl Feature for FuzzyScore {
             .unwrap_or(0); // Return 0 if no match
 
         Ok(score as f64)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NOW: i64 = 1_700_086_400;
+
+    fn events(offsets_in_seconds: &[i64]) -> Vec<ClickEvent> {
+        offsets_in_seconds
+            .iter()
+            .map(|offset| ClickEvent {
+                timestamp: NOW - offset,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_counts_only_events_inside_the_window() {
+        let events = events(&[
+            60,          // a minute ago
+            2 * 3600,    // 2 hours ago
+            36 * 3600,   // a day and a half ago
+            40 * 86_400, // well outside every window
+        ]);
+
+        assert_eq!(count_in_window(Some(&events), NOW, SECONDS_PER_HOUR), 1.0);
+        assert_eq!(count_in_window(Some(&events), NOW, SECONDS_PER_DAY), 2.0);
+        assert_eq!(
+            count_in_window(Some(&events), NOW, 7 * SECONDS_PER_DAY),
+            3.0
+        );
+        assert_eq!(
+            count_in_window(Some(&events), NOW, 30 * SECONDS_PER_DAY),
+            3.0,
+            "The 40-day-old event is outside even the widest window"
+        );
+    }
+
+    #[test]
+    fn test_window_boundary_is_inclusive() {
+        // An event exactly one window old counts; one second older does not.
+        let on_the_boundary = events(&[SECONDS_PER_DAY]);
+        let just_past_it = events(&[SECONDS_PER_DAY + 1]);
+
+        assert_eq!(
+            count_in_window(Some(&on_the_boundary), NOW, SECONDS_PER_DAY),
+            1.0
+        );
+        assert_eq!(
+            count_in_window(Some(&just_past_it), NOW, SECONDS_PER_DAY),
+            0.0
+        );
+    }
+
+    #[test]
+    fn test_future_events_do_not_count() {
+        // Clock skew, or feature generation replaying an impression from before a
+        // later click: neither should count toward the window.
+        let ahead_of_now = events(&[-60]);
+        assert_eq!(
+            count_in_window(Some(&ahead_of_now), NOW, SECONDS_PER_DAY),
+            0.0
+        );
+    }
+
+    #[test]
+    fn test_no_events_for_this_file() {
+        assert_eq!(count_in_window(None, NOW, SECONDS_PER_DAY), 0.0);
+        assert_eq!(
+            count_in_window(Some(&Vec::new()), NOW, SECONDS_PER_DAY),
+            0.0
+        );
+    }
+
+    #[test]
+    fn test_windows_are_the_lengths_they_claim() {
+        assert_eq!(SECONDS_PER_HOUR, 3_600);
+        assert_eq!(SECONDS_PER_DAY, 86_400);
+        assert_eq!(7 * SECONDS_PER_DAY, 604_800);
+        assert_eq!(30 * SECONDS_PER_DAY, 2_592_000);
     }
 }

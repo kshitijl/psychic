@@ -18,8 +18,9 @@ pub enum Commands {
         #[arg(short, long, value_enum, default_value = "csv")]
         format: OutputFormat,
     },
-    /// Retrain the ranking model using collected events. This does everything,
-    /// including feature gen.
+    /// Retrain the ranking model using collected events
+    ///
+    /// This does everything, including feature generation.
     Retrain,
     /// Output shell integration script for zsh
     Zsh,
