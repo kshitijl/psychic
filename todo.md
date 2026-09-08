@@ -255,16 +255,32 @@ Filter+rank is ~2ms per keystroke and is not the problem.
 
 #### Performance
 
-- **P1. Shallow-mode restart throws away ~8000 stats.** `walker.rs`
-  descends, buffers every entry in a Vec (so it never streams, contrary to
-  the docs), hits `SHALLOW_MODE_THRESHOLD`, discards everything, and
-  re-walks `max_depth(1)`. That is the 70-150ms in every home-directory
-  session. Fix: walk `max_depth(1)` first and send it immediately, then walk
-  `min_depth(2)` and abort past the threshold. The worker needs one new
-  message, e.g. `WalkerMessage::DropDeeperThanRoot`, to retain only entries
-  whose parent is the root when the deep pass aborts. Removes the buffer,
-  the restart, the duplicated command-check loop, and the unreachable
-  `MAX_FILES` guard in deep mode.
+- **P1. Two-phase walk.** DONE (2026-09-09). The walker now sends the root's
+  own children first (one readdir, `min_depth(1).max_depth(1)`) followed by a
+  new `WalkerMessage::ChildrenDone`, then collects everything deeper
+  (`min_depth(2)`) and hands it over only if it comes in under the threshold.
+  Past the threshold the deep pass is abandoned and the children stand alone,
+  so a tree too big to index costs one walk instead of two and shows its
+  children immediately instead of after both walks. `ChildrenDone` bypasses
+  the worker's 200ms debounce the way `AllDone` does, without which publishing
+  early would have bought nothing.
+  Measured, launch to the file list appearing, median of 5: in `~` 80.9ms ->
+  13.3ms; in this repo 13.7ms -> 12.3ms (small tree, never hit the threshold,
+  so nothing to win). `walker_complete` itself barely moves (65-69ms either
+  way): the depth-1 re-walk that was removed was always the cheap half.
+  Two bugs fixed on the way, both found while rewriting:
+  * An interrupted walk `try_recv`d the `ChangeCwd` that interrupted it and
+    dropped it, then the outer loop blocked on `recv` for a command already
+    delivered - so navigating during a long walk never walked the new
+    directory. `walk_directory` now returns the command that stopped it.
+  * `filter_entry` was applied to the root, so launching inside a directory
+    called `target` (or `.git`, `node_modules`, `.venv`) showed an empty
+    screen. Depth 0 is now exempt.
+  Follow-up if a large-but-under-threshold project ever feels slow: stream the
+  deep pass too, in batches, and add a message telling the worker to drop
+  everything below depth 1 when the threshold is hit. Not done because it
+  would make results appear and then vanish in exactly the `~` case this was
+  about.
 - **P2. `bat`/`eza` run inside `terminal.draw` on the UI thread.**
   `render.rs::render_normal_mode` calls `PreviewManager::render`, which
   spawns bat (12-16ms). Holding Down spawns one per row. History mode
@@ -496,7 +512,8 @@ Filter+rank is ~2ms per keystroke and is not the problem.
   `suspend_tui_and_run_shell` are identical except the Command;
   `cleanup_terminal` is a third copy of the teardown. One
   `with_tui_suspended(app, terminal, |..| Command)`.
-- **S6. Walker cleanup** falls out of P1.
+- **S6. Walker cleanup.** DONE with P1: the buffer, the restart, the duplicated
+  command-check loop and the unreachable deep-mode `MAX_FILES` guard are gone.
 - **S7. `context.rs`** runs five `sh -c` pipelines per launch; nothing reads
   any of it. Keep `cwd`, delete the rest (see P8).
 - **S8. `check_and_log_impressions`** builds the 25-row Vec on every event

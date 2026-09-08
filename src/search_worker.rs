@@ -38,6 +38,12 @@ pub enum WalkerCommand {
 #[derive(Debug, Clone)]
 pub enum WalkerMessage {
     FileMetadata(WalkerFileMetadata),
+    /// Every direct child of the root has been sent.
+    ///
+    /// Published straight away rather than on the next debounce tick: these are
+    /// what the user is looking at, they arrive within a few milliseconds, and
+    /// for a directory with little under it they are the entire answer.
+    ChildrenDone,
     AllDone,
 }
 
@@ -914,7 +920,9 @@ fn worker_thread_loop<T>(
     loop {
         // Process walker updates (non-blocking)
         let mut files_changed = false;
-        let mut walker_done = false;
+        // Set by the milestones worth showing at once, rather than whenever the
+        // debounce below next comes round.
+        let mut publish_now = false;
         while let Ok(message) = walker_rx.try_recv() {
             match message {
                 WalkerMessage::FileMetadata(metadata) => {
@@ -927,14 +935,18 @@ fn worker_thread_loop<T>(
                     );
                     files_changed = true;
                 }
+                WalkerMessage::ChildrenDone => {
+                    files_changed = true;
+                    publish_now = true;
+                }
                 WalkerMessage::AllDone => {
                     // Measured from process start, not from when this loop began,
                     // so it lines up with first_render / first_query_complete /
                     // startup_complete and with the debug pane.
                     let walk_ms = crate::PROCESS_START.elapsed().as_secs_f64() * 1000.0;
                     log::info!("TIMING {{\"op\":\"walker_complete\",\"ms\":{}}}", walk_ms);
-                    walker_done = true;
                     files_changed = true;
+                    publish_now = true;
                     // Notify UI that walker is done
                     let _ = event_tx.send(WorkerResponse::WalkerDone { walk_ms }.into());
                 }
@@ -942,9 +954,10 @@ fn worker_thread_loop<T>(
         }
 
         // If files changed, notify the UI so it can decide to trigger a refresh.
-        // We debounce this to avoid spamming the UI thread, UNLESS the walker is done.
+        // Debounced to avoid spamming the UI thread, unless this is one of the
+        // milestones that should reach the screen the moment it happens.
         if files_changed
-            && (walker_done
+            && (publish_now
                 || last_files_changed_notification.elapsed() > Duration::from_millis(200))
         {
             let _ = event_tx.send(WorkerResponse::FilesChanged.into());

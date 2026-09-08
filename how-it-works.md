@@ -267,39 +267,74 @@ Why: Files can be modified between discovery and impression. Event-time metadata
 
 ### Module: `walker.rs`
 
-Background thread that recursively walks current directory using `walkdir`.
+Background thread that walks the current directory with `walkdir`, in two passes.
+
+**Two passes, because the two halves of a tree are worth very different amounts.**
+
+1. **The root's own children** (`min_depth(1).max_depth(1)`). One `readdir`, and
+   it is exactly what the user is looking at, so it is sent immediately and
+   followed by `ChildrenDone`.
+2. **Everything below them** (`min_depth(2)`). This is the pass that can be
+   enormous, so it is collected rather than sent, and only handed over if it
+   finishes under `SHALLOW_MODE_THRESHOLD` (8,000). Past that the tree is
+   declared too big to index and pass one stands alone.
+
+Why it matters: the registry is filtered and ranked on every keystroke, so an
+unbounded walk of `~` would make every search slow, not just the walk. The cap is
+about steady-state cost, not about the walk itself.
+
+This used to be a single full-depth walk that buffered everything and, on passing
+the threshold, threw all of it away and started again at `max_depth(1)`. So the
+common case of launching in `~` paid for two walks and showed *nothing* until
+both had finished. Now the expensive pass is the one that gets abandoned, and
+abandoning it costs nothing that was already on screen. Measured on this machine,
+time from launch to the file list appearing, in `~`:
+
+| | before | after |
+|---|---|---|
+| median of 5 runs | 80.9ms | 13.3ms |
+
+A small tree is unchanged (13.7ms to 12.3ms in this repository): it never hit the
+threshold, so it never paid for the restart.
 
 **Key points:**
-- Streams results via mpsc channel using `WalkerMessage` enum
-- Filters: `.git`, `node_modules`, `.venv`, `target`, plus any directory the user has
-  hidden that applies to the current root (see "Hiding directories")
+- Streams the root's children immediately; holds everything deeper until the walk
+  is known to be small enough to keep
+- Filters: `.git`, `node_modules`, `.venv`, `target`, plus any directory the user
+  has hidden that applies to the current root (see "Hiding directories")
+- The root itself is exempt from that name filter, so launching inside a
+  directory called `target` shows its contents instead of an empty screen
 - Sends both files and directories (with `is_dir` flag)
 - Extracts mtime, atime, and file_size from walkdir's cached metadata
-- Adaptive depth: switches to depth=1 if >8k items found (shallow mode)
-- Sends `AllDone` message when walk completes
-- Supports dynamic directory changes via `ChangeCwd` command
-- Checks for commands every 100 files (COMMAND_CHECK_INTERVAL)
-
-**Shallow mode:** If walker encounters more than 8,000 items during full-depth exploration, it aborts and restarts with `max_depth(1)` to only show first-level items. This prevents performance issues in large directory trees like `~/`.
-
-**Command support:** Walker can receive `ChangeCwd` commands to restart walking in a new directory. It checks for commands periodically (every 100 files) during walks to remain responsive to navigation requests.
+- Sends `AllDone` when a walk runs to the end
+- Checks for commands every 100 entries (COMMAND_CHECK_INTERVAL)
 
 **WalkerMessage enum:**
 ```rust
 pub enum WalkerMessage {
     FileMetadata(WalkerFileMetadata),
+    ChildrenDone,
     AllDone,
 }
 ```
 
-The `AllDone` message bypasses the worker's 200ms debounce to ensure the UI updates immediately when the walk completes, even if it finishes quickly.
+`ChildrenDone` and `AllDone` both bypass the worker's 200ms debounce, so the two
+moments worth showing reach the screen as soon as they happen rather than on the
+next tick of the debounce. Without that bypass, publishing the children early
+would have bought nothing: they would have sat in the worker for up to 200ms.
 
-Why background thread: Large directories take seconds to scan. Streaming keeps UI responsive.
-Why send metadata: Avoids re-fetching later (performance).
-Why AllDone: Ensures UI updates even when walker completes in <200ms (debounce bypass).
-Why periodic command checks: Allows aborting long walks when user navigates to different directory.
+**Command support:** the walker takes `ChangeCwd` commands, and checks for one
+every 100 entries so a walk of somewhere enormous can be abandoned when the user
+moves on. An interrupted walk *returns* the command that interrupted it, and does
+not send `AllDone`. That return is load-bearing: the interrupt used to `try_recv`
+the command and drop it, after which the blocking `recv` at the top of the loop
+waited for a command that had already been delivered - so navigating during a
+long walk meant the directory you navigated to was never walked at all.
 
-### Module: `context.rs`
+Why background thread: large directories take seconds to scan.
+Why send metadata: avoids re-fetching it later.
+
+### Module: `context.rs`### Module: `context.rs`
 
 Gathers system context at startup in background thread:
 - `cwd` - Current working directory
