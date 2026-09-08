@@ -126,6 +126,21 @@ impl Database {
             [],
         )?;
 
+        // Directories the user never wants to see in results again.
+        //
+        // Its own table, not an `events` row: this is mutable, undoable state,
+        // and hiding is deliberately not a training signal. It suppresses rows
+        // at display time and nothing else - the events under a hidden
+        // directory stay exactly as they are, and the model never learns from
+        // the fact that it was hidden.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS hidden_prefixes (
+                path TEXT PRIMARY KEY,
+                created_at INTEGER NOT NULL
+            )",
+            [],
+        )?;
+
         // This index is for click count queries. We might want to do those in Rust
         // code at some point, but this is convenient for now.
         // The clause: WHERE action = 'click' AND timestamp >= ? GROUP BY full_path
@@ -225,6 +240,48 @@ impl Database {
         }
 
         Ok(())
+    }
+
+    /// Stop showing `path` and everything under it in search results.
+    ///
+    /// Idempotent: hiding an already-hidden directory keeps the original
+    /// `created_at`, so the record says when the user first decided this.
+    pub fn hide_prefix(&self, path: &Path) -> Result<()> {
+        let timestamp = jiff::Timestamp::now().as_second();
+        self.conn.execute(
+            "INSERT OR IGNORE INTO hidden_prefixes (path, created_at) VALUES (?1, ?2)",
+            params![path.to_string_lossy(), timestamp],
+        )?;
+        Ok(())
+    }
+
+    /// Undo `hide_prefix`. Returns whether anything was actually hidden.
+    pub fn unhide_prefix(&self, path: &Path) -> Result<bool> {
+        let removed = self.conn.execute(
+            "DELETE FROM hidden_prefixes WHERE path = ?1",
+            params![path.to_string_lossy()],
+        )?;
+        Ok(removed > 0)
+    }
+
+    /// Every hidden directory, most recently hidden first.
+    ///
+    /// Unbounded on purpose, unlike `get_previously_interacted_files`: this
+    /// list only grows when the user explicitly adds to it, so it is small by
+    /// construction and does not need a cap to stay off the startup budget.
+    pub fn get_hidden_prefixes(&self) -> Result<Vec<PathBuf>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path FROM hidden_prefixes ORDER BY created_at DESC")?;
+
+        let paths = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
+
+        Ok(paths)
     }
 
     /// Paths the user has clicked, scrolled, or visited, most recently

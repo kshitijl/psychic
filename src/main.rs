@@ -188,6 +188,41 @@ fn main() -> Result<()> {
                 print!("{}", include_str!("../shell/psychic.zsh"));
                 return Ok(());
             }
+            Commands::Hidden { command } => {
+                let db_path = db::Database::get_db_path(&data_dir);
+                let db = db::Database::new(&db_path)?;
+
+                match command {
+                    cli::HiddenCommands::List => {
+                        let hidden = db.get_hidden_prefixes()?;
+                        if hidden.is_empty() {
+                            println!("No hidden directories.");
+                        } else {
+                            for path in hidden {
+                                println!("{}", path.display());
+                            }
+                        }
+                    }
+                    cli::HiddenCommands::Add { path } => {
+                        // Canonicalized so it matches the paths in the file
+                        // registry, which are canonical. A directory that is
+                        // already gone can still be hidden - falling back to
+                        // the path as given is better than refusing.
+                        let full_path = path.canonicalize().unwrap_or(path);
+                        db.hide_prefix(&full_path)?;
+                        println!("Hidden: {}", full_path.display());
+                    }
+                    cli::HiddenCommands::Remove { path } => {
+                        let full_path = path.canonicalize().unwrap_or(path);
+                        if db.unhide_prefix(&full_path)? {
+                            println!("No longer hidden: {}", full_path.display());
+                        } else {
+                            println!("Not hidden: {}", full_path.display());
+                        }
+                    }
+                }
+                return Ok(());
+            }
             Commands::TrackVisit { path } => {
                 // Canonicalize the path to get the absolute path
                 let full_path = path

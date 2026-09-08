@@ -183,6 +183,7 @@ fn dispatch(
             set_filter(app, FilterType::OnlyFiles);
             Ok(InputAction::Continue)
         }
+        Action::HideSelected => handle_hide_selected(app),
         Action::CycleDebugPane => {
             app.ui_state.cycle_debug_pane_mode();
             // The pane shows database counts; fetch them the first time it opens
@@ -377,6 +378,56 @@ fn handle_ctrl_enter(
 
     // Execute the on-cwd-visit action for the selected directory
     execute_cwd_visit_action(app, &selection.full_path, terminal)
+}
+
+/// Hide the selected directory from results, for good.
+///
+/// The target is the selected row if it is a directory, otherwise its parent:
+/// the unit a user thinks in is "that folder", and pressing this on a file
+/// inside the folder they mean is the obvious way to ask for it.
+///
+/// Goes through `resolve_selection`, so a stale row is evicted rather than
+/// hidden - either way it stops showing, and the one that reflects reality
+/// wins.
+fn handle_hide_selected(app: &mut App) -> Result<InputAction> {
+    if app.ui_state.history_mode || app.total_results == 0 {
+        return Ok(InputAction::Continue);
+    }
+
+    let Some(selection) = resolve_selection(app) else {
+        return Ok(InputAction::Continue);
+    };
+
+    let target = if selection.is_dir {
+        selection.full_path
+    } else {
+        match selection.full_path.parent() {
+            Some(parent) => parent.to_path_buf(),
+            None => return Ok(InputAction::Continue),
+        }
+    };
+
+    // Hiding an ancestor of where we are standing does nothing now - the
+    // current directory is exempt - and then swallows everything the moment the
+    // user walks out of it. That is a trap, not a feature, so refuse it here
+    // and let the worker assert the invariant.
+    if app.cwd.starts_with(&target) {
+        app.status_message = Some(format!(
+            "Won't hide {}: the current directory is inside it",
+            target.display()
+        ));
+        return Ok(InputAction::Continue);
+    }
+
+    let query_id = app.next_query_id();
+    let _ = app.worker_tx.send(WorkerRequest::Hide {
+        path: target.clone(),
+        query_id,
+    });
+
+    app.status_message = Some(format!("Hidden: {}", target.display()));
+
+    Ok(InputAction::Continue)
 }
 
 /// Handle Ctrl-H (toggle history mode)

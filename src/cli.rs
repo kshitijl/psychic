@@ -29,10 +29,34 @@ pub enum Commands {
         /// Directory path to track
         path: PathBuf,
     },
+    /// Manage directories hidden from search results
+    ///
+    /// Hiding only suppresses results. Nothing is deleted: the events under a
+    /// hidden directory stay in the database exactly as they were.
+    Hidden {
+        #[command(subcommand)]
+        command: HiddenCommands,
+    },
     /// Internal development and debugging commands
     Internal {
         #[command(subcommand)]
         command: InternalCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum HiddenCommands {
+    /// List every hidden directory, most recently hidden first
+    List,
+    /// Hide a directory and everything under it
+    Add {
+        /// Directory to hide
+        path: PathBuf,
+    },
+    /// Stop hiding a directory
+    Remove {
+        /// Directory to stop hiding
+        path: PathBuf,
     },
 }
 

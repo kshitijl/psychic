@@ -160,6 +160,20 @@ CREATE TABLE sessions (
 );
 ```
 
+```sql
+CREATE TABLE hidden_prefixes (
+    path TEXT PRIMARY KEY,   -- absolute, canonical
+    created_at INTEGER
+);
+```
+
+**Why hiding is its own table:** it is mutable, undoable state, not a log. Hiding
+suppresses results and nothing else - the events under a hidden directory stay exactly
+as they are, so a directory you stop using still contributes everything it taught the
+model. Hiding is deliberately *not* recorded as an event and *not* a training signal:
+it is a rare, explicit act of curation, and treating it as a negative label would put
+weight on something the user does a handful of times a year.
+
 **Index:**
 ```sql
 CREATE INDEX idx_events_click_lookup ON events(action, timestamp, full_path);
@@ -179,7 +193,8 @@ Background thread that recursively walks current directory using `walkdir`.
 
 **Key points:**
 - Streams results via mpsc channel using `WalkerMessage` enum
-- Filters: `.git`, `node_modules`, `.venv`, `target`
+- Filters: `.git`, `node_modules`, `.venv`, `target`, plus any directory the user has
+  hidden that applies to the current root (see "Hiding directories")
 - Sends both files and directories (with `is_dir` flag)
 - Extracts mtime, atime, and file_size from walkdir's cached metadata
 - Adaptive depth: switches to depth=1 if >8k items found (shallow mode)
@@ -259,6 +274,48 @@ the flag before doing any matching work, making an evicted entry cost a bool tes
 
 `add_file` clears the flag if the walker later rediscovers the path - the walker
 seeing it on disk is proof it exists, so the eviction should not outlive that.
+
+### Hiding directories
+
+Sometimes a directory is still on disk and still worth having in the training data, but
+you never want to click it again - you reorganised, and the old copy keeps winning
+searches. `Ctrl-X` on a result hides it: the selected row if it is a directory,
+otherwise its parent. `psychic hidden list|add|remove` manages the set from the shell,
+which is also how you undo a mis-hit.
+
+**The rule:** a hidden directory is suppressed everywhere *except* from inside it. If
+the search root is at or under a hidden prefix, the user has deliberately navigated in
+there, and hiding what they are standing in would leave them staring at an empty screen
+with no explanation.
+
+The obvious alternative - "show it whenever it is under the current root" - does not
+work. Running psychic from a parent directory puts the walker inside the hidden tree,
+and the hiding stops meaning anything at exactly the moment it matters.
+
+`active_hidden_for(hidden, root)` is that rule, in one place. It drops the prefixes
+containing `root`, and both consumers take its output:
+
+- **The walker** never descends into an active hidden directory (`should_descend`), so
+  hiding makes a search tree *cheaper*: the subtree is not walked, rather than walked
+  and then discarded. The worker narrows the set before sending it, so starting psychic
+  inside a hidden directory walks it normally, with nothing to skip.
+- **The registry** carries a `hidden` bool per `FileInfo`, recomputed whenever the root
+  or the hidden set changes (startup, `change_cwd`, `hide`). The query path only tests
+  the bool, so hiding costs nothing per keystroke.
+
+**Impressions:** hidden rows are dropped in `filter_and_rank`, so they never enter
+`filtered_files`, never reach a page, and never reach the UI's page cache - which is
+what `check_and_log_impressions` reads. A hidden file therefore cannot be logged as
+seen when it was not. `test_hidden_files_never_reach_a_page` pins this down, because it
+is the property that keeps hiding from quietly corrupting the training data.
+
+**Hiding an ancestor of the current directory is refused** (`input.rs`, asserted in the
+worker). It would do nothing at the time - the current directory is exempt - and then
+swallow everything the moment the user walked out of it.
+
+**Known gap:** hiding something while the walker is still running does not stop the
+current walk from descending into it. The results are filtered either way; only the
+walk is wasted, and only until the next `change_cwd`.
 
 **Debouncing:** If user types "hello" quickly, only process final query (not 5 intermediate queries).
 Why: Avoids wasted computation and improves responsiveness.

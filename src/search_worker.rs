@@ -28,7 +28,10 @@ pub struct WalkerFileMetadata {
 // Commands sent from worker to walker
 #[derive(Debug, Clone)]
 pub enum WalkerCommand {
-    ChangeCwd(PathBuf),
+    /// Walk somewhere else. `hidden` is the set of hidden directories that
+    /// apply to `path`, already narrowed by the worker, so the walker can skip
+    /// those subtrees instead of walking and then discarding them.
+    ChangeCwd { path: PathBuf, hidden: Vec<PathBuf> },
 }
 
 // Messages from walker to worker
@@ -109,6 +112,11 @@ pub enum WorkerRequest {
         path: PathBuf,
         query_id: u64,
     },
+    /// Stop showing a directory and everything under it, from now on.
+    Hide {
+        path: PathBuf,
+        query_id: u64,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -168,6 +176,10 @@ struct FileInfo {
     /// (held by `filtered_files` and the UI's page cache) remain valid, but
     /// `filter_and_rank` never emits them again.
     evicted: bool,
+    /// Set when this path sits under a hidden prefix that does not contain the
+    /// current root - see `WorkerState::recompute_hidden`. Recomputed whenever
+    /// the root or the hidden set changes, so filtering stays a bool test.
+    hidden: bool,
 }
 
 impl FileInfo {
@@ -211,6 +223,8 @@ impl FileInfo {
             is_dir,
             is_under_cwd,
             evicted: false,
+            // Set by recompute_hidden once the whole registry is built.
+            hidden: false,
         }
     }
 }
@@ -230,7 +244,24 @@ where
     let (walker_command_tx, walker_command_rx) = mpsc::channel::<WalkerCommand>();
 
     let data_dir = data_dir.to_path_buf();
+
+    // Read once here and hand to both threads: the walker needs it before
+    // WorkerState exists, and a second connection on the startup path would
+    // buy nothing. The table only grows when the user hides something, so it
+    // is a handful of rows.
+    let hidden_prefixes = Database::new(&Database::get_db_path(&data_dir))
+        .and_then(|db| db.get_hidden_prefixes())
+        .unwrap_or_else(|e| {
+            log::error!("Failed to load hidden directories: {}", e);
+            Vec::new()
+        });
+    log::info!("Loaded {} hidden directories", hidden_prefixes.len());
+
+    let canonical_cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.clone());
+    let walker_hidden = active_hidden_for(&hidden_prefixes, &canonical_cwd);
+
     let cwd_clone = cwd.clone();
+    let hidden_for_worker = hidden_prefixes;
     let walker_command_tx_clone = walker_command_tx.clone();
     let worker_handle = std::thread::spawn(move || {
         // WorkerState is constructed in this thread so the ranker never moves
@@ -243,15 +274,44 @@ where
             walker_command_tx_clone,
             no_click_loading,
             no_model,
+            hidden_for_worker,
         )
         .unwrap();
         worker_thread_loop(worker_task_rx, event_tx, walker_message_rx, worker_state);
     });
 
     // Start walker thread
-    start_file_walker(cwd, walker_command_rx, walker_message_tx);
+    start_file_walker(cwd, walker_hidden, walker_command_rx, walker_message_tx);
 
     Ok((worker_tx, worker_handle))
+}
+
+/// Whether `path` sits under one of the currently active hidden prefixes.
+///
+/// `starts_with` compares whole path components, so hiding `/a/b` does not hide
+/// `/a/bcd`.
+fn is_hidden_by(active_hidden: &[PathBuf], path: &Path) -> bool {
+    active_hidden.iter().any(|prefix| path.starts_with(prefix))
+}
+
+/// The hidden directories that actually suppress anything when the search root
+/// is `root`.
+///
+/// A hidden directory is suppressed everywhere *except* from inside it: if the
+/// root is at or under a hidden prefix, the user has deliberately navigated in
+/// there, and hiding the contents of the directory they are standing in would
+/// leave them staring at an empty screen with no explanation. Everywhere else -
+/// including from the parent - it stays out of the way, which is the point.
+///
+/// The alternative rule, "show it whenever it happens to be under the current
+/// root", does not work: running psychic from a parent directory puts the
+/// walker inside the hidden tree and the hiding stops meaning anything.
+fn active_hidden_for(hidden: &[PathBuf], root: &Path) -> Vec<PathBuf> {
+    hidden
+        .iter()
+        .filter(|prefix| !root.starts_with(prefix))
+        .cloned()
+        .collect()
 }
 
 // Worker thread state - owns all file data
@@ -270,6 +330,11 @@ struct WorkerState {
     walker_command_tx: Sender<WalkerCommand>,
     /// How long the last filter-and-rank took, reported back with its results.
     last_rank_ms: f64,
+    /// Every directory the user has hidden, as stored.
+    hidden_prefixes: Vec<PathBuf>,
+    /// The subset of `hidden_prefixes` that suppresses anything right now:
+    /// those that do not contain `root`. Derived, never stored.
+    active_hidden: Vec<PathBuf>,
 }
 
 impl WorkerState {
@@ -279,6 +344,7 @@ impl WorkerState {
         walker_command_tx: Sender<WalkerCommand>,
         no_click_loading: bool,
         _no_model: bool,
+        hidden_prefixes: Vec<PathBuf>,
     ) -> Result<Self> {
         let worker_state_start = std::time::Instant::now();
 
@@ -371,6 +437,7 @@ impl WorkerState {
                 is_dir: true,
                 is_under_cwd: true,
                 evicted: false,
+                hidden: false,
             };
 
             let file_id = FileId(file_registry.len());
@@ -387,7 +454,7 @@ impl WorkerState {
             worker_state_start.elapsed().as_secs_f64() * 1000.0
         );
 
-        Ok(WorkerState {
+        let mut state = WorkerState {
             file_registry,
             path_to_id,
             filtered_files: Vec::new(),
@@ -401,7 +468,47 @@ impl WorkerState {
             db_path,
             walker_command_tx,
             last_rank_ms: 0.0,
-        })
+            hidden_prefixes,
+            active_hidden: Vec::new(),
+        };
+        state.recompute_hidden();
+
+        Ok(state)
+    }
+
+    /// Work out which hidden directories apply right now, and mark the registry.
+    ///
+    /// Called whenever the root or the hidden set changes - see
+    /// [`active_hidden_for`] for the rule - so that the query path only ever
+    /// tests a bool.
+    fn recompute_hidden(&mut self) {
+        self.active_hidden = active_hidden_for(&self.hidden_prefixes, &self.root);
+
+        for file_info in self.file_registry.iter_mut() {
+            file_info.hidden = is_hidden_by(&self.active_hidden, &file_info.full_path);
+        }
+    }
+
+    /// Hide `path` and everything under it, from now on and in future sessions.
+    ///
+    /// Returns whether anything changed.
+    fn hide(&mut self, path: PathBuf) -> Result<bool> {
+        assert!(
+            !self.root.starts_with(&path),
+            "Refused in input.rs: hiding an ancestor of the root would hide nothing now and \
+             everything later"
+        );
+
+        if self.hidden_prefixes.contains(&path) {
+            return Ok(false);
+        }
+
+        Database::new(&self.db_path)?.hide_prefix(&path)?;
+        log::info!("Worker: hiding {:?}", path);
+        self.hidden_prefixes.push(path);
+        self.recompute_hidden();
+
+        Ok(true)
     }
 
     fn add_file(
@@ -450,6 +557,7 @@ impl WorkerState {
                 is_dir,
                 is_under_cwd: true,
                 evicted: false,
+                hidden: is_hidden_by(&self.active_hidden, &canonical_path),
             };
 
             let file_id = FileId(self.file_registry.len());
@@ -472,9 +580,10 @@ impl WorkerState {
             .filter_map(|file_id| {
                 let file_info = &self.file_registry[file_id.0];
 
-                // Gone from disk. Checked first so an evicted entry costs a
-                // bool test rather than a fuzzy match.
-                if file_info.evicted {
+                // Gone from disk, or under a directory the user hid. Both are
+                // checked first so a suppressed entry costs a bool test rather
+                // than a fuzzy match.
+                if file_info.evicted || file_info.hidden {
                     return None;
                 }
 
@@ -765,9 +874,16 @@ impl WorkerState {
             self.path_to_id.insert(file.full_path.clone(), FileId(idx));
         }
 
+        // The root moved, so which hidden directories apply moved with it: one
+        // that contains the new root is now exempt, and one that no longer
+        // contains it starts applying again.
+        self.recompute_hidden();
+
         // Send command to walker thread to change directory
-        self.walker_command_tx
-            .send(WalkerCommand::ChangeCwd(new_cwd))?;
+        self.walker_command_tx.send(WalkerCommand::ChangeCwd {
+            path: new_cwd,
+            hidden: self.active_hidden.clone(),
+        })?;
 
         log::info!("Worker: CWD change command sent to walker");
         Ok(())
@@ -969,6 +1085,33 @@ fn worker_thread_loop<T>(
                     }
                 }
             }
+            Ok(WorkerRequest::Hide { path, query_id }) => {
+                state.current_query_id = query_id;
+                match state.hide(path) {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        // Re-run the current query so the rows go at once.
+                        let query = state.current_query.clone();
+                        if let Err(e) = state.filter_and_rank(&query) {
+                            log::error!("Filter/rank failed after hiding: {}", e);
+                        } else {
+                            let initial_page = state.get_page(0, 128);
+                            let _ = event_tx.send(
+                                WorkerResponse::QueryUpdated {
+                                    query_id,
+                                    total_results: state.filtered_files.len(),
+                                    total_files: state.file_registry.len(),
+                                    initial_page,
+                                    model_stats: state.ranker.stats.clone(),
+                                    rank_ms: state.last_rank_ms,
+                                }
+                                .into(),
+                            );
+                        }
+                    }
+                    Err(e) => log::error!("Failed to hide directory: {}", e),
+                }
+            }
             Err(RecvTimeoutError::Timeout) => {
                 // No work to do, loop again
                 continue;
@@ -1056,6 +1199,7 @@ mod tests {
             is_dir: false,
             is_under_cwd: walker_path.starts_with(&cwd),
             evicted: false,
+            hidden: false,
         };
 
         let history_in_cwd_path = PathBuf::from("/home/user/project/README.md");
@@ -1070,6 +1214,7 @@ mod tests {
             is_dir: false,
             is_under_cwd: history_in_cwd_path.starts_with(&cwd),
             evicted: false,
+            hidden: false,
         };
 
         let history_outside_path = PathBuf::from("/home/user/other/file.txt");
@@ -1084,6 +1229,7 @@ mod tests {
             is_dir: false,
             is_under_cwd: history_outside_path.starts_with(&cwd),
             evicted: false,
+            hidden: false,
         };
 
         // Test OnlyCwd filter
@@ -1115,6 +1261,7 @@ mod tests {
             is_dir: true,
             is_under_cwd: true,
             evicted: false,
+            hidden: false,
         };
 
         let file_regular = FileInfo {
@@ -1127,6 +1274,7 @@ mod tests {
             is_dir: false,
             is_under_cwd: true,
             evicted: false,
+            hidden: false,
         };
 
         // OnlyDirs filter: is_dir == true
@@ -1231,12 +1379,12 @@ mod eviction_tests {
     use super::*;
 
     /// A scratch directory with a real (empty) events database in it.
-    struct TempDataDir {
-        path: PathBuf,
+    pub(super) struct TempDataDir {
+        pub(super) path: PathBuf,
     }
 
     impl TempDataDir {
-        fn new(name: &str) -> Self {
+        pub(super) fn new(name: &str) -> Self {
             let path =
                 std::env::temp_dir().join(format!("psychic-test-{}-{}", name, std::process::id()));
             let _ = std::fs::remove_dir_all(&path);
@@ -1257,7 +1405,7 @@ mod eviction_tests {
     /// The paths do not exist on disk, which is what we want: `add_file`
     /// canonicalizes, and canonicalizing a missing path leaves it unchanged, so
     /// the registry holds exactly the paths written here.
-    fn worker_with_three_files(
+    pub(super) fn worker_with_three_files(
         name: &str,
     ) -> (WorkerState, TempDataDir, mpsc::Receiver<WalkerCommand>) {
         let dir = TempDataDir::new(name);
@@ -1269,6 +1417,7 @@ mod eviction_tests {
             walker_command_tx,
             true, // no_click_loading: keep the registry to just what we add
             true, // no_model
+            Vec::new(),
         )
         .expect("Worker state should build against an empty data dir");
 
@@ -1289,7 +1438,36 @@ mod eviction_tests {
         (state, dir, walker_command_rx)
     }
 
-    fn results(state: &WorkerState) -> Vec<String> {
+    /// A worker rooted at `root` holding one file inside `/test/old` and one
+    /// outside it, with `/test/old` already hidden.
+    pub(super) fn worker_across_hidden_boundary(
+        root: &str,
+        name: &str,
+    ) -> (WorkerState, TempDataDir, mpsc::Receiver<WalkerCommand>) {
+        let dir = TempDataDir::new(name);
+        let (walker_command_tx, walker_command_rx) = mpsc::channel::<WalkerCommand>();
+
+        let mut state = WorkerState::new(
+            PathBuf::from(root),
+            &dir.path,
+            walker_command_tx,
+            true,
+            true,
+            vec![PathBuf::from("/test/old")],
+        )
+        .expect("Worker state should build against an empty data dir");
+
+        state.file_registry.clear();
+        state.path_to_id.clear();
+
+        for path in ["/test/old/notes.txt", "/test/current/notes.txt"] {
+            state.add_file(PathBuf::from(path), Some(1000), Some(1000), Some(10), false);
+        }
+
+        (state, dir, walker_command_rx)
+    }
+
+    pub(super) fn results(state: &WorkerState) -> Vec<String> {
         state
             .filtered_files
             .iter()
@@ -1392,6 +1570,192 @@ mod eviction_tests {
             after,
             vec!["alpha.txt", "beta.txt", "gamma.txt"],
             "Rediscovered file is back, and was not registered a second time"
+        );
+    }
+}
+
+#[cfg(test)]
+mod hiding_tests {
+    use super::eviction_tests::*;
+    use super::*;
+
+    #[test]
+    fn test_active_hidden_excludes_prefixes_containing_the_root() {
+        let hidden = vec![PathBuf::from("/test/old"), PathBuf::from("/other")];
+
+        assert_eq!(
+            active_hidden_for(&hidden, &PathBuf::from("/test")),
+            vec![PathBuf::from("/test/old"), PathBuf::from("/other")],
+            "From the parent, both still apply"
+        );
+        assert_eq!(
+            active_hidden_for(&hidden, &PathBuf::from("/test/old")),
+            vec![PathBuf::from("/other")],
+            "Standing in a hidden directory exempts it, and only it"
+        );
+        assert_eq!(
+            active_hidden_for(&hidden, &PathBuf::from("/test/old/deeper")),
+            vec![PathBuf::from("/other")],
+            "Standing below a hidden directory exempts it too"
+        );
+    }
+
+    #[test]
+    fn test_hidden_prefix_matches_whole_components_only() {
+        let hidden = vec![PathBuf::from("/test/old")];
+
+        assert!(
+            is_hidden_by(&hidden, &PathBuf::from("/test/old/notes.txt")),
+            "A file inside the hidden directory is hidden"
+        );
+        assert!(
+            is_hidden_by(&hidden, &PathBuf::from("/test/old")),
+            "The hidden directory itself is hidden"
+        );
+        assert!(
+            !is_hidden_by(&hidden, &PathBuf::from("/test/older/notes.txt")),
+            "A sibling sharing a name prefix is not hidden"
+        );
+        assert!(
+            !is_hidden_by(&hidden, &PathBuf::from("/test/notes.txt")),
+            "A file outside the hidden directory is not hidden"
+        );
+    }
+
+    #[test]
+    fn test_hidden_files_do_not_show_from_outside() {
+        let (mut state, _dir, _rx) = worker_across_hidden_boundary("/test", "hide-outside");
+
+        state
+            .filter_and_rank("notes")
+            .expect("Filter should succeed");
+        assert_eq!(
+            results(&state),
+            vec!["current/notes.txt"],
+            "From the parent, only the file outside the hidden directory shows"
+        );
+    }
+
+    #[test]
+    fn test_hidden_files_show_from_inside() {
+        // Navigating into a hidden directory has to work, or the user is left
+        // staring at an empty screen with no explanation.
+        let (mut state, _dir, _rx) = worker_across_hidden_boundary("/test/old", "hide-inside");
+
+        state
+            .filter_and_rank("notes")
+            .expect("Filter should succeed");
+        let mut found = results(&state);
+        found.sort();
+        assert_eq!(
+            found,
+            vec!["/test/current/notes.txt", "notes.txt"],
+            "Inside the hidden directory everything shows normally"
+        );
+    }
+
+    #[test]
+    fn test_hiding_takes_effect_without_a_restart() {
+        let (mut state, _dir, _rx) = worker_with_three_files("hide-live");
+
+        state.filter_and_rank("").expect("Filter should succeed");
+        assert_eq!(results(&state).len(), 3, "Everything shows to begin with");
+
+        // Root is /test, so hide a subdirectory of it rather than an ancestor.
+        state.add_file(
+            PathBuf::from("/test/sub/buried.txt"),
+            Some(1000),
+            Some(1000),
+            Some(10),
+            false,
+        );
+        state.filter_and_rank("").expect("Filter should succeed");
+        assert_eq!(results(&state).len(), 4, "The new file shows before hiding");
+
+        assert!(
+            state
+                .hide(PathBuf::from("/test/sub"))
+                .expect("Hiding should persist"),
+            "Hiding a directory reports that it changed something"
+        );
+
+        state.filter_and_rank("").expect("Filter should succeed");
+        let mut after = results(&state);
+        after.sort();
+        assert_eq!(
+            after,
+            vec!["alpha.txt", "beta.txt", "gamma.txt"],
+            "The file under the hidden directory is gone, the rest untouched"
+        );
+    }
+
+    #[test]
+    fn test_hiding_the_same_directory_twice_changes_nothing() {
+        let (mut state, _dir, _rx) = worker_with_three_files("hide-twice");
+
+        assert!(
+            state.hide(PathBuf::from("/test/sub")).unwrap(),
+            "First hide takes effect"
+        );
+        assert!(
+            !state.hide(PathBuf::from("/test/sub")).unwrap(),
+            "Hiding again reports no change"
+        );
+    }
+
+    #[test]
+    fn test_hiding_survives_a_restart() {
+        let (mut state, dir, _rx) = worker_with_three_files("hide-persist");
+        state.hide(PathBuf::from("/test/sub")).unwrap();
+
+        let reloaded = crate::db::Database::new(&crate::db::Database::get_db_path(&dir.path))
+            .unwrap()
+            .get_hidden_prefixes()
+            .unwrap();
+
+        assert_eq!(
+            reloaded,
+            vec![PathBuf::from("/test/sub")],
+            "The hidden directory is in the database for the next session"
+        );
+    }
+
+    #[test]
+    fn test_unhiding_removes_it() {
+        let (mut state, dir, _rx) = worker_with_three_files("hide-undo");
+        state.hide(PathBuf::from("/test/sub")).unwrap();
+
+        let db = crate::db::Database::new(&crate::db::Database::get_db_path(&dir.path)).unwrap();
+        assert!(
+            db.unhide_prefix(&PathBuf::from("/test/sub")).unwrap(),
+            "Unhiding a hidden directory reports that it did something"
+        );
+        assert!(
+            !db.unhide_prefix(&PathBuf::from("/test/sub")).unwrap(),
+            "Unhiding it again reports no change"
+        );
+        assert!(
+            db.get_hidden_prefixes().unwrap().is_empty(),
+            "Nothing is hidden any more"
+        );
+    }
+
+    #[test]
+    fn test_hidden_files_never_reach_a_page() {
+        // Impressions are logged from the UI's page cache, which is filled from
+        // these pages. A hidden file that reached a page would be logged as
+        // seen when the user never saw it, so this is the property that keeps
+        // hiding out of the training data.
+        let (mut state, _dir, _rx) = worker_across_hidden_boundary("/test", "hide-pages");
+
+        state.filter_and_rank("").expect("Filter should succeed");
+        let page = state.get_page(0, 128);
+
+        let paths: Vec<PathBuf> = page.files.iter().map(|f| f.full_path.clone()).collect();
+        assert_eq!(
+            paths,
+            vec![PathBuf::from("/test/current/notes.txt")],
+            "The hidden file is absent from the page the UI logs impressions from"
         );
     }
 }

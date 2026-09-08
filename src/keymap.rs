@@ -54,6 +54,7 @@ pub enum Action {
     SetFilterDirectCwd,
     SetFilterDirs,
     SetFilterFiles,
+    HideSelected,
 
     // Panes
     CycleDebugPane,
@@ -377,6 +378,13 @@ pub static KEYMAP: &[Binding] = &[
         Context::FilterPicker,
         Section::Filters,
         "in picker: files only",
+    ),
+    Binding::new(
+        Action::HideSelected,
+        &[ctrl('x')],
+        Context::Global,
+        Section::Filters,
+        "never show the selected directory again",
     ),
     // ---- Panes ----
     Binding::new(
