@@ -309,11 +309,12 @@ Filter+rank is ~2ms per keystroke and is not the problem.
   files into memory as styled text), sliced to the visible window at draw time
   so a long preview is not cloned every frame, and scroll is clamped so it
   cannot walk off into the distance.
-  Generation is to a **line budget**: a screen on show and one in hand,
-  extended (doubling) when scrolled past. The first cut generated whole files
-  and a large markdown preview took 150ms - `bat` was given
-  `--line-range :height` for exactly this reason and dropping it was a
-  regression. Syntect is built with `oniguruma`, not `fancy-regex`: measured on
+  Generation has **two states**, as the `bat` version did: a screenful while
+  unscrolled, then the whole file in one pass on the first scroll, after which
+  scrolling is free. The first cut generated whole files up front and a large
+  markdown preview took 150ms; the second cut grew the budget as the user
+  scrolled, which is worse still - syntect state means every pass restarts at
+  line one, so a growing budget costs ~2x the work in a series of hiccups. Syntect is built with `oniguruma`, not `fancy-regex`: measured on
   markdown it is ~5x faster (median 11.81ms -> 2.53ms, worst 102.57 -> 25.79)
   and the binary is *smaller* (12.7MB -> 11.2MB).
 - **P3. Three syscalls per historical path at startup.** `WorkerState::new`

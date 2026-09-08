@@ -14,6 +14,7 @@ use std::{
 use crate::help::{self, HelpLine};
 use crate::keymap::{self, Action};
 use crate::path_display::{human_bytes, printable, truncate_absolute_path};
+use crate::preview::PreviewPane;
 
 /// Group digits so six-figure counts stay readable in a narrow pane.
 fn thousands(n: i64) -> String {
@@ -441,15 +442,6 @@ fn styled_help_lines(lines: &[HelpLine]) -> Vec<Line<'static>> {
         })
         .collect()
 }
-/// How much room the preview pane has. Only the layout knows, and the preview
-/// thread needs it: the width decides a listing's columns, and the height
-/// decides how much of a file is worth highlighting.
-#[derive(Debug, Clone, Copy)]
-pub struct PreviewPane {
-    pub width: u16,
-    pub height: u16,
-}
-
 /// State updates computed during rendering that need to be applied to App after rendering
 pub struct RenderUpdates {
     pub file_list_scroll: Option<usize>,

@@ -52,6 +52,16 @@ const SNIFF_BYTES: usize = 8 << 10;
 /// Below this width the listing drops its permissions and date columns.
 const NARROW: u16 = 80;
 
+/// How much room the preview pane has.
+///
+/// The width decides a listing's columns; the height decides how much of a file
+/// is worth highlighting before the user has scrolled.
+#[derive(Debug, Clone, Copy)]
+pub struct PreviewPane {
+    pub width: u16,
+    pub height: u16,
+}
+
 /// A request for the preview of one path.
 pub struct PreviewRequest {
     pub id: u64,
@@ -199,11 +209,25 @@ impl PreviewState {
     /// Ask for `path`'s preview, if we do not already have enough of it.
     ///
     /// Called after each frame, because that is when the pane's size is known.
-    /// `wanted` is how many lines from the top the pane could show: it grows as
-    /// the user scrolls, and asking again with a bigger number is how more of a
-    /// long file gets highlighted.
-    pub fn request(&mut self, path: &Path, is_dir: bool, width: u16, wanted: usize) {
-        let wanted = wanted.min(MAX_LINES);
+    ///
+    /// Two states, not a sliding window. Unscrolled, a screenful is generated
+    /// and nothing more, because that is all anyone can see and highlighting is
+    /// the expensive part. The moment the user scrolls, the rest is generated
+    /// in one go and scrolling is free from then on.
+    ///
+    /// The obvious-looking alternative - grow the budget as the user scrolls -
+    /// is worse. Syntect carries state from line to line, so every pass has to
+    /// start at line one; a budget that grows by steps re-highlights the whole
+    /// preamble each time, costing about twice the total work and paying it in
+    /// a series of visible hiccups rather than one.
+    pub fn request(&mut self, path: &Path, is_dir: bool, pane: PreviewPane) {
+        let wanted = if self.scroll == 0 {
+            // The screen on show, and one in hand so that a first nudge of the
+            // wheel does not have to wait for anything.
+            (2 * pane.height as usize).clamp(1, MAX_LINES)
+        } else {
+            MAX_LINES
+        };
 
         if let Some(shown) = &self.showing
             && shown.path == path
@@ -218,22 +242,16 @@ impl PreviewState {
             return;
         }
 
-        // Doubling, so that scrolling through a long file does not re-highlight
-        // from the top on every wheel click. Each pass starts at line one
-        // because that is where syntect's state has to start.
-        let have = self.showing.as_ref().map_or(0, |s| s.text.lines.len());
-        let lines = wanted.max(have * 2).min(MAX_LINES);
-
         self.next_id += 1;
         let id = self.next_id;
-        self.pending = Some((id, path.to_path_buf(), lines));
+        self.pending = Some((id, path.to_path_buf(), wanted));
 
         let _ = self.request_tx.send(PreviewRequest {
             id,
             path: path.to_path_buf(),
             is_dir,
-            width,
-            lines,
+            width: pane.width,
+            lines: wanted,
         });
     }
 
@@ -261,11 +279,6 @@ impl PreviewState {
         self.showing = None;
         self.pending = None;
         self.scroll = 0;
-    }
-
-    /// Where the pane is scrolled to, in lines from the top of the file.
-    pub fn scroll_offset(&self) -> usize {
-        self.scroll
     }
 
     /// Move the pane, clamped to the preview we actually have.
@@ -887,6 +900,83 @@ mod tests {
             generated.complete,
             "Nothing more to ask for, so scrolling should stop at the end"
         );
+    }
+
+    /// A preview of `lines` blank lines, as though the thread had answered.
+    fn answered(id: u64, lines: usize, complete: bool) -> Preview {
+        Preview {
+            id,
+            text: Text::from(vec![Line::from("x"); lines]),
+            complete,
+        }
+    }
+
+    #[test]
+    fn test_a_screenful_until_the_user_scrolls_then_the_rest_once() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut state = PreviewState::new(tx);
+        let pane = PreviewPane {
+            width: 100,
+            height: 40,
+        };
+        let path = Path::new("/some/file.md");
+
+        state.request(path, false, pane);
+        let first = rx.try_recv().expect("something should have been asked for");
+        assert_eq!(first.lines, 80, "the screen on show, and one in hand");
+
+        state.request(path, false, pane);
+        assert!(rx.try_recv().is_err(), "asking twice for the same thing");
+
+        state.ready(answered(first.id, 80, false));
+        state.request(path, false, pane);
+        assert!(
+            rx.try_recv().is_err(),
+            "a screenful is still all anyone can see"
+        );
+
+        // The first scroll buys the rest of the file, in one pass.
+        state.scroll(3);
+        state.request(path, false, pane);
+        let second = rx.try_recv().expect("scrolling should ask for the rest");
+        assert_eq!(second.lines, MAX_LINES);
+
+        state.ready(answered(second.id, 500, true));
+        for _ in 0..20 {
+            state.scroll(3);
+            state.request(path, false, pane);
+            assert!(
+                rx.try_recv().is_err(),
+                "and then scrolling is free: no regeneration per wheel click"
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_stale_answer_is_not_shown() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut state = PreviewState::new(tx);
+        let pane = PreviewPane {
+            width: 100,
+            height: 40,
+        };
+
+        state.request(Path::new("/one.rs"), false, pane);
+        let first = rx.try_recv().expect("a request");
+
+        // The selection moves before the answer comes back.
+        state.clear();
+        state.request(Path::new("/two.rs"), false, pane);
+        let second = rx.try_recv().expect("a second request");
+
+        state.ready(answered(first.id, 80, true));
+        assert!(
+            state.text_for(Path::new("/one.rs")).is_none(),
+            "the row it was generated for is not the row selected now"
+        );
+
+        state.ready(answered(second.id, 80, true));
+        assert!(state.text_for(Path::new("/two.rs")).is_some());
     }
 
     #[test]

@@ -1079,14 +1079,19 @@ built on - and a listing is a `read_dir`, so styles are constructed directly.
 That also removes two things psychic had to be installed alongside, and the
 silent degradation to `ls` and unhighlighted text when they were missing.
 
-**Only what the pane can show is highlighted.** A screenful on show and one in
-hand, extended when the user scrolls past it. Syntect carries state from line to
-line, so every pass starts at line one and the budget is a count from the top;
-successive requests double it, so scrolling a long file does not re-highlight
-from the top on every wheel click. The first version of this generated the whole
-file at once, which made a large markdown preview take 150ms - `bat` was asked
-for `--line-range :height` for exactly this reason, and dropping that was a
-regression, not a simplification.
+**Only what the pane can show is highlighted, in two states.** Unscrolled, a
+screenful is generated and nothing more: that is all anyone can see, and
+highlighting is the expensive part. The moment the user scrolls, the rest of the
+file is generated in one pass, and scrolling is free from then on. This is what
+the `bat` version did with `--line-range :height` and then a full run; generating
+the whole file up front instead made a large markdown preview take 150ms.
+
+A sliding window that grows with the scroll offset looks tidier and is worse.
+Syntect carries state from line to line, so every pass has to start at line one:
+a budget that grows by steps re-highlights the whole preamble each time, costing
+about twice the total work and paying it in a series of visible hiccups instead
+of one. Measured on a real scroll, the two-state version generates once per file
+and then not again - twelve wheel clicks produced one regeneration.
 
 **Syntect is built with `oniguruma` rather than `fancy-regex`.** The pure-Rust
 engine looked like the tidier dependency, but measured on markdown - syntect's
@@ -1503,15 +1508,29 @@ Why worker sends page 0: Avoids extra round-trip. Main thread has immediate resu
 
 ## Shutdown Sequence
 
-**Order:**
-1. Drop worker_tx (signals worker to stop)
-2. Join worker thread (wait for completion)
-3. Drop app (closes logging channel)
-4. Disable raw mode
-5. Leave alternate screen
-6. Disable mouse capture
+**The rule: the log sink must outlive everything that logs.**
 
-Why this order: Worker can log its shutdown message before logging channel closes. Prevents "Error performing logging" messages.
+Background threads log as they wind down, and several of them are only *told* to
+stop by `App` being dropped. If `App` also owned the receiving end of the logging
+channel, dropping it would take the sink with it - and fern reports a send to a
+dead channel by printing the entire record to stderr, over the terminal that is
+at that moment being restored. The user sees a wall of `Error performing logging`
+after quitting.
+
+So `log_rx` is owned by `main`, not by `App`, and dropped last. That is
+structural rather than a matter of ordering: `App` cannot close the sink because
+it does not hold it. The earlier fix - join each thread before `drop(app)` - only
+ever fixed the thread being joined, and had to be done again the next time a
+thread was added. The retraining and context threads are detached and can log at
+any moment, so they could not have been fixed that way at all.
+
+**Order:**
+1. Drop `worker_tx` (signals the worker to stop) and join the worker
+2. `input.shutdown()` - not for the logging, but so nothing is still reading the
+   terminal while it is being put back
+3. Drop `app`
+4. Restore the terminal: raw mode, enhancement flags, mouse capture, alt screen
+5. Drop `log_rx` last
 
 ## Dependencies
 

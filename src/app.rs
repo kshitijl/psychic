@@ -2,11 +2,7 @@ use anyhow::{Context, Result};
 use std::{
     collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::AtomicBool,
-        mpsc::{self, Receiver},
-    },
+    sync::{Arc, atomic::AtomicBool, mpsc},
     thread::JoinHandle,
     time::Instant,
 };
@@ -61,7 +57,6 @@ pub struct AppOptions {
 }
 
 pub struct AppBootstrap {
-    pub log_receiver: Receiver<String>,
     pub event_tx: mpsc::Sender<crate::AppEvent>,
     pub input: crate::tty_input::TtyInput,
     pub preview_tx: mpsc::Sender<PreviewRequest>,
@@ -89,7 +84,11 @@ pub struct App {
     // For debug pane
     pub model_stats_cache: Option<ranker::ModelStats>, // Cached from worker, refreshed periodically
     pub currently_retraining: bool,
-    pub log_receiver: Receiver<String>,
+    /// The last few log lines, for the debug pane. Filled by the event loop
+    /// from a receiver it owns: see the note on shutdown in `main`, and note
+    /// that `App` deliberately does *not* hold the receiving end of the
+    /// logging channel. Threads log while they wind down, and `App` is dropped
+    /// during shutdown, so owning the sink here would kill it too early.
     pub recent_logs: VecDeque<String>,
 
     // Filter state
@@ -146,7 +145,6 @@ impl App {
         log::debug!("App::new() started");
 
         let AppBootstrap {
-            log_receiver,
             event_tx,
             input,
             preview_tx,
@@ -192,7 +190,6 @@ impl App {
             last_path_bar_update: Instant::now(),
             model_stats_cache: None,
             currently_retraining: false,
-            log_receiver,
             recent_logs: VecDeque::with_capacity(50),
             current_filter: initial_filter,
             status_message: None,
@@ -358,7 +355,7 @@ impl App {
     /// Called after each frame, because the pane's size is a layout fact and the
     /// layout is only known once it has been computed. Repeat calls for a path
     /// already covered, or already requested in that much detail, cost nothing.
-    pub fn update_preview(&mut self, pane: crate::render::PreviewPane) {
+    pub fn update_preview(&mut self, pane: crate::preview::PreviewPane) {
         if self.options.no_preview {
             return;
         }
@@ -373,12 +370,7 @@ impl App {
         };
 
         if let Some((path, is_dir)) = selection {
-            // One screen on show and one in hand, from the top of the file:
-            // highlighting has to start there, and doing all of a long file up
-            // front is what made a large markdown preview take 150ms.
-            let wanted = self.preview.scroll_offset() + 2 * pane.height as usize;
-            self.preview
-                .request(&path, is_dir, pane.width, wanted.max(1));
+            self.preview.request(&path, is_dir, pane);
         }
     }
 

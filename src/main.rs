@@ -383,7 +383,6 @@ fn main() -> Result<()> {
     // Initialize app
     let app_new_start = Instant::now();
     let bootstrap = AppBootstrap {
-        log_receiver: log_rx,
         event_tx: event_tx.clone(),
         input,
         preview_tx,
@@ -521,11 +520,18 @@ fn main() -> Result<()> {
     );
 
     // Run the app
-    let result = run_app(&mut terminal, &mut app, event_rx, main_start);
+    let result = run_app(&mut terminal, &mut app, event_rx, main_start, &log_rx);
 
-    // Shutdown sequence: extract and drop worker_tx to signal the worker to stop,
-    // then wait for the worker thread to finish, THEN drop app (which drops log_rx).
-    // This ensures the worker can log its shutdown message before the logging channel closes.
+    // Shutdown. The one rule: **the log sink must outlive everything that logs.**
+    // Background threads log as they wind down, and several of them are only
+    // told to stop by `app` being dropped, so if `app` owned the receiving end
+    // of the logging channel it would take the sink with it - and fern reports
+    // a dead channel by printing the whole record to stderr, over the terminal
+    // we are in the middle of restoring.
+    //
+    // `log_rx` is owned by `main` for exactly this reason, and dropped last.
+    // Joining threads one at a time only ever fixed the thread being joined;
+    // the retraining and context threads are detached and can log at any moment.
     let worker_tx = std::mem::replace(&mut app.worker_tx, mpsc::channel().0);
     drop(worker_tx);
 
@@ -533,12 +539,10 @@ fn main() -> Result<()> {
         let _ = handle.join();
     }
 
-    // The input thread logs as it exits, and it only starts exiting when its
-    // handle is dropped - which, left to `drop(app)`, happens *after* the field
-    // holding the logging channel. Same reasoning as the worker above.
+    // Not for the logging - that is handled above - but so that nothing is
+    // still reading the terminal while we put it back the way we found it.
     app.input.shutdown();
 
-    // Now it's safe to drop app, which will close the logging channel
     drop(app);
 
     // Terminal cleanup
@@ -551,6 +555,10 @@ fn main() -> Result<()> {
         Show
     )?;
 
+    // Everything that could have logged has now been told to stop, and the
+    // terminal is back. Anything still arriving goes nowhere, quietly.
+    drop(log_rx);
+
     result
 }
 
@@ -559,6 +567,7 @@ fn run_app(
     app: &mut App,
     event_rx: Receiver<AppEvent>,
     main_start: Instant,
+    log_rx: &Receiver<String>,
 ) -> Result<()> {
     let mut first_render_logged = false;
     // Captured inside the draw closure, applied to app once the borrow ends.
@@ -693,7 +702,7 @@ fn run_app(
         }
 
         // Collect new log messages (non-blocking)
-        while let Ok(log_msg) = app.log_receiver.try_recv() {
+        while let Ok(log_msg) = log_rx.try_recv() {
             // fern adds a newline to each message sent via channel, so trim it
             app.recent_logs.push_back(log_msg.trim_end().to_string());
             // Keep only last 50 messages
