@@ -1,5 +1,49 @@
+use std::borrow::Cow;
 use std::path::Path;
 use std::time::Duration;
+
+/// What is safe to put in a terminal cell.
+///
+/// Control characters are not just ugly, they are *instructions*: an ESC in a
+/// file, or in a filename, starts an escape sequence that the terminal obeys,
+/// and a carriage return or backspace moves the cursor out from under whatever
+/// we thought we were drawing. Ratatui passes a cell's contents straight
+/// through, so anything that reaches a cell reaches the terminal.
+///
+/// Tabs become four spaces, since a literal tab moves the cursor by an amount
+/// the layout has not accounted for. Everything else in the control categories
+/// becomes a dot. Borrows when there is nothing to change, which is almost
+/// always.
+pub fn printable(text: &str) -> Cow<'_, str> {
+    if !text.chars().any(|c| c.is_control()) {
+        return Cow::Borrowed(text);
+    }
+
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '\t' => out.push_str("    "),
+            c if c.is_control() => out.push('·'),
+            c => out.push(c),
+        }
+    }
+    Cow::Owned(out)
+}
+
+/// Human-readable byte count, at most one decimal place.
+///
+/// Shared by the debug pane and the directory listing so that a size means the
+/// same thing wherever it appears.
+pub fn human_bytes(bytes: u64) -> String {
+    const UNITS: [(&str, u64); 3] = [("GB", 1 << 30), ("MB", 1 << 20), ("KB", 1 << 10)];
+
+    for (unit, scale) in UNITS {
+        if bytes >= scale {
+            return format!("{:.1} {}", bytes as f64 / scale as f64, unit);
+        }
+    }
+    format!("{} B", bytes)
+}
 
 /// Truncates a path string in the middle if it's too long, keeping the first
 /// component and the end of the path.
@@ -273,5 +317,56 @@ mod tests {
         assert!(result.contains("..."), "Should use ellipsis");
         assert!(result.starts_with('/'), "Should start with slash");
         assert!(result.len() <= 40, "Should respect max length");
+    }
+}
+
+#[cfg(test)]
+mod byte_tests {
+    use super::human_bytes;
+
+    #[test]
+    fn test_human_bytes() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(2048), "2.0 KB");
+        assert_eq!(human_bytes(62_914_560), "60.0 MB");
+        assert_eq!(human_bytes(3 << 30), "3.0 GB");
+    }
+}
+
+#[cfg(test)]
+mod printable_tests {
+    use super::printable;
+
+    #[test]
+    fn test_ordinary_text_is_left_alone_and_not_copied() {
+        let text = printable("src/main.rs");
+        assert_eq!(text, "src/main.rs");
+        assert!(
+            matches!(text, std::borrow::Cow::Borrowed(_)),
+            "no allocation"
+        );
+    }
+
+    #[test]
+    fn test_escape_sequences_cannot_reach_the_terminal() {
+        assert_eq!(
+            printable("red \x1b[31mnot red"),
+            "red ·[31mnot red",
+            "The ESC is the whole problem; the rest is only text"
+        );
+    }
+
+    #[test]
+    fn test_cursor_moving_characters_are_defanged() {
+        assert_eq!(printable("a\rb"), "a·b", "carriage return");
+        assert_eq!(printable("a\x08b"), "a·b", "backspace");
+        assert_eq!(printable("a\x07b"), "a·b", "bell");
+        assert_eq!(printable("a\x7fb"), "a·b", "delete");
+    }
+
+    #[test]
+    fn test_tabs_become_spaces_the_layout_can_count() {
+        assert_eq!(printable("a\tb"), "a    b");
     }
 }

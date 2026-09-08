@@ -14,7 +14,7 @@ use std::{
 use crate::analytics::Analytics;
 use crate::cli::{OnCwdVisitAction, OnDirClickAction};
 use crate::db::{EventData, FileMetadata};
-use crate::preview::PreviewManager;
+use crate::preview::{PreviewRequest, PreviewState};
 use crate::search_worker::{self, DisplayFileInfo, WorkerRequest};
 use crate::{history, ranker, ui_state};
 
@@ -64,6 +64,7 @@ pub struct AppBootstrap {
     pub log_receiver: Receiver<String>,
     pub event_tx: mpsc::Sender<crate::AppEvent>,
     pub input: crate::tty_input::TtyInput,
+    pub preview_tx: mpsc::Sender<PreviewRequest>,
 }
 
 pub struct App {
@@ -73,7 +74,7 @@ pub struct App {
     pub total_files: usize,               // Total number of files in index
     pub selected_index: usize,
     pub file_list_scroll: usize, // Scroll offset for file list
-    pub preview: PreviewManager,
+    pub preview: PreviewState,
     pub cwd: PathBuf, // Current working directory
     pub history: history::History,
     pub history_selected: usize, // Selected item in history mode UI
@@ -148,6 +149,7 @@ impl App {
             log_receiver,
             event_tx,
             input,
+            preview_tx,
         } = bootstrap;
         let initial_filter = options.initial_filter;
 
@@ -180,7 +182,7 @@ impl App {
             total_files: 0,
             selected_index: 0,
             file_list_scroll: 0,
-            preview: PreviewManager::new(),
+            preview: PreviewState::new(preview_tx),
             cwd: root.clone(),
             history: history::History::new(root),
             history_selected: 0,
@@ -349,6 +351,30 @@ impl App {
 
         // Delegate to analytics module
         self.analytics.check_and_log_impressions(force, top_n)
+    }
+
+    /// Ask for the preview of whatever is selected.
+    ///
+    /// Called after each frame, because the pane's width is a layout fact and
+    /// the layout is only known once it has been computed. Repeat calls for a
+    /// path already shown or already requested cost nothing.
+    pub fn update_preview(&mut self, pane_width: u16) {
+        if self.options.no_preview {
+            return;
+        }
+
+        let selection = if self.ui_state.history_mode {
+            self.get_filtered_history()
+                .get(self.history_selected)
+                .map(|dir| (dir.clone(), true))
+        } else {
+            self.get_file_at_index(self.selected_index)
+                .map(|info| (info.full_path.clone(), info.is_dir))
+        };
+
+        if let Some((path, is_dir)) = selection {
+            self.preview.request(&path, is_dir, pane_width);
+        }
     }
 
     pub fn move_selection(&mut self, delta: isize) {

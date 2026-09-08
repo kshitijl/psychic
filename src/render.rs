@@ -13,7 +13,7 @@ use std::{
 
 use crate::help::{self, HelpLine};
 use crate::keymap::{self, Action};
-use crate::path_display::truncate_absolute_path;
+use crate::path_display::{human_bytes, printable, truncate_absolute_path};
 
 /// Group digits so six-figure counts stay readable in a narrow pane.
 fn thousands(n: i64) -> String {
@@ -32,18 +32,6 @@ fn thousands(n: i64) -> String {
     } else {
         grouped
     }
-}
-
-/// Human-readable byte count, at most one decimal place.
-fn human_bytes(bytes: u64) -> String {
-    const UNITS: [(&str, u64); 3] = [("GB", 1 << 30), ("MB", 1 << 20), ("KB", 1 << 10)];
-
-    for (unit, scale) in UNITS {
-        if bytes >= scale {
-            return format!("{:.1} {}", bytes as f64 / scale as f64, unit);
-        }
-    }
-    format!("{} B", bytes)
 }
 
 /// One latency line, or a placeholder while we are still waiting for it.
@@ -72,7 +60,7 @@ pub struct HistoryRenderContext<'a> {
     pub filtered_history: &'a [PathBuf],
     pub history_selected: usize,
     pub total_history_items: usize,
-    pub preview_scroll_position: u16,
+    pub preview: &'a crate::preview::PreviewState,
     pub query: &'a str,
 }
 
@@ -84,7 +72,7 @@ pub struct NormalRenderContext<'a> {
     pub total_files: usize,
     pub current_filter: crate::search_worker::FilterType,
     pub no_preview: bool,
-    pub preview: &'a crate::preview::PreviewManager,
+    pub preview: &'a crate::preview::PreviewState,
     pub currently_retraining: bool,
     pub model_stats_cache: Option<&'a crate::ranker::ModelStats>,
     pub timings: &'a crate::app::Timings,
@@ -192,8 +180,11 @@ fn compute_scroll(
     scroll
 }
 
-/// Render the history navigation mode UI
-pub fn render_history_mode(f: &mut Frame, ctx: HistoryRenderContext<'_>) {
+/// Render the history navigation mode UI.
+///
+/// Returns the width of the preview pane, which only the layout knows and the
+/// main loop needs in order to ask for the next preview.
+pub fn render_history_mode(f: &mut Frame, ctx: HistoryRenderContext<'_>) -> u16 {
     // Split vertically: top for dir list + preview, bottom for input
     let main_chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -280,57 +271,18 @@ pub fn render_history_mode(f: &mut Frame, ctx: HistoryRenderContext<'_>) {
     );
     f.render_widget(list, top_chunks[0]);
 
-    // Preview pane: show eza -al of selected directory
-    let preview_text = if !filtered_history.is_empty()
-        && ctx.history_selected < filtered_history.len()
-    {
-        let selected_dir = &filtered_history[ctx.history_selected];
-
-        let preview_width = top_chunks[1].width;
-        let extra_flags = get_eza_flags(preview_width);
-
-        let mut eza_cmd = std::process::Command::new("eza");
-        eza_cmd.arg("-al").arg("--color=always");
-
-        // Add extra flags if preview is narrow
-        for flag in extra_flags.split_whitespace() {
-            if !flag.is_empty() {
-                eza_cmd.arg(flag);
-            }
-        }
-
-        eza_cmd.arg(selected_dir);
-        let eza_start = Instant::now();
-        let eza_output = eza_cmd.output();
-        log::info!(
-            "TIMING {{\"op\":\"eza_history_preview\",\"ms\":{}}}",
-            eza_start.elapsed().as_secs_f64() * 1000.0
-        );
-
-        match eza_output {
-            Ok(output) => match ansi_to_tui::IntoText::into_text(&output.stdout) {
-                Ok(text) => text,
-                Err(_) => Text::from("[Unable to parse directory listing]"),
-            },
-            Err(_) => {
-                // Fallback to ls if eza not available
-                let ls_output = std::process::Command::new("ls")
-                    .arg("-lah")
-                    .arg(selected_dir)
-                    .output();
-                match ls_output {
-                    Ok(output) => Text::from(String::from_utf8_lossy(&output.stdout).to_string()),
-                    Err(_) => Text::from("[Unable to list directory]"),
-                }
-            }
-        }
-    } else {
-        Text::from("No history available")
+    // Directories here go through the same preview thread as the file list.
+    // This used to run `eza` on every frame, including every 200ms tick, with
+    // no cache at all.
+    let preview_text = match filtered_history.get(ctx.history_selected) {
+        Some(dir) => ctx
+            .preview
+            .visible(dir, top_chunks[1].height.saturating_sub(2)),
+        None => Text::from("No history available"),
     };
 
-    let preview_para = Paragraph::new(preview_text)
-        .block(Block::default().borders(Borders::ALL).title("Preview"))
-        .scroll((ctx.preview_scroll_position, 0));
+    let preview_para =
+        Paragraph::new(preview_text).block(Block::default().borders(Borders::ALL).title("Preview"));
     f.render_widget(preview_para, top_chunks[1]);
 
     // Search input at bottom
@@ -356,6 +308,8 @@ pub fn render_history_mode(f: &mut Frame, ctx: HistoryRenderContext<'_>) {
                 ),
         );
     f.render_widget(input_para, input_area);
+
+    top_chunks[1].width
 }
 
 /// Draw the help screen on top of whatever is behind it.
@@ -487,7 +441,9 @@ fn styled_help_lines(lines: &[HelpLine]) -> Vec<Line<'static>> {
 /// State updates computed during rendering that need to be applied to App after rendering
 pub struct RenderUpdates {
     pub file_list_scroll: Option<usize>,
-    pub preview: Option<crate::preview::PreviewManager>,
+    /// Width of the preview pane, which only the layout knows. The main loop
+    /// uses it to ask for the preview after the frame is drawn.
+    pub preview_width: Option<u16>,
     pub path_bar_scroll: Option<u16>,
     pub path_bar_scroll_direction: Option<i8>,
     pub last_path_bar_update: Option<std::time::Instant>,
@@ -498,7 +454,7 @@ impl RenderUpdates {
     pub fn new() -> Self {
         Self {
             file_list_scroll: None,
-            preview: None,
+            preview_width: None,
             path_bar_scroll: None,
             path_bar_scroll_direction: None,
             last_path_bar_update: None,
@@ -510,9 +466,6 @@ impl RenderUpdates {
     pub fn apply_to(self, app: &mut crate::app::App) {
         if let Some(scroll) = self.file_list_scroll {
             app.file_list_scroll = scroll;
-        }
-        if let Some(preview) = self.preview {
-            app.preview = preview;
         }
         if let Some(scroll) = self.path_bar_scroll {
             app.path_bar_scroll = scroll;
@@ -664,6 +617,9 @@ pub fn render_normal_mode(
                 } else {
                     truncate_path(&display_name, adjusted_file_width)
                 };
+                // A path is whatever someone managed to create on disk, and it
+                // goes into a cell verbatim otherwise.
+                let truncated_path = printable(&truncated_path).into_owned();
 
                 // Build line with styled spans
                 let base_style = if i == ctx.selected_index {
@@ -772,38 +728,16 @@ pub fn render_normal_mode(
     let current_file_info: Option<(PathBuf, String, bool)> = ctx
         .get_file_at_index(ctx.selected_index)
         .map(|f| (f.full_path.clone(), f.display_name.clone(), f.is_dir));
-    let current_file_path = current_file_info
-        .as_ref()
-        .map(|(p, _, _)| p.to_string_lossy().to_string());
-    let is_dir = current_file_info
-        .as_ref()
-        .map(|(_, _, d)| *d)
-        .unwrap_or(false);
 
-    // Preview on the right using bat/eza (with smart caching)
-    let preview_text = if ctx.no_preview {
-        // Skip preview generation when --no-preview is enabled
-        Text::from("")
-    } else if current_file_info.is_some() && ctx.total_results > 0 {
-        if let Some(current_file_path) = &current_file_path {
-            let preview_width = top_chunks[1].width;
-            let preview_height = top_chunks[1].height.saturating_sub(2);
-
-            // Use preview manager to render preview
-            let mut preview_clone = ctx.preview.clone();
-            let text = preview_clone.render(
-                std::path::Path::new(current_file_path),
-                is_dir,
-                preview_width,
-                preview_height,
-            );
-            updates.preview = Some(preview_clone);
-            text
-        } else {
-            Text::from("[Loading preview...]")
-        }
-    } else {
-        Text::from("")
+    // The preview is generated on its own thread; this only shows whatever has
+    // arrived for the row that is selected right now. Anything else would mean
+    // a spawn or a file read inside the draw.
+    updates.preview_width = Some(top_chunks[1].width);
+    let preview_text = match &current_file_info {
+        Some((path, _, _)) if !ctx.no_preview && ctx.total_results > 0 => ctx
+            .preview
+            .visible(path, top_chunks[1].height.saturating_sub(2)),
+        _ => Text::default(),
     };
 
     let preview_pane_title = current_file_info
@@ -813,13 +747,11 @@ pub fn render_normal_mode(
         .map(|x| x.to_string())
         .unwrap_or("No file selected".to_string());
 
-    let preview = Paragraph::new(preview_text)
-        .scroll((ctx.preview.scroll_position() as u16, 0))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(preview_pane_title),
-        );
+    let preview = Paragraph::new(preview_text).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(preview_pane_title),
+    );
     f.render_widget(preview, top_chunks[1]);
 
     // Debug panel on the right
@@ -959,9 +891,7 @@ pub fn render_normal_mode(
 
     // Add preview cache status
     if let Some((file_path, _, _)) = &current_file_info {
-        let full_path_str = file_path.to_string_lossy().to_string();
-        let cache_status = ctx.preview.status(&full_path_str);
-        debug_lines.push(format!("Preview: {}", cache_status));
+        debug_lines.push(format!("Preview: {}", ctx.preview.status(file_path)));
     } else {
         debug_lines.push(String::from("Preview: N/A"));
     }
@@ -1029,7 +959,7 @@ pub fn render_normal_mode(
         .unwrap_or_default();
 
     // Pad the string to make the marquee scroll past the end
-    let padded_path = format!("{}    ", selected_path_str);
+    let padded_path = format!("{}    ", printable(&selected_path_str));
 
     let path_bar_width = main_chunks[1].width as usize;
 
@@ -1187,22 +1117,6 @@ pub fn render_normal_mode(
     updates
 }
 
-/// Get eza command flags based on preview pane width
-///
-/// # Arguments
-/// * `width` - Available width for the preview pane
-///
-/// # Returns
-/// The flags to pass to eza (everything after "eza -al")
-fn get_eza_flags(width: u16) -> &'static str {
-    // If width is small, omit user and permissions to save space
-    if width < 80 {
-        " --no-user --no-permissions"
-    } else {
-        ""
-    }
-}
-
 #[cfg(test)]
 mod test {
     use super::*;
@@ -1216,15 +1130,6 @@ mod test {
         assert_eq!(thousands(80_855), "80,855");
         assert_eq!(thousands(1_234_567), "1,234,567");
         assert_eq!(thousands(-4_200), "-4,200");
-    }
-
-    #[test]
-    fn test_human_bytes() {
-        assert_eq!(human_bytes(0), "0 B");
-        assert_eq!(human_bytes(512), "512 B");
-        assert_eq!(human_bytes(2048), "2.0 KB");
-        assert_eq!(human_bytes(62_914_560), "60.0 MB");
-        assert_eq!(human_bytes(3 << 30), "3.0 GB");
     }
 
     #[test]
@@ -1256,34 +1161,6 @@ mod test {
                 line.len()
             );
         }
-    }
-
-    #[test]
-    fn test_get_eza_flags_wide_screen() {
-        // Wide screens get full eza output
-        assert_eq!(get_eza_flags(80), "", "80 width should use full eza");
-        assert_eq!(get_eza_flags(100), "", "100 width should use full eza");
-        assert_eq!(get_eza_flags(120), "", "120 width should use full eza");
-    }
-
-    #[test]
-    fn test_get_eza_flags_narrow_screen() {
-        // Narrow screens get compact eza output
-        assert_eq!(
-            get_eza_flags(79),
-            " --no-user --no-permissions",
-            "79 width should use compact eza"
-        );
-        assert_eq!(
-            get_eza_flags(60),
-            " --no-user --no-permissions",
-            "60 width should use compact eza"
-        );
-        assert_eq!(
-            get_eza_flags(40),
-            " --no-user --no-permissions",
-            "40 width should use compact eza"
-        );
     }
 }
 

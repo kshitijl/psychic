@@ -56,6 +56,9 @@ enum AppEvent {
     /// Database statistics for the debug pane, gathered off the UI thread.
     /// Boxed to keep the event enum small; this arrives at most once per run.
     DbStats(Box<db::DbStats>),
+    /// A preview finished generating. Boxed because `Text` is much larger than
+    /// every other variant, and this enum is passed by value on every event.
+    Preview(Box<preview::Preview>),
 }
 
 impl From<WorkerResponse> for AppEvent {
@@ -67,6 +70,12 @@ impl From<WorkerResponse> for AppEvent {
 impl From<Event> for AppEvent {
     fn from(event: Event) -> Self {
         AppEvent::Input(event)
+    }
+}
+
+impl From<preview::Preview> for AppEvent {
+    fn from(generated: preview::Preview) -> Self {
+        AppEvent::Preview(Box::new(generated))
     }
 }
 
@@ -337,6 +346,11 @@ fn main() -> Result<()> {
     // terminal. See tty_input.rs for why that is harder than it sounds.
     let input = tty_input::spawn(event_tx.clone()).context("Failed to start the input thread")?;
 
+    // Thread 2: preview generation. Kept off the UI thread because how long a
+    // preview takes depends on the file, and the pane must never be what the
+    // rest of the frame is waiting for.
+    let preview_tx = preview::spawn(event_tx.clone());
+
     // Start background retraining in a new thread
     let retrain_start = Instant::now();
     let data_dir_clone = data_dir.clone();
@@ -372,6 +386,7 @@ fn main() -> Result<()> {
         log_receiver: log_rx,
         event_tx: event_tx.clone(),
         input,
+        preview_tx,
     };
 
     // Detect editor from environment, with fallback chain
@@ -562,6 +577,7 @@ fn run_app(
         let draw_start = Instant::now();
         let mut render_updates = None;
         let mut help_scroll_max = None;
+        let mut preview_width = None;
         terminal.draw(|f| {
             // Log first render
             if !first_render_logged {
@@ -578,10 +594,10 @@ fn run_app(
                     filtered_history: &filtered_history,
                     history_selected: app.history_selected,
                     total_history_items: app.history.items_for_display().len(),
-                    preview_scroll_position: app.preview.scroll_position() as u16,
+                    preview: &app.preview,
                     query: &app.query,
                 };
-                render::render_history_mode(f, history_ctx);
+                preview_width = Some(render::render_history_mode(f, history_ctx));
 
                 // The help screen is reachable from every mode, so it is drawn
                 // last, over whichever mode is underneath.
@@ -616,6 +632,7 @@ fn run_app(
                 status_message: app.status_message.as_deref(),
             };
             let updates = render::render_normal_mode(f, normal_ctx, marquee_delay, marquee_speed);
+            preview_width = updates.preview_width;
             render_updates = Some(updates);
 
             if app.ui_state.help_visible {
@@ -632,6 +649,13 @@ fn run_app(
         if let Some(max) = help_scroll_max {
             app.ui_state.help_scroll_max = max;
             app.ui_state.help_scroll = app.ui_state.help_scroll.min(max);
+        }
+
+        // Now that the layout is known, ask for the preview of whatever is
+        // selected. Generating it during the draw would put a file read, and
+        // once a process spawn, in front of every frame.
+        if let Some(width) = preview_width {
+            app.update_preview(width);
         }
 
         // Apply render updates to app state after rendering is complete
@@ -688,6 +712,9 @@ fn run_app(
             }
             AppEvent::DbStats(stats) => {
                 app.db_stats = Some(*stats);
+            }
+            AppEvent::Preview(generated) => {
+                app.preview.ready(*generated);
             }
             AppEvent::Tick => {
                 // Tick event - just triggers a redraw for marquee animation

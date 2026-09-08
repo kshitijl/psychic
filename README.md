@@ -30,7 +30,7 @@ The model is written to disk so that next time you open the app, it uses the mod
 
 The sqlite database has some indexes to support the most common queries. There is one particularly expensive but also important feature that we mostly pre-compute at the time of writing to the db: "which queries were tried before the user clicked on this file?" The actions a user does before clicking is called, in this code, an *episode*. The episode queries help make psychic feel magical: it can sometimes guess the file you want based on the very first letter you type, even if that letter is buried somewhere in the middle of the filename, because in previous episodes, when you typed that letter, you eventually clicked on that file. The episode queries are written in the same db event row as the click even though they can be derived from the other data we write, because doing this lets us avoid a linear scan through all that data at startup time.
 
-We use `bat` to show you a preview of the currently selected file, but some files are huge so we don't want to generate a preview of the whole thing. So we generate a preview of only the first bit of the file and cache that in memory. If you scroll, we ask `bat` to generate the rest and cache *that*.
+The preview pane is generated in-process, on its own thread. Syntax highlighting is `syntect`, the same library `bat` is built on, and a directory listing is a `read_dir`. It used to shell out to `bat` and `eza` and parse the ANSI they printed back, which cost a process spawn per preview: moving the selection took 16ms, and all of it was in the way of the redraw. Now it is half a millisecond, because the redraw never waits for the preview at all - it is generated on a thread and appears when it is ready. Big files are capped rather than read whole, and anything that isn't text is named rather than painted.
 
 Syscalls are expensive but of course this whole program is syscalls. We try to minimize syscalls. No syscalls in the main render loop; we carefully make sure that we ask for file metadata at the time we walk the filesystem and then carry that around everywhere else.
 
@@ -47,8 +47,6 @@ I'm working on making this part better, but for now there are no pre-built packa
 You'll need the rust toolchain, `uv` and a recent version of CMake installed. Then,
 
 `cargo install --path .`
-
-For preview, you'll also need `bat` and `eza` installed.
 
 For shell integration, put this in your `.zshrc`:
 

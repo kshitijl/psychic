@@ -850,7 +850,6 @@ pub struct UiState {
 - `toggle_filter_picker()`, `hide_filter_picker()`
 - `cycle_debug_pane_mode()` - cycles through Hidden → Small → Expanded → Hidden
 - `toggle_help()`, `hide_help()`, `scroll_help(delta)` - help always reopens at the top
-- `get_eza_flags(width)` - returns compact flags for narrow screens (<80 cols)
 - `is_debug_pane_visible()`, `is_debug_pane_expanded()`
 
 Why `help_scroll_max` lives here: only the renderer knows how much of the help
@@ -1041,7 +1040,7 @@ pub fn render_history_mode(f: &mut Frame, app: &App)
 - Layout calculation (horizontal vs vertical, adaptive based on terminal width)
 - Debug pane modes (Hidden, Small, Expanded)
 - File list rendering with ranking, colors, truncation
-- Preview pane rendering with bat/eza integration
+- Preview pane rendering, from text the preview thread has already generated
 - Marquee scrolling for long paths
 - Filter picker overlay popup
 - Path bar with scrolling animation
@@ -1053,29 +1052,68 @@ pub fn render_history_mode(f: &mut Frame, app: &App)
 
 **Simple interface:**
 ```rust
-pub fn get_preview_with_cache(
-    cache: &PreviewCache,
-    path: &str,
-    is_dir: bool,
-    preview_height: u16,
-    preview_scroll: usize,
-    extra_flags: &str,
-) -> (Text<'static>, PreviewCache)
+pub fn spawn<T: From<Preview>>(event_tx: Sender<T>) -> Sender<PreviewRequest>
 
-pub fn generate_directory_preview(path: &Path, extra_flags: &str) -> Text<'static>
-pub fn generate_full_file_preview(path: &Path) -> Text<'static>
-pub fn generate_light_file_preview(path: &Path, preview_height: u16) -> Text<'static>
+impl PreviewState {
+    pub fn request(&mut self, path: &Path, is_dir: bool, width: u16)
+    pub fn ready(&mut self, preview: Preview)
+    pub fn visible(&self, path: &Path, height: u16) -> Text<'static>
+    pub fn scroll(&mut self, delta: isize)
+    pub fn clear(&mut self)
+}
 ```
 
-**Complex implementation:**
-- Three-state caching (None, Light preview for first screen, Full preview when scrolled)
-- bat command execution with ANSI parsing
-- eza command execution with flags based on terminal width
-- Fallback to plain text/ls when bat/eza not available
-- Cache invalidation logic
-- Performance optimization (light preview = first N lines, full = entire file)
+**On a thread, because how long a preview takes is not up to us.** It used to
+run inside `terminal.draw`, so every frame that changed the selection paid for
+it before anything could be painted, and holding Down meant one preview per row
+in the way of each redraw. The thread keeps only its newest request, since
+everything older describes a row the user has already left. The UI shows a
+preview only when the path it was generated for is the path selected now, so
+there is no moment where one file's contents sit under another's name; the pane
+is empty for the frame or two in between.
 
-**Why this module:** Encapsulates preview generation and caching complexity. Caller just gets back (preview_text, updated_cache) without understanding bat flags, caching strategy, or ANSI parsing.
+**In process, because a process spawn cost more than the work.** `bat` and `eza`
+were 12-16ms of spawn each, and their output then had to be parsed back out of
+ANSI into ratatui spans. Highlighting is now `syntect` - the library `bat` is
+built on - and a listing is a `read_dir`, so styles are constructed directly.
+That also removes two things psychic had to be installed alongside, and the
+silent degradation to `ls` and unhighlighted text when they were missing.
+
+Measured, moving the selection one row, which is what regenerates a preview:
+
+| | before | after |
+|---|---|---|
+| median | 15.90ms | 0.55ms |
+| p90 | 20.84ms | 2.18ms |
+| first full draw | 31.6ms | 4.2ms |
+
+The syntax definitions take 3ms to deserialize, once, on the preview thread
+while the walker is still running.
+
+**Complex implementation:**
+- syntect highlighting, with the theme's foreground colours only: a theme
+  background would paint over the terminal's own, which the rest of psychic
+  honours
+- Directory listings: permissions, size, date, name, sorted case-insensitively,
+  dropping the wide columns below 80 columns the way the `eza` flags used to
+- Whole preview generated at once and sliced at draw time, so scrolling costs
+  nothing and a 5,000 line preview is not cloned every frame
+- Capped at 5,000 lines and 4MB: a preview is not a pager, and the old code
+  would happily read an entire file into memory as styled text
+
+**Nothing a file contains may reach the terminal as an instruction.** Control
+characters are not merely ugly: an ESC starts an escape sequence the terminal
+obeys, and a carriage return or backspace moves the cursor out from under what
+is being drawn. Ratatui passes a cell's contents straight through. So every
+string that reaches a cell goes through `path_display::printable` first, which
+turns tabs into spaces and everything else in the control categories into a dot:
+file contents, directory entry names, file list rows, and the path bar. Filenames
+are whatever someone managed to create on disk, so they need it as much as file
+contents do.
+
+A file whose first 8KB contain a NUL is named as binary rather than painted, but
+that check is a courtesy, not the safety net - a file that turns to rubbish
+halfway through is caught by sanitising, not by sniffing.
 
 ### Module: `main.rs`
 
@@ -1107,7 +1145,7 @@ Now a clean ~600-line event loop and application glue (down from 2000+ lines bef
 │  File List  │   Preview   │ Debug/Stats  │
 │   (35%)     │    (45%)    │    (20%)     │
 │             │             │              │
-│ 1. file.rs  │ [bat output]│ Score: 0.72  │
+│ 1. file.rs  │ [highlighted│ Score: 0.72  │
 │ 2. main.rs  │             │ Features:    │
 │ ...         │             │  Clicks: 3   │
 └─────────────┴─────────────┴──────────────┘
@@ -1126,7 +1164,7 @@ Now a clean ~600-line event loop and application glue (down from 2000+ lines bef
 ├──────────────────────────────────────────┤
 │  Preview (60%)                           │
 │                                          │
-│  [bat output]                            │
+│  [highlighted preview]                   │
 │                                          │
 ├──────────────────────────────────────────┤
 │   Search Input                           │
@@ -1339,7 +1377,7 @@ This creates a branch-point model similar to browser history - you can go back, 
 - Left pane: List of directories in reverse chronological order (most recent at top, with line numbers)
   - Includes current directory as the first entry (most recent)
   - Works even when starting fresh with no history (shows just current dir)
-- Right pane: Preview of selected directory using `eza -al` (or `ls -lah` fallback)
+- Right pane: listing of the selected directory, from the same preview thread as the file list
 - Bottom: Search bar filters history using case-insensitive substring matching
 - Navigation: Up/Down, Ctrl-P/Ctrl-N to move selection
 - Enter: Navigate to selected directory and exit history mode
@@ -1352,13 +1390,11 @@ Why substring filtering: Consistent with normal search behavior (both use `.cont
 Why auto-exit on Enter: Most common use case is "go back to X" - staying in history mode would require extra keypress.
 
 **Preview:**
-- Uses `bat --color=always --style=numbers --paging=never`
-- `ansi-to-tui` crate converts ANSI codes to ratatui Text
-- Cached by file path (invalidated on selection change)
-- Scrollable with mouse wheel
+- Highlighted in process with `syntect`; see "Module: `preview.rs`"
+- Generated once per path and sliced to the visible window when drawn
+- Scrollable with mouse wheel, clamped to the preview that exists
 
-Why cache: Running bat on every frame is slow. Cache entire file once, scroll offset is instant.
-Why ansi-to-tui: ratatui doesn't parse ANSI codes natively. Without it, raw escape codes appear as literal text.
+Why generate once: scrolling then costs nothing, since the offset is applied when slicing.
 
 **Editor launch:**
 ```rust
@@ -1442,8 +1478,8 @@ Why worker sends page 0: Avoids extra round-trip. Main thread has immediate resu
 7. **Page caching:** Request visible slice only, cache with prefetch.
    Why: Large result sets don't slow down rendering.
 
-8. **Preview caching:** Bat runs once per file, cached as Text<'static>.
-   Why: Scrolling is 60fps (no re-rendering).
+8. **Preview off the UI thread:** generated once per path on its own thread and sliced when drawn.
+   Why: the redraw never waits for a file read, and scrolling re-copies only what is on screen.
 
 ## Shutdown Sequence
 
@@ -1466,14 +1502,13 @@ Why this order: Worker can log its shutdown message before logging channel close
 - `lightgbm3` - LightGBM inference
 - `anyhow` - Error handling
 - `jiff` - Timestamps
-- `ansi-to-tui` - ANSI to ratatui Text conversion
+- `syntect` - syntax highlighting, in process
 - `clap` - CLI argument parsing
 - `fern` - Logging dispatch
 - `log` - Logging facade
 - `once_cell` - Lazy static for feature registry
 - `timeago` - Human-readable relative timestamps
 - `rand` - Random number generation (session IDs)
-- External: `bat` - Syntax highlighting (optional, has fallback)
 
 ## CLI Commands
 

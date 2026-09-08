@@ -281,22 +281,34 @@ Filter+rank is ~2ms per keystroke and is not the problem.
   everything below depth 1 when the threshold is hit. Not done because it
   would make results appear and then vanish in exactly the `~` case this was
   about.
-- **P2. `bat`/`eza` run inside `terminal.draw` on the UI thread.**
-  `render.rs::render_normal_mode` calls `PreviewManager::render`, which
-  spawns bat (12-16ms). Holding Down spawns one per row. History mode
-  (`render.rs` ~line 292) spawns `eza` on every frame including every 200ms
-  tick, with no cache at all. Fix: a preview thread that receives
-  (path, is_dir, width, height, token) and sends `AppEvent::Preview` back;
-  the UI keeps the last text and ignores stale tokens, same pattern as
-  query ids. History mode should use the same cache. Also skip preview
-  generation when the preview pane has zero width (debug pane Expanded).
-  Follow-up once this lands: replace `eza` with an in-process directory
-  listing (~150 lines: read_dir + metadata + size/date formatting + color
-  by type; removes a 12ms spawn and the ANSI round trip), and measure
-  `syntect` directly for file previews (styled ranges -> ratatui spans, no
-  ANSI; check cold syntax-set load time on the preview thread at startup
-  and binary size before committing; upside: previews without bat
-  installed).
+- **P2. Previews: off the UI thread and in process.** DONE (2026-09-09).
+  New `preview.rs`: a thread that turns a path into styled text and keeps only
+  its newest request, plus a `PreviewState` holding what is shown, what was
+  asked for, and the scroll offset. The UI shows a preview only when the path
+  it was generated for is the path selected now, so no file's contents ever
+  sit under another's name. `render.rs` records the pane width; the main loop
+  asks for the preview after the frame is drawn.
+  `bat` and `eza` are gone: highlighting is `syntect` (the library bat is
+  built on), a listing is a `read_dir`, and `ansi-to-tui` is dropped because
+  nothing produces ANSI to parse any more. History mode uses the same thread,
+  where it used to spawn `eza` on every frame including every tick, uncached.
+  Measured, moving the selection one row: median 15.90ms -> 0.55ms, p90
+  20.84 -> 2.18, max 23.58 -> 2.33. First full draw 31.6ms -> 4.2ms. The
+  syntax set costs 3ms to load, once, on the preview thread. Binary grows
+  10.0MB -> 12.7MB for the syntax definitions.
+  Fixed along the way: **the binary-file display corruption** (todo: "display
+  is broken if we scroll past a binary file"). The real fix is not sniffing
+  but sanitising - `path_display::printable` turns tabs into spaces and every
+  other control character into a dot, and every string that reaches a cell
+  goes through it: file contents, directory entry names, file list rows, the
+  path bar. Ratatui passes cell contents straight through, so an ESC in a file
+  *or in a filename* was an instruction the terminal obeyed. The NUL sniff
+  still names an obvious binary, but it only looks at the first 8KB and is no
+  longer what keeps the display safe.
+  Also: previews are capped at 5,000 lines and 4MB (the old code read whole
+  files into memory as styled text), generated once and sliced to the visible
+  window at draw time so scrolling costs nothing, and scroll is clamped to the
+  preview that exists rather than walking off into the distance.
 - **P3. Three syscalls per historical path at startup.** `WorkerState::new`
   does `exists()`, then `canonicalize()`, then `metadata()` per path: 6.3ms
   for 172 paths. Stored `full_path` values are already canonical. One
