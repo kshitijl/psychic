@@ -97,6 +97,7 @@ pub struct NormalRenderContext<'a> {
     pub path_bar_scroll_direction: i8,
     pub cwd: &'a Path,
     pub query: &'a str,
+    pub status_message: Option<&'a str>,
 }
 
 impl<'a> NormalRenderContext<'a> {
@@ -1094,7 +1095,18 @@ pub fn render_normal_mode(
         search_worker::FilterType::OnlyDirs => " [DIRS]",
         search_worker::FilterType::OnlyFiles => " [FILES]",
     };
-    let search_title = format!("Search: {}{}", cwd_str, filter_indicator);
+    // A status message replaces the title rather than sharing the line with it:
+    // the cwd is already on screen in the path bar above, and a message that
+    // gets truncated away by a long path is not worth showing.
+    let search_title = match ctx.status_message {
+        Some(message) => Span::styled(
+            message.to_string(),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        None => Span::raw(format!("Search: {}{}", cwd_str, filter_indicator)),
+    };
     let input = Paragraph::new(ctx.query).block(
         Block::default()
             .borders(Borders::ALL)

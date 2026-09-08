@@ -94,6 +94,11 @@ pub struct App {
     // Filter state
     pub current_filter: search_worker::FilterType,
 
+    /// One line of feedback shown in the search bar, e.g. when a selected file
+    /// turned out to be gone. Cleared on the next keypress, so it is visible
+    /// exactly until the user does something else.
+    pub status_message: Option<String>,
+
     // UI state machine
     pub ui_state: ui_state::UiState,
 
@@ -187,6 +192,7 @@ impl App {
             log_receiver,
             recent_logs: VecDeque::with_capacity(50),
             current_filter: initial_filter,
+            status_message: None,
             ui_state: ui_state::UiState::new(),
             options,
             analytics,

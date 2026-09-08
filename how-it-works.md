@@ -250,6 +250,16 @@ Worker thread owns all file data and processes queries asynchronously.
 3. Process work requests with 5ms timeout
 4. Debounce queries (drain channel, keep latest)
 
+**Eviction:** `WorkerRequest::Evict { path, query_id }` drops a path the UI found
+missing from disk, then re-runs the current query so the row disappears at once. The
+`FileInfo` is *marked* `evicted`, not removed: `FileId` is an index into
+`file_registry`, and those indices are held by `filtered_files` and by pages already
+sent to the UI, so removing an element would invalidate them. `filter_and_rank` tests
+the flag before doing any matching work, making an evicted entry cost a bool test.
+
+`add_file` clears the flag if the walker later rediscovers the path - the walker
+seeing it on disk is proof it exists, so the eviction should not outlive that.
+
 **Debouncing:** If user types "hello" quickly, only process final query (not 5 intermediate queries).
 Why: Avoids wasted computation and improves responsiveness.
 
@@ -311,6 +321,12 @@ LIMIT ?                       -- HISTORY_MAX_PATHS = 2000
 Neither bound bites at present scale (207 paths from 3,174 rows, oldest 312 days),
 which is the point: they are there so an unusual history degrades rather than
 slows everything down.
+
+**Stale entries:** the registry is a cache of the filesystem, and the `path.exists()`
+filter above validates it only once, at startup. A file deleted mid-session stays in
+the results, because nothing else revalidates it: `FilesChanged` fires on walker
+*additions* only. The registry is therefore revalidated a second time at the moment
+the user acts on a row - see "Act-time validation" under `input.rs`.
 
 The ordering is load-bearing: the worker registers these paths in order and file
 registry order breaks ties between equally scored results. It was previously
@@ -740,6 +756,23 @@ pub fn handle_input(
 - Input control channel management (pausing/resuming crossterm thread)
 
 **Why this module:** Hides all terminal management complexity. Main event loop just calls handle_input() and gets back a simple action to take.
+
+**Act-time validation:** every action that touches the selected row - open, navigate,
+print-and-exit, drop-into-shell - goes through `resolve_selection()`, which is the one
+place a row becomes an actionable path and therefore the one place its existence is
+checked. It returns a `Selection` only for a path still on disk, so holding one is
+evidence the check was made. `handle_enter` and `handle_ctrl_enter` both take this
+path, and both log their click through the shared `log_selection_click()`.
+
+If the path is gone, the click is *not* logged (it would be a click on a nonexistent
+file in the training data), a `WorkerRequest::Evict` drops the row, and the search bar
+title is replaced with `Gone: <name>` until the next keypress. The user stays in the
+TUI with the bad row removed, instead of being dropped back into a shell whose `cd`
+then fails.
+
+Why here and not at render time: `App::get_file_at_index` is called for every visible
+row on every frame and must stay IO-free. This is one `stat`, on one path, per
+keypress. Display-time revalidation was considered and deliberately not done.
 
 **What it does not decide:** which key does what. `handle_input` resolves the
 event to a `keymap::Action` and then dispatches on that action, so this module

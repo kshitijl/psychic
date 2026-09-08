@@ -82,6 +82,10 @@ fn handle_key_press(
     modifiers: KeyModifiers,
     terminal: &mut Terminal<CrosstermBackend<std::fs::File>>,
 ) -> Result<InputAction> {
+    // A status message lasts until the user does something else. Cleared before
+    // dispatch, so a handler below can set a fresh one for this keypress.
+    app.status_message = None;
+
     // The help screen is a cheat sheet, not a mode: it scrolls, and anything
     // else dismisses it rather than acting on whatever was underneath.
     if app.ui_state.help_visible {
@@ -255,6 +259,93 @@ fn handle_ctrl_j(
     execute_cwd_visit_action(app, &app.cwd, terminal)
 }
 
+/// The selected row, confirmed to still exist on disk.
+///
+/// Produced only by `resolve_selection`, so holding one is evidence the check
+/// was made.
+struct Selection {
+    display_name: String,
+    full_path: std::path::PathBuf,
+    mtime: Option<i64>,
+    atime: Option<i64>,
+    file_size: Option<i64>,
+    is_dir: bool,
+}
+
+/// Resolve the selected row, dropping it if it is no longer on disk.
+///
+/// The file registry is a cache of the filesystem, validated once at startup
+/// (`search_worker::WorkerState::new` skips historical paths that do not
+/// exist). Nothing revalidates it afterwards, so a file deleted mid-session
+/// stays in the results. Acting on such a row used to log a click on a
+/// nonexistent path and then hand that path to the shell, which failed the
+/// `cd` after psychic had already exited.
+///
+/// This is the one place a path becomes actionable, so it is the one place the
+/// check belongs: every action that touches the selection - open, navigate,
+/// print-and-exit, drop-into-shell - goes through here first. `Ok(None)` means
+/// the caller should do nothing; the row has been evicted and the user told.
+///
+/// One `stat` per keypress on one path, so the cost is not measurable. It is
+/// deliberately not done at render time: `App::get_file_at_index` is called for
+/// every visible row on every frame and must stay IO-free.
+fn resolve_selection(app: &mut App) -> Option<Selection> {
+    let display_info = app.get_file_at_index(app.selected_index)?;
+
+    // Clone what we need before the mutable borrows below.
+    let selection = Selection {
+        display_name: display_info.display_name.clone(),
+        full_path: display_info.full_path.clone(),
+        mtime: display_info.mtime,
+        atime: display_info.atime,
+        file_size: display_info.file_size,
+        is_dir: display_info.is_dir,
+    };
+
+    // `exists()` follows symlinks, matching the startup filter: a broken
+    // symlink is not something the user can open or cd into either.
+    if selection.full_path.exists() {
+        return Some(selection);
+    }
+
+    log::info!(
+        "Selected path no longer exists, evicting: {:?}",
+        selection.full_path
+    );
+
+    let query_id = app.next_query_id();
+    let _ = app.worker_tx.send(WorkerRequest::Evict {
+        path: selection.full_path.clone(),
+        query_id,
+    });
+
+    app.status_message = Some(format!("Gone: {}", selection.display_name));
+
+    None
+}
+
+/// Log a click on the selected row.
+///
+/// Shared by the actions that count as a click so that they agree on what gets
+/// written to the events table - this is training data, and a click logged by
+/// one path but not another would be a silent hole in it.
+fn log_selection_click(app: &mut App, selection: &Selection) -> Result<()> {
+    let subsession_id = app.analytics.current_subsession_id();
+    let session_id = app.analytics.session_id().to_string();
+    app.analytics.log_click(EventData {
+        query: &app.query,
+        file_path: &selection.display_name,
+        full_path: &selection.full_path.to_string_lossy(),
+        mtime: selection.mtime,
+        atime: selection.atime,
+        file_size: selection.file_size,
+        subsession_id,
+        action: UserInteraction::Click,
+        session_id: &session_id,
+        episode_queries: None,
+    })
+}
+
 /// Handle Ctrl-Enter (execute on-cwd-visit action for selected directory)
 fn handle_ctrl_enter(
     app: &mut App,
@@ -273,41 +364,19 @@ fn handle_ctrl_enter(
     // Log impressions before action
     app.check_and_log_impressions(true)?;
 
-    let Some(display_info) = app.get_file_at_index(app.selected_index) else {
+    let Some(selection) = resolve_selection(app) else {
         return Ok(InputAction::Continue);
     };
 
     // Only handle directories
-    if !display_info.is_dir {
+    if !selection.is_dir {
         return Ok(InputAction::Continue);
     }
 
-    // Clone data we need before mutable borrow
-    let display_name = display_info.display_name.clone();
-    let full_path = display_info.full_path.clone();
-    let full_path_str = full_path.to_string_lossy().to_string();
-    let mtime = display_info.mtime;
-    let atime = display_info.atime;
-    let file_size = display_info.file_size;
-
-    // Log the click event
-    let subsession_id = app.analytics.current_subsession_id();
-    let session_id = app.analytics.session_id().to_string();
-    app.analytics.log_click(EventData {
-        query: &app.query,
-        file_path: &display_name,
-        full_path: &full_path_str,
-        mtime,
-        atime,
-        file_size,
-        subsession_id,
-        action: UserInteraction::Click,
-        session_id: &session_id,
-        episode_queries: None,
-    })?;
+    log_selection_click(app, &selection)?;
 
     // Execute the on-cwd-visit action for the selected directory
-    execute_cwd_visit_action(app, &full_path, terminal)
+    execute_cwd_visit_action(app, &selection.full_path, terminal)
 }
 
 /// Handle Ctrl-H (toggle history mode)
@@ -431,39 +500,17 @@ fn handle_enter(
     // Log impressions before click (analytics module handles no_logging flag)
     app.check_and_log_impressions(true)?;
 
-    let Some(display_info) = app.get_file_at_index(app.selected_index) else {
+    let Some(selection) = resolve_selection(app) else {
         return Ok(InputAction::Continue);
     };
 
-    // Clone data we need before mutable borrow
-    let display_name = display_info.display_name.clone();
-    let full_path = display_info.full_path.clone();
-    let full_path_str = full_path.to_string_lossy().to_string();
-    let mtime = display_info.mtime;
-    let atime = display_info.atime;
-    let file_size = display_info.file_size;
-    let is_dir = display_info.is_dir;
-
     // Log the click event (analytics module handles no_logging flag)
-    let subsession_id = app.analytics.current_subsession_id();
-    let session_id = app.analytics.session_id().to_string();
-    app.analytics.log_click(EventData {
-        query: &app.query,
-        file_path: &display_name,
-        full_path: &full_path_str,
-        mtime,
-        atime,
-        file_size,
-        subsession_id,
-        action: UserInteraction::Click,
-        session_id: &session_id,
-        episode_queries: None,
-    })?;
+    log_selection_click(app, &selection)?;
 
-    if is_dir {
-        handle_directory_click(app, full_path.clone(), terminal)
+    if selection.is_dir {
+        handle_directory_click(app, selection.full_path, terminal)
     } else {
-        handle_file_click(app, full_path, terminal)?;
+        handle_file_click(app, selection.full_path, terminal)?;
         Ok(InputAction::Continue)
     }
 }

@@ -606,6 +606,7 @@ fn run_app(
                 path_bar_scroll_direction: app.path_bar_scroll_direction,
                 cwd: app.cwd.as_path(),
                 query: &app.query,
+                status_message: app.status_message.as_deref(),
             };
             let updates = render::render_normal_mode(f, normal_ctx, marquee_delay, marquee_speed);
             render_updates = Some(updates);

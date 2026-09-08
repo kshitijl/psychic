@@ -90,10 +90,25 @@ pub struct UpdateQueryRequest {
 
 pub enum WorkerRequest {
     UpdateQuery(UpdateQueryRequest),
-    GetPage { query_id: u64, page_num: usize },
-    ReloadModel { query_id: u64 },
-    ReloadClicks { query_id: u64 },
-    ChangeCwd { new_cwd: PathBuf, query_id: u64 },
+    GetPage {
+        query_id: u64,
+        page_num: usize,
+    },
+    ReloadModel {
+        query_id: u64,
+    },
+    ReloadClicks {
+        query_id: u64,
+    },
+    ChangeCwd {
+        new_cwd: PathBuf,
+        query_id: u64,
+    },
+    /// Drop a path from the results because it is no longer on disk.
+    Evict {
+        path: PathBuf,
+        query_id: u64,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -148,6 +163,11 @@ struct FileInfo {
     origin: FileOrigin,
     is_dir: bool,
     is_under_cwd: bool,
+    /// Set when the path was found missing from disk at the moment the user
+    /// acted on it. Evicted entries stay in the registry so `FileId` indices
+    /// (held by `filtered_files` and the UI's page cache) remain valid, but
+    /// `filter_and_rank` never emits them again.
+    evicted: bool,
 }
 
 impl FileInfo {
@@ -190,6 +210,7 @@ impl FileInfo {
             origin: FileOrigin::UserClickedInEventsDb,
             is_dir,
             is_under_cwd,
+            evicted: false,
         }
     }
 }
@@ -349,6 +370,7 @@ impl WorkerState {
                 origin: FileOrigin::CwdWalker,
                 is_dir: true,
                 is_under_cwd: true,
+                evicted: false,
             };
 
             let file_id = FileId(file_registry.len());
@@ -393,7 +415,15 @@ impl WorkerState {
         // `path` is the original path from the walker.
         let canonical_path = path.canonicalize().unwrap_or_else(|_| path.clone());
 
-        if !self.path_to_id.contains_key(&canonical_path) {
+        if let Some(&file_id) = self.path_to_id.get(&canonical_path) {
+            // Already registered. If it had been evicted as missing, the walker
+            // has just seen it on disk again, so it is real: put it back.
+            let file_info = &mut self.file_registry[file_id.0];
+            if file_info.evicted {
+                log::info!("Worker: un-evicting rediscovered path {:?}", canonical_path);
+                file_info.evicted = false;
+            }
+        } else {
             // We have a new file.
             // The display path should be the original `path` relative to `self.root`.
             let display_name = if canonical_path == self.root {
@@ -419,6 +449,7 @@ impl WorkerState {
                 origin: FileOrigin::CwdWalker,
                 is_dir,
                 is_under_cwd: true,
+                evicted: false,
             };
 
             let file_id = FileId(self.file_registry.len());
@@ -440,6 +471,12 @@ impl WorkerState {
             .map(FileId)
             .filter_map(|file_id| {
                 let file_info = &self.file_registry[file_id.0];
+
+                // Gone from disk. Checked first so an evicted entry costs a
+                // bool test rather than a fuzzy match.
+                if file_info.evicted {
+                    return None;
+                }
 
                 // Apply text query filter using fuzzy matching
                 let fuzzy_score = if query.is_empty() {
@@ -672,6 +709,30 @@ impl WorkerState {
         Ok(())
     }
 
+    /// Stop showing `path`, which the UI found missing from disk.
+    ///
+    /// The registry entry is marked rather than removed: `FileId` is an index
+    /// into `file_registry`, and those indices are held by `filtered_files` and
+    /// by the pages already sent to the UI.
+    ///
+    /// Returns whether a registered path was actually evicted.
+    fn evict(&mut self, path: &Path) -> bool {
+        // The UI acts on `full_path`, which is canonical, so no canonicalizing
+        // here - and the path is gone anyway, so canonicalize would fail.
+        let Some(&file_id) = self.path_to_id.get(path) else {
+            log::warn!("Worker: asked to evict unregistered path {:?}", path);
+            return false;
+        };
+
+        let file_info = &mut self.file_registry[file_id.0];
+        if file_info.evicted {
+            return false;
+        }
+        file_info.evicted = true;
+        log::info!("Worker: evicted missing path {:?}", path);
+        true
+    }
+
     fn change_cwd(&mut self, new_cwd: PathBuf) -> Result<()> {
         log::info!("Worker: Changing cwd from {:?} to {:?}", self.root, new_cwd);
 
@@ -884,6 +945,30 @@ fn worker_thread_loop<T>(
                     }
                 }
             }
+            Ok(WorkerRequest::Evict { path, query_id }) => {
+                state.current_query_id = query_id;
+                // Re-run the current query so the missing row disappears
+                // immediately. Nothing to do if the path was not registered.
+                if state.evict(&path) {
+                    let query = state.current_query.clone();
+                    if let Err(e) = state.filter_and_rank(&query) {
+                        log::error!("Filter/rank failed after eviction: {}", e);
+                    } else {
+                        let initial_page = state.get_page(0, 128);
+                        let _ = event_tx.send(
+                            WorkerResponse::QueryUpdated {
+                                query_id,
+                                total_results: state.filtered_files.len(),
+                                total_files: state.file_registry.len(),
+                                initial_page,
+                                model_stats: state.ranker.stats.clone(),
+                                rank_ms: state.last_rank_ms,
+                            }
+                            .into(),
+                        );
+                    }
+                }
+            }
             Err(RecvTimeoutError::Timeout) => {
                 // No work to do, loop again
                 continue;
@@ -970,6 +1055,7 @@ mod tests {
             origin: FileOrigin::CwdWalker,
             is_dir: false,
             is_under_cwd: walker_path.starts_with(&cwd),
+            evicted: false,
         };
 
         let history_in_cwd_path = PathBuf::from("/home/user/project/README.md");
@@ -983,6 +1069,7 @@ mod tests {
             origin: FileOrigin::UserClickedInEventsDb,
             is_dir: false,
             is_under_cwd: history_in_cwd_path.starts_with(&cwd),
+            evicted: false,
         };
 
         let history_outside_path = PathBuf::from("/home/user/other/file.txt");
@@ -996,6 +1083,7 @@ mod tests {
             origin: FileOrigin::UserClickedInEventsDb,
             is_dir: false,
             is_under_cwd: history_outside_path.starts_with(&cwd),
+            evicted: false,
         };
 
         // Test OnlyCwd filter
@@ -1026,6 +1114,7 @@ mod tests {
             origin: FileOrigin::CwdWalker,
             is_dir: true,
             is_under_cwd: true,
+            evicted: false,
         };
 
         let file_regular = FileInfo {
@@ -1037,6 +1126,7 @@ mod tests {
             origin: FileOrigin::CwdWalker,
             is_dir: false,
             is_under_cwd: true,
+            evicted: false,
         };
 
         // OnlyDirs filter: is_dir == true
@@ -1133,5 +1223,175 @@ mod load_ranker_tests {
             .expect("A corrupt model must not stop psychic from starting");
 
         assert!(!ranker.has_model(), "The unusable model was not loaded");
+    }
+}
+
+#[cfg(test)]
+mod eviction_tests {
+    use super::*;
+
+    /// A scratch directory with a real (empty) events database in it.
+    struct TempDataDir {
+        path: PathBuf,
+    }
+
+    impl TempDataDir {
+        fn new(name: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("psychic-test-{}-{}", name, std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("Failed to create temp data dir");
+            crate::db::Database::new(&path.join("events.db")).expect("Failed to create test db");
+            Self { path }
+        }
+    }
+
+    impl Drop for TempDataDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    /// A worker holding three walker-discovered files under `/test`.
+    ///
+    /// The paths do not exist on disk, which is what we want: `add_file`
+    /// canonicalizes, and canonicalizing a missing path leaves it unchanged, so
+    /// the registry holds exactly the paths written here.
+    fn worker_with_three_files(
+        name: &str,
+    ) -> (WorkerState, TempDataDir, mpsc::Receiver<WalkerCommand>) {
+        let dir = TempDataDir::new(name);
+        let (walker_command_tx, walker_command_rx) = mpsc::channel::<WalkerCommand>();
+
+        let mut state = WorkerState::new(
+            PathBuf::from("/test"),
+            &dir.path,
+            walker_command_tx,
+            true, // no_click_loading: keep the registry to just what we add
+            true, // no_model
+        )
+        .expect("Worker state should build against an empty data dir");
+
+        // `new` registers the root itself; drop it so the test sees only files.
+        state.file_registry.clear();
+        state.path_to_id.clear();
+
+        for name in ["alpha.txt", "beta.txt", "gamma.txt"] {
+            state.add_file(
+                PathBuf::from("/test").join(name),
+                Some(1000),
+                Some(1000),
+                Some(10),
+                false,
+            );
+        }
+
+        (state, dir, walker_command_rx)
+    }
+
+    fn results(state: &WorkerState) -> Vec<String> {
+        state
+            .filtered_files
+            .iter()
+            .map(|id| state.file_registry[id.0].display_name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn test_evicted_file_disappears_from_results() {
+        let (mut state, _dir, _rx) = worker_with_three_files("evict-basic");
+
+        state.filter_and_rank("").expect("Filter should succeed");
+        let mut before = results(&state);
+        before.sort();
+        assert_eq!(
+            before,
+            vec!["alpha.txt", "beta.txt", "gamma.txt"],
+            "All three files show before anything is evicted"
+        );
+
+        assert!(
+            state.evict(&PathBuf::from("/test/beta.txt")),
+            "Evicting a registered path reports that it did something"
+        );
+
+        state.filter_and_rank("").expect("Filter should succeed");
+        let mut after = results(&state);
+        after.sort();
+        assert_eq!(
+            after,
+            vec!["alpha.txt", "gamma.txt"],
+            "The evicted file is gone and the others are untouched"
+        );
+    }
+
+    #[test]
+    fn test_evicted_file_stays_gone_for_a_matching_query() {
+        let (mut state, _dir, _rx) = worker_with_three_files("evict-query");
+
+        state.evict(&PathBuf::from("/test/beta.txt"));
+
+        state
+            .filter_and_rank("beta")
+            .expect("Filter should succeed");
+        assert_eq!(
+            results(&state),
+            Vec::<String>::new(),
+            "A query that matches only the evicted file finds nothing"
+        );
+    }
+
+    #[test]
+    fn test_evicting_unknown_path_is_a_no_op() {
+        let (mut state, _dir, _rx) = worker_with_three_files("evict-unknown");
+
+        assert!(
+            !state.evict(&PathBuf::from("/test/never-registered.txt")),
+            "An unregistered path reports that nothing was evicted"
+        );
+        assert!(
+            state.evict(&PathBuf::from("/test/beta.txt")),
+            "First eviction of a real path succeeds"
+        );
+        assert!(
+            !state.evict(&PathBuf::from("/test/beta.txt")),
+            "Evicting the same path twice reports no further change"
+        );
+
+        state.filter_and_rank("").expect("Filter should succeed");
+        assert_eq!(
+            results(&state).len(),
+            2,
+            "Only the one real eviction took effect"
+        );
+    }
+
+    #[test]
+    fn test_walker_rediscovery_un_evicts() {
+        // A path can come back: deleted and recreated, or a directory the user
+        // navigated away from and back to. The walker seeing it on disk is
+        // proof it exists, so the eviction should not outlive that.
+        let (mut state, _dir, _rx) = worker_with_three_files("evict-rediscover");
+
+        state.evict(&PathBuf::from("/test/beta.txt"));
+        state.filter_and_rank("").expect("Filter should succeed");
+        assert_eq!(results(&state).len(), 2, "Evicted file is hidden");
+
+        state.add_file(
+            PathBuf::from("/test/beta.txt"),
+            Some(2000),
+            Some(2000),
+            Some(20),
+            false,
+        );
+
+        state.filter_and_rank("").expect("Filter should succeed");
+        let mut after = results(&state);
+        after.sort();
+        assert_eq!(
+            after,
+            vec!["alpha.txt", "beta.txt", "gamma.txt"],
+            "Rediscovered file is back, and was not registered a second time"
+        );
     }
 }
