@@ -74,7 +74,7 @@ beside it.
 - **Main (UI)**: Renders UI, blocks on unified event channel, owns visible file slice only
 - **Worker**: Owns all file data, does filtering/ranking, sends results to unified channel
 - **Walker**: Discovers files via walkdir, sends to worker
-- **Crossterm forwarder**: Polls for keyboard/mouse events every 10ms, sends to unified channel
+- **Input**: Sleeps in the kernel until the terminal has bytes, decodes them with crossterm, sends to unified channel. Stoppable, so a child process can own the terminal (see "The input thread" below)
 - **Tick timer**: Sends tick events every 200ms for UI animations (marquee)
 
 **Communication via Unified Event Channel:**
@@ -87,8 +87,8 @@ Worker → AppEvent::Worker(Page{...}) → Main
 Worker → AppEvent::Worker(FilesChanged) → Main
 Worker → AppEvent::Worker(WalkerDone{walk_ms}) → Main
 
-// Crossterm thread forwards input events
-Crossterm → AppEvent::Input(Event) → Main
+// Input thread forwards keyboard and mouse events
+Input → AppEvent::Input(Event) → Main
 
 // Tick timer for animations
 Tick → AppEvent::Tick → Main
@@ -106,8 +106,86 @@ Main blocks on event_rx.recv() → instant wake on ANY event
 **Why unified event channel:**
 The main thread uses a single blocking `recv()` on a unified event channel instead of polling multiple channels with timeouts. This provides instant wake-up when any event arrives (worker response, keyboard input, tick, retrain status), eliminating the 0-100ms polling delay that previously caused sluggish first renders. All event sources send to the same channel, and main wakes instantly.
 
-**Why separate crossterm thread:**
-crossterm's `event::poll()` is blocking and would prevent instant response to worker events. By running it in a separate thread that forwards events to the unified channel, we can use crossterm's efficient polling while still maintaining instant response to all event types.
+**Why separate input thread:**
+crossterm's `event::poll()` blocks, which would prevent instant response to worker
+events. Running it on its own thread that forwards into the unified channel keeps
+every event type instant.
+
+### The input thread
+
+Lives in `tty_input.rs`. It has to do two things that are harder to combine than
+they look: wait for the terminal, and stop on demand. It must stop because
+pressing Enter on a file hands the terminal to `$EDITOR`, and two readers on one
+terminal means the editor loses keystrokes to us.
+
+crossterm's synchronous API offers exactly two ways to wait: `read()`, which
+blocks forever, and `poll(timeout)`, which blocks for at most the timeout.
+Neither can be woken by another thread. That is a missing feature, not a bug, and
+three earlier designs worked around it: blocking in `read()` and forwarding to a
+channel (`83ccd32`, which ate the editor's keystrokes, because a thread inside
+`read()` cannot be told to stop); then `crossbeam::select!` on a pause channel
+with a 10ms `default` arm followed by `event::poll(Duration::ZERO)` (`9058bec`),
+which never blocked and so could always be paused, at the price of checking the
+terminal only 100 times a second; then a 50ms sleep after signalling a pause
+(`da7d259`), hoping the thread had noticed by then.
+
+**Why a pipe is the answer.** `crossbeam::select!` waits on *channels*. The
+terminal is not a channel, it is a file descriptor, and the only thing that can
+wait on a file descriptor is the kernel:
+
+```
+    crossbeam::select!   channels: yes    file descriptors: no
+    kernel poll(2)       channels: no     file descriptors: yes
+```
+
+To wait on the terminal *and* on "please stop" in one call with no timeout, one
+of them has to cross over into the other's world. Making the terminal look like a
+channel is the design that ate keystrokes. So the stop signal is made to look
+like a file descriptor instead: a pipe. `TtyInput::pause` writes one byte, and
+the kernel wakes the thread out of a `poll` that had no timeout at all.
+
+The thread waits on three descriptors: the terminal, that pipe, and a second pipe
+fed by a SIGWINCH handler. The third is needed because a window resize arrives as
+a signal rather than as bytes, so `poll` sleeps straight through it. crossterm
+has an `Event::Resize` ready, but only hands it over when asked, and we only ask
+when the kernel wakes us. The signal cannot do the waking either: `signal-hook`
+registers with `SA_RESTART`, so the kernel restarts the interrupted `poll`
+rather than returning `EINTR`.
+
+Without that pipe a resize is not lost, only late. The 200ms tick redraws, and
+ratatui re-reads the terminal size on every `draw`, so the UI reflows on the next
+tick: measured at 134-151ms, against about 1ms with the pipe. That fallback stops
+existing the moment ticks are made conditional on something actually animating,
+which is the remaining half of this cleanup.
+
+`signal-hook` keeps a registry of handlers per signal, so ours is added alongside
+crossterm's rather than replacing it: crossterm still turns the signal into the
+event, and our pipe only wakes us up to ask for it.
+
+**What crossterm still does** is everything except deciding when to read: escape
+sequence decoding, the kitty keyboard protocol, SGR mouse, bracketed paste,
+sequences split across reads, raw mode, the alternate screen, and being ratatui's
+backend. It is called only with a zero timeout, after the kernel has already said
+a byte is waiting, so it can never block and the eaten-keystroke bug cannot come
+back.
+
+Two consequences worth knowing:
+
+- **Crossterm's queue has to be drained to exhaustion** before going back to the
+  kernel. It reads the terminal in blocks and can decode several events out of
+  one read - a paste, or a mouse drag - and those extra events sit in its queue,
+  not in the kernel's buffer. Waiting on the descriptor while they are queued
+  would hang until the user happened to press another key.
+- **Hangup is checked before readability.** A terminal that has gone away reports
+  both, and at end of file the descriptor is readable forever, so treating that
+  as "there is input" would spin the thread at 100%. Nothing is lost: the thread
+  drains crossterm one last time on its way out.
+
+**Pausing is now an answer, not a guess.** `pause()` returns only once the thread
+has confirmed on an ack channel that it has stopped reading, so the child process
+provably has the terminal to itself. It returns a guard whose `Drop` resumes the
+thread, so no early return on the way back from a child can leave the terminal
+permanently deaf. The 50ms sleeps are gone.
 
 **Why separate tick thread:**
 Previously relied on event poll timeout for periodic UI updates (marquee animation). Now that we use blocking recv(), a dedicated tick thread sends periodic events to trigger redraws for animations.
@@ -810,7 +888,7 @@ pub fn handle_input(
 - Directory navigation (Enter on files/dirs)
 - Terminal suspension for editor/shell
 - Terminal cleanup and restoration
-- Input control channel management (pausing/resuming crossterm thread)
+- Stopping and restarting the input thread around a child process
 
 **Why this module:** Hides all terminal management complexity. Main event loop just calls handle_input() and gets back a simple action to take.
 
@@ -968,7 +1046,7 @@ Now a clean ~600-line event loop and application glue (down from 2000+ lines bef
 
 **Main responsibilities:**
 - Create unified event channel
-- Spawn threads (worker, walker, crossterm forwarder, tick timer, retraining)
+- Spawn threads (worker, walker, input, tick timer, retraining)
 - Initialize App state
 - Run event loop (draw UI, receive events, dispatch to modules)
 - Coordinate modules (analytics, input, render, preview)

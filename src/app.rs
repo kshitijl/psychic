@@ -63,7 +63,7 @@ pub struct AppOptions {
 pub struct AppBootstrap {
     pub log_receiver: Receiver<String>,
     pub event_tx: mpsc::Sender<crate::AppEvent>,
-    pub input_control_tx: crossbeam::channel::Sender<bool>,
+    pub input: crate::tty_input::TtyInput,
 }
 
 pub struct App {
@@ -112,8 +112,9 @@ pub struct App {
     pub worker_tx: mpsc::Sender<WorkerRequest>,
     pub worker_handle: Option<JoinHandle<()>>,
 
-    // Crossterm thread control (for pausing when launching child processes)
-    pub input_control_tx: crossbeam::channel::Sender<bool>,
+    /// The input thread, which has to be stopped while a child process owns
+    /// the terminal.
+    pub input: crate::tty_input::TtyInput,
 
     // Tick thread control (for pausing when launching child processes)
     pub tick_paused: Arc<AtomicBool>,
@@ -146,7 +147,7 @@ impl App {
         let AppBootstrap {
             log_receiver,
             event_tx,
-            input_control_tx,
+            input,
         } = bootstrap;
         let initial_filter = options.initial_filter;
 
@@ -198,7 +199,7 @@ impl App {
             analytics,
             worker_tx: worker_tx.clone(),
             worker_handle: Some(worker_handle),
-            input_control_tx,
+            input,
             tick_paused: Arc::new(AtomicBool::new(false)),
             walker_done: false,
             startup_complete_logged: false,

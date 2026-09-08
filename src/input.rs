@@ -20,6 +20,7 @@ use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use crossterm::{
     cursor::Show,
+    event::{KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -656,13 +657,95 @@ fn send_query_update(app: &mut App) {
 
 /// Cleanup terminal before exiting
 fn cleanup_terminal(terminal: &mut Terminal<CrosstermBackend<std::fs::File>>) -> Result<()> {
+    leave_tui(terminal)
+}
+
+/// Give the terminal back: cooked mode, main screen, cursor visible.
+///
+/// The keyboard enhancement flags are popped first, undoing the push in
+/// [`enter_tui`]. They are a stack in the terminal, not a mode we own, so a
+/// push without a matching pop leaves one entry behind on every round trip
+/// through an editor.
+fn leave_tui(terminal: &mut Terminal<CrosstermBackend<std::fs::File>>) -> Result<()> {
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
-        crossterm::event::DisableMouseCapture
+        PopKeyboardEnhancementFlags,
+        crossterm::event::DisableMouseCapture,
+        LeaveAlternateScreen,
+        Show
     )?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    execute!(terminal.backend_mut(), Show)?;
+    Ok(())
+}
+
+/// Take the terminal back for the TUI.
+fn enter_tui(terminal: &mut Terminal<CrosstermBackend<std::fs::File>>) -> Result<()> {
+    enable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        crossterm::event::EnableMouseCapture,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    )?;
+    // Wipe whatever the child left on the alternate screen; without this the
+    // first frame back can be a blank or half-drawn screen.
+    terminal.clear()?;
+    Ok(())
+}
+
+/// Hand the terminal to a child process, wait for it, and take it back.
+///
+/// The order matters. The input thread has to be off the terminal *before* the
+/// child starts, or the two race for the user's keystrokes and the child loses
+/// some of them - that was the original bug behind all the polling in
+/// `tty_input.rs`. `pause` returns only once the thread has confirmed it has
+/// stopped, and the guard it returns resumes the thread however we leave here.
+fn suspend_tui_and_run(
+    app: &App,
+    terminal: &mut Terminal<CrosstermBackend<std::fs::File>>,
+    command: &mut std::process::Command,
+) -> Result<()> {
+    let _paused = app.input.pause();
+
+    // Ticks would otherwise pile up in the event channel while the child runs,
+    // and arrive in one burst on the way back (commit 7ab2a8d).
+    app.tick_paused
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+
+    // Our own stdout may be a pipe - the shell integration reads a path off it -
+    // so the child gets the terminal itself rather than whatever we inherited.
+    let outcome = open_child_tty(command).and_then(|()| {
+        leave_tui(terminal)?;
+
+        // Not `?`: the terminal has to be restored below whatever the child did.
+        if let Err(e) = command.status() {
+            log::error!("Failed to launch {:?}: {}", command.get_program(), e);
+        }
+        Ok(())
+    });
+
+    log::info!("Resuming TUI after editor/shell");
+    let restored = enter_tui(terminal);
+
+    app.tick_paused
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+
+    outcome.and(restored)
+}
+
+/// Point a child's three standard streams at the terminal.
+fn open_child_tty(command: &mut std::process::Command) -> Result<()> {
+    use std::process::Stdio;
+
+    let tty_in = std::fs::OpenOptions::new().read(true).open("/dev/tty")?;
+    let tty_out = std::fs::OpenOptions::new().write(true).open("/dev/tty")?;
+    let tty_err = std::fs::OpenOptions::new().write(true).open("/dev/tty")?;
+
+    command
+        .stdin(Stdio::from(tty_in))
+        .stdout(Stdio::from(tty_out))
+        .stderr(Stdio::from(tty_err));
+
     Ok(())
 }
 
@@ -672,131 +755,21 @@ fn suspend_tui_and_run_shell(
     dir: &std::path::Path,
     terminal: &mut Terminal<CrosstermBackend<std::fs::File>>,
 ) -> Result<()> {
-    // Pause crossterm thread
-    let _ = app.input_control_tx.send(false);
-
-    // Pause tick thread to prevent event queue buildup
-    app.tick_paused
-        .store(true, std::sync::atomic::Ordering::Relaxed);
-
-    // Give the input thread time to enter paused state to avoid race condition
-    std::thread::sleep(std::time::Duration::from_millis(50));
-
-    // Suspend TUI
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        crossterm::event::DisableMouseCapture
-    )?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    execute!(terminal.backend_mut(), Show)?;
-
-    // Run shell
-    use std::process::Stdio;
-    let tty_in = std::fs::OpenOptions::new().read(true).open("/dev/tty")?;
-    let tty_out = std::fs::OpenOptions::new().write(true).open("/dev/tty")?;
-    let tty_err = std::fs::OpenOptions::new().write(true).open("/dev/tty")?;
-
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
-    let status = std::process::Command::new(&shell)
-        .current_dir(dir)
-        .stdin(Stdio::from(tty_in))
-        .stdout(Stdio::from(tty_out))
-        .stderr(Stdio::from(tty_err))
-        .status();
+    let mut command = std::process::Command::new(&shell);
+    command.current_dir(dir);
 
-    // Resume TUI
-    log::info!("Resuming TUI after editor/shell");
-    enable_raw_mode()?;
-    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
-    execute!(terminal.backend_mut(), crossterm::event::EnableMouseCapture)?;
-    // Re-enable enhanced keyboard protocol
-    execute!(
-        terminal.backend_mut(),
-        crossterm::event::PushKeyboardEnhancementFlags(
-            crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-        )
-    )?;
-    terminal.clear()?;
-
-    // Resume crossterm thread
-    log::info!("Sending resume signal to input thread");
-    let _ = app.input_control_tx.send(true);
-
-    // Resume tick thread
-    app.tick_paused
-        .store(false, std::sync::atomic::Ordering::Relaxed);
-
-    if let Err(e) = status {
-        log::error!("Failed to launch shell: {}", e);
-    }
-
-    Ok(())
+    suspend_tui_and_run(app, terminal, &mut command)
 }
 
-/// Suspend TUI and run editor for the given file
+/// Suspend TUI and run the user's editor on the given file
 fn suspend_tui_for_editor(
     app: &App,
     file_path: &std::path::Path,
     terminal: &mut Terminal<CrosstermBackend<std::fs::File>>,
 ) -> Result<()> {
-    // Pause crossterm thread
-    let _ = app.input_control_tx.send(false);
+    let mut command = std::process::Command::new(&app.options.editor);
+    command.arg(file_path);
 
-    // Pause tick thread to prevent event queue buildup
-    app.tick_paused
-        .store(true, std::sync::atomic::Ordering::Relaxed);
-
-    // Give the input thread time to enter paused state to avoid race condition
-    std::thread::sleep(std::time::Duration::from_millis(50));
-
-    // Suspend TUI
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        crossterm::event::DisableMouseCapture
-    )?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    execute!(terminal.backend_mut(), Show)?;
-
-    // Run editor
-    use std::process::Stdio;
-    let tty_in = std::fs::OpenOptions::new().read(true).open("/dev/tty")?;
-    let tty_out = std::fs::OpenOptions::new().write(true).open("/dev/tty")?;
-    let tty_err = std::fs::OpenOptions::new().write(true).open("/dev/tty")?;
-
-    let status = std::process::Command::new(&app.options.editor)
-        .arg(file_path)
-        .stdin(Stdio::from(tty_in))
-        .stdout(Stdio::from(tty_out))
-        .stderr(Stdio::from(tty_err))
-        .status();
-
-    // Resume TUI
-    log::info!("Resuming TUI after editor/shell");
-    enable_raw_mode()?;
-    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
-    execute!(terminal.backend_mut(), crossterm::event::EnableMouseCapture)?;
-    // Re-enable enhanced keyboard protocol
-    execute!(
-        terminal.backend_mut(),
-        crossterm::event::PushKeyboardEnhancementFlags(
-            crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-        )
-    )?;
-    terminal.clear()?;
-
-    // Resume crossterm thread
-    log::info!("Sending resume signal to input thread");
-    let _ = app.input_control_tx.send(true);
-
-    // Resume tick thread
-    app.tick_paused
-        .store(false, std::sync::atomic::Ordering::Relaxed);
-
-    if let Err(e) = status {
-        log::error!("Failed to launch editor: {}", e);
-    }
-
-    Ok(())
+    suspend_tui_and_run(app, terminal, &mut command)
 }

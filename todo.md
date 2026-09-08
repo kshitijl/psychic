@@ -315,97 +315,50 @@ Filter+rank is ~2ms per keystroke and is not the problem.
   `file_scores.iter().find(..)` for each of 128 rows. `filtered_files` is
   built from `file_scores` in the same order; index directly and delete
   `filtered_files`.
-- **P7. Idle wakeups and input latency.** Three loops poll; only one of
-  them is a real workaround.
-  - *History (commit log only, not in docs):* `83ccd32` (2025-10-20) had
-    the input thread block in `event::read()`. `9058bec` the same day:
-    "fixes bug where keyboard events are eaten. but now we back to polling":
-    a thread parked in crossterm 0.28's `read()` cannot be interrupted, and
-    while $EDITOR runs it keeps reading the tty and eats the editor's
-    keystrokes. Fix was to never block: `select!` on the pause channel with
-    `default(10ms)`, then `poll(Duration::ZERO)`. `da7d259` added the 50ms
-    sleeps as a race guard around pause/resume. `7ab2a8d` paused ticks
-    because they piled up during a long editor session and hung resume.
-    Put a comment on the input thread saying this; how-it-works.md still
-    describes the blocking version.
-  - *Worker (unrelated to the above):* `recv_timeout(5ms)` in
-    `worker_thread_loop` exists only because the walker has its own channel.
-    Give the walker a clone of the worker request sender and add
-    `WorkerRequest::Walker(WalkerMessage)`; the worker then blocks on one
-    `recv()` with no timeout. Keep the FilesChanged debounce logic.
-  - *Tick (unrelated):* send ticks only while something animates, i.e.
-    the marquee path overflows the path bar; otherwise sleep on a condvar
-    or simply check a shared `AtomicBool` the renderer sets.
-  - *Input, tier 1 (do regardless, one line):* replace
-    `default(Duration::from_millis(10))` + `poll(Duration::ZERO)` with a
-    blocking `event::poll(Duration::from_millis(10))`, then `try_recv` the
-    pause channel between polls. Key latency goes from up to 10ms to zero;
-    pause is observed at most 10ms late, which the existing 50ms sleep
-    already covers. Semantics otherwise identical to `9058bec`.
-  - *Input, tier 2 (zero idle wakeups, instant pause):* wait with
-    `libc::poll` on two fds, the tty (open /dev/tty read-only for this) and
-    the read end of a self-pipe. Tty readable -> crossterm `poll(ZERO)` +
-    `read()` as now. Pipe readable -> drain it, send an `Ack` on a channel,
-    park until resume. Pause then does `send(false); ack_rx.recv()` and the
-    50ms sleeps in `suspend_tui_*` go away. ~40 lines with the `libc`
-    crate. Works because the block is in the kernel outside crossterm, where
-    a pipe can wake it; the original bug was blocking inside crossterm.
-  - *Why tier 2 is shaped like that (move this into how-it-works.md once it
-    is implemented, under "Thread Architecture"):*
-
-    This is not a crossterm bug. Crossterm's synchronous API has exactly two
-    ways to wait for input: `read()`, which blocks forever, and
-    `poll(timeout)`, which blocks for at most the timeout. Neither can be
-    woken from another thread. So every version of this code has waited
-    with a timeout, and the timeout *is* the polling interval.
-
-    Nor is `crossbeam::select!` the problem. `select!` waits on several
-    *channels* at once. The terminal is not a channel; it is a file
-    descriptor owned by the kernel, and the only way to wait on a file
-    descriptor is a kernel call such as `poll`, which is what
-    `event::poll` wraps. `select!` has no arm for "also wake me when this
-    fd is readable", so the current `default(10ms)` branch is a timeout
-    pretending to be that arm: wait on the pause channel up to 10ms, give
-    up, glance at the terminal with a zero timeout, repeat.
-
-    Two worlds, each able to wait only on its own kind:
-
-        crossbeam::select!   channels: yes    file descriptors: no
-        kernel poll          channels: no     file descriptors: yes
-
-    To wait on the pause signal and the terminal in one blocking call with
-    no timeout, one of them has to cross over:
-
-    * Make the terminal look like a channel: a thread blocks in
-      `event::read()` forever and forwards events into a channel. That is
-      `83ccd32`, and it ate keystrokes, because a thread inside `read()`
-      cannot be stopped when $EDITOR takes over the tty.
-    * Make the pause signal look like a file descriptor: a pipe. The main
-      thread writes one byte to pause; the kernel wakes the input thread
-      from `poll`, which was watching the tty fd and the pipe's read end
-      together. This direction works because the thing that blocks is the
-      kernel, which wakes for either fd.
-
-    What crossterm still does afterwards is nearly everything: decoding the
-    byte stream into `Event::Key`/`Event::Mouse` (escape sequences, the
-    kitty keyboard protocol behind `DISAMBIGUATE_ESCAPE_CODES`, SGR mouse,
-    bracketed paste, sequences split across reads), raw mode, alternate
-    screen, mouse capture, enhancement flag push/pop, and being ratatui's
-    backend. Tier 2 takes exactly one step away from it: "sleep until a
-    byte is available". Crossterm is then only ever called with a zero
-    timeout, after the kernel has already said a byte is there, so it can
-    never block, and the eaten-keystroke bug cannot recur. Our ~40 lines
-    decide *when* to read; crossterm decides *what was read*. After this,
-    `crossbeam` is used nowhere else and can be dropped; the ack and resume
-    channels are fine as `std::sync::mpsc`.
-
-  - *While there:* `suspend_tui_*` pushes `PushKeyboardEnhancementFlags` on
-    every resume but never pops before suspending, so the terminal's flag
-    stack grows by one per editor round trip and only one Pop happens at
-    exit. Pop before suspend, push after.
-  - Also each redraw builds the debug pane text even when hidden and
-    deep-clones `PreviewManager` twice (render.rs `ctx.preview.clone()`
-    then `text.clone()`); gate on visibility and pass `&mut`.
+- **P7. Idle wakeups and input latency.** Three loops poll. The input one is
+  DONE (2026-09-09); the other two are independent of it and still open.
+  - *DONE: the input thread.* Rewritten as `src/tty_input.rs`: it waits with
+    `libc::poll` on three descriptors - the terminal, a self-pipe for "stop
+    reading", and a second self-pipe fed by a SIGWINCH handler - so it can
+    block with no timeout and still be interrupted. `crossbeam` was used for
+    nothing else and is gone. `pause()` now returns only once the thread has
+    acknowledged it stopped, so the two 50ms sleeps in `input.rs` are gone,
+    and it returns a guard whose Drop resumes the thread. The two
+    near-identical `suspend_tui_*` functions are now one
+    `suspend_tui_and_run`, which also pops the keyboard enhancement flags
+    before suspending (they were pushed on every resume and never popped).
+    The thread is shut down and joined explicitly in main before `drop(app)`,
+    like the worker: it logs as it exits, and App's `log_receiver` field is
+    declared before `input`, so leaving it to Drop closed the logging channel
+    first and printed "Error performing logging" over the restored terminal
+    (reproduced on 3 of 5 runs, 0 of 5 after).
+    The reasoning is written up in how-it-works.md under "The input thread".
+  - *Measured, old binary vs new, same pty, 30 trials:* keystroke to redraw
+    median 6.87ms -> 2.00ms, mean 7.50 -> 1.74, p90 12.90 -> 3.17, max
+    14.38 -> 3.64. Resize to redraw 4.8-13.1ms -> 1.0-2.2ms. The old numbers
+    are the ~2ms of real work plus a uniform 0-10ms wait for the next poll.
+  - *Correction to the original finding:* the idle CPU claim was wrong. Both
+    binaries use 0.02s of CPU over 20s idle (`ps -o time`), i.e. the 100
+    wakeups/second cost nothing measurable - each was a cheap `kevent` that
+    found nothing. The wins here were latency and correctness (a design in
+    which the eaten-keystroke bug cannot recur), not CPU. Do not expect the
+    two items below to show up in a CPU measurement either; do them for
+    simplicity, and because the tick one is a prerequisite for anything that
+    wants the UI to be genuinely idle when idle.
+  - *Still open - worker:* `recv_timeout(5ms)` in `worker_thread_loop` exists
+    only because the walker has its own channel. Give the walker a clone of
+    the worker request sender and add `WorkerRequest::Walker(WalkerMessage)`;
+    the worker then blocks on one `recv()` with no timeout. Keep the
+    FilesChanged debounce logic.
+  - *Still open - tick:* send ticks only while something animates, i.e. the
+    marquee path overflows the path bar. Note that the tick currently also
+    serves as the fallback that makes a resize take effect (ratatui
+    re-reads the terminal size on every `draw`); that fallback is no longer
+    load-bearing now that the input thread wakes on SIGWINCH itself.
+  - *Still open:* each redraw builds the debug pane text even when the pane
+    is hidden, and deep-clones `PreviewManager` twice (render.rs
+    `ctx.preview.clone()` then `text.clone()`); gate on visibility and pass
+    `&mut`.
 - **P8. Database diet: 62MB, of which 35MB is `ps` output.** Measured on a
   copy of the real events.db (2026-09-08): `sessions` 36MB, of which
   `running_processes` is 35MB; `events` 16MB; `idx_events_click_lookup`

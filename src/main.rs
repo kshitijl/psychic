@@ -17,6 +17,7 @@ mod preview;
 mod ranker;
 mod render;
 mod search_worker;
+mod tty_input;
 mod ui_state;
 mod walker;
 
@@ -25,8 +26,7 @@ use clap::Parser;
 use crossterm::{
     cursor::Show,
     event::{
-        self, Event, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-        PushKeyboardEnhancementFlags,
+        Event, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -61,6 +61,12 @@ enum AppEvent {
 impl From<WorkerResponse> for AppEvent {
     fn from(response: WorkerResponse) -> Self {
         AppEvent::Worker(response)
+    }
+}
+
+impl From<Event> for AppEvent {
+    fn from(event: Event) -> Self {
+        AppEvent::Input(event)
     }
 }
 
@@ -326,49 +332,10 @@ fn main() -> Result<()> {
     // Create unified event channel - all events (worker, input, tick) flow through this
     let (event_tx, event_rx) = mpsc::channel::<AppEvent>();
 
-    // Create control channel for pausing/resuming crossterm thread
-    let (input_control_tx, input_control_rx) = crossbeam::channel::unbounded::<bool>();
-
-    // Thread 1: Pauseable crossterm event forwarder
-    let input_tx = event_tx.clone();
-    std::thread::spawn(move || {
-        loop {
-            // Use crossbeam::select! to wait on both control channel and check for events
-            crossbeam::select! {
-                recv(input_control_rx) -> msg => {
-                    match msg {
-                        Ok(false) => {
-                            // Paused - wait for resume signal
-                            loop {
-                                match input_control_rx.recv() {
-                                    Ok(true) => break,  // Resumed
-                                    Ok(false) => continue,  // Still paused
-                                    Err(_) => return,  // Channel closed, exit thread
-                                }
-                            }
-                        }
-                        Ok(true) => {
-                            // Already running, continue
-                        }
-                        Err(_) => break,  // Channel closed, exit thread
-                    }
-                }
-                default(Duration::from_millis(10)) => {
-                    // Check for crossterm events (non-blocking poll)
-                    if event::poll(Duration::ZERO).unwrap_or(false) {
-                        match event::read() {
-                            Ok(evt) => {
-                                if input_tx.send(AppEvent::Input(evt)).is_err() {
-                                    break;  // Main thread died, exit
-                                }
-                            }
-                            Err(_) => break,  // Error reading events, exit
-                        }
-                    }
-                }
-            }
-        }
-    });
+    // Thread 1: terminal input. It sleeps in the kernel until a key arrives, a
+    // resize happens, or we ask it to stop so a child process can have the
+    // terminal. See tty_input.rs for why that is harder than it sounds.
+    let input = tty_input::spawn(event_tx.clone()).context("Failed to start the input thread")?;
 
     // Start background retraining in a new thread
     let retrain_start = Instant::now();
@@ -404,7 +371,7 @@ fn main() -> Result<()> {
     let bootstrap = AppBootstrap {
         log_receiver: log_rx,
         event_tx: event_tx.clone(),
-        input_control_tx: input_control_tx.clone(),
+        input,
     };
 
     // Detect editor from environment, with fallback chain
@@ -550,6 +517,11 @@ fn main() -> Result<()> {
     if let Some(handle) = app.worker_handle.take() {
         let _ = handle.join();
     }
+
+    // The input thread logs as it exits, and it only starts exiting when its
+    // handle is dropped - which, left to `drop(app)`, happens *after* the field
+    // holding the logging channel. Same reasoning as the worker above.
+    app.input.shutdown();
 
     // Now it's safe to drop app, which will close the logging channel
     drop(app);
