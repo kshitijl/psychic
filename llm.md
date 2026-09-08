@@ -29,6 +29,11 @@ Do not run `cargo build`. I have a symlink to the RELEASE binary under target. T
 
 You MUST ensure that `just build`, `cargo test` and `cargo clippy` produce clean output! No warnings or broken tests! No documentation link warnings!
 
+## Version control
+
+This is a single developer repository. Work on `main` and commit there directly.
+Do not create a branch or open a pull request unless I ask for one.
+
 ## Running the binary
 
 Write tests instead of trying to run the binary. It is a TUI application. It doesn't make sense for you, as an LLM, to test the binary by running it. It only makes sense when testing things like feature generation.
