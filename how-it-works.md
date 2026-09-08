@@ -279,9 +279,19 @@ Background thread that walks the current directory with `walkdir`, in two passes
    finishes under `SHALLOW_MODE_THRESHOLD` (8,000). Past that the tree is
    declared too big to index and pass one stands alone.
 
-Why it matters: the registry is filtered and ranked on every keystroke, so an
-unbounded walk of `~` would make every search slow, not just the walk. The cap is
-about steady-state cost, not about the walk itself.
+The threshold earns its keep twice.
+
+- **It bounds the walk.** Hitting it stops the descent then and there. Without
+  it, launching in `/`, or a system directory, or anywhere else with a few
+  hundred thousand files under it, would have the walker stat every one of them
+  in the background and hand them all to the worker. Since pass one has already
+  delivered the directory's own children, the rest of that descent is work
+  nobody is waiting for. Measured from `/`: its 21 children are on screen at
+  13ms, and the walk below them is abandoned rather than run out.
+- **It bounds every keystroke after the walk.** Each entry reported becomes a
+  registry entry that is filtered and ranked on every keypress. Eight thousand of
+  those is already tens of milliseconds per keystroke against an empty query, so
+  the limit is protecting the steady state as much as the startup.
 
 This used to be a single full-depth walk that buffered everything and, on passing
 the threshold, threw all of it away and started again at `max_depth(1)`. So the

@@ -38,9 +38,13 @@ const MAX_FILES: usize = 250_000;
 /// How much may live *below* the root's children before the tree is declared
 /// too big to index and only those children are shown.
 ///
-/// Every entry reported becomes a file registry entry that each later search
-/// filters and ranks over, so this bounds the cost of every keystroke, not just
-/// the walk. `~` is the case it exists for.
+/// Two things depend on it. It bounds the **walk**: reaching it stops the
+/// descent, so starting in `/` or a system directory does not stat a few hundred
+/// thousand files in the background for nobody - the first pass has already
+/// shown that directory's children. And it bounds every **keystroke**
+/// afterwards, because each entry reported becomes a registry entry that is
+/// filtered and ranked on every keypress. `~` is the everyday case; `/` is the
+/// one that would otherwise never stop.
 const SHALLOW_MODE_THRESHOLD: usize = 8_000;
 
 /// How often, in entries, to look for a command telling us to go elsewhere.
