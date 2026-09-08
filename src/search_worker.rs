@@ -1698,6 +1698,38 @@ mod hiding_tests {
     }
 
     #[test]
+    fn test_hiding_a_directory_hides_what_is_already_below_it() {
+        // Hiding a/b while a/b/c is on screen has to take a/b/c with it, not
+        // just the row that was selected.
+        let (mut state, _dir, _rx) = worker_with_three_files("hide-descendants");
+
+        state.add_file(PathBuf::from("/test/b"), Some(1000), Some(1000), None, true);
+        for path in ["/test/b/c", "/test/b/c/deep.txt"] {
+            state.add_file(PathBuf::from(path), Some(1000), Some(1000), Some(10), false);
+        }
+
+        state.filter_and_rank("").expect("Filter should succeed");
+        assert_eq!(
+            results(&state).len(),
+            6,
+            "Three files, the directory, and two things under it"
+        );
+
+        state
+            .hide(PathBuf::from("/test/b"))
+            .expect("Hiding should persist");
+
+        state.filter_and_rank("").expect("Filter should succeed");
+        let mut after = results(&state);
+        after.sort();
+        assert_eq!(
+            after,
+            vec!["alpha.txt", "beta.txt", "gamma.txt"],
+            "The hidden directory and everything under it are gone together"
+        );
+    }
+
+    #[test]
     fn test_hiding_the_same_directory_twice_changes_nothing() {
         let (mut state, _dir, _rx) = worker_with_three_files("hide-twice");
 
