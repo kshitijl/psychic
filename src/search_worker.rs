@@ -281,7 +281,15 @@ where
     });
 
     // Start walker thread
-    start_file_walker(cwd, walker_hidden, walker_command_rx, walker_message_tx);
+    // The canonical form, because hidden prefixes are stored canonical and the
+    // walker compares entry paths against them directly. Passing the raw cwd
+    // would silently stop the skipping from matching if the two ever diverged.
+    start_file_walker(
+        canonical_cwd,
+        walker_hidden,
+        walker_command_rx,
+        walker_message_tx,
+    );
 
     Ok((worker_tx, worker_handle))
 }

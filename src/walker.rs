@@ -235,4 +235,112 @@ mod tests {
             "Started inside the hidden directory, so it walks normally"
         );
     }
+
+    /// Walk a real tree and report every path the walker emitted.
+    fn walked_paths(root: &Path, hidden: &[PathBuf]) -> Vec<PathBuf> {
+        let (_command_tx, command_rx) = std::sync::mpsc::channel::<WalkerCommand>();
+        let (tx, rx) = std::sync::mpsc::channel::<WalkerMessage>();
+
+        walk_directory(&root.to_path_buf(), hidden, &command_rx, &tx);
+        drop(tx);
+
+        let mut paths: Vec<PathBuf> = rx
+            .into_iter()
+            .filter_map(|m| match m {
+                WalkerMessage::FileMetadata(f) => Some(f.path),
+                WalkerMessage::AllDone => None,
+            })
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    /// `a/b/c/d/buried.txt`, plus a file beside each level, in a temp dir.
+    struct TempTree {
+        root: PathBuf,
+    }
+
+    impl TempTree {
+        fn new(name: &str) -> Self {
+            let root = std::env::temp_dir()
+                .join(format!("psychic-walk-{}-{}", name, std::process::id()))
+                .join("a");
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join("b/c/d")).expect("create tree");
+            std::fs::create_dir_all(root.join("b/other")).expect("create sibling");
+
+            for path in [
+                "top.txt",
+                "b/mid.txt",
+                "b/c/near.txt",
+                "b/c/d/buried.txt",
+                "b/other/kept.txt",
+            ] {
+                std::fs::write(root.join(path), b"x").expect("create file");
+            }
+
+            // Canonical, because that is the form hidden prefixes are stored
+            // in and the walk root arrives in.
+            let root = root.canonicalize().expect("canonicalize tree root");
+            Self { root }
+        }
+    }
+
+    impl Drop for TempTree {
+        fn drop(&mut self) {
+            if let Some(parent) = self.root.parent() {
+                let _ = std::fs::remove_dir_all(parent);
+            }
+        }
+    }
+
+    #[test]
+    fn test_nested_hidden_directory_is_not_walked() {
+        // Start in `a` with `a/b/c/d` hidden: the intermediate directories must
+        // still be walked, because everything else is reached through them, but
+        // the hidden directory and its contents must not be.
+        let tree = TempTree::new("nested");
+        let hidden = vec![tree.root.join("b/c/d")];
+
+        let walked = walked_paths(&tree.root, &hidden);
+
+        assert!(
+            !walked.contains(&tree.root.join("b/c/d")),
+            "The hidden directory itself was walked: {:?}",
+            walked
+        );
+        assert!(
+            !walked.contains(&tree.root.join("b/c/d/buried.txt")),
+            "A file inside the hidden directory was walked: {:?}",
+            walked
+        );
+        assert!(
+            walked.contains(&tree.root.join("b/c/near.txt")),
+            "A file beside the hidden directory must still be found: {:?}",
+            walked
+        );
+        assert!(
+            walked.contains(&tree.root.join("b/other/kept.txt")),
+            "An unrelated subtree must still be walked: {:?}",
+            walked
+        );
+        assert!(
+            walked.contains(&tree.root.join("b/c")),
+            "The parent of the hidden directory must still be walked: {:?}",
+            walked
+        );
+    }
+
+    #[test]
+    fn test_nothing_is_skipped_without_hidden_directories() {
+        let tree = TempTree::new("nothing-hidden");
+
+        let walked = walked_paths(&tree.root, &[]);
+
+        assert!(
+            walked.contains(&tree.root.join("b/c/d/buried.txt")),
+            "With nothing hidden the whole tree is walked: {:?}",
+            walked
+        );
+    }
 }
