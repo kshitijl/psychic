@@ -182,9 +182,9 @@ fn compute_scroll(
 
 /// Render the history navigation mode UI.
 ///
-/// Returns the width of the preview pane, which only the layout knows and the
+/// Returns the size of the preview pane, which only the layout knows and the
 /// main loop needs in order to ask for the next preview.
-pub fn render_history_mode(f: &mut Frame, ctx: HistoryRenderContext<'_>) -> u16 {
+pub fn render_history_mode(f: &mut Frame, ctx: HistoryRenderContext<'_>) -> PreviewPane {
     // Split vertically: top for dir list + preview, bottom for input
     let main_chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -309,7 +309,10 @@ pub fn render_history_mode(f: &mut Frame, ctx: HistoryRenderContext<'_>) -> u16 
         );
     f.render_widget(input_para, input_area);
 
-    top_chunks[1].width
+    PreviewPane {
+        width: top_chunks[1].width,
+        height: top_chunks[1].height.saturating_sub(2),
+    }
 }
 
 /// Draw the help screen on top of whatever is behind it.
@@ -438,12 +441,21 @@ fn styled_help_lines(lines: &[HelpLine]) -> Vec<Line<'static>> {
         })
         .collect()
 }
+/// How much room the preview pane has. Only the layout knows, and the preview
+/// thread needs it: the width decides a listing's columns, and the height
+/// decides how much of a file is worth highlighting.
+#[derive(Debug, Clone, Copy)]
+pub struct PreviewPane {
+    pub width: u16,
+    pub height: u16,
+}
+
 /// State updates computed during rendering that need to be applied to App after rendering
 pub struct RenderUpdates {
     pub file_list_scroll: Option<usize>,
-    /// Width of the preview pane, which only the layout knows. The main loop
+    /// Size of the preview pane, which only the layout knows. The main loop
     /// uses it to ask for the preview after the frame is drawn.
-    pub preview_width: Option<u16>,
+    pub preview_pane: Option<PreviewPane>,
     pub path_bar_scroll: Option<u16>,
     pub path_bar_scroll_direction: Option<i8>,
     pub last_path_bar_update: Option<std::time::Instant>,
@@ -454,7 +466,7 @@ impl RenderUpdates {
     pub fn new() -> Self {
         Self {
             file_list_scroll: None,
-            preview_width: None,
+            preview_pane: None,
             path_bar_scroll: None,
             path_bar_scroll_direction: None,
             last_path_bar_update: None,
@@ -732,7 +744,10 @@ pub fn render_normal_mode(
     // The preview is generated on its own thread; this only shows whatever has
     // arrived for the row that is selected right now. Anything else would mean
     // a spawn or a file read inside the draw.
-    updates.preview_width = Some(top_chunks[1].width);
+    updates.preview_pane = Some(PreviewPane {
+        width: top_chunks[1].width,
+        height: top_chunks[1].height.saturating_sub(2),
+    });
     let preview_text = match &current_file_info {
         Some((path, _, _)) if !ctx.no_preview && ctx.total_results > 0 => ctx
             .preview

@@ -81,10 +81,10 @@ mod tests {
     #[test]
     fn test_initial_state() {
         let state = UiState::new();
-        assert_eq!(state.history_mode, false);
-        assert_eq!(state.filter_picker_visible, false);
+        assert!(!state.history_mode);
+        assert!(!state.filter_picker_visible);
         assert_eq!(state.debug_pane_mode, DebugPaneMode::Hidden);
-        assert_eq!(state.is_debug_pane_expanded(), false);
+        assert!(!state.is_debug_pane_expanded());
     }
 
     #[test]
@@ -92,10 +92,10 @@ mod tests {
         let mut state = UiState::new();
 
         state.history_mode = true;
-        assert_eq!(state.history_mode, true);
+        assert!(state.history_mode);
 
         state.history_mode = false;
-        assert_eq!(state.history_mode, false);
+        assert!(!state.history_mode);
     }
 
     #[test]
@@ -103,10 +103,10 @@ mod tests {
         let mut state = UiState::new();
 
         state.filter_picker_visible = true;
-        assert_eq!(state.filter_picker_visible, true);
+        assert!(state.filter_picker_visible);
 
         state.filter_picker_visible = false;
-        assert_eq!(state.filter_picker_visible, false);
+        assert!(!state.filter_picker_visible);
     }
 
     #[test]
@@ -115,34 +115,34 @@ mod tests {
 
         // Initial: Hidden
         assert_eq!(state.debug_pane_mode, DebugPaneMode::Hidden);
-        assert_eq!(state.is_debug_pane_expanded(), false);
+        assert!(!state.is_debug_pane_expanded());
 
         // Cycle to Small
         state.cycle_debug_pane_mode();
         assert_eq!(state.debug_pane_mode, DebugPaneMode::Small);
-        assert_eq!(state.is_debug_pane_expanded(), false);
+        assert!(!state.is_debug_pane_expanded());
 
         // Cycle to Expanded
         state.cycle_debug_pane_mode();
         assert_eq!(state.debug_pane_mode, DebugPaneMode::Expanded);
-        assert_eq!(state.is_debug_pane_expanded(), true);
+        assert!(state.is_debug_pane_expanded());
 
         // Cycle back to Hidden
         state.cycle_debug_pane_mode();
         assert_eq!(state.debug_pane_mode, DebugPaneMode::Hidden);
-        assert_eq!(state.is_debug_pane_expanded(), false);
+        assert!(!state.is_debug_pane_expanded());
     }
 
     #[test]
     fn test_toggle_help() {
         let mut state = UiState::new();
-        assert_eq!(state.help_visible, false);
+        assert!(!state.help_visible);
 
         state.toggle_help();
-        assert_eq!(state.help_visible, true);
+        assert!(state.help_visible);
 
         state.toggle_help();
-        assert_eq!(state.help_visible, false);
+        assert!(!state.help_visible);
     }
 
     #[test]
@@ -188,33 +188,27 @@ mod tests {
 
         // User opens history mode
         state.history_mode = true;
-        assert_eq!(state.history_mode, true);
+        assert!(state.history_mode);
 
         // User toggles filter picker while in history
         state.filter_picker_visible = true;
-        assert_eq!(state.filter_picker_visible, true);
-        assert_eq!(
-            state.history_mode, true,
-            "History mode should remain active"
-        );
+        assert!(state.filter_picker_visible);
+        assert!(state.history_mode, "History mode should remain active");
 
         // User cycles debug pane (Hidden -> Small)
         state.cycle_debug_pane_mode();
         assert_eq!(state.debug_pane_mode, DebugPaneMode::Small);
-        assert_eq!(
-            state.history_mode, true,
-            "History mode should remain active"
-        );
-        assert_eq!(
-            state.filter_picker_visible, true,
+        assert!(state.history_mode, "History mode should remain active");
+        assert!(
+            state.filter_picker_visible,
             "Filter picker should remain visible"
         );
 
         // User exits history mode
         state.history_mode = false;
-        assert_eq!(state.history_mode, false);
-        assert_eq!(
-            state.filter_picker_visible, true,
+        assert!(!state.history_mode);
+        assert!(
+            state.filter_picker_visible,
             "Filter picker should remain visible"
         );
         assert_eq!(

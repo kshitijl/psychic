@@ -611,19 +611,10 @@ fn compute_features(
     file: &FileCandidate,
     current_timestamp: i64,
     cwd: &Path,
-    clicks_by_file: &FxHashMap<String, Vec<ClickEvent>>,
-    clicks_by_parent_dir: &FxHashMap<PathBuf, Vec<ClickEvent>>,
-    clicks_by_query_and_file: &FxHashMap<(String, String), Vec<ClickEvent>>,
-    engagements_by_episode_query_and_file: &FxHashMap<(String, String), Vec<ClickEvent>>,
+    click_indexes: &FeatureClickIndexes<'_>,
 ) -> Result<Vec<f64>> {
-    let indexes = FeatureClickIndexes {
-        clicks_by_file,
-        clicks_by_parent_dir,
-        clicks_by_query_and_file,
-        engagements_by_episode_query_and_file,
-    };
     let (features, _timings) =
-        compute_features_with_timing(query, file, current_timestamp, cwd, &indexes)?;
+        compute_features_with_timing(query, file, current_timestamp, cwd, click_indexes)?;
     Ok(features)
 }
 
@@ -992,10 +983,12 @@ mod tests {
             &file,
             current_timestamp,
             &cwd,
-            &clicks_by_file,
-            &clicks_by_parent_dir,
-            &clicks_by_query_and_file,
-            &engagements_by_episode_query_and_file,
+            &FeatureClickIndexes {
+                clicks_by_file: &clicks_by_file,
+                clicks_by_parent_dir: &clicks_by_parent_dir,
+                clicks_by_query_and_file: &clicks_by_query_and_file,
+                engagements_by_episode_query_and_file: &engagements_by_episode_query_and_file,
+            },
         )
         .expect("Failed to compute features");
 

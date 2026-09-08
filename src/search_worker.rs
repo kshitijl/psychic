@@ -1299,22 +1299,19 @@ mod tests {
         };
 
         // OnlyDirs filter: is_dir == true
-        assert_eq!(
-            file_dir.is_dir, true,
-            "Directory should pass OnlyDirs filter"
-        );
-        assert_eq!(
-            file_regular.is_dir, false,
+        assert!(file_dir.is_dir, "Directory should pass OnlyDirs filter");
+        assert!(
+            !file_regular.is_dir,
             "Regular file should NOT pass OnlyDirs filter"
         );
 
         // OnlyFiles filter: !is_dir (is_dir == false)
-        assert_eq!(
-            !file_dir.is_dir, false,
+        assert!(
+            !(!file_dir.is_dir),
             "Directory should NOT pass OnlyFiles filter"
         );
-        assert_eq!(
-            !file_regular.is_dir, true,
+        assert!(
+            !file_regular.is_dir,
             "Regular file should pass OnlyFiles filter"
         );
     }
@@ -1374,7 +1371,7 @@ mod load_ranker_tests {
     fn test_truncated_model_falls_back_instead_of_failing_startup() {
         let dir = TempDataDir::new("truncated-model");
         // What a write interrupted partway through leaves behind.
-        std::fs::write(&dir.model_path(), "").expect("Failed to write empty model");
+        std::fs::write(dir.model_path(), "").expect("Failed to write empty model");
 
         let ranker = WorkerState::load_ranker(&dir.model_path(), &dir.db_path())
             .expect("An empty model file must not stop psychic from starting");
@@ -1385,7 +1382,7 @@ mod load_ranker_tests {
     #[test]
     fn test_corrupt_model_falls_back_instead_of_failing_startup() {
         let dir = TempDataDir::new("corrupt-model");
-        std::fs::write(&dir.model_path(), "this is not a LightGBM model")
+        std::fs::write(dir.model_path(), "this is not a LightGBM model")
             .expect("Failed to write corrupt model");
 
         let ranker = WorkerState::load_ranker(&dir.model_path(), &dir.db_path())

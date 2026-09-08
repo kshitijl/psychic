@@ -306,9 +306,16 @@ Filter+rank is ~2ms per keystroke and is not the problem.
   still names an obvious binary, but it only looks at the first 8KB and is no
   longer what keeps the display safe.
   Also: previews are capped at 5,000 lines and 4MB (the old code read whole
-  files into memory as styled text), generated once and sliced to the visible
-  window at draw time so scrolling costs nothing, and scroll is clamped to the
-  preview that exists rather than walking off into the distance.
+  files into memory as styled text), sliced to the visible window at draw time
+  so a long preview is not cloned every frame, and scroll is clamped so it
+  cannot walk off into the distance.
+  Generation is to a **line budget**: a screen on show and one in hand,
+  extended (doubling) when scrolled past. The first cut generated whole files
+  and a large markdown preview took 150ms - `bat` was given
+  `--line-range :height` for exactly this reason and dropping it was a
+  regression. Syntect is built with `oniguruma`, not `fancy-regex`: measured on
+  markdown it is ~5x faster (median 11.81ms -> 2.53ms, worst 102.57 -> 25.79)
+  and the binary is *smaller* (12.7MB -> 11.2MB).
 - **P3. Three syscalls per historical path at startup.** `WorkerState::new`
   does `exists()`, then `canonicalize()`, then `metadata()` per path: 6.3ms
   for 172 paths. Stored `full_path` values are already canonical. One

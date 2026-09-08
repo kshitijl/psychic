@@ -577,7 +577,7 @@ fn run_app(
         let draw_start = Instant::now();
         let mut render_updates = None;
         let mut help_scroll_max = None;
-        let mut preview_width = None;
+        let mut preview_pane = None;
         terminal.draw(|f| {
             // Log first render
             if !first_render_logged {
@@ -597,7 +597,7 @@ fn run_app(
                     preview: &app.preview,
                     query: &app.query,
                 };
-                preview_width = Some(render::render_history_mode(f, history_ctx));
+                preview_pane = Some(render::render_history_mode(f, history_ctx));
 
                 // The help screen is reachable from every mode, so it is drawn
                 // last, over whichever mode is underneath.
@@ -632,7 +632,7 @@ fn run_app(
                 status_message: app.status_message.as_deref(),
             };
             let updates = render::render_normal_mode(f, normal_ctx, marquee_delay, marquee_speed);
-            preview_width = updates.preview_width;
+            preview_pane = updates.preview_pane;
             render_updates = Some(updates);
 
             if app.ui_state.help_visible {
@@ -654,8 +654,8 @@ fn run_app(
         // Now that the layout is known, ask for the preview of whatever is
         // selected. Generating it during the draw would put a file read, and
         // once a process spawn, in front of every frame.
-        if let Some(width) = preview_width {
-            app.update_preview(width);
+        if let Some(pane) = preview_pane {
+            app.update_preview(pane);
         }
 
         // Apply render updates to app state after rendering is complete

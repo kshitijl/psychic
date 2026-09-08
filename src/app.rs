@@ -355,10 +355,10 @@ impl App {
 
     /// Ask for the preview of whatever is selected.
     ///
-    /// Called after each frame, because the pane's width is a layout fact and
-    /// the layout is only known once it has been computed. Repeat calls for a
-    /// path already shown or already requested cost nothing.
-    pub fn update_preview(&mut self, pane_width: u16) {
+    /// Called after each frame, because the pane's size is a layout fact and the
+    /// layout is only known once it has been computed. Repeat calls for a path
+    /// already covered, or already requested in that much detail, cost nothing.
+    pub fn update_preview(&mut self, pane: crate::render::PreviewPane) {
         if self.options.no_preview {
             return;
         }
@@ -373,7 +373,12 @@ impl App {
         };
 
         if let Some((path, is_dir)) = selection {
-            self.preview.request(&path, is_dir, pane_width);
+            // One screen on show and one in hand, from the top of the file:
+            // highlighting has to start there, and doing all of a long file up
+            // front is what made a large markdown preview take 150ms.
+            let wanted = self.preview.scroll_offset() + 2 * pane.height as usize;
+            self.preview
+                .request(&path, is_dir, pane.width, wanted.max(1));
         }
     }
 

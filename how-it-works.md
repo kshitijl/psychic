@@ -1079,13 +1079,33 @@ built on - and a listing is a `read_dir`, so styles are constructed directly.
 That also removes two things psychic had to be installed alongside, and the
 silent degradation to `ls` and unhighlighted text when they were missing.
 
+**Only what the pane can show is highlighted.** A screenful on show and one in
+hand, extended when the user scrolls past it. Syntect carries state from line to
+line, so every pass starts at line one and the budget is a count from the top;
+successive requests double it, so scrolling a long file does not re-highlight
+from the top on every wheel click. The first version of this generated the whole
+file at once, which made a large markdown preview take 150ms - `bat` was asked
+for `--line-range :height` for exactly this reason, and dropping that was a
+regression, not a simplification.
+
+**Syntect is built with `oniguruma` rather than `fancy-regex`.** The pure-Rust
+engine looked like the tidier dependency, but measured on markdown - syntect's
+heaviest grammar, since it embeds every language it might find in a code fence -
+it was several times slower *and* produced a larger binary:
+
+| | fancy-regex | oniguruma |
+|---|---|---|
+| generate, median | 11.81ms | 2.53ms |
+| generate, worst seen | 102.57ms | 25.79ms |
+| binary | 12.7MB | 11.2MB |
+
 Measured, moving the selection one row, which is what regenerates a preview:
 
 | | before | after |
 |---|---|---|
-| median | 15.90ms | 0.55ms |
-| p90 | 20.84ms | 2.18ms |
-| first full draw | 31.6ms | 4.2ms |
+| median | 25.95ms | 1.71ms |
+| p90 | 37.45ms | 3.06ms |
+| first full draw | 37.0ms | 3.3ms |
 
 The syntax definitions take 3ms to deserialize, once, on the preview thread
 while the walker is still running.
@@ -1096,8 +1116,8 @@ while the walker is still running.
   honours
 - Directory listings: permissions, size, date, name, sorted case-insensitively,
   dropping the wide columns below 80 columns the way the `eza` flags used to
-- Whole preview generated at once and sliced at draw time, so scrolling costs
-  nothing and a 5,000 line preview is not cloned every frame
+- Generated to a line budget and sliced at draw time, so a preview is never
+  larger than it needs to be and is not cloned every frame
 - Capped at 5,000 lines and 4MB: a preview is not a pager, and the old code
   would happily read an entire file into memory as styled text
 
