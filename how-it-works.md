@@ -1891,16 +1891,80 @@ Three things the raw numbers hide:
 - **Per-query numbers must be compared in the steady state,** after the walk
   finishes and both hold the same 243 files. Comparing first queries compares
   126 files against 243 and reads as a regression.
-- **The walk really is slower,** and it is the gitignore support that costs it:
-  the same binary with `--no-ignore` walks in 70.6ms against the baseline's
-  68.9ms, so ~7ms of the ~9ms is reading and applying ignore rules. That is a
-  feature being paid for, not a regression to fix, and it happens after the
-  results are already on screen.
+- **The walk really is slower, and gitignore support is all of it.**
+  Interleaved, 12 trials each: baseline 64.7ms, current 76.9ms, and the current
+  binary with `--no-ignore` 61.9ms - slightly *faster* than the baseline, so the
+  whole 12ms and a little more is reading and applying ignore rules. (An earlier
+  block-ordered run put it at 7ms of 9ms; running all trials of one
+  configuration before the next let a slow minute land on one of them. The walk
+  reads the filesystem and is the noisiest thing measured here.)
+
+  It costs nothing the user feels: first results are on screen at 7-8ms and the
+  walk finishes at 77ms, so the extra 12ms lands in a window where the list is
+  already up and usable.
+
+  What it buys did *not* show up in either directory measured. From `$HOME` both
+  settings index the same 243 files; in this repo it is 175 against 178. The
+  walker's built-in floor already skips `target`, `node_modules`, `.git` and
+  `.venv` by name, which is where the bulk of the noise lives, so `.gitignore`
+  is left with whatever a project ignores beyond that - six paths in the largest
+  repo on this machine. The reason to keep it is not the file count: it is that
+  "what belongs to this project" should mean the same thing to psychic as it
+  does to git, without psychic having to grow its own list of every build
+  artifact anyone might name. The floor is a heuristic; the ignore file is the
+  answer.
 
 The baseline reproduces the profile recorded when this work was scoped, scaled
 by about 0.6 - that session ran in a larger terminal. The shape is what matters
 and it holds: the draw was 61% of the first full render here against 63% then,
 and first results landed at 18% of walk-complete against 20% then.
+
+### The benchmark harness: `bench/`
+
+```bash
+./bench/run.py setup 1d4d767   # build that commit, stage a data dir per version
+./bench/run.py startup 10      # startup timings, alternating, medians
+./bench/run.py keystroke 50    # keystroke -> redraw
+./bench/run.py walk 12         # walk time, with and without gitignore
+```
+
+`setup` builds the baseline in a git worktree under `/tmp/psychic-bench` and
+gives each version its own copy of the real `events.db`, so the two runs cannot
+interfere. Nothing reads or writes the real data directory except to copy out of
+it. `harness.py` holds the pty plumbing and the log parsing; `run.py` is the four
+commands on top.
+
+Psychic is a TUI, so both halves of a measurement are awkward: it has to be
+driven on a real terminal, and the numbers have to come back out of its own
+`TIMING` lines rather than from wall-clock guesses outside the process. Five
+things had to be got right, each of which produced a confident wrong answer
+first:
+
+- **Pin the model.** Every launch retrains in the background, and a retrain that
+  finishes replaces `model.txt`. The baseline's `train.py` wrote a 53-tree model
+  where the current one writes 84, and the resulting 1.8x difference in predict
+  time looked exactly like a regression. Pinning one model for both closed it to
+  1.10x.
+- **Size the pty.** `script(1)` gives no control over geometry and hands out
+  80x24, which nobody runs and which makes the baseline's synchronous `bat`
+  spawn look four times cheaper than it is. The harness opens the pty itself and
+  sets 40x120 with `TIOCSWINSZ`.
+- **Keep stdin open.** An immediate EOF on the pty reads as a keypress, and
+  psychic quits before it has finished starting up - so the first version of the
+  harness measured nothing at all, silently.
+- **Compare queries in the steady state.** At its first query the baseline ranks
+  126 files and the current binary ranks all 243, because the two-phase walk has
+  already delivered the root's children. Comparing those two numbers makes a 1.5x
+  improvement read as a 2x regression. The last query of a run, after the walk,
+  has both at 243.
+- **Interleave, do not block.** Running all trials of one configuration before
+  the next lets a slow patch on the machine land entirely on one of them. That
+  inverted the walk result once already.
+
+Both versions still redraw on a tick, about ten writes a second when idle, so
+the keystroke measurement waits for a quiet moment before starting its clock:
+that puts it just after a tick redraw, which makes the next write the one the
+keystroke caused.
 
 ## Shutdown Sequence
 

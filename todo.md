@@ -84,11 +84,12 @@ work.** Both binaries from `$HOME` on a 40x120 pty, same events.db copy, same
 pinned model. Keystroke to redraw 12.20ms -> 2.45ms; first full render
 29.92 -> 11.55ms, its draw 18.23 -> 3.08ms; first results 11.54 -> 8.28ms
 while ranking 243 files rather than 126; worker state 8.50 -> 3.96ms;
-steady-state filter+rank 1.57 -> 1.05ms. Walk complete went 68.9 -> 77.4ms,
-of which ~7ms is gitignore support (`--no-ignore` walks in 70.6ms). The
-numbers above reproduce at about 0.6x scale - that session ran in a larger
-terminal - with the same shape. Full table in how-it-works.md under
-"Performance Optimizations".
+steady-state filter+rank 1.57 -> 1.05ms. Walk complete went 64.7 -> 76.9ms,
+and gitignore support is all of it: `--no-ignore` walks in 61.9ms, faster
+than the baseline. The numbers above reproduce at about 0.6x scale - that
+session ran in a larger terminal - with the same shape. Full table and the
+harness (`bench/run.py`) in how-it-works.md under "Performance
+Optimizations".
 
 #### Performance
 
