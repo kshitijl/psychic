@@ -978,156 +978,65 @@ fn worker_thread_loop<T>(
         }
 
         // Wait for worker requests with timeout
-        match task_rx.recv_timeout(Duration::from_millis(5)) {
-            Ok(WorkerRequest::UpdateQuery(update_req)) => {
-                // Debounce: drain all pending queries and keep the latest
-                let latest_req = drain_latest_update_request(&task_rx, update_req);
-                state.current_query = latest_req.query.clone();
-                state.current_query_id = latest_req.query_id;
-                state.current_filter = latest_req.filter;
+        let pending = match task_rx.recv_timeout(Duration::from_millis(5)) {
+            Ok(first) => drain_requests(&task_rx, first),
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => {
+                log::debug!("Worker thread channel disconnected");
+                break;
+            }
+        };
 
-                // Filter and rank
-                if let Err(e) = state.filter_and_rank(&latest_req.query) {
-                    log::error!("Filter/rank failed: {}", e);
-                    continue;
-                }
+        for request in pending {
+            match request {
+                WorkerRequest::UpdateQuery(latest_req) => {
+                    state.current_query = latest_req.query.clone();
+                    state.current_query_id = latest_req.query_id;
+                    state.current_filter = latest_req.filter;
 
-                // Send back results with initial page (page 0)
-                let initial_page = state.get_page(0, 128);
-                let _ = event_tx.send(
-                    WorkerResponse::QueryUpdated {
-                        query_id: latest_req.query_id,
-                        total_results: state.filtered_files.len(),
-                        total_files: state.file_registry.len(),
-                        initial_page,
-                        model_stats: state.ranker.stats.clone(),
-                        rank_ms: state.last_rank_ms,
+                    // Filter and rank
+                    if let Err(e) = state.filter_and_rank(&latest_req.query) {
+                        log::error!("Filter/rank failed: {}", e);
+                        continue;
                     }
-                    .into(),
-                );
-            }
-            Ok(WorkerRequest::GetPage { query_id, page_num }) => {
-                // If the request is for an old query, ignore it.
-                if query_id != state.current_query_id {
-                    continue;
+
+                    // Send back results with initial page (page 0)
+                    let initial_page = state.get_page(0, 128);
+                    let _ = event_tx.send(
+                        WorkerResponse::QueryUpdated {
+                            query_id: latest_req.query_id,
+                            total_results: state.filtered_files.len(),
+                            total_files: state.file_registry.len(),
+                            initial_page,
+                            model_stats: state.ranker.stats.clone(),
+                            rank_ms: state.last_rank_ms,
+                        }
+                        .into(),
+                    );
                 }
-                let page_data = state.get_page(page_num, 128);
-                let _ = event_tx.send(
-                    WorkerResponse::Page {
-                        query_id,
-                        page_data,
+                WorkerRequest::GetPage { query_id, page_num } => {
+                    // If the request is for an old query, ignore it.
+                    if query_id != state.current_query_id {
+                        continue;
                     }
-                    .into(),
-                );
-            }
-            Ok(WorkerRequest::ReloadModel { query_id }) => {
-                state.current_query_id = query_id;
-                if let Err(e) = state.reload_model() {
-                    log::error!("Failed to reload model: {}", e);
-                } else {
-                    // Re-filter and rank with new model
-                    let query = state.current_query.clone();
-                    if let Err(e) = state.filter_and_rank(&query) {
-                        log::error!("Filter/rank failed after model reload: {}", e);
+                    let page_data = state.get_page(page_num, 128);
+                    let _ = event_tx.send(
+                        WorkerResponse::Page {
+                            query_id,
+                            page_data,
+                        }
+                        .into(),
+                    );
+                }
+                WorkerRequest::ReloadModel { query_id } => {
+                    state.current_query_id = query_id;
+                    if let Err(e) = state.reload_model() {
+                        log::error!("Failed to reload model: {}", e);
                     } else {
-                        let initial_page = state.get_page(0, 128);
-                        let _ = event_tx.send(
-                            WorkerResponse::QueryUpdated {
-                                query_id,
-                                total_results: state.filtered_files.len(),
-                                total_files: state.file_registry.len(),
-                                initial_page,
-                                model_stats: state.ranker.stats.clone(),
-                                rank_ms: state.last_rank_ms,
-                            }
-                            .into(),
-                        );
-                    }
-                }
-            }
-            Ok(WorkerRequest::ReloadClicks { query_id }) => {
-                state.current_query_id = query_id;
-                if let Err(e) = state.reload_clicks() {
-                    log::error!("Failed to reload clicks: {}", e);
-                } else {
-                    // Re-filter and rank with new clicks
-                    let query = state.current_query.clone();
-                    if let Err(e) = state.filter_and_rank(&query) {
-                        log::error!("Filter/rank failed after clicks reload: {}", e);
-                    } else {
-                        let initial_page = state.get_page(0, 128);
-                        let _ = event_tx.send(
-                            WorkerResponse::QueryUpdated {
-                                query_id,
-                                total_results: state.filtered_files.len(),
-                                total_files: state.file_registry.len(),
-                                initial_page,
-                                model_stats: state.ranker.stats.clone(),
-                                rank_ms: state.last_rank_ms,
-                            }
-                            .into(),
-                        );
-                    }
-                }
-            }
-            Ok(WorkerRequest::ChangeCwd { new_cwd, query_id }) => {
-                state.current_query_id = query_id;
-                if let Err(e) = state.change_cwd(new_cwd) {
-                    log::error!("Failed to change cwd: {}", e);
-                } else {
-                    // Clear query and re-filter (will show only historical files until walker sends new ones)
-                    state.current_query = String::new();
-                    if let Err(e) = state.filter_and_rank("") {
-                        log::error!("Filter/rank failed after cwd change: {}", e);
-                    } else {
-                        let initial_page = state.get_page(0, 128);
-                        let _ = event_tx.send(
-                            WorkerResponse::QueryUpdated {
-                                query_id,
-                                total_results: state.filtered_files.len(),
-                                total_files: state.file_registry.len(),
-                                initial_page,
-                                model_stats: state.ranker.stats.clone(),
-                                rank_ms: state.last_rank_ms,
-                            }
-                            .into(),
-                        );
-                    }
-                }
-            }
-            Ok(WorkerRequest::Evict { path, query_id }) => {
-                state.current_query_id = query_id;
-                // Re-run the current query so the missing row disappears
-                // immediately. Nothing to do if the path was not registered.
-                if state.evict(&path) {
-                    let query = state.current_query.clone();
-                    if let Err(e) = state.filter_and_rank(&query) {
-                        log::error!("Filter/rank failed after eviction: {}", e);
-                    } else {
-                        let initial_page = state.get_page(0, 128);
-                        let _ = event_tx.send(
-                            WorkerResponse::QueryUpdated {
-                                query_id,
-                                total_results: state.filtered_files.len(),
-                                total_files: state.file_registry.len(),
-                                initial_page,
-                                model_stats: state.ranker.stats.clone(),
-                                rank_ms: state.last_rank_ms,
-                            }
-                            .into(),
-                        );
-                    }
-                }
-            }
-            Ok(WorkerRequest::Hide { path, query_id }) => {
-                state.current_query_id = query_id;
-                match state.hide(path) {
-                    Ok(false) => {}
-                    Ok(true) => {
-                        // Re-run the current query so the rows go at once.
+                        // Re-filter and rank with new model
                         let query = state.current_query.clone();
                         if let Err(e) = state.filter_and_rank(&query) {
-                            log::error!("Filter/rank failed after hiding: {}", e);
+                            log::error!("Filter/rank failed after model reload: {}", e);
                         } else {
                             let initial_page = state.get_page(0, 128);
                             let _ = event_tx.send(
@@ -1143,40 +1052,139 @@ fn worker_thread_loop<T>(
                             );
                         }
                     }
-                    Err(e) => log::error!("Failed to hide directory: {}", e),
                 }
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                // No work to do, loop again
-                continue;
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-                log::debug!("Worker thread channel disconnected");
-                break;
+                WorkerRequest::ReloadClicks { query_id } => {
+                    state.current_query_id = query_id;
+                    if let Err(e) = state.reload_clicks() {
+                        log::error!("Failed to reload clicks: {}", e);
+                    } else {
+                        // Re-filter and rank with new clicks
+                        let query = state.current_query.clone();
+                        if let Err(e) = state.filter_and_rank(&query) {
+                            log::error!("Filter/rank failed after clicks reload: {}", e);
+                        } else {
+                            let initial_page = state.get_page(0, 128);
+                            let _ = event_tx.send(
+                                WorkerResponse::QueryUpdated {
+                                    query_id,
+                                    total_results: state.filtered_files.len(),
+                                    total_files: state.file_registry.len(),
+                                    initial_page,
+                                    model_stats: state.ranker.stats.clone(),
+                                    rank_ms: state.last_rank_ms,
+                                }
+                                .into(),
+                            );
+                        }
+                    }
+                }
+                WorkerRequest::ChangeCwd { new_cwd, query_id } => {
+                    state.current_query_id = query_id;
+                    if let Err(e) = state.change_cwd(new_cwd) {
+                        log::error!("Failed to change cwd: {}", e);
+                    } else {
+                        // Clear query and re-filter (will show only historical files until walker sends new ones)
+                        state.current_query = String::new();
+                        if let Err(e) = state.filter_and_rank("") {
+                            log::error!("Filter/rank failed after cwd change: {}", e);
+                        } else {
+                            let initial_page = state.get_page(0, 128);
+                            let _ = event_tx.send(
+                                WorkerResponse::QueryUpdated {
+                                    query_id,
+                                    total_results: state.filtered_files.len(),
+                                    total_files: state.file_registry.len(),
+                                    initial_page,
+                                    model_stats: state.ranker.stats.clone(),
+                                    rank_ms: state.last_rank_ms,
+                                }
+                                .into(),
+                            );
+                        }
+                    }
+                }
+                WorkerRequest::Evict { path, query_id } => {
+                    state.current_query_id = query_id;
+                    // Re-run the current query so the missing row disappears
+                    // immediately. Nothing to do if the path was not registered.
+                    if state.evict(&path) {
+                        let query = state.current_query.clone();
+                        if let Err(e) = state.filter_and_rank(&query) {
+                            log::error!("Filter/rank failed after eviction: {}", e);
+                        } else {
+                            let initial_page = state.get_page(0, 128);
+                            let _ = event_tx.send(
+                                WorkerResponse::QueryUpdated {
+                                    query_id,
+                                    total_results: state.filtered_files.len(),
+                                    total_files: state.file_registry.len(),
+                                    initial_page,
+                                    model_stats: state.ranker.stats.clone(),
+                                    rank_ms: state.last_rank_ms,
+                                }
+                                .into(),
+                            );
+                        }
+                    }
+                }
+                WorkerRequest::Hide { path, query_id } => {
+                    state.current_query_id = query_id;
+                    match state.hide(path) {
+                        Ok(false) => {}
+                        Ok(true) => {
+                            // Re-run the current query so the rows go at once.
+                            let query = state.current_query.clone();
+                            if let Err(e) = state.filter_and_rank(&query) {
+                                log::error!("Filter/rank failed after hiding: {}", e);
+                            } else {
+                                let initial_page = state.get_page(0, 128);
+                                let _ = event_tx.send(
+                                    WorkerResponse::QueryUpdated {
+                                        query_id,
+                                        total_results: state.filtered_files.len(),
+                                        total_files: state.file_registry.len(),
+                                        initial_page,
+                                        model_stats: state.ranker.stats.clone(),
+                                        rank_ms: state.last_rank_ms,
+                                    }
+                                    .into(),
+                                );
+                            }
+                        }
+                        Err(e) => log::error!("Failed to hide directory: {}", e),
+                    }
+                }
             }
         }
     }
 }
 
-// Helper to drain all pending UpdateQuery requests and return the latest one
-fn drain_latest_update_request(
-    rx: &mpsc::Receiver<WorkerRequest>,
-    initial: UpdateQueryRequest,
-) -> UpdateQueryRequest {
-    let mut latest = initial;
+/// Take everything already waiting, collapsing runs of query updates.
+///
+/// Only *consecutive* `UpdateQuery`s are collapsed. A query the user has
+/// already typed past need not be run, but every other request is a distinct
+/// instruction and has to survive: this used to keep the latest `UpdateQuery`
+/// and throw away whatever it found in between, so typing and then pressing
+/// Enter while the worker was busy ate the `ChangeCwd`. The UI moved to the new
+/// directory and the worker went on serving the old one.
+fn drain_requests(rx: &mpsc::Receiver<WorkerRequest>, first: WorkerRequest) -> Vec<WorkerRequest> {
+    let mut queue = vec![first];
+
     while let Ok(request) = rx.try_recv() {
-        if let WorkerRequest::UpdateQuery(update_req) = request {
-            latest = update_req;
-        } else {
-            // This is not ideal, we've consumed a non-UpdateQuery request.
-            // For this application, the channel logic is simple enough that
-            // this case is unlikely, but in a more complex app, we'd need
-            // to handle or requeue the request.
-            log::warn!("Unexpected request type in drain_latest_update_request");
-            break;
+        let supersedes_the_last = matches!(
+            (queue.last(), &request),
+            (
+                Some(WorkerRequest::UpdateQuery(_)),
+                WorkerRequest::UpdateQuery(_)
+            )
+        );
+        if supersedes_the_last {
+            queue.pop();
         }
+        queue.push(request);
     }
-    latest
+
+    queue
 }
 
 // Internal struct for file metadata (not exported)
@@ -1214,6 +1222,59 @@ fn get_file_metadata(path: &PathBuf) -> FileMetadata {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    fn update(query: &str) -> WorkerRequest {
+        WorkerRequest::UpdateQuery(UpdateQueryRequest {
+            query: query.to_string(),
+            query_id: 0,
+            filter: FilterType::None,
+        })
+    }
+
+    #[test]
+    fn test_typing_does_not_swallow_what_follows_it() {
+        // The user types, then hits Enter on a directory, then types again,
+        // all while the worker is busy. Every keystroke but the last is dead,
+        // but the navigation in the middle is not: this used to keep only the
+        // newest query and drop whatever it found on the way, so the UI moved
+        // to the new directory and the worker went on serving the old one.
+        let (tx, rx) = mpsc::channel::<WorkerRequest>();
+        tx.send(update("a")).unwrap();
+        tx.send(update("ab")).unwrap();
+        tx.send(WorkerRequest::ChangeCwd {
+            new_cwd: PathBuf::from("/elsewhere"),
+            query_id: 7,
+        })
+        .unwrap();
+        tx.send(update("z")).unwrap();
+
+        let first = rx.recv().unwrap();
+        let queue = drain_requests(&rx, first);
+
+        let described: Vec<String> = queue
+            .iter()
+            .map(|request| match request {
+                WorkerRequest::UpdateQuery(r) => format!("query {:?}", r.query),
+                WorkerRequest::ChangeCwd { new_cwd, .. } => format!("cd {}", new_cwd.display()),
+                _ => "other".to_string(),
+            })
+            .collect();
+
+        assert_eq!(
+            described,
+            vec!["query \"ab\"", "cd /elsewhere", "query \"z\""],
+            "the superseded query goes, everything else stays, in order"
+        );
+    }
+
+    #[test]
+    fn test_a_lone_request_is_returned_as_is() {
+        let (_tx, rx) = mpsc::channel::<WorkerRequest>();
+
+        let queue = drain_requests(&rx, update("hello"));
+
+        assert_eq!(queue.len(), 1);
+    }
 
     #[test]
     fn test_filter_cwd_includes_historical_files_in_cwd() {
