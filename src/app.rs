@@ -517,6 +517,7 @@ impl App {
                     action: crate::db::UserInteraction::Scroll,
                     session_id: &session_id,
                     episode_queries: None,
+                    rank: None, // not an impression
                 },
             )?;
         }

@@ -1717,6 +1717,7 @@ mod reload_tests {
             action: crate::db::UserInteraction::Click,
             session_id: "session-1",
             episode_queries: None,
+            rank: None, // not an impression
         })
         .expect("log the click");
 
@@ -1859,6 +1860,7 @@ mod fresh_install_tests {
             action: crate::db::UserInteraction::Click,
             session_id: "session-1",
             episode_queries: None,
+            rank: None, // not an impression
         })
         .unwrap();
 
@@ -1982,6 +1984,7 @@ mod trained_model_tests {
                 action: crate::db::UserInteraction::Click,
                 session_id: "session-1",
                 episode_queries: None,
+                rank: None, // not an impression
             })
             .unwrap();
         }

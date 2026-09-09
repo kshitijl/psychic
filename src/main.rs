@@ -355,6 +355,7 @@ fn main() -> Result<()> {
                     action: db::UserInteraction::StartupVisit,
                     session_id: &session_id,
                     episode_queries: None,
+                    rank: None, // not an impression
                 })?;
 
                 return Ok(());
@@ -557,6 +558,7 @@ fn main() -> Result<()> {
                     action: db::UserInteraction::StartupVisit,
                     session_id: &session_id_clone,
                     episode_queries: None,
+                    rank: None, // not an impression
                 }) {
                     Ok(_) => log::info!("Logged startup visit for {}", root_clone.display()),
                     Err(e) => log::error!("Failed to log startup visit: {:?}", e),

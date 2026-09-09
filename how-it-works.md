@@ -243,6 +243,17 @@ This ensures that both the UI and the worker can safely discard stale messages, 
 
 ### Module: `db.rs`
 
+**Impressions record where they were shown.** `events.rank` is the row's
+position in the list, counting from 1, and it is set only for impressions -
+a click has no position because a click is not a list. It matters because a row
+nobody clicked at position 1 is a far stronger "no" than the same row at
+position 24, which may never have been looked at, and today the training data
+treats those two identically.
+
+Nothing reads it yet, and that is the point of collecting it now: it cannot be
+backfilled. Rows written before this keep `NULL`, so any future use has to cope
+with a mixture until enough history accumulates.
+
 Database at `~/.local/share/psychic/events.db` with two tables:
 
 ```sql

@@ -88,6 +88,9 @@ pub struct EventData<'a> {
     pub action: UserInteraction,
     pub session_id: &'a str,
     pub episode_queries: Option<&'a str>, // JSON array of queries in this episode
+    /// Where this row sat in the list, counting from 1, when it was shown.
+    /// `None` for anything that is not an impression.
+    pub rank: Option<usize>,
 }
 
 /// Databases whose schema this process has already set up.
@@ -176,7 +179,8 @@ impl Database {
                 subsession_id INTEGER,
                 action TEXT NOT NULL,
                 session_id TEXT NOT NULL,
-                episode_queries TEXT
+                episode_queries TEXT,
+                rank INTEGER
             )",
             [],
         )?;
@@ -236,6 +240,18 @@ impl Database {
                 conn.execute(&format!("ALTER TABLE sessions DROP COLUMN {}", column), [])?;
                 dropped = true;
             }
+        }
+
+        // Where a row sat in the list it was shown in. Cannot be backfilled -
+        // nothing recorded it - so old impressions keep NULL and only rows
+        // logged from here on can be used by anything that reads it.
+        let event_columns: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('events')")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        if !event_columns.iter().any(|name| name == "rank") {
+            log::info!("Adding events.rank for impression positions");
+            conn.execute("ALTER TABLE events ADD COLUMN rank INTEGER", [])?;
         }
 
         // The old index covered every row, and 96% of them are impressions
@@ -318,8 +334,8 @@ impl Database {
         };
 
         self.conn.prepare_cached(
-            "INSERT INTO events (timestamp, query, file_path, full_path, mtime, atime, file_size, subsession_id, action, session_id, episode_queries)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT INTO events (timestamp, query, file_path, full_path, mtime, atime, file_size, subsession_id, action, session_id, episode_queries, rank)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         )?.execute(
             params![
                 timestamp,
@@ -332,7 +348,8 @@ impl Database {
                 event.subsession_id,
                 action,
                 event.session_id,
-                event.episode_queries
+                event.episode_queries,
+                event.rank
             ],
         )?;
 
@@ -344,6 +361,12 @@ impl Database {
     /// These arrive two dozen at a time, on the UI thread, after every query
     /// the user pauses on. One statement each meant a transaction and an fsync
     /// each.
+    /// Log what was on screen, in the order it was on screen.
+    ///
+    /// The position matters as much as the path: a row nobody clicked at the
+    /// top of the list is a much stronger "no" than the same row at number 24,
+    /// where it may never have been looked at. `file_paths` is in display
+    /// order, so the index is the rank.
     pub fn log_impressions(
         &self,
         query: &str,
@@ -353,13 +376,16 @@ impl Database {
     ) -> Result<()> {
         let transaction = self.conn.unchecked_transaction()?;
 
-        for FileMetadata {
-            relative_path,
-            full_path,
-            mtime,
-            atime,
-            size,
-        } in file_paths
+        for (
+            position,
+            FileMetadata {
+                relative_path,
+                full_path,
+                mtime,
+                atime,
+                size,
+            },
+        ) in file_paths.iter().enumerate()
         {
             self.log_event(EventData {
                 query,
@@ -372,6 +398,7 @@ impl Database {
                 action: UserInteraction::Impression,
                 session_id,
                 episode_queries: None,
+                rank: Some(position + 1), // as the user counts them
             })?;
         }
 
@@ -704,6 +731,130 @@ mod tests {
             vec!["/clicked".to_string()],
             "Impressions are 96% of the table and none of them are history"
         );
+    }
+}
+
+#[cfg(test)]
+mod rank_tests {
+    //! Impressions record where they sat in the list.
+    //!
+    //! A row nobody clicked at position 1 is a much stronger "no" than the same
+    //! row at position 24, which may never have been looked at. Nothing reads
+    //! this yet - it cannot be backfilled, so it has to be collected before it
+    //! can be used.
+
+    use super::*;
+
+    fn shown(names: &[&str]) -> Vec<FileMetadata> {
+        names
+            .iter()
+            .map(|name| FileMetadata {
+                relative_path: name.to_string(),
+                full_path: format!("/tmp/{}", name),
+                mtime: Some(1_700_000_000),
+                atime: None,
+                size: Some(100),
+            })
+            .collect()
+    }
+
+    fn ranks(db: &Database) -> Vec<(String, Option<i64>)> {
+        db.conn
+            .prepare("SELECT file_path, rank FROM events WHERE action = 'impression' ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_impressions_record_the_position_they_were_shown_at() {
+        let db = Database::new(Path::new(":memory:")).unwrap();
+        db.log_impressions("q", &shown(&["first.rs", "second.rs", "third.rs"]), 1, "s")
+            .unwrap();
+
+        assert_eq!(
+            ranks(&db),
+            vec![
+                ("first.rs".to_string(), Some(1)),
+                ("second.rs".to_string(), Some(2)),
+                ("third.rs".to_string(), Some(3)),
+            ],
+            "counted from 1, in display order"
+        );
+    }
+
+    #[test]
+    fn test_a_click_has_no_position_because_it_is_not_a_list() {
+        let db = Database::new(Path::new(":memory:")).unwrap();
+        db.log_event(EventData {
+            query: "q",
+            file_path: "first.rs",
+            full_path: "/tmp/first.rs",
+            mtime: None,
+            atime: None,
+            file_size: None,
+            subsession_id: 1,
+            action: UserInteraction::Click,
+            session_id: "s",
+            episode_queries: None,
+            rank: None,
+        })
+        .unwrap();
+
+        let rank: Option<i64> = db
+            .conn
+            .query_row("SELECT rank FROM events WHERE action = 'click'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(rank, None);
+    }
+
+    #[test]
+    fn test_an_older_database_gains_the_column_and_keeps_its_rows() {
+        // What every existing install does on the first launch after this.
+        let dir = std::env::temp_dir().join(format!("psychic-rank-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("events.db");
+
+        {
+            let old = Connection::open(&path).unwrap();
+            old.execute(
+                "CREATE TABLE events (
+                     id INTEGER PRIMARY KEY, timestamp INTEGER NOT NULL, query TEXT NOT NULL,
+                     file_path TEXT NOT NULL, full_path TEXT NOT NULL, mtime INTEGER,
+                     atime INTEGER, file_size INTEGER, subsession_id INTEGER,
+                     action TEXT NOT NULL, session_id TEXT NOT NULL, episode_queries TEXT)",
+                [],
+            )
+            .unwrap();
+            old.execute(
+                "INSERT INTO events (timestamp, query, file_path, full_path, action, session_id)
+                 VALUES (1, 'q', 'old.rs', '/tmp/old.rs', 'impression', 's')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let db = Database::new(&path).expect("an older database still opens");
+        assert_eq!(
+            ranks(&db),
+            vec![("old.rs".to_string(), None)],
+            "the row survives, with no position - it cannot be invented"
+        );
+
+        db.log_impressions("q", &shown(&["new.rs"]), 1, "s")
+            .unwrap();
+        assert_eq!(
+            ranks(&db).last().unwrap().1,
+            Some(1),
+            "and new rows have one"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
 

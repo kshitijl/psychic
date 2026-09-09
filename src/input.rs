@@ -345,6 +345,7 @@ fn log_selection_click(app: &mut App, selection: &Selection) -> Result<()> {
         action: UserInteraction::Click,
         session_id: &session_id,
         episode_queries: None,
+        rank: None, // not an impression
     })
 }
 

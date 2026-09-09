@@ -460,10 +460,15 @@ Accumulator's fold over time-sorted events), so add the index to both
    (-0.025), gain 1.1%, rank 12 of 20 - so it stays out. The finding was the
    point: the objective was the problem, not the feature, and that is fixed
    for every feature rather than this one.
-4. **Collection change: record rank position on impressions.** Add
-   `rank INTEGER` to events, set in `log_impressions` from the row's index.
-   Cannot be backfilled. Enables position-aware weighting/features later
-   (unclicked at #1 is far more negative than unclicked at #24).
+4. **Collection change: record rank position on impressions.** DONE
+   (2026-09-10). `events.rank`, set from the display index in
+   `log_impressions`, NULL for everything that is not an impression and for
+   every row written before this. Nothing reads it yet; it had to start being
+   collected before it could be used.
+
+   Two things to do once there is history: weight unclicked rows by position
+   when training (unclicked at #1 is a much stronger negative than unclicked at
+   #24), and consider a feature for where the row sat last time it was shown.
 5. **Collection change: record `is_dir` on events** (see B5). Also cannot
    be backfilled; closes the train/serve skew.
 6. **Click-through rate per file** (preferred over a raw impression count:

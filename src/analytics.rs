@@ -246,6 +246,7 @@ mod episode_tests {
                 action: UserInteraction::Click,
                 session_id: "test-session",
                 episode_queries: None,
+                rank: None, // not an impression
             })
             .expect("click");
     }
