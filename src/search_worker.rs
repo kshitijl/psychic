@@ -188,6 +188,30 @@ struct FileInfo {
     hidden: bool,
 }
 
+/// How a path should read in the list, given where we are standing.
+///
+/// The root gets its own directory name. Stripping the root from itself leaves
+/// an empty string, and the renderer decorates that into a nameless "/ (cwd)"
+/// row - which is what the current directory looked like after navigating into
+/// somewhere the user had visited before.
+fn display_name_for(path: &Path, root: &Path) -> String {
+    if path == root {
+        return root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(".")
+            .to_string();
+    }
+
+    match path.strip_prefix(root) {
+        // Under the current tree: show where it is relative to here.
+        Ok(relative) => relative.to_string_lossy().to_string(),
+        // From somewhere else entirely: show the whole path. The UI colours
+        // these differently to say so.
+        Err(_) => path.to_string_lossy().to_string(),
+    }
+}
+
 impl FileInfo {
     fn from_history(
         full_path: PathBuf,
@@ -197,26 +221,7 @@ impl FileInfo {
         is_dir: bool,
         root: &PathBuf,
     ) -> Self {
-        let display_name = if full_path == *root {
-            // Special case: if this is the root directory itself, show just the dir name
-            root.file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(".")
-                .to_string()
-        } else {
-            match full_path.strip_prefix(root) {
-                Ok(postfix) => {
-                    // File is in current tree - show relative path
-                    postfix.to_string_lossy().to_string()
-                }
-                Err(_) => {
-                    // File is from elsewhere - show full absolute path
-                    // Will be colored differently in UI to indicate it's historical
-                    full_path.to_string_lossy().to_string()
-                }
-            }
-        };
-
+        let display_name = display_name_for(&full_path, root);
         let is_under_cwd = full_path.starts_with(root);
 
         FileInfo {
@@ -436,45 +441,7 @@ impl WorkerState {
             file_registry.len()
         );
 
-        // Add the root directory itself to the registry
-        let root_add_start = std::time::Instant::now();
-        // (walker skips it, but we want it to appear in results as "(cwd)")
         let canonical_root = root.canonicalize().unwrap_or_else(|_| root.clone());
-        if !path_to_id.contains_key(&canonical_root) {
-            let metadata = get_file_metadata(&canonical_root);
-            let display_name = canonical_root
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(".")
-                .to_string();
-
-            log::debug!(
-                "Adding root directory to registry: canonical_root={:?}, display_name={:?}",
-                canonical_root,
-                display_name
-            );
-
-            let file_info = FileInfo {
-                full_path: canonical_root.clone(),
-                display_name,
-                mtime: metadata.mtime,
-                atime: metadata.atime,
-                file_size: metadata.file_size,
-                origin: FileOrigin::CwdWalker,
-                is_dir: true,
-                is_under_cwd: true,
-                evicted: false,
-                hidden: false,
-            };
-
-            let file_id = FileId(file_registry.len());
-            path_to_id.insert(canonical_root.clone(), file_id);
-            file_registry.push(file_info);
-        }
-        log::info!(
-            "TIMING {{\"op\":\"add_root_directory\",\"ms\":{}}}",
-            root_add_start.elapsed().as_secs_f64() * 1000.0
-        );
 
         log::info!(
             "TIMING {{\"op\":\"worker_state_new_total\",\"ms\":{}}}",
@@ -498,9 +465,53 @@ impl WorkerState {
             hidden_prefixes,
             active_hidden: Vec::new(),
         };
+        // The walker never reports the directory it is walking, so this is the
+        // only thing that puts the current directory in the registry.
+        state.ensure_root_row();
         state.recompute_hidden();
 
         Ok(state)
+    }
+
+    /// Make sure the current directory has a row of its own.
+    ///
+    /// The walker skips the directory it is walking, so nothing else adds it.
+    /// It has to run again after every `change_cwd`, not only at startup: the
+    /// row `new` created is dropped along with the walked files, and if the new
+    /// directory happens to be one the user has visited before - which, with
+    /// the zsh hook logging every `cd`, is nearly always - it is sitting in the
+    /// registry as a *historical* entry instead, showing an absolute path where
+    /// it should show its own name.
+    fn ensure_root_row(&mut self) {
+        let root = self.root.clone();
+        let display_name = display_name_for(&root, &root);
+
+        if let Some(&file_id) = self.path_to_id.get(&root) {
+            let existing = &mut self.file_registry[file_id.0];
+            existing.display_name = display_name;
+            // It is where we are standing now, not somewhere we once went.
+            existing.origin = FileOrigin::CwdWalker;
+            existing.is_dir = true;
+            existing.is_under_cwd = true;
+            existing.evicted = false;
+            return;
+        }
+
+        let metadata = get_file_metadata(&root);
+        let file_id = FileId(self.file_registry.len());
+        self.file_registry.push(FileInfo {
+            full_path: root.clone(),
+            display_name,
+            mtime: metadata.mtime,
+            atime: metadata.atime,
+            file_size: metadata.file_size,
+            origin: FileOrigin::CwdWalker,
+            is_dir: true,
+            is_under_cwd: true,
+            evicted: false,
+            hidden: false,
+        });
+        self.path_to_id.insert(root, file_id);
     }
 
     /// Work out which hidden directories apply right now, and mark the registry.
@@ -560,19 +571,7 @@ impl WorkerState {
         } else {
             // We have a new file.
             // The display path should be the original `path` relative to `self.root`.
-            let display_name = if canonical_path == self.root {
-                // For the root directory itself, show just the directory name
-                self.root
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(".")
-                    .to_string()
-            } else {
-                path.strip_prefix(&self.root)
-                    .unwrap_or(&path) // fallback to original path if not in root
-                    .to_string_lossy()
-                    .to_string()
-            };
+            let display_name = display_name_for(&path, &self.root);
 
             let file_info = FileInfo {
                 full_path: canonical_path.clone(), // Store the canonical path
@@ -876,22 +875,13 @@ impl WorkerState {
         self.file_registry
             .retain(|f| f.origin != FileOrigin::CwdWalker);
 
-        // Update root
-        self.root = new_cwd.clone();
+        // Canonical, like the root `new` starts with, so that comparisons
+        // against the registry's canonical paths mean what they say.
+        self.root = new_cwd.canonicalize().unwrap_or(new_cwd.clone());
 
         // Recalculate display names for all historical files with new root
         for file in self.file_registry.iter_mut() {
-            file.display_name = match file.full_path.strip_prefix(&self.root) {
-                Ok(postfix) => {
-                    // File is in current tree - show relative path
-                    postfix.to_string_lossy().to_string()
-                }
-                Err(_) => {
-                    // File is from elsewhere - show full absolute path
-                    // Will be colored differently in UI to indicate it's historical
-                    file.full_path.to_string_lossy().to_string()
-                }
-            };
+            file.display_name = display_name_for(&file.full_path, &self.root);
             file.is_under_cwd = file.full_path.starts_with(&self.root);
         }
 
@@ -900,6 +890,9 @@ impl WorkerState {
         for (idx, file) in self.file_registry.iter().enumerate() {
             self.path_to_id.insert(file.full_path.clone(), FileId(idx));
         }
+
+        // The row for where we are now went with the walked files above.
+        self.ensure_root_row();
 
         // The root moved, so which hidden directories apply moved with it: one
         // that contains the new root is now exempt, and one that no longer
@@ -1463,6 +1456,100 @@ mod load_ranker_tests {
             .expect("A corrupt model must not stop psychic from starting");
 
         assert!(!ranker.has_model(), "The unusable model was not loaded");
+    }
+}
+
+#[cfg(test)]
+mod cwd_row_tests {
+    use super::eviction_tests::worker_with_three_files;
+    use super::*;
+
+    /// The row for the directory we are standing in, if there is one.
+    fn cwd_row(state: &WorkerState) -> Option<&FileInfo> {
+        let root = state.root.clone();
+        state.file_registry.iter().find(|f| f.full_path == root)
+    }
+
+    #[test]
+    fn test_the_current_directory_has_a_row_at_startup() {
+        let (state, _dir, _rx) = worker_with_three_files("cwd-row-start");
+
+        // `worker_with_three_files` clears the registry after `new`, so rebuild
+        // the row the way `new` would to check the name it produces.
+        let mut state = state;
+        state.ensure_root_row();
+
+        assert_eq!(
+            cwd_row(&state).map(|f| f.display_name.as_str()),
+            Some("test"),
+            "the current directory is shown by its own name"
+        );
+    }
+
+    #[test]
+    fn test_navigating_somewhere_new_still_leaves_a_row() {
+        let (mut state, _dir, _rx) = worker_with_three_files("cwd-row-fresh");
+
+        state
+            .change_cwd(PathBuf::from("/test/somewhere"))
+            .expect("change_cwd");
+
+        let row = cwd_row(&state).expect("the directory we are in needs a row");
+        assert_eq!(row.display_name, "somewhere");
+        assert!(row.is_dir);
+        assert!(row.is_under_cwd);
+    }
+
+    #[test]
+    fn test_navigating_somewhere_already_visited_does_not_leave_it_nameless() {
+        let (mut state, _dir, _rx) = worker_with_three_files("cwd-row-historical");
+
+        // With the zsh hook logging every `cd`, the directory you navigate into
+        // is nearly always in the registry already, as history.
+        let visited = PathBuf::from("/test/visited");
+        let file_id = FileId(state.file_registry.len());
+        state.file_registry.push(FileInfo::from_history(
+            visited.clone(),
+            None,
+            None,
+            None,
+            true,
+            &PathBuf::from("/test"),
+        ));
+        state.path_to_id.insert(visited.clone(), file_id);
+
+        state.change_cwd(visited).expect("change_cwd");
+
+        let row = cwd_row(&state).expect("the directory we are in needs a row");
+        assert_eq!(
+            row.display_name, "visited",
+            "stripping the root from itself gave an empty name, which the \
+             renderer drew as a nameless \"/ (cwd)\" row"
+        );
+        assert_eq!(
+            row.origin,
+            FileOrigin::CwdWalker,
+            "and it is where we are standing now, not somewhere we once went"
+        );
+    }
+
+    #[test]
+    fn test_the_row_is_not_duplicated_by_navigating_back_and_forth() {
+        let (mut state, _dir, _rx) = worker_with_three_files("cwd-row-twice");
+
+        for dir in ["/test/a", "/test/b", "/test/a"] {
+            state.change_cwd(PathBuf::from(dir)).expect("change_cwd");
+        }
+
+        let rows = state
+            .file_registry
+            .iter()
+            .filter(|f| f.full_path == Path::new("/test/a"))
+            .count();
+        assert_eq!(
+            rows, 1,
+            "one row per directory, however often it is visited"
+        );
     }
 }
 
