@@ -1,20 +1,5 @@
 ## now
 
-### Blend weight: ramp on recent positives once there is a reason to
-
-The blend now ramps on `num_positive_examples` from model_stats.json, which
-counts every clicked row the model trained on, however old. Recency weights
-ship at a 180-day half-life, so train.py already knows how much of that
-evidence is recent: it could also write `recent_positive_examples` (the
-weight-sum over positives, or positives in the last 60 days) and have
-`compute_blend_weights` ramp on that instead, so a model trained mostly on
-one old burst is trusted slightly less.
-
-Not obviously worth doing. The ramp saturates at 60 positives and this
-install sits at 1163, so nothing would change today; it only matters for an
-installation that was used hard once and then went quiet for a year. Revisit
-if that ever shows up.
-
 ### 2026-09-08 review: remaining findings and suggested order
 
 **Working notes for whoever picks these up.**
