@@ -488,10 +488,19 @@ Accumulator's fold over time-sorted events), so add the index to both
    or accept a scan of one month) or a small counts table maintained at
    write time. Measure the startup cost first. Rank position (item 4) will
    later let this become position-debiased.
-7. **Clicks under this directory** (7d, 30d). A dir row's own clicks only
-   count Enter on it; clicks on anything beneath it are the better signal.
-   Build at load time by bumping every ancestor of each clicked path
-   (bounded to, say, 8 levels). 0 for files.
+7. **Clicks under this directory.** TRIED AND REJECTED (2026-09-10). Built as
+   specified - every clicked path credited to its 8 nearest ancestors at index
+   time, 7d and 30d windows, 0 for files - and the model would not use it: gain
+   8 and 0, ranks 20 and 22 of 22. With the round count fixed so early stopping
+   cannot move, two of three folds come out bit-identical with and without it
+   and the third is 0.017 worse; MRR +0.0002.
+
+   It is not that the signal is wrong, it is that `visits_last_*` already
+   carries it. Both answer "do I work in this directory", and visits answer it
+   more directly - the user said so by `cd`-ing there - from twice as much data
+   (2,312 visits against 1,165 clicks). This was the collinearity risk noted
+   when the two were compared before either was built; worth knowing it
+   resolved this way rather than the other.
 8. **Clicks for this query in this directory.** Generalizes
    clicks_for_this_query to siblings: map keyed (query, parent_dir).
 9. **Modified since last click** (binary: mtime > last click ts). "Something
