@@ -24,6 +24,47 @@ After adding implementing a feature or fixing a bug:
 * also `cargo clippy`.
 * add new tests for the feature just added, if possible
 * update how-it-works.md so that it reflects current state.
+* **benchmark the change against the commit before it, and put the numbers in
+  the commit message.**
+
+## Benchmarking every change
+
+Every commit gets benchmarked against its parent, and the numbers go in the
+commit message. Not just the ones meant to be faster.
+
+```bash
+./bench/run.py setup HEAD      # build the parent commit as the baseline
+# ... make the change, just build, cargo test, cargo clippy ...
+./bench/run.py startup 6
+./bench/run.py keystroke 30
+```
+
+Why every commit and not just the performance ones:
+
+* **A regression is only cheap to fix while you remember what you changed.**
+  Found six commits later it is an afternoon of bisecting; found in the commit
+  that caused it, it is usually obvious.
+* **A performance claim with no measurement behind it is a guess.** Several
+  changes in this repo that were "obviously" faster were not, and one that
+  looked like a 1.8x regression turned out to be a benchmarking mistake. Write
+  down what was measured, not what was expected.
+* **The numbers accumulate into a history.** `git log` becomes the record of how
+  the tool got faster and where it got slower, which is the only way to answer
+  "when did startup double" without re-deriving it.
+
+**Know the noise floor before reading anything into a number.** Benchmarked
+against itself, the same binary lands within 1-3% on the big figures (walk
+complete, worker state, first full render) and within about 15% on the
+sub-millisecond ones (first paint, load clicks, per-feature times). A 10% move
+on a 0.3ms number is noise; a 10% move on walk complete is real. When a result
+matters, run it again.
+
+Slower is often the right call - a bug fix, a feature, a refactor that makes the
+code honest. Gitignore support costs 12ms of walk time and is worth keeping.
+The rule is not "never regress", it is **never regress without knowing**: if a
+change costs something, the commit message says how much and why it is worth it.
+Read `bench/harness.py` before trusting a surprising result; five different
+mistakes there each produced a confident wrong answer first.
 
 Do not run `cargo build`. I have a symlink to the RELEASE binary under target. That's what I use every day, and that's what I test as a user. It must reflect the current latest code. You must run `just build`, which will build a release binary and also other tasks that I need done in order to read and understand the code.
 

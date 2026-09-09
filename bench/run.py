@@ -35,21 +35,44 @@ def versions():
 
 
 def setup(ref):
+    """Build `ref` as the baseline and stage a data directory per version.
+
+    Re-pointing an existing worktree rather than insisting on a fresh one is
+    what makes "benchmark every commit against its parent" bearable: the
+    rebuild is incremental, so moving the baseline forward one commit costs
+    seconds rather than the forty a clean build takes.
+    """
     WORK.mkdir(parents=True, exist_ok=True)
     src = WORK / "old-src"
-    if not src.exists():
-        subprocess.run(["git", "worktree", "add", str(src), ref], cwd=REPO, check=True)
+    # Resolve in the repo, not the worktree: "HEAD" there means whatever the
+    # last benchmark left checked out, which is how a baseline silently stops
+    # moving forward.
+    resolved = subprocess.run(["git", "rev-parse", "--short", ref], cwd=REPO,
+                              capture_output=True, text=True, check=True).stdout.strip()
+    if src.exists():
+        subprocess.run(["git", "checkout", "--detach", resolved], cwd=src, check=True)
+    else:
+        subprocess.run(["git", "worktree", "add", str(src), resolved], cwd=REPO, check=True)
     subprocess.run(["cargo", "build", "--release"], cwd=src, check=True)
 
     for name in ("model.txt", "model_stats.json"):
         subprocess.run(["cp", str(DEFAULT_DATA_DIR / name), str(WORK / f"pinned-{name}")],
                        check=True)
 
+    # Both versions start from a byte-identical database every time. Left to
+    # accumulate, the two dirs drift - one run left a 20MB write-ahead log
+    # against the other's 4.4MB, and the same binary measured against itself
+    # came out 1.6x apart on first paint, entirely from the cost of opening it.
     for version in versions().values():
+        if version.data_dir.exists():
+            subprocess.run(["rm", "-rf", str(version.data_dir)], check=True)
         version.data_dir.mkdir(parents=True, exist_ok=True)
-        for name in ("events.db", "feature_schema.json"):
-            subprocess.run(["cp", str(DEFAULT_DATA_DIR / name),
-                            str(version.data_dir / name)], check=True)
+        # .backup rather than cp: it folds the source's write-ahead log into one
+        # clean file, so neither copy starts with recovery work to do.
+        subprocess.run(["sqlite3", str(DEFAULT_DATA_DIR / "events.db"),
+                        f".backup '{version.data_dir}/events.db'"], check=True)
+        subprocess.run(["cp", str(DEFAULT_DATA_DIR / "feature_schema.json"),
+                        str(version.data_dir / "feature_schema.json")], check=True)
         version.pin_model()
 
     # Commits before `03ca743` still write the two session columns that commit
@@ -59,7 +82,7 @@ def setup(ref):
          "ALTER TABLE sessions ADD COLUMN shell_history TEXT NOT NULL DEFAULT '';"
          "ALTER TABLE sessions ADD COLUMN running_processes TEXT NOT NULL DEFAULT '';"],
         capture_output=True)
-    print(f"staged {WORK}: baseline at {ref}, data dirs, pinned model")
+    print(f"staged {WORK}: baseline at {resolved} ({ref}), data dirs, pinned model")
 
 
 ROWS_TO_REPORT = [
