@@ -1631,7 +1631,7 @@ mod query_timing_tests {
     fn test_a_query_writes_one_line_with_its_whole_breakdown() {
         assert_eq!(
             timings().to_json(),
-            r#"{"blend_ms":0.125,"count":171,"features_ms":0.75,"filter_ms":1.5,"op":"query","per_feature":{"clicks_for_this_query":0.0,"clicks_last_24h":0.0,"clicks_last_30_days":0.0,"clicks_last_7_days":0.0,"clicks_last_hour":0.0,"clicks_last_week_parent_dir":0.0,"engagements_in_episode_with_query":0.0,"filename_starts_with_query":0.0,"fuzzy_score":0.0,"is_dir":0.0,"is_hidden":0.0,"is_under_cwd":0.0,"log_file_size":0.5,"modified_age":0.0,"modified_last_24h":0.0,"visits_last_30_days":0.0,"visits_last_7_days":0.0},"predict_ms":0.5,"simple_ms":0.25,"total_ms":3.25}"#
+            r#"{"blend_ms":0.125,"count":171,"features_ms":0.75,"filter_ms":1.5,"op":"query","per_feature":{"clicks_for_this_query":0.0,"clicks_last_24h":0.0,"clicks_last_30_days":0.0,"clicks_last_7_days":0.0,"clicks_last_hour":0.0,"clicks_last_week_parent_dir":0.0,"engagements_in_episode_with_query":0.0,"filename_starts_with_query":0.0,"fuzzy_score":0.0,"is_dir":0.0,"is_hidden":0.0,"is_under_cwd":0.0,"log_file_size":0.5,"modified_age":0.0,"modified_last_24h":0.0,"seconds_since_last_click":0.0,"seconds_since_last_click_parent_dir":0.0,"visits_last_30_days":0.0,"visits_last_7_days":0.0},"predict_ms":0.5,"simple_ms":0.25,"total_ms":3.25}"#
         );
     }
 

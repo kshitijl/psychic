@@ -888,6 +888,25 @@ costs less than the model inference it feeds (0.71ms), and the most expensive
 single feature is `log_file_size` at 0.25ms total, which is a `stat` syscall
 doing real work.
 
+**How long since, not how many.** `seconds_since_last_click` is
+`ln(1 + seconds)` since the most recent engagement with this exact file, and
+`seconds_since_last_click_parent_dir` the same for its directory. The count
+windows can say a file was clicked today; only this can say it was clicked a
+moment ago, and "a moment ago" is most of what makes a file the one you want
+next.
+
+Two details carry the design. It is **logged**, because the difference that
+matters is order of magnitude: a minute against an hour is real, an hour against
+an hour and a minute is not. And a file with no history reports a constant
+`NEVER_CLICKED` of 19.57 - `ln(1 + ten years)` - rather than something outside
+the range: the click index only ever holds 30 days, whose log is 14.77, so
+"never" sits clear of every real value while staying on the same axis, which is
+what lets one monotone split tell "no history" from "old history".
+
+On this developer's data `seconds_since_last_click` came out as the largest
+feature by gain, at 22.7% of the total - ahead of `clicks_for_this_query` and
+`fuzzy_score`.
+
 **Directory visits are not clicks.** `visits_last_7_days` and
 `visits_last_30_days` count `startup_visit` events - the zsh `chpwd` hook, via
 `track-visit` - for the directory being ranked, and are 0 for files. They are

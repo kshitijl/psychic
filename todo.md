@@ -428,10 +428,12 @@ Accumulator's fold over time-sorted events), so add the index to both
    folds moved the same way. The features rank 16th and 17th of 17 by gain,
    which is what a feature that only fires on directory rows looks like: small
    share of the total, decisive where it applies.
-2. **Seconds since last click**, `ln(1 + now - last_click_ts)`, 
-   large constant when never clicked; monotone decreasing. Same for parent
-   dir. The windows count clicks but cannot tell 1 minute ago from 50.
-   Uses existing `clicks_by_file` (take max timestamp).
+2. **Seconds since last click.** DONE (2026-09-10).
+   `seconds_since_last_click` and `seconds_since_last_click_parent_dir`, both
+   `ln(1 + age)` with 19.57 (`ln(1 + ten years)`) when there is no history.
+   Largest feature by gain at 22.7% of the total, ahead of
+   `clicks_for_this_query`. top-1 0.6921 -> 0.7145 over three folds, but they
+   disagreed: +0.010, +0.066, -0.008, so the mean leans on one fold.
 3. **Query length** (`query.chars().count()`). Fuzzy scores scale with it
    and clicks_for_this_query only means anything past a few chars; today
    the tree infers it from fuzzy_score magnitude. Trivial.

@@ -1143,12 +1143,17 @@ mod tests {
         // fuzzy_score=0 (foo/bar.txt doesn't match "test" - fuzzy matcher returns None)
         // visits_last_7_days=0, visits_last_30_days=0 (this is a file, not a
         //   directory, and files are never visited)
+        // seconds_since_last_click=11.1035 = ln(1 + 66400), the most recent of
+        //   the three clicks being 18.4h old - the same event the "oldest click
+        //   is 18.4h before current_timestamp" note above refers to
+        // seconds_since_last_click_parent_dir=11.1035 (same event: the most
+        //   recent click in /tmp/foo is the one on bar.txt itself)
         //
         // This expectation used to depend on the machine's timezone: when
         // clicks_last_24h was "clicks_today" it counted clicks since local midnight,
         // giving 0 in America/New_York, 2 in UTC and 3 in Asia/Kolkata for exactly
         // this data. Rolling windows are the same number everywhere.
-        let expected = "[0.0, 3.0, 0.0, 1.0, 0.0, 13.585079902767108, 4.0, 0.0, 3.0, 3.0, 86400.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0]";
+        let expected = "[0.0, 3.0, 0.0, 1.0, 0.0, 13.585079902767108, 4.0, 0.0, 3.0, 3.0, 86400.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 11.103467395592086, 11.103467395592086]";
 
         assert_eq!(actual, expected, "Feature vector mismatch");
     }

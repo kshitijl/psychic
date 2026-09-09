@@ -472,6 +472,88 @@ impl Feature for FuzzyScore {
 }
 
 // ============================================================================
+// Feature: seconds_since_last_click, seconds_since_last_click_parent_dir
+// ============================================================================
+
+/// What a file with no clicks at all reports, in log-seconds.
+///
+/// `ln(1 + ten years)`, to 2dp. The click index only ever holds 30 days, whose
+/// log is 14.77, so every real gap sits well below this: "never" stays clearly
+/// separated from "a long time ago" while living on the same axis, which is
+/// what lets one monotone split tell the two apart.
+const NEVER_CLICKED: f64 = 19.57;
+
+/// How long since the most recent event in `events`, as `ln(1 + seconds)`.
+///
+/// Log-scaled because what matters is the order of magnitude: a minute against
+/// an hour is a real difference, an hour against an hour and a minute is not.
+/// The click-count windows can say a file was clicked today; only this can say
+/// it was clicked a moment ago.
+fn log_seconds_since_last(events: Option<&Vec<ClickEvent>>, now: i64) -> f64 {
+    let Some(events) = events else {
+        return NEVER_CLICKED;
+    };
+
+    // Events after `now` come from a clock that moved backwards; treat them as
+    // just-happened rather than letting a negative age take the log.
+    let most_recent = events.iter().map(|event| event.timestamp).max();
+    match most_recent {
+        Some(timestamp) => ((1 + (now - timestamp).max(0)) as f64).ln(),
+        None => NEVER_CLICKED,
+    }
+}
+
+pub struct SecondsSinceLastClick;
+
+impl Feature for SecondsSinceLastClick {
+    fn name(&self) -> &'static str {
+        "seconds_since_last_click"
+    }
+
+    fn feature_type(&self) -> FeatureType {
+        FeatureType::Numeric
+    }
+
+    fn monotonicity(&self) -> Option<Monotonicity> {
+        Some(Monotonicity::Decreasing) // longer ago -> less relevant
+    }
+
+    fn compute(&self, inputs: &FeatureInputs) -> f64 {
+        let full_path = inputs.full_path.to_string_lossy();
+        log_seconds_since_last(
+            inputs.clicks_by_file.get(full_path.as_ref()),
+            inputs.current_timestamp,
+        )
+    }
+}
+
+pub struct SecondsSinceLastClickParentDir;
+
+impl Feature for SecondsSinceLastClickParentDir {
+    fn name(&self) -> &'static str {
+        "seconds_since_last_click_parent_dir"
+    }
+
+    fn feature_type(&self) -> FeatureType {
+        FeatureType::Numeric
+    }
+
+    fn monotonicity(&self) -> Option<Monotonicity> {
+        Some(Monotonicity::Decreasing)
+    }
+
+    fn compute(&self, inputs: &FeatureInputs) -> f64 {
+        let Some(parent_dir) = inputs.full_path.parent() else {
+            return NEVER_CLICKED;
+        };
+        log_seconds_since_last(
+            inputs.clicks_by_parent_dir.get(parent_dir),
+            inputs.current_timestamp,
+        )
+    }
+}
+
+// ============================================================================
 // Feature: visits_last_7_days, visits_last_30_days
 // ============================================================================
 
@@ -574,6 +656,60 @@ mod tests {
             is_dir,
             fuzzy_score: 0,
         }
+    }
+
+    #[test]
+    fn test_recency_reports_the_most_recent_click_not_the_first() {
+        // Three clicks, one of them a minute ago: what matters is the newest.
+        let events = events(&[60, 3600, 40 * 86_400]);
+        let seconds = log_seconds_since_last(Some(&events), NOW);
+
+        assert!(
+            (seconds - (61.0f64).ln()).abs() < 1e-12,
+            "expected ln(1 + 60), got {}",
+            seconds
+        );
+    }
+
+    #[test]
+    fn test_never_clicked_sits_above_anything_the_index_can_hold() {
+        // The click index holds 30 days. "Never" has to be clear of that, or a
+        // split cannot separate "no history" from "old history".
+        let oldest_possible = events(&[30 * 86_400]);
+        let thirty_days = log_seconds_since_last(Some(&oldest_possible), NOW);
+
+        assert_eq!(log_seconds_since_last(None, NOW), NEVER_CLICKED);
+        assert!(
+            NEVER_CLICKED > thirty_days + 4.0,
+            "never ({}) should be well clear of a 30-day-old click ({})",
+            NEVER_CLICKED,
+            thirty_days
+        );
+    }
+
+    #[test]
+    fn test_a_minute_and_an_hour_are_further_apart_than_two_similar_hours() {
+        // The point of the log: the windows already say "clicked today", so
+        // this has to be the feature that tells a minute from an hour.
+        let minute = log_seconds_since_last(Some(&events(&[60])), NOW);
+        let hour = log_seconds_since_last(Some(&events(&[3600])), NOW);
+        let hour_and_a_bit = log_seconds_since_last(Some(&events(&[3660])), NOW);
+
+        assert!(hour - minute > 4.0, "a minute and an hour are far apart");
+        assert!(
+            hour_and_a_bit - hour < 0.02,
+            "an hour and an hour and a minute are nearly the same"
+        );
+    }
+
+    #[test]
+    fn test_a_clock_that_went_backwards_reads_as_just_now() {
+        // Timestamps come from wall clocks on machines that adjust them. A
+        // future click must not produce ln of a negative number.
+        let future = vec![ClickEvent {
+            timestamp: NOW + 3600,
+        }];
+        assert_eq!(log_seconds_since_last(Some(&future), NOW), (1.0f64).ln());
     }
 
     #[test]
