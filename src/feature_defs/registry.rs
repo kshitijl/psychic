@@ -1,7 +1,8 @@
 use super::implementations::{
     ClicksForThisQuery, ClicksLast7Days, ClicksLast24h, ClicksLast30Days, ClicksLastHour,
     ClicksLastWeekParentDir, EngagementsInEpisodeWithQuery, FilenameStartsWithQuery, FuzzyScore,
-    IsDir, IsHidden, IsUnderCwd, LogFileSize, ModifiedAge, ModifiedLast24h,
+    IsDir, IsHidden, IsUnderCwd, LogFileSize, ModifiedAge, ModifiedLast24h, VisitsLast7Days,
+    VisitsLast30Days,
 };
 use super::schema::{Feature, FeatureType};
 use once_cell::sync::Lazy;
@@ -26,6 +27,11 @@ pub static FEATURE_REGISTRY: Lazy<Vec<Box<dyn Feature>>> = Lazy::new(|| {
         Box::new(EngagementsInEpisodeWithQuery),
         Box::new(IsDir),
         Box::new(FuzzyScore),
+        // New features go on the end: the position in this list is the
+        // position in the model's feature vector, so inserting one in the
+        // middle silently repoints every feature after it.
+        Box::new(VisitsLast7Days),
+        Box::new(VisitsLast30Days),
     ]
 });
 

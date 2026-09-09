@@ -471,9 +471,72 @@ impl Feature for FuzzyScore {
     }
 }
 
+// ============================================================================
+// Feature: visits_last_7_days, visits_last_30_days
+// ============================================================================
+
+/// How often the user has changed into this directory in `window_seconds`.
+///
+/// Zero for files: a file is never `cd`'d into, and letting it inherit its
+/// directory's count would make every file in a busy directory look visited.
+fn visits_for_dir(inputs: &FeatureInputs, window_seconds: i64) -> f64 {
+    if !inputs.is_dir {
+        return 0.0;
+    }
+
+    let full_path = inputs.full_path.to_string_lossy();
+    count_in_window(
+        inputs.visits_by_dir.get(full_path.as_ref()),
+        inputs.current_timestamp,
+        window_seconds,
+    )
+}
+
+pub struct VisitsLast7Days;
+
+impl Feature for VisitsLast7Days {
+    fn name(&self) -> &'static str {
+        "visits_last_7_days"
+    }
+
+    fn feature_type(&self) -> FeatureType {
+        FeatureType::Numeric
+    }
+
+    fn monotonicity(&self) -> Option<Monotonicity> {
+        Some(Monotonicity::Increasing)
+    }
+
+    fn compute(&self, inputs: &FeatureInputs) -> f64 {
+        visits_for_dir(inputs, 7 * SECONDS_PER_DAY)
+    }
+}
+
+pub struct VisitsLast30Days;
+
+impl Feature for VisitsLast30Days {
+    fn name(&self) -> &'static str {
+        "visits_last_30_days"
+    }
+
+    fn feature_type(&self) -> FeatureType {
+        FeatureType::Numeric
+    }
+
+    fn monotonicity(&self) -> Option<Monotonicity> {
+        Some(Monotonicity::Increasing)
+    }
+
+    fn compute(&self, inputs: &FeatureInputs) -> f64 {
+        visits_for_dir(inputs, 30 * SECONDS_PER_DAY)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustc_hash::FxHashMap;
+    use std::path::PathBuf;
 
     const NOW: i64 = 1_700_086_400;
 
@@ -484,6 +547,80 @@ mod tests {
                 timestamp: NOW - offset,
             })
             .collect()
+    }
+
+    /// FeatureInputs for one row, with everything empty but the visit index.
+    fn inputs_for<'a>(
+        full_path: &'a Path,
+        is_dir: bool,
+        visits: &'a FxHashMap<String, Vec<ClickEvent>>,
+        empty_clicks: &'a FxHashMap<String, Vec<ClickEvent>>,
+        empty_dirs: &'a FxHashMap<PathBuf, Vec<ClickEvent>>,
+    ) -> FeatureInputs<'a> {
+        FeatureInputs {
+            query: "",
+            file_path: "row",
+            full_path,
+            mtime: None,
+            file_size: None,
+            cwd: Path::new("/tmp"),
+            clicks_by_file: empty_clicks,
+            visits_by_dir: visits,
+            clicks_by_parent_dir: empty_dirs,
+            clicks_for_query: None,
+            engagements_for_query: None,
+            current_timestamp: NOW,
+            is_from_walker: true,
+            is_dir,
+            fuzzy_score: 0,
+        }
+    }
+
+    #[test]
+    fn test_visits_count_only_this_directory_and_only_in_window() {
+        let mut visits = FxHashMap::default();
+        visits.insert(
+            "/tmp/project".to_string(),
+            events(&[
+                60,          // a minute ago
+                3 * 86_400,  // three days ago
+                20 * 86_400, // twenty days ago
+                40 * 86_400, // outside every window
+            ]),
+        );
+        let (clicks, dirs) = (FxHashMap::default(), FxHashMap::default());
+        let path = PathBuf::from("/tmp/project");
+        let inputs = inputs_for(&path, true, &visits, &clicks, &dirs);
+
+        assert_eq!(VisitsLast7Days.compute(&inputs), 2.0);
+        assert_eq!(VisitsLast30Days.compute(&inputs), 3.0);
+    }
+
+    #[test]
+    fn test_a_directory_nobody_visited_scores_zero() {
+        let mut visits = FxHashMap::default();
+        visits.insert("/tmp/project".to_string(), events(&[60]));
+        let (clicks, dirs) = (FxHashMap::default(), FxHashMap::default());
+        let path = PathBuf::from("/tmp/elsewhere");
+        let inputs = inputs_for(&path, true, &visits, &clicks, &dirs);
+
+        assert_eq!(VisitsLast30Days.compute(&inputs), 0.0);
+    }
+
+    #[test]
+    fn test_a_file_never_counts_as_visited() {
+        // The visit index is keyed by directory, and a file has none - but a
+        // file could share a path with a directory that was later replaced, and
+        // more to the point, letting a file inherit its directory's count would
+        // make every file in a busy directory look visited.
+        let mut visits = FxHashMap::default();
+        visits.insert("/tmp/project".to_string(), events(&[60, 120]));
+        let (clicks, dirs) = (FxHashMap::default(), FxHashMap::default());
+        let path = PathBuf::from("/tmp/project");
+        let inputs = inputs_for(&path, false, &visits, &clicks, &dirs);
+
+        assert_eq!(VisitsLast7Days.compute(&inputs), 0.0);
+        assert_eq!(VisitsLast30Days.compute(&inputs), 0.0);
     }
 
     #[test]

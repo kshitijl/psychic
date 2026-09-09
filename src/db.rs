@@ -28,6 +28,12 @@ pub struct Engagement {
     pub episode_queries: Option<String>,
 }
 
+/// A directory the user changed into, from the shell hook.
+pub struct Visit {
+    pub full_path: String,
+    pub timestamp: i64,
+}
+
 pub struct FileMetadata {
     pub relative_path: String,
     pub full_path: String,
@@ -462,6 +468,38 @@ impl Database {
         Ok(paths)
     }
 
+    /// Every directory the user has `cd`'d into since `cutoff`.
+    ///
+    /// Visits come from the zsh `chpwd` hook via `track-visit`, which only ever
+    /// records directories, and they are kept apart from clicks on purpose: a
+    /// visit says "I work here", a click says "I opened this", and counting
+    /// them together would let a busy afternoon of navigation look like
+    /// engagement with files nobody opened.
+    ///
+    /// The redundant `action IN` clause is the same trick as
+    /// `engagements_since`: without it SQLite cannot see that this query's
+    /// WHERE implies the partial index's, and scans the table.
+    pub fn visits_since(&self, cutoff: i64) -> Result<Vec<Visit>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT full_path, timestamp
+             FROM events
+             WHERE action IN ('click', 'scroll', 'startup_visit')
+               AND action = 'startup_visit'
+               AND timestamp >= ?1",
+        )?;
+
+        let rows = stmt
+            .query_map([cutoff], |row| {
+                Ok(Visit {
+                    full_path: row.get(0)?,
+                    timestamp: row.get(1)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(rows)
+    }
+
     /// Every click and scroll since `cutoff`, for the ranker's indexes.
     ///
     /// The SQL lives here, beside the index it depends on and the plan test
@@ -724,6 +762,26 @@ mod plan_tests {
         assert!(
             plan.contains("idx_events_engagement"),
             "load_clicks must not scan the table: {}",
+            plan
+        );
+    }
+
+    #[test]
+    fn test_the_visit_loading_query_uses_the_engagement_index() {
+        let db = Database::new(Path::new(":memory:")).unwrap();
+
+        // Exactly what `visits_since` runs, redundant clause and all.
+        let plan = plan(
+            &db,
+            "SELECT full_path, timestamp FROM events
+             WHERE action IN ('click', 'scroll', 'startup_visit')
+               AND action = 'startup_visit'
+               AND timestamp >= 1",
+        );
+
+        assert!(
+            plan.contains("idx_events_engagement"),
+            "visits_since must not scan the table: {}",
             plan
         );
     }

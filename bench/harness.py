@@ -58,11 +58,22 @@ class Version:
         """
         return [self.data_dir / "app.log", DEFAULT_DATA_DIR / "app.log"]
 
+    def pinned(self, name):
+        """Where this version's own trained model is kept between trials."""
+        return WORK / f"pinned-{self.name}-{name}"
+
     def pin_model(self):
+        """Restore this version's model, in case a trial's retrain replaced it.
+
+        Per version, not one shared model: a change that adds a feature makes
+        the two builds expect different numbers of columns, and a model that
+        does not fit is refused at load, so the run would measure the simple
+        model instead of the thing being benchmarked.
+        """
         for name in ("model.txt", "model_stats.json"):
-            src = WORK / f"pinned-{name}"
-            if src.exists():
-                subprocess.run(["cp", str(src), str(self.data_dir / name)], check=True)
+            if self.pinned(name).exists():
+                subprocess.run(["cp", str(self.pinned(name)), str(self.data_dir / name)],
+                               check=True)
 
 
 def set_size(fd, rows=ROWS, cols=COLS):

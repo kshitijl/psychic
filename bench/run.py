@@ -55,10 +55,6 @@ def setup(ref):
         subprocess.run(["git", "worktree", "add", str(src), resolved], cwd=REPO, check=True)
     subprocess.run(["cargo", "build", "--release"], cwd=src, check=True)
 
-    for name in ("model.txt", "model_stats.json"):
-        subprocess.run(["cp", str(DEFAULT_DATA_DIR / name), str(WORK / f"pinned-{name}")],
-                       check=True)
-
     # Both versions start from a byte-identical database every time. Left to
     # accumulate, the two dirs drift - one run left a 20MB write-ahead log
     # against the other's 4.4MB, and the same binary measured against itself
@@ -73,7 +69,6 @@ def setup(ref):
                         f".backup '{version.data_dir}/events.db'"], check=True)
         subprocess.run(["cp", str(DEFAULT_DATA_DIR / "feature_schema.json"),
                         str(version.data_dir / "feature_schema.json")], check=True)
-        version.pin_model()
 
     # Commits before `03ca743` still write the two session columns that commit
     # dropped, and INSERT fails without them. Harmless to add back.
@@ -82,7 +77,17 @@ def setup(ref):
          "ALTER TABLE sessions ADD COLUMN shell_history TEXT NOT NULL DEFAULT '';"
          "ALTER TABLE sessions ADD COLUMN running_processes TEXT NOT NULL DEFAULT '';"],
         capture_output=True)
-    print(f"staged {WORK}: baseline at {resolved} ({ref}), data dirs, pinned model")
+    # Each version trains its own model, with its own feature set. Sharing one
+    # would mean benchmarking a build against a model it cannot load.
+    for version in versions().values():
+        print(f"training {version.name}'s model...", flush=True)
+        subprocess.run([str(version.binary), "retrain", "--data-dir", str(version.data_dir)],
+                       check=True, capture_output=True)
+        for name in ("model.txt", "model_stats.json"):
+            subprocess.run(["cp", str(version.data_dir / name), str(version.pinned(name))],
+                           check=True)
+
+    print(f"staged {WORK}: baseline at {resolved} ({ref}), data dirs, a model each")
 
 
 ROWS_TO_REPORT = [

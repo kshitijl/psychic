@@ -61,6 +61,9 @@ pub struct FeatureImportance {
 
 pub struct ClickData {
     pub clicks_by_file: FxHashMap<String, Vec<ClickEvent>>,
+    /// Directories the user has `cd`'d into, from the shell hook. Kept apart
+    /// from clicks: a visit says "I work here", a click says "I opened this".
+    pub visits_by_dir: FxHashMap<String, Vec<ClickEvent>>,
     pub clicks_by_parent_dir: FxHashMap<PathBuf, Vec<ClickEvent>>,
     /// query -> path -> events. Nested rather than keyed by `(query, path)`
     /// because a ranking pass has one query and hundreds of paths: the query is
@@ -243,6 +246,7 @@ impl Ranker {
 
         let query_start = std::time::Instant::now();
         let rows = db.engagements_since(thirty_days_ago_ts)?;
+        let visits = db.visits_since(thirty_days_ago_ts)?;
         log::info!(
             "TIMING {{\"op\":\"collect_rows\",\"ms\":{},\"count\":{}}}",
             query_start.elapsed().as_secs_f64() * 1000.0,
@@ -294,6 +298,20 @@ impl Ranker {
             row_count
         );
 
+        // Index visits by the directory visited
+        let mut visits_by_dir: FxHashMap<String, Vec<ClickEvent>> =
+            FxHashMap::with_capacity_and_hasher(128, Default::default());
+        for db::Visit {
+            full_path,
+            timestamp,
+        } in visits
+        {
+            visits_by_dir
+                .entry(full_path)
+                .or_default()
+                .push(ClickEvent { timestamp });
+        }
+
         // Build parent directory index
         let parent_dir_start = std::time::Instant::now();
         let mut clicks_by_parent_dir: FxHashMap<PathBuf, Vec<ClickEvent>> = FxHashMap::default();
@@ -329,8 +347,11 @@ impl Ranker {
             engagements_by_episode_query_and_file.len()
         );
 
+        log::debug!("Loaded visits to {} directories", visits_by_dir.len());
+
         Ok(ClickData {
             clicks_by_file,
+            visits_by_dir,
             clicks_by_parent_dir,
             clicks_by_query_and_file,
             engagements_by_episode_query_and_file,
@@ -719,6 +740,7 @@ fn compute_features_into(
         file_size: file.file_size,
         cwd,
         clicks_by_file: &clicks.all.clicks_by_file,
+        visits_by_dir: &clicks.all.visits_by_dir,
         clicks_by_parent_dir: &clicks.all.clicks_by_parent_dir,
         clicks_for_query: clicks.clicks_for_query,
         engagements_for_query: clicks.engagements_for_query,
@@ -1092,6 +1114,7 @@ mod tests {
             &cwd,
             &ClickData {
                 clicks_by_file,
+                visits_by_dir: FxHashMap::default(),
                 clicks_by_parent_dir,
                 clicks_by_query_and_file,
                 engagements_by_episode_query_and_file,
@@ -1118,12 +1141,14 @@ mod tests {
         // engagements_in_episode_with_query=0 (no episode engagement data in test)
         // is_dir=0 (this is a file, not a directory)
         // fuzzy_score=0 (foo/bar.txt doesn't match "test" - fuzzy matcher returns None)
+        // visits_last_7_days=0, visits_last_30_days=0 (this is a file, not a
+        //   directory, and files are never visited)
         //
         // This expectation used to depend on the machine's timezone: when
         // clicks_last_24h was "clicks_today" it counted clicks since local midnight,
         // giving 0 in America/New_York, 2 in UTC and 3 in Asia/Kolkata for exactly
         // this data. Rolling windows are the same number everywhere.
-        let expected = "[0.0, 3.0, 0.0, 1.0, 0.0, 13.585079902767108, 4.0, 0.0, 3.0, 3.0, 86400.0, 2.0, 0.0, 0.0, 0.0]";
+        let expected = "[0.0, 3.0, 0.0, 1.0, 0.0, 13.585079902767108, 4.0, 0.0, 3.0, 3.0, 86400.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0]";
 
         assert_eq!(actual, expected, "Feature vector mismatch");
     }
@@ -1139,6 +1164,7 @@ mod tests {
             model: None,
             clicks: ClickData {
                 clicks_by_file: FxHashMap::default(),
+                visits_by_dir: FxHashMap::default(),
                 clicks_by_parent_dir: FxHashMap::default(),
                 clicks_by_query_and_file: FxHashMap::default(),
                 engagements_by_episode_query_and_file: FxHashMap::default(),
@@ -1376,6 +1402,7 @@ mod tests {
             model: None,
             clicks: ClickData {
                 clicks_by_file,
+                visits_by_dir: FxHashMap::default(),
                 clicks_by_parent_dir: FxHashMap::default(),
                 clicks_by_query_and_file: FxHashMap::default(),
                 engagements_by_episode_query_and_file: FxHashMap::default(),
@@ -1490,6 +1517,7 @@ mod tests {
             model: None,
             clicks: ClickData {
                 clicks_by_file,
+                visits_by_dir: FxHashMap::default(),
                 clicks_by_parent_dir: FxHashMap::default(),
                 clicks_by_query_and_file: FxHashMap::default(),
                 engagements_by_episode_query_and_file: FxHashMap::default(),
@@ -1575,6 +1603,7 @@ mod tests {
             model: None,
             clicks: ClickData {
                 clicks_by_file,
+                visits_by_dir: FxHashMap::default(),
                 clicks_by_parent_dir: FxHashMap::default(),
                 clicks_by_query_and_file: FxHashMap::default(),
                 engagements_by_episode_query_and_file: FxHashMap::default(),

@@ -888,6 +888,21 @@ costs less than the model inference it feeds (0.71ms), and the most expensive
 single feature is `log_file_size` at 0.25ms total, which is a `stat` syscall
 doing real work.
 
+**Directory visits are not clicks.** `visits_last_7_days` and
+`visits_last_30_days` count `startup_visit` events - the zsh `chpwd` hook, via
+`track-visit` - for the directory being ranked, and are 0 for files. They are
+loaded by `Database::visits_since` into their own index, never mixed into the
+click counts: a visit says "I work here", a click says "I opened this", and
+adding them together would let an afternoon of navigation look like engagement
+with files nobody opened.
+
+This is the one signal a directory row had nothing to say about before.
+`clicks_last_week_parent_dir` asks about the row's *container* - for a directory
+`/a/b` it counts activity in `/a`, its siblings - so for the rows where "is this
+a place I work" is the whole question, every existing feature was answering a
+different one. The data was already being collected and read by nothing: 2,312
+visits across 130 directories, against 1,165 clicks across 132 paths.
+
 **Query-specific features:** The `clicks_for_this_query` feature tracks clicks for specific (query, file) pairs. This distinguishes between files clicked for different search contexts - e.g., a file clicked 10 times for query "config" vs 0 times for query "test" is more relevant for "config" searches.
 Why: General click counts don't capture query-specific relevance. A frequently clicked file for one query may be irrelevant for another.
 
@@ -1198,6 +1213,14 @@ requested. It now writes once, to the directory it was told to use.
 `model.txt` is missing *or* unreadable, rather than propagating the error. An
 unusable model must not stop psychic from starting - ranking degrades to what a
 fresh install runs on, and the retrain launched at startup replaces the bad file.
+
+"Unreadable" includes *a model from a build with a different feature set*, which
+is what the first launch after adding a feature loads. `Ranker::new` compares the
+booster's feature count against `FEATURE_REGISTRY.len()` and refuses a model that
+does not fit. Without that check the model loaded happily and then failed inside
+every `predict`, and `filter_and_rank`'s error path handed back the filter's own
+order with no scores - worse than the cold-start path, which at least ranks on
+the simple model.
 
 **Visualizations:** Training curves, feature importance, SHAP analysis, score distributions, rank position analysis.
 

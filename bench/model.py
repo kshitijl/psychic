@@ -107,6 +107,7 @@ def evaluate(train_py, csv_path, schema_dir):
     metrics = {key: float(np.mean([f[key] for f in folds])) for key in
                ("auc", "top1", "mrr", "rmse", "rounds")}
     metrics["episodes"] = int(sum(f["episodes"] for f in folds))
+    metrics["folds"] = folds
     return metrics, gains
 
 
@@ -159,6 +160,13 @@ def compare():
         delta = after[key] - before[key]
         print(f"{label:<10}{before[key]:>10.4f}{after[key]:>10.4f}{delta:>+10.4f}")
     print(f"{'rounds':<10}{before['rounds']:>10.0f}{after['rounds']:>10.0f}")
+
+    # Per fold as well as averaged. A mean that moves while the folds disagree
+    # is one fold's luck, not a feature that works.
+    print(f"\n{'fold':<10}{'top-1 before':>14}{'top-1 after':>13}{'rounds':>16}")
+    for start, before_fold, after_fold in zip(FOLD_STARTS, before["folds"], after["folds"]):
+        print(f"train<={start:<5.2f}{before_fold['top1']:>14.4f}{after_fold['top1']:>13.4f}"
+              f"{before_fold['rounds']:>9.0f} ->{after_fold['rounds']:>4.0f}")
 
     new = [name for name in after_gains if name not in before_gains]
     gone = [name for name in before_gains if name not in after_gains]

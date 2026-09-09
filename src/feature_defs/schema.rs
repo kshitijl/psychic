@@ -31,6 +31,8 @@ pub struct FeatureInputs<'a> {
     pub file_size: Option<i64>,
     pub cwd: &'a Path,
     pub clicks_by_file: &'a FxHashMap<String, Vec<ClickEvent>>,
+    /// Directories the user has changed into, by directory.
+    pub visits_by_dir: &'a FxHashMap<String, Vec<ClickEvent>>,
     pub clicks_by_parent_dir: &'a FxHashMap<PathBuf, Vec<ClickEvent>>,
     /// Clicks on each path *for this query*, resolved once by the caller rather
     /// than by every feature for every file. `None` when the query has never

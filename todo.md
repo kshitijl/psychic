@@ -420,14 +420,14 @@ Accumulator's fold over time-sorted events), so add the index to both
 
 **Ranked.** Ordered by expected signal per unit of work.
 
-1. **Directory visits.** 2,099 `startup_visit` rows from the zsh `chpwd`
-   hook are never read by any feature; `load_clicks` filters to click and
-   scroll. README claims visits teach directory preferences; nothing makes
-   that true. Add `visits_by_dir: map<path, Vec<ts>>` loaded alongside
-   clicks (add 'startup_visit' to the load query, into a separate map, do
-   NOT count them as clicks or in total_clicks). Features
-   `visits_last_7_days`, `visits_last_30_days` (0 for files). Strongest
-   signal for `pd`, zero collection cost.
+1. **Directory visits.** DONE (2026-09-10). `Database::visits_since` loads
+   `startup_visit` rows into `ClickData.visits_by_dir`, kept apart from clicks;
+   `visits_last_7_days` and `visits_last_30_days` count them for directory rows
+   and read 0 for files. Over three rolling-origin folds: top-1 0.6773 ->
+   0.6975, MRR 0.7878 -> 0.7997, RMSE 0.1192 -> 0.1169, AUC flat, and all three
+   folds moved the same way. The features rank 16th and 17th of 17 by gain,
+   which is what a feature that only fires on directory rows looks like: small
+   share of the total, decisive where it applies.
 2. **Seconds since last click**, `ln(1 + now - last_click_ts)`, 
    large constant when never clicked; monotone decreasing. Same for parent
    dir. The windows count clicks but cannot tell 1 minute ago from 50.

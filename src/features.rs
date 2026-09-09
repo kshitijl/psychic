@@ -40,6 +40,10 @@ pub enum OutputFormat {
 // Accumulator for fold-based processing
 struct Accumulator {
     clicks_by_file: FxHashMap<String, Vec<ClickEvent>>,
+    /// Directories the user changed into, from `startup_visit` events. Fed by
+    /// the same fold over time-sorted events, so an impression only ever sees
+    /// the visits that had happened by then.
+    visits_by_dir: FxHashMap<String, Vec<ClickEvent>>,
     clicks_by_parent_dir: FxHashMap<std::path::PathBuf, Vec<ClickEvent>>,
     /// query -> path -> events, the same shape `Ranker::load_clicks` builds.
     clicks_by_query_and_file: FxHashMap<String, FxHashMap<String, Vec<ClickEvent>>>,
@@ -63,6 +67,7 @@ impl Accumulator {
     fn new() -> Self {
         Self {
             clicks_by_file: FxHashMap::default(),
+            visits_by_dir: FxHashMap::default(),
             clicks_by_parent_dir: FxHashMap::default(),
             clicks_by_query_and_file: FxHashMap::default(),
             engagements_by_episode_query_and_file: FxHashMap::default(),
@@ -111,6 +116,16 @@ impl Accumulator {
                     .push(click);
             }
         }
+    }
+
+    /// Remember that the user changed into this directory.
+    fn record_visit(&mut self, event: &Event) {
+        self.visits_by_dir
+            .entry(event.full_path.clone())
+            .or_default()
+            .push(ClickEvent {
+                timestamp: event.timestamp,
+            });
     }
 
     fn add_impression(&mut self, event: &Event, mut features: HashMap<String, String>) {
@@ -240,7 +255,9 @@ pub fn generate_features(
                 acc.mark_impressions_as_engaged(event);
             }
             "startup_visit" => {
-                // Startup visits prime history without affecting labels or click stats
+                // A visit is not an engagement: it primes history and the
+                // directory-visit features, and never counts as a click.
+                acc.record_visit(event);
             }
             _ => {} // Ignore unknown actions
         }
@@ -362,6 +379,7 @@ fn compute_features_from_accumulator(
         file_size: impression.file_size,
         cwd,
         clicks_by_file: &acc.clicks_by_file,
+        visits_by_dir: &acc.visits_by_dir,
         clicks_by_parent_dir: &acc.clicks_by_parent_dir,
         clicks_for_query: acc.clicks_by_query_and_file.get(&impression.query),
         engagements_for_query: acc
