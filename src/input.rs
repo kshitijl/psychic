@@ -243,7 +243,7 @@ fn execute_cwd_visit_action(
 ) -> Result<InputAction> {
     match app.options.on_cwd_visit {
         OnCwdVisitAction::PrintToStdout => {
-            cleanup_terminal(terminal)?;
+            leave_tui(terminal)?;
             Ok(InputAction::PrintAndExit(dir_path.display().to_string()))
         }
         OnCwdVisitAction::DropIntoShell => {
@@ -593,7 +593,7 @@ fn handle_directory_click(
             Ok(InputAction::Continue)
         }
         OnDirClickAction::PrintToStdout => {
-            cleanup_terminal(terminal)?;
+            leave_tui(terminal)?;
             Ok(InputAction::PrintAndExit(dir_path.display().to_string()))
         }
         OnDirClickAction::DropIntoShell => {
@@ -651,18 +651,18 @@ fn send_query_update(app: &mut App) {
         }));
 }
 
-/// Cleanup terminal before exiting
-fn cleanup_terminal(terminal: &mut Terminal<CrosstermBackend<std::fs::File>>) -> Result<()> {
-    leave_tui(terminal)
-}
-
 /// Give the terminal back: cooked mode, main screen, cursor visible.
 ///
 /// The keyboard enhancement flags are popped first, undoing the push in
 /// [`enter_tui`]. They are a stack in the terminal, not a mode we own, so a
 /// push without a matching pop leaves one entry behind on every round trip
 /// through an editor.
-fn leave_tui(terminal: &mut Terminal<CrosstermBackend<std::fs::File>>) -> Result<()> {
+///
+/// The one place the terminal is handed back, whether that is for an editor, a
+/// subshell, printing a path on the way out, or shutting down. There were three
+/// copies of this sequence; the one in main's shutdown had drifted into being
+/// written out longhand.
+pub fn leave_tui(terminal: &mut Terminal<CrosstermBackend<std::fs::File>>) -> Result<()> {
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),

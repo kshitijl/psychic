@@ -23,12 +23,9 @@ mod walker;
 use anyhow::{Context, Result};
 use clap::Parser;
 use crossterm::{
-    cursor::Show,
-    event::{
-        Event, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
-    },
+    event::{Event, KeyboardEnhancementFlags, PushKeyboardEnhancementFlags},
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{EnterAlternateScreen, enable_raw_mode},
 };
 use db::EventData;
 use metadata_ext::MetadataExt;
@@ -634,15 +631,8 @@ fn main() -> Result<()> {
 
     drop(app);
 
-    // Terminal cleanup
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        PopKeyboardEnhancementFlags,
-        crossterm::event::DisableMouseCapture,
-        LeaveAlternateScreen,
-        Show
-    )?;
+    // Terminal cleanup, through the same function every other hand-back uses.
+    input::leave_tui(&mut terminal)?;
 
     // Everything that could have logged has now been told to stop, and the
     // terminal is back. Anything still arriving goes nowhere, quietly.

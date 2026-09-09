@@ -39,6 +39,16 @@ commit message. Not just the ones meant to be faster.
 ./bench/run.py keystroke 30
 ```
 
+Put the numbers in the commit message **as a table**, not as a run of
+`a -> b; c -> d` prose - that is unreadable at the width a commit message wants:
+
+```
+                        before   after
+first paint               1.50    1.33
+steady: filter+rank       1.00    0.92
+keystroke -> redraw       3.14    2.92
+```
+
 Why every commit and not just the performance ones:
 
 * **A regression is only cheap to fix while you remember what you changed.**

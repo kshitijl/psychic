@@ -379,10 +379,12 @@ Optimizations".
   the worker's held connection by building a variant without it: still 4.
   Explained in how-it-works.md under "Why the same database is opened several
   times".
-- **S5. Deduplicate terminal suspension.** `suspend_tui_for_editor` and
-  `suspend_tui_and_run_shell` are identical except the Command;
-  `cleanup_terminal` is a third copy of the teardown. One
-  `with_tui_suspended(app, terminal, |..| Command)`.
+- **S5. Deduplicate terminal suspension.** DONE (2026-09-09). The two
+  `suspend_tui_*` functions became thin Command builders over one
+  `suspend_tui_and_run` with P7. What was left was the teardown: `leave_tui`,
+  a `cleanup_terminal` that only called it, and a third copy written out
+  longhand in main's shutdown. One `leave_tui` now, called by all four
+  hand-backs (editor, subshell, printing a path on the way out, and exit).
 - **S6. Walker cleanup.** DONE with P1: the buffer, the restart, the duplicated
   command-check loop and the unreachable deep-mode `MAX_FILES` guard are gone.
 - **S7. `context.rs`** runs five `sh -c` pipelines per launch; nothing reads
