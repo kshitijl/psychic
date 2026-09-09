@@ -818,13 +818,14 @@ impl WorkerState {
             .collect()
     }
 
-    fn get_page(&self, page_num: usize, page_size: usize) -> PageData {
-        // Precondition: page_size must be reasonable (non-zero)
-        assert!(
-            page_size > 0,
-            "page_size must be positive, got {}",
-            page_size
-        );
+    /// One page of results, in the size the UI caches by.
+    ///
+    /// The size is `app::PAGE_SIZE` rather than an argument: the UI keys its
+    /// page cache by `index / PAGE_SIZE`, so a worker that paginated by anything
+    /// else would hand back pages that land in the wrong slot. Every caller
+    /// passed the same literal 128 anyway.
+    fn get_page(&self, page_num: usize) -> PageData {
+        let page_size = crate::app::PAGE_SIZE;
 
         let start_index = page_num * page_size;
         let end_index = (start_index + page_size).min(self.filtered_files.len());
@@ -1019,7 +1020,7 @@ fn send_query_updated<T>(state: &mut WorkerState, event_tx: &mpsc::Sender<T>, qu
 where
     T: From<WorkerResponse> + Send,
 {
-    let initial_page = state.get_page(0, 128);
+    let initial_page = state.get_page(0);
     let _ = event_tx.send(
         WorkerResponse::QueryUpdated {
             query_id,
@@ -1124,7 +1125,7 @@ fn worker_thread_loop<T>(
                     if query_id != state.current_query_id {
                         continue;
                     }
-                    let page_data = state.get_page(page_num, 128);
+                    let page_data = state.get_page(page_num);
                     let _ = event_tx.send(
                         WorkerResponse::Page {
                             query_id,
@@ -2469,7 +2470,7 @@ mod hiding_tests {
         let (mut state, _dir, _rx) = worker_across_hidden_boundary("/test", "hide-pages");
 
         state.filter_and_rank("").expect("Filter should succeed");
-        let page = state.get_page(0, 128);
+        let page = state.get_page(0);
 
         let paths: Vec<PathBuf> = page.files.iter().map(|f| f.full_path.clone()).collect();
         assert_eq!(

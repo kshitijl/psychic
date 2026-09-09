@@ -337,9 +337,13 @@ Optimizations".
   tests cover overflow, turning around at the ends, the two delays, and doing
   nothing before the first frame. `App::for_test` and `TtyInput::detached` are
   new, since a render test now needs an `App`.
-- **S2. One response path in the worker.** Five arms each do "set id,
-  mutate, filter_and_rank, get_page(0, 128), send QueryUpdated". One helper,
-  and use `app::PAGE_SIZE` instead of the literal 128.
+- **S2. One response path in the worker.** DONE (2026-09-09). The five arms
+  that each did "set id, mutate, filter_and_rank, get_page, send QueryUpdated"
+  went through `send_query_updated` with P4, which is also what guarantees the
+  log lands after the response rather than in front of it. `get_page` no longer
+  takes a page size: it uses `app::PAGE_SIZE`, because the UI keys its cache by
+  `index / PAGE_SIZE` and a worker paginating by anything else would hand back
+  pages that land in the wrong slot. Every caller passed the same literal 128.
 - **S3. Collapse parallel structs.** `FeatureClickIndexes` is `&ClickData`.
   `FileCandidate` duplicates `FileInfo` fields; rank over `&[&FileInfo]` (or
   store fuzzy score on a small wrapper). `Episode` is a Vec<String> with a
