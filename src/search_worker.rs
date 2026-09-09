@@ -701,8 +701,8 @@ impl WorkerState {
                 let file_info = &self.file_registry[file_id.0];
                 ranker::FileCandidate {
                     file_id: file_id.0,
-                    relative_path: file_info.display_name.clone(),
-                    full_path: file_info.full_path.clone(),
+                    relative_path: &file_info.display_name,
+                    full_path: &file_info.full_path,
                     mtime: file_info.mtime,
                     file_size: file_info.file_size,
                     is_from_walker: file_info.origin == FileOrigin::CwdWalker,
@@ -1921,11 +1921,23 @@ mod trained_model_tests {
         );
 
         let mut ranker = ranker;
-        let candidates: Vec<ranker::FileCandidate> = (0..3)
-            .map(|n| ranker::FileCandidate {
+        // Candidates borrow from the registry in production; here they borrow
+        // from names that outlive the ranking call.
+        let names: Vec<(String, PathBuf)> = (0..3)
+            .map(|n| {
+                (
+                    format!("file{}.rs", n),
+                    PathBuf::from(format!("/test/file{}.rs", n)),
+                )
+            })
+            .collect();
+        let candidates: Vec<ranker::FileCandidate> = names
+            .iter()
+            .enumerate()
+            .map(|(n, (relative_path, full_path))| ranker::FileCandidate {
                 file_id: n,
-                relative_path: format!("file{}.rs", n),
-                full_path: PathBuf::from(format!("/test/file{}.rs", n)),
+                relative_path,
+                full_path,
                 mtime: Some(1_700_000_000),
                 file_size: Some(100),
                 is_from_walker: true,

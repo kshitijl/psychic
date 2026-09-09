@@ -13,10 +13,16 @@ use crate::feature_defs::{ClickEvent, FEATURE_REGISTRY, FeatureInputs, feature_n
 use crate::{db, features};
 
 #[derive(Debug, Clone)]
-pub struct FileCandidate {
+/// One file to rank, borrowed from the worker's registry.
+///
+/// It borrows rather than owns because it is built fresh for every keystroke:
+/// owning the two strings meant two allocations per file per query, and a query
+/// over this developer's home directory ranks 243 of them. Nothing here outlives
+/// the `rank_files` call it was made for.
+pub struct FileCandidate<'a> {
     pub file_id: usize, // Index into main.rs file registry
-    pub relative_path: String,
-    pub full_path: PathBuf,
+    pub relative_path: &'a str,
+    pub full_path: &'a Path,
     pub mtime: Option<i64>,
     pub file_size: Option<i64>,
     pub is_from_walker: bool,
@@ -311,7 +317,7 @@ impl Ranker {
     /// Raw formula: CLICKS_WEIGHT * clicks_last_7_days + RECENCY_WEIGHT / (1 + modified_age_in_days)
     ///               + 2.0 * fuzzy_score
     /// Then normalized to [0, 1] using sigmoid function
-    fn compute_simple_score(&self, file: &FileCandidate, current_timestamp: i64) -> f64 {
+    fn compute_simple_score(&self, file: &FileCandidate<'_>, current_timestamp: i64) -> f64 {
         // Count clicks in last 7 days
         let seven_days_ago = current_timestamp - (7 * 24 * 60 * 60);
         let full_path_str = file.full_path.to_string_lossy().to_string();
@@ -380,7 +386,7 @@ impl Ranker {
     pub fn rank_files(
         &mut self,
         query: &str,
-        files: &[FileCandidate],
+        files: &[FileCandidate<'_>],
         current_timestamp: i64,
         cwd: &Path,
     ) -> Result<Ranking> {
@@ -402,19 +408,7 @@ impl Ranker {
         // Always compute features for all files in parallel (for debugging visibility)
         let compute_start = Instant::now();
 
-        // Capture what we need for parallel computation
-        let clicks_by_file = &self.clicks.clicks_by_file;
-        let clicks_by_parent_dir = &self.clicks.clicks_by_parent_dir;
-        let clicks_by_query_and_file = &self.clicks.clicks_by_query_and_file;
-        let engagements_by_episode_query_and_file =
-            &self.clicks.engagements_by_episode_query_and_file;
-
-        let click_indexes = FeatureClickIndexes {
-            clicks_by_file,
-            clicks_by_parent_dir,
-            clicks_by_query_and_file,
-            engagements_by_episode_query_and_file,
-        };
+        let clicks = &self.clicks;
 
         // Careful with lazily-initialized globals inside this loop. Feature code
         // runs once per file across every core, so the *first* call after launch
@@ -441,7 +435,7 @@ impl Ranker {
                         file,
                         current_timestamp,
                         cwd,
-                        &click_indexes,
+                        clicks,
                         &mut per_feature,
                     ));
                     (features, per_feature)
@@ -623,21 +617,14 @@ pub struct Ranking {
     pub timings: RankTimings,
 }
 
-struct FeatureClickIndexes<'a> {
-    clicks_by_file: &'a FxHashMap<String, Vec<ClickEvent>>,
-    clicks_by_parent_dir: &'a FxHashMap<PathBuf, Vec<ClickEvent>>,
-    clicks_by_query_and_file: &'a FxHashMap<(String, String), Vec<ClickEvent>>,
-    engagements_by_episode_query_and_file: &'a FxHashMap<(String, String), Vec<ClickEvent>>,
-}
-
 #[cfg(test)]
 /// Compute features for a file (for tests, discarding the timings)
 fn compute_features(
     query: &str,
-    file: &FileCandidate,
+    file: &FileCandidate<'_>,
     current_timestamp: i64,
     cwd: &Path,
-    click_indexes: &FeatureClickIndexes<'_>,
+    clicks: &ClickData,
 ) -> Vec<f64> {
     let mut per_feature = vec![Duration::ZERO; FEATURE_REGISTRY.len()];
     compute_features_into(
@@ -645,7 +632,7 @@ fn compute_features(
         file,
         current_timestamp,
         cwd,
-        click_indexes,
+        clicks,
         &mut per_feature,
     )
 }
@@ -657,10 +644,10 @@ fn compute_features(
 /// chunk rather than a map of 15 freshly allocated `String` keys per file.
 fn compute_features_into(
     query: &str,
-    file: &FileCandidate,
+    file: &FileCandidate<'_>,
     current_timestamp: i64,
     cwd: &Path,
-    click_indexes: &FeatureClickIndexes<'_>,
+    clicks: &ClickData,
     per_feature: &mut [Duration],
 ) -> Vec<f64> {
     assert_eq!(
@@ -672,15 +659,15 @@ fn compute_features_into(
     // Create FeatureInputs for inference
     let inputs = FeatureInputs {
         query,
-        file_path: &file.relative_path,
-        full_path: &file.full_path,
+        file_path: file.relative_path,
+        full_path: file.full_path,
         mtime: file.mtime,
         file_size: file.file_size,
         cwd,
-        clicks_by_file: click_indexes.clicks_by_file,
-        clicks_by_parent_dir: click_indexes.clicks_by_parent_dir,
-        clicks_by_query_and_file: click_indexes.clicks_by_query_and_file,
-        engagements_by_episode_query_and_file: click_indexes.engagements_by_episode_query_and_file,
+        clicks_by_file: &clicks.clicks_by_file,
+        clicks_by_parent_dir: &clicks.clicks_by_parent_dir,
+        clicks_by_query_and_file: &clicks.clicks_by_query_and_file,
+        engagements_by_episode_query_and_file: &clicks.engagements_by_episode_query_and_file,
         current_timestamp,
         is_from_walker: file.is_from_walker,
         is_dir: file.is_dir,
@@ -922,10 +909,11 @@ mod tests {
         let mut ranker = ranker.unwrap();
 
         // Test with simple data
+        let test_path = PathBuf::from("/tmp/test.md");
         let test_files = vec![FileCandidate {
             file_id: 0,
-            relative_path: "test.md".to_string(),
-            full_path: PathBuf::from("/tmp/test.md"),
+            relative_path: "test.md",
+            full_path: &test_path,
             mtime: Some(1234567890),
             file_size: Some(2048),
             is_from_walker: true,
@@ -972,8 +960,8 @@ mod tests {
         // Create file candidate
         let file = FileCandidate {
             file_id: 0,
-            relative_path: "foo/bar.txt".to_string(),
-            full_path: PathBuf::from("/tmp/foo/bar.txt"),
+            relative_path: "foo/bar.txt",
+            full_path: &PathBuf::from("/tmp/foo/bar.txt"),
             mtime: Some(1700000000i64), // Nov 14, 2023
             file_size: Some(12_288),
             is_from_walker: true,
@@ -1040,11 +1028,11 @@ mod tests {
             &file,
             current_timestamp,
             &cwd,
-            &FeatureClickIndexes {
-                clicks_by_file: &clicks_by_file,
-                clicks_by_parent_dir: &clicks_by_parent_dir,
-                clicks_by_query_and_file: &clicks_by_query_and_file,
-                engagements_by_episode_query_and_file: &engagements_by_episode_query_and_file,
+            &ClickData {
+                clicks_by_file,
+                clicks_by_parent_dir,
+                clicks_by_query_and_file,
+                engagements_by_episode_query_and_file,
             },
         );
 
@@ -1098,13 +1086,23 @@ mod tests {
 
         // Enough files that rayon splits them across more than one chunk.
         let sizes: Vec<i64> = (0..512).map(|i| 1024 + i * 7).collect();
-        let files: Vec<FileCandidate> = sizes
+        // Candidates borrow, so the names have to outlive them.
+        let names: Vec<(String, PathBuf)> = (0..sizes.len())
+            .map(|i| {
+                (
+                    format!("file{}.txt", i),
+                    PathBuf::from(format!("/tmp/file{}.txt", i)),
+                )
+            })
+            .collect();
+        let files: Vec<FileCandidate> = names
             .iter()
+            .zip(&sizes)
             .enumerate()
-            .map(|(i, &size)| FileCandidate {
+            .map(|(i, ((relative_path, full_path), &size))| FileCandidate {
                 file_id: i,
-                relative_path: format!("file{}.txt", i),
-                full_path: PathBuf::from(format!("/tmp/file{}.txt", i)),
+                relative_path,
+                full_path,
                 mtime: Some(1_700_500_000),
                 file_size: Some(size),
                 is_from_walker: true,
@@ -1318,8 +1316,8 @@ mod tests {
         // sigmoid(31.45) with k=0.1, x0=10 ≈ 0.895
         let popular_file = FileCandidate {
             file_id: 0,
-            relative_path: "popular.txt".to_string(),
-            full_path: PathBuf::from("/tmp/popular.txt"),
+            relative_path: "popular.txt",
+            full_path: &PathBuf::from("/tmp/popular.txt"),
             mtime: Some(1700500000), // Recent (1.2 days ago)
             file_size: Some(1024),
             is_from_walker: true,
@@ -1343,8 +1341,8 @@ mod tests {
         // sigmoid(1.45) ≈ 0.304
         let recent_file = FileCandidate {
             file_id: 1,
-            relative_path: "recent.txt".to_string(),
-            full_path: PathBuf::from("/tmp/recent.txt"),
+            relative_path: "recent.txt",
+            full_path: &PathBuf::from("/tmp/recent.txt"),
             mtime: Some(1700500000), // Recent
             file_size: Some(2048),
             is_from_walker: true,
@@ -1368,8 +1366,8 @@ mod tests {
         // sigmoid(1.003) ≈ 0.295
         let old_file = FileCandidate {
             file_id: 2,
-            relative_path: "old.txt".to_string(),
-            full_path: PathBuf::from("/tmp/old.txt"),
+            relative_path: "old.txt",
+            full_path: &PathBuf::from("/tmp/old.txt"),
             mtime: Some(1600000000), // Very old
             file_size: Some(512),
             is_from_walker: true,
@@ -1428,8 +1426,8 @@ mod tests {
         let current_timestamp = 1700604800; // Nov 22, 2023
         let file = FileCandidate {
             file_id: 0,
-            relative_path: "foo.txt".to_string(),
-            full_path: PathBuf::from("/tmp/foo.txt"),
+            relative_path: "foo.txt",
+            full_path: &PathBuf::from("/tmp/foo.txt"),
             mtime: Some(1700500000), // Recent (1 day ago)
             file_size: Some(1024),
             is_from_walker: true,
@@ -1455,8 +1453,8 @@ mod tests {
         // Test file with no clicks and old mtime
         let old_file = FileCandidate {
             file_id: 1,
-            relative_path: "bar.txt".to_string(),
-            full_path: PathBuf::from("/tmp/bar.txt"),
+            relative_path: "bar.txt",
+            full_path: &PathBuf::from("/tmp/bar.txt"),
             mtime: Some(1600000000), // Very old
             file_size: Some(2048),
             is_from_walker: true,
@@ -1511,11 +1509,15 @@ mod tests {
         };
 
         let current_timestamp = 1700604800;
+        let (popular, recent) = (
+            PathBuf::from("/tmp/popular.txt"),
+            PathBuf::from("/tmp/recent.txt"),
+        );
         let files = vec![
             FileCandidate {
                 file_id: 0,
-                relative_path: "popular.txt".to_string(),
-                full_path: PathBuf::from("/tmp/popular.txt"),
+                relative_path: "popular.txt",
+                full_path: &popular,
                 mtime: Some(1700000000),
                 file_size: Some(1024),
                 is_from_walker: true,
@@ -1524,8 +1526,8 @@ mod tests {
             },
             FileCandidate {
                 file_id: 1,
-                relative_path: "recent.txt".to_string(),
-                full_path: PathBuf::from("/tmp/recent.txt"),
+                relative_path: "recent.txt",
+                full_path: &recent,
                 mtime: Some(1700600000), // Very recent
                 file_size: Some(2048),
                 is_from_walker: true,

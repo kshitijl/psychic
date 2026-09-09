@@ -12,16 +12,24 @@
 
 use anyhow::Result;
 use std::collections::HashSet;
+use std::time::{Duration, Instant};
 
 use crate::db::{Database, EventData, FileMetadata};
-use crate::episode::Episode;
+
+/// How long a query has to have been on screen before its results count as
+/// impressions. Faster than this and the user never saw them - they were typing
+/// through it on the way to something else.
+const IMPRESSION_AGE: Duration = Duration::from_millis(200);
 
 /// Every time the query changes, as the user types, corresponds to a new
 /// subsession. Subsession id is logged to the db.
 pub struct Subsession {
     pub id: u64,
     pub query: String,
-    pub created_at: jiff::Timestamp,
+    /// When this query was typed. An `Instant`, not a wall clock: it is only
+    /// ever used for the 200ms "has this been on screen long enough to count as
+    /// an impression" test, and a wall clock can go backwards under it.
+    pub created_at: Instant,
     pub events_have_been_logged: bool,
 }
 
@@ -34,7 +42,13 @@ pub struct Analytics {
     /// Tracks which files we've logged scroll events for (to avoid duplicates)
     scrolled_files: HashSet<(String, String)>, // (query, full_path)
     /// Current episode (tracks all queries until engagement event)
-    episode: Episode,
+    /// Every distinct query seen since the last engagement.
+    ///
+    /// The user types "tc", then "todo", then "todo-current", then clicks: all
+    /// three queries get credit for that file, which is what
+    /// `engagements_in_episode_with_query` is computed from. Cleared when the
+    /// engagement is logged.
+    episode_queries: Vec<String>,
     /// Session ID for this app instance
     session_id: String,
     /// Database handle
@@ -49,7 +63,7 @@ impl Analytics {
             current_subsession: None,
             next_subsession_id: 1, // Start with 1, 0 is for initial query
             scrolled_files: HashSet::new(),
-            episode: Episode::new(),
+            episode_queries: Vec::new(),
             session_id,
             db,
             no_logging,
@@ -91,7 +105,9 @@ impl Analytics {
             };
 
         // Add query to episode (deduplicates automatically)
-        self.episode.add_query(&subsession_query);
+        if !self.episode_queries.contains(&subsession_query) {
+            self.episode_queries.push(subsession_query.clone());
+        }
 
         // Skip if already logged
         if already_logged {
@@ -99,9 +115,7 @@ impl Analytics {
         }
 
         // Check if we should log: either forced or >200ms old
-        let elapsed = jiff::Timestamp::now().duration_since(created_at);
-        let threshold = jiff::SignedDuration::from_millis(200);
-        let should_log = force || elapsed >= threshold;
+        let should_log = force || created_at.elapsed() >= IMPRESSION_AGE;
         if !should_log {
             return Ok(());
         }
@@ -133,7 +147,7 @@ impl Analytics {
     ) -> Result<()> {
         event_data.episode_queries = Some(episode_json);
         self.db.log_event(event_data)?;
-        self.episode.clear();
+        self.episode_queries.clear();
         Ok(())
     }
 
@@ -145,7 +159,7 @@ impl Analytics {
         let key = (query.to_string(), event_data.full_path.to_string());
 
         if !self.scrolled_files.contains(&key) {
-            let episode_json = self.episode.to_json()?;
+            let episode_json = serde_json::to_string(&self.episode_queries)?;
             self.log_engagement(event_data, &episode_json)?;
             self.scrolled_files.insert(key);
         }
@@ -159,7 +173,7 @@ impl Analytics {
             return Ok(());
         }
 
-        let episode_json = self.episode.to_json()?;
+        let episode_json = serde_json::to_string(&self.episode_queries)?;
         self.log_engagement(event_data, &episode_json)
     }
 
@@ -168,7 +182,7 @@ impl Analytics {
         self.current_subsession = Some(Subsession {
             id: query_id,
             query,
-            created_at: jiff::Timestamp::now(),
+            created_at: Instant::now(),
             events_have_been_logged: false,
         });
     }
@@ -178,5 +192,130 @@ impl Analytics {
         let id = self.next_subsession_id;
         self.next_subsession_id += 1;
         id
+    }
+}
+
+#[cfg(test)]
+mod episode_tests {
+    //! An episode is every distinct query the user typed on the way to one
+    //! engagement. The user types "tc", then "todo", then "todo-current", then
+    //! clicks: all three get credit for that file, which is what the
+    //! `engagements_in_episode_with_query` feature is computed from.
+    //!
+    //! This used to be an `Episode` struct in its own module - a `Vec<String>`,
+    //! a `contains` check and a `to_json`. These tests are what it took with it.
+
+    use super::*;
+    use crate::db::UserInteraction;
+    use std::path::Path;
+
+    fn analytics() -> Analytics {
+        let db = Database::new(Path::new(":memory:")).expect("in-memory database");
+        Analytics::new("test-session".to_string(), db, false)
+    }
+
+    fn shown(name: &str) -> Vec<FileMetadata> {
+        vec![FileMetadata {
+            relative_path: name.to_string(),
+            full_path: format!("/tmp/{}", name),
+            mtime: Some(1_700_000_000),
+            atime: None,
+            size: Some(100),
+        }]
+    }
+
+    /// Type a query and let its results count as seen.
+    fn typed(analytics: &mut Analytics, query: &str) {
+        let id = analytics.next_subsession_id;
+        analytics.new_subsession(id, query.to_string());
+        analytics
+            .check_and_log_impressions(true, shown("a.rs"))
+            .expect("impressions");
+    }
+
+    fn clicked(analytics: &mut Analytics) {
+        analytics
+            .log_click(EventData {
+                query: "todo",
+                file_path: "a.rs",
+                full_path: "/tmp/a.rs",
+                mtime: Some(1_700_000_000),
+                atime: None,
+                file_size: Some(100),
+                subsession_id: 1,
+                action: UserInteraction::Click,
+                session_id: "test-session",
+                episode_queries: None,
+            })
+            .expect("click");
+    }
+
+    #[test]
+    fn test_every_query_on_the_way_to_a_click_is_remembered_in_order() {
+        let mut analytics = analytics();
+
+        typed(&mut analytics, "tc");
+        typed(&mut analytics, "todo");
+        typed(&mut analytics, "todo-current");
+
+        assert_eq!(analytics.episode_queries, ["tc", "todo", "todo-current"]);
+    }
+
+    #[test]
+    fn test_a_query_typed_twice_is_only_counted_once() {
+        let mut analytics = analytics();
+
+        typed(&mut analytics, "todo");
+        typed(&mut analytics, "notes");
+        typed(&mut analytics, "todo");
+
+        assert_eq!(
+            analytics.episode_queries,
+            ["todo", "notes"],
+            "returning to an earlier query does not repeat it"
+        );
+    }
+
+    #[test]
+    fn test_the_episode_starts_over_after_an_engagement() {
+        let mut analytics = analytics();
+
+        typed(&mut analytics, "tc");
+        typed(&mut analytics, "todo");
+        clicked(&mut analytics);
+
+        assert!(
+            analytics.episode_queries.is_empty(),
+            "the click ended the episode"
+        );
+
+        typed(&mut analytics, "notes");
+        assert_eq!(
+            analytics.episode_queries,
+            ["notes"],
+            "and the next one starts from nothing"
+        );
+    }
+
+    #[test]
+    fn test_the_episode_reaches_the_database_as_json() {
+        let mut analytics = analytics();
+        typed(&mut analytics, "tc");
+        typed(&mut analytics, "todo");
+
+        assert_eq!(
+            serde_json::to_string(&analytics.episode_queries).unwrap(),
+            r#"["tc","todo"]"#
+        );
+    }
+
+    #[test]
+    fn test_nothing_is_recorded_when_logging_is_off() {
+        let db = Database::new(Path::new(":memory:")).expect("in-memory database");
+        let mut analytics = Analytics::new("test-session".to_string(), db, true);
+
+        typed(&mut analytics, "todo");
+
+        assert!(analytics.episode_queries.is_empty());
     }
 }

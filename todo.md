@@ -344,11 +344,17 @@ Optimizations".
   takes a page size: it uses `app::PAGE_SIZE`, because the UI keys its cache by
   `index / PAGE_SIZE` and a worker paginating by anything else would hand back
   pages that land in the wrong slot. Every caller passed the same literal 128.
-- **S3. Collapse parallel structs.** `FeatureClickIndexes` is `&ClickData`.
-  `FileCandidate` duplicates `FileInfo` fields; rank over `&[&FileInfo]` (or
-  store fuzzy score on a small wrapper). `Episode` is a Vec<String> with a
-  contains check; inline into `Analytics`. `Subsession.created_at` is a
-  jiff Timestamp used for a 200ms debounce; use `Instant`.
+- **S3. Collapse parallel structs.** DONE (2026-09-09). `FeatureClickIndexes`
+  was `ClickData` field for field and is gone. `FileCandidate` now borrows
+  (`&'a str`, `&'a Path`) instead of cloning the display name and path for
+  every file on every keystroke - 243 files a query here, so 486 allocations
+  saved per keystroke; it kept the ranker's own vocabulary type rather than
+  taking `&FileInfo`, which would have pointed the ranker at the worker.
+  `Episode` was a `Vec<String>`, a `contains` check and a `to_json`, and is now
+  those three lines inside `Analytics` as `episode_queries`; its module is
+  deleted and its tests moved to `analytics::episode_tests`.
+  `Subsession.created_at` is an `Instant`, since it only ever answers "has this
+  been on screen 200ms" and a wall clock can go backwards under that.
 - **S4. One database open per thread.** DONE (2026-09-09), with the caveat
   that it bought no measurable speed. `Ranker::load_clicks` no longer opens a
   raw `Connection` with its own copy of the pragmas: the query moved to

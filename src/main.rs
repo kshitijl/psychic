@@ -4,7 +4,6 @@ mod app;
 mod cli;
 mod context;
 mod db;
-mod episode;
 mod feature_defs;
 mod features;
 mod help;

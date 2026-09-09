@@ -923,6 +923,14 @@ pub struct ClickData {
 }
 ```
 
+**`FileCandidate` borrows.** It is built fresh for every keystroke, one per
+file, and owning its display name and path meant two allocations per file per
+query - 486 of them on a 243-file query here. It holds `&'a str` and `&'a Path`
+into the worker's registry instead, and nothing in it outlives the `rank_files`
+call it was made for. The ranker keeps its own candidate type rather than taking
+the worker's `FileInfo`: the worker knows about the ranker, and pointing that
+the other way as well would tie the two together for no gain.
+
 **Preloading clicks:** All click and scroll events from the last 30 days are loaded at startup into multiple HashMaps:
 - `clicks_by_file`: Indexed by full file path
 - `clicks_by_parent_dir`: Indexed by parent directory path
@@ -1227,8 +1235,17 @@ impl Analytics {
 - Subsession tracking (query changes create new subsessions)
 - 200ms impression debouncing (don't log on every keystroke)
 - Scroll deduplication (HashSet tracks scrolled files to avoid duplicates)
+- Episode tracking: `episode_queries` is every distinct query typed since the
+  last engagement, so a click on the file the user reached by typing "tc", then
+  "todo", then "todo-current" credits all three. It used to be an `Episode`
+  struct in `episode.rs` - a `Vec<String>`, a `contains` check and a `to_json`,
+  which is what it still is, three lines inside the thing that uses it.
 - Event data formatting for database
 - Temporal correctness (force flush before click/scroll events)
+
+`Subsession.created_at` is an `Instant` rather than a wall-clock timestamp: it
+answers one question, "has this query been on screen for 200ms", and a wall
+clock can go backwards underneath that.
 
 **Why this module:** Encapsulates all analytics complexity behind simple log_* methods. Main code just calls the methods without worrying about debouncing, deduplication, or subsession management.
 
