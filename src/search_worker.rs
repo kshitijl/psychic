@@ -1477,6 +1477,351 @@ mod load_ranker_tests {
 }
 
 #[cfg(test)]
+pub(super) mod fresh_install_tests_support {
+    use std::path::PathBuf;
+
+    /// An empty directory, as a new user has.
+    pub(crate) struct FreshDataDir {
+        pub(crate) path: PathBuf,
+    }
+
+    impl FreshDataDir {
+        pub(crate) fn new(name: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("psychic-fresh-{}-{}", name, std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("create data dir");
+            Self { path }
+        }
+
+        pub(crate) fn db_path(&self) -> PathBuf {
+            crate::db::Database::get_db_path(&self.path)
+        }
+
+        pub(crate) fn model_path(&self) -> PathBuf {
+            self.path.join("model.txt")
+        }
+    }
+
+    impl Drop for FreshDataDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+#[cfg(test)]
+mod fresh_install_tests {
+    //! What happens the first time psychic is run on a machine.
+    //!
+    //! The pieces of this were each covered and the whole was not, which is how
+    //! a fresh install came to spend a long time logging `Background retraining
+    //! failed: no such table: events` on every launch without anyone noticing.
+
+    use super::fresh_install_tests_support::*;
+    use super::*;
+    use crate::db::Database;
+
+    fn names(db: &Database, kind: &str) -> Vec<String> {
+        db.connection()
+            .prepare("SELECT name FROM sqlite_master WHERE type = ?1 AND name NOT LIKE 'sqlite_%'")
+            .unwrap()
+            .query_map([kind], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_an_empty_data_directory_gets_the_whole_schema() {
+        let dir = FreshDataDir::new("schema");
+
+        let db = Database::new(&dir.db_path()).expect("a new user's first open");
+
+        let mut tables = names(&db, "table");
+        tables.sort();
+        assert_eq!(tables, vec!["events", "hidden_prefixes", "sessions"]);
+
+        let mut indexes = names(&db, "index");
+        indexes.sort();
+        assert_eq!(
+            indexes,
+            vec!["idx_events_action", "idx_events_engagement"],
+            "a new database is created with the indexes, not left to a migration"
+        );
+    }
+
+    #[test]
+    fn test_the_first_launch_ranks_on_the_simple_model() {
+        let dir = FreshDataDir::new("cold-start");
+        let (walker_tx, _walker_rx) = mpsc::channel::<WalkerCommand>();
+
+        // No model file, no click history, no events: exactly what
+        // `WorkerState` is handed the first time psychic is run.
+        let mut state = WorkerState::new(
+            PathBuf::from("/test"),
+            &dir.path,
+            walker_tx,
+            false,
+            false,
+            Vec::new(),
+        )
+        .expect("a fresh install must start");
+
+        assert!(
+            !state.ranker.has_model(),
+            "there is no model to load on a first launch"
+        );
+
+        for name in ["alpha.rs", "beta.rs"] {
+            state.add_file(
+                PathBuf::from("/test").join(name),
+                Some(1_700_000_000),
+                Some(1_700_000_000),
+                Some(100),
+                false,
+            );
+        }
+
+        state.filter_and_rank("").expect("first query");
+
+        assert_eq!(
+            state.filtered_files.len(),
+            3,
+            "two files and the directory the user is standing in"
+        );
+        let scored = state.file_scores.first().expect("something was scored");
+        assert!(scored.simple_score.is_some(), "the simple model ran");
+        assert_eq!(scored.ml_score, None, "and nothing else did");
+        assert_eq!(scored.simple_weight, Some(1.0));
+        assert_eq!(scored.ml_weight, Some(0.0));
+    }
+
+    #[test]
+    fn test_clicks_reach_the_database_and_come_back_as_training_rows() {
+        let dir = FreshDataDir::new("clicks");
+        let db = Database::new(&dir.db_path()).unwrap();
+
+        // What the UI writes: the rows it showed, then the one that was taken.
+        let seen = [
+            crate::db::FileMetadata {
+                relative_path: "alpha.rs".to_string(),
+                full_path: "/test/alpha.rs".to_string(),
+                mtime: Some(1_700_000_000),
+                atime: None,
+                size: Some(100),
+            },
+            crate::db::FileMetadata {
+                relative_path: "beta.rs".to_string(),
+                full_path: "/test/beta.rs".to_string(),
+                mtime: Some(1_700_000_000),
+                atime: None,
+                size: Some(100),
+            },
+        ];
+        db.log_impressions("al", &seen, 1, "session-1").unwrap();
+        db.log_event(crate::db::EventData {
+            query: "al",
+            file_path: "alpha.rs",
+            full_path: "/test/alpha.rs",
+            mtime: Some(1_700_000_000),
+            atime: None,
+            file_size: Some(100),
+            subsession_id: 1,
+            action: crate::db::UserInteraction::Click,
+            session_id: "session-1",
+            episode_queries: None,
+        })
+        .unwrap();
+
+        assert_eq!(
+            db.get_previously_interacted_files().unwrap(),
+            vec!["/test/alpha.rs".to_string()],
+            "the click is what makes a path findable next time"
+        );
+        assert_eq!(
+            db.engagements_since(0).unwrap().len(),
+            1,
+            "and what the ranker loads"
+        );
+
+        let summary = crate::features::generate_features(
+            &dir.db_path(),
+            &dir.path.join("features.csv"),
+            &dir.path.join("feature_schema.json"),
+            crate::features::OutputFormat::Csv,
+        )
+        .expect("feature generation on a nearly empty database");
+
+        assert_eq!(summary.rows, 2, "one row per impression");
+        assert_eq!(summary.positives, 1, "the one that was clicked");
+    }
+
+    #[test]
+    fn test_training_is_skipped_while_nothing_has_been_clicked() {
+        let dir = FreshDataDir::new("no-positives");
+        let db = Database::new(&dir.db_path()).unwrap();
+
+        // Impressions but no click: the state every install starts in, and for
+        // as long as the user is only looking.
+        db.log_impressions(
+            "a",
+            &[crate::db::FileMetadata {
+                relative_path: "alpha.rs".to_string(),
+                full_path: "/test/alpha.rs".to_string(),
+                mtime: None,
+                atime: None,
+                size: None,
+            }],
+            1,
+            "session-1",
+        )
+        .unwrap();
+
+        let summary = crate::features::generate_features(
+            &dir.db_path(),
+            &dir.path.join("features.csv"),
+            &dir.path.join("feature_schema.json"),
+            crate::features::OutputFormat::Csv,
+        )
+        .unwrap();
+
+        assert_eq!(summary.positives, 0);
+
+        // `retrain_model` returns Ok without running train.py at all. Handing
+        // it to Python instead produced a traceback and an ERROR in the log on
+        // every first launch, for a state that is entirely normal.
+        crate::ranker::retrain_model(&dir.path, Some(dir.path.join("training.log")))
+            .expect("a fresh install must not report a failure");
+
+        assert!(
+            !dir.model_path().exists(),
+            "and no model is written from nothing"
+        );
+    }
+}
+
+#[cfg(test)]
+mod trained_model_tests {
+    //! The rest of the fresh-install story: use psychic enough that there is
+    //! something to learn from, and check the model that comes out is actually
+    //! the one used.
+    //!
+    //! Ignored by default because it runs `train.py` through `uv`, which wants
+    //! a package cache and, the first time, a network. Run it with
+    //! `cargo test --release trained_model -- --ignored --nocapture`.
+
+    use super::fresh_install_tests_support::*;
+    use super::*;
+    use crate::db::Database;
+
+    /// Enough sessions that every episode has something to learn from.
+    ///
+    /// Also more than the blend's crossover at 30 engagements, so that the
+    /// trained model is expected to outweigh the simple one afterwards.
+    const SESSIONS: usize = 40;
+
+    #[test]
+    #[ignore]
+    fn test_a_used_install_trains_and_then_ranks_with_the_model() {
+        let dir = FreshDataDir::new("trained");
+        let db = Database::new(&dir.db_path()).unwrap();
+
+        // Use it: each query shows three files and the user takes one.
+        for i in 0..SESSIONS {
+            let chosen = format!("/test/file{}.rs", i % 7);
+            let shown: Vec<crate::db::FileMetadata> = (0..3)
+                .map(|n| crate::db::FileMetadata {
+                    relative_path: format!("file{}.rs", (i + n) % 7),
+                    full_path: format!("/test/file{}.rs", (i + n) % 7),
+                    mtime: Some(1_700_000_000),
+                    atime: None,
+                    size: Some(100 + n as i64),
+                })
+                .collect();
+            db.log_impressions("fi", &shown, i as u64, "session-1")
+                .unwrap();
+            db.log_event(crate::db::EventData {
+                query: "fi",
+                file_path: &chosen,
+                full_path: &chosen,
+                mtime: Some(1_700_000_000),
+                atime: None,
+                file_size: Some(100),
+                subsession_id: i as u64,
+                action: crate::db::UserInteraction::Click,
+                session_id: "session-1",
+                episode_queries: None,
+            })
+            .unwrap();
+        }
+
+        crate::ranker::retrain_model(&dir.path, Some(dir.path.join("training.log")))
+            .expect("training should succeed once there is something to learn from");
+
+        assert!(
+            dir.model_path().exists(),
+            "a model file is what the next launch loads: {}",
+            std::fs::read_to_string(dir.path.join("training.log")).unwrap_or_default()
+        );
+
+        // Now the next launch: the model is picked up, and used.
+        let ranker = WorkerState::load_ranker(&dir.model_path(), &db)
+            .expect("the model psychic just wrote must load");
+        assert!(
+            ranker.has_model(),
+            "and be used rather than fallen back from"
+        );
+
+        let mut ranker = ranker;
+        let candidates: Vec<ranker::FileCandidate> = (0..3)
+            .map(|n| ranker::FileCandidate {
+                file_id: n,
+                relative_path: format!("file{}.rs", n),
+                full_path: PathBuf::from(format!("/test/file{}.rs", n)),
+                mtime: Some(1_700_000_000),
+                file_size: Some(100),
+                is_from_walker: true,
+                is_dir: false,
+                fuzzy_score: 50,
+            })
+            .collect();
+
+        let scored = ranker
+            .rank_files(
+                "fi",
+                &candidates,
+                jiff::Timestamp::now().as_second(),
+                Path::new("/test"),
+            )
+            .expect("ranking with a model");
+
+        let top = scored.first().expect("something was ranked");
+        let simple = top
+            .simple_weight
+            .expect("the simple model still has a weight");
+        let ml = top.ml_weight.expect("and so does the model");
+
+        assert!(top.ml_score.is_some(), "the trained model produced a score");
+        assert!(
+            ml > simple,
+            "past the crossover the model should lead: ml {:.3} vs simple {:.3}",
+            ml,
+            simple
+        );
+        assert!(
+            simple > 0.0,
+            "but the simple model still contributes: {:.3}",
+            simple
+        );
+        assert!(
+            (simple + ml - 1.0).abs() < 1e-9,
+            "the two weights are a blend"
+        );
+    }
+}
+
+#[cfg(test)]
 mod cwd_row_tests {
     use super::eviction_tests::worker_with_three_files;
     use super::*;

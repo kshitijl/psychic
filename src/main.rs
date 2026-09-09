@@ -37,7 +37,6 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use search_worker::{WorkerRequest, WorkerResponse};
 use std::{
     env,
-    path::PathBuf,
     sync::mpsc::{self, Receiver},
     time::{Duration, Instant},
 };
@@ -180,30 +179,34 @@ fn main() -> Result<()> {
     // pins it to process start rather than to whoever reads it first.
     let main_start = *PROCESS_START;
 
+    // Parsed before logging is set up, because `--data-dir` decides where the
+    // log goes. It used to be written to `~/.local/share/psychic` regardless,
+    // while `internal analyze-perf` and `print-log` read it from the data
+    // directory - so pointing psychic somewhere else split its own log from the
+    // commands that read it, and quietly wrote into the default directory.
+    let cli = Cli::parse();
+
+    let data_dir = cli
+        .data_dir
+        .clone()
+        .or_else(|| cli::get_default_data_dir().ok());
+
     // Generate session ID early so we can include it in all logs
     let session_id = create_session_id();
-
-    // Set as environment variable so all threads can access it
-    // SAFETY: We set this once at the very beginning of main() before any other threads exist
-    unsafe {
-        std::env::set_var("PSYCHIC_SESSION_ID", &session_id);
-    }
 
     // Initialize logger with fern to write to both file and memory
     let (log_tx, log_rx) = mpsc::channel();
 
-    if let Ok(home) = std::env::var("HOME") {
-        let log_dir = PathBuf::from(&home)
-            .join(".local")
-            .join("share")
-            .join("psychic");
-        let _ = std::fs::create_dir_all(&log_dir);
-        let log_file = log_dir.join("app.log");
+    if let Some(dir) = &data_dir {
+        let _ = std::fs::create_dir_all(dir);
+        let log_file = dir.join("app.log");
 
+        // The session id is captured, not read from the environment on every
+        // line. It also means nothing has to `set_var` before the threads
+        // start, which was the one `unsafe` block in the program.
+        let session = session_id.clone();
         fern::Dispatch::new()
-            .format(|out, message, record| {
-                let session =
-                    std::env::var("PSYCHIC_SESSION_ID").unwrap_or_else(|_| "unknown".to_string());
+            .format(move |out, message, record| {
                 out.finish(format_args!(
                     "[{} {} {} {}] {}",
                     jiff::Timestamp::now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -220,14 +223,11 @@ fn main() -> Result<()> {
             .expect("Failed to initialize logger");
     }
 
-    let cli = Cli::parse();
-
     // Handle subcommands
     if let Some(command) = cli.command {
-        // Get data directory (global option)
-        let data_dir = cli.data_dir.unwrap_or_else(|| {
-            cli::get_default_data_dir().expect("Failed to get default data directory")
-        });
+        let data_dir = data_dir
+            .clone()
+            .context("No data directory: pass --data-dir, or set HOME")?;
 
         match command {
             Commands::GenerateFeatures { format } => {
@@ -258,9 +258,17 @@ fn main() -> Result<()> {
                     "Generating features ({}) from DB at {:?} and writing to {:?}",
                     format_str, db_path, output_path
                 );
-                features::generate_features(&db_path, &output_path, &schema_path, features_format)?;
+                let summary = features::generate_features(
+                    &db_path,
+                    &output_path,
+                    &schema_path,
+                    features_format,
+                )?;
 
-                println!("Generated features at {:?}", output_path);
+                println!(
+                    "Generated {} rows, {} of them clicked, at {:?}",
+                    summary.rows, summary.positives, output_path
+                );
                 println!("Generated feature schema at {:?}", schema_path);
                 println!("Done.");
                 return Ok(());
@@ -416,10 +424,7 @@ fn main() -> Result<()> {
         root_start.elapsed().as_secs_f64() * 1000.0
     );
 
-    // Get data directory for main app
-    let data_dir = cli.data_dir.unwrap_or_else(|| {
-        cli::get_default_data_dir().expect("Failed to get default data directory")
-    });
+    let data_dir = data_dir.context("No data directory: pass --data-dir, or set HOME")?;
 
     // Create unified event channel - all events (worker, input, tick) flow through this
     let (event_tx, event_rx) = mpsc::channel::<AppEvent>();
@@ -466,6 +471,7 @@ fn main() -> Result<()> {
     // Initialize app
     let app_new_start = Instant::now();
     let bootstrap = AppBootstrap {
+        session_id,
         event_tx: event_tx.clone(),
         input,
         preview_tx,

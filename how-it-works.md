@@ -284,6 +284,44 @@ of them inserts a session row that would fail against the older, wider table. It
 `VACUUM`s only when it actually dropped something, which took 83ms once on a
 67MB database.
 
+### The first launch on a new machine
+
+There is no model, no click history and no database. Everything below has a test
+in `search_worker::fresh_install_tests`, because the pieces of this were each
+covered while the whole was not, and it stayed broken for a long time without
+anyone noticing.
+
+- **The database is created on first open**, tables and both indexes together;
+  the migration path only runs against an older one.
+- **Ranking runs on the simple model.** `load_ranker` finds no `model.txt`,
+  falls back, and every score comes back with `simple_weight` 1.0 and no ML
+  score at all. The first query still returns results, including the row for the
+  directory the user is standing in.
+- **Training does not run.** A fresh install has impressions but nothing
+  clicked, so there is nothing to learn from. `generate_features` reports how
+  many rows it wrote and how many were clicked, and `retrain_model` returns
+  early when none were. Handing an empty set to `train.py` produced a Python
+  traceback and an `ERROR` in the log on every first launch, for a state that is
+  entirely normal.
+- **Once the user has clicked, it trains and the model is used.** The blend
+  hands over as engagement accumulates, crossing at 30. That whole loop -
+  use it, train, load, rank with the trained model outweighing the simple one -
+  is `trained_model_tests`, which is `#[ignore]`d because it runs `train.py`
+  through `uv`.
+
+**Two ordering bugs lived here**, both only reachable on a first launch, which
+is why nothing caught them:
+
+- Feature generation opened its own connection without going through
+  `Database`, so on a first launch it reached the file before anything had
+  created the schema and every launch logged `no such table: events`.
+- `PRAGMA busy_timeout` was set *after* `PRAGMA journal_mode = WAL` in the same
+  batch. Switching a fresh database to WAL takes a write lock, and on a first
+  launch several threads reach that line at once, so the losers failed
+  immediately with `database is locked` instead of waiting. The first open of a
+  file is now done while holding the registry lock, so the others wait for it
+  rather than racing.
+
 ### Why the same database is opened several times
 
 A `rusqlite::Connection` is `Send` but **not `Sync`**: it can be moved to another
@@ -1620,7 +1658,11 @@ Why `terminal.backend_mut().execute()`: Must use same terminal instance (not std
 Why `terminal.clear()`: Wipes leftover state from editor. Without it, blank screen on resume.
 
 **Logging:** Uses `fern` crate with dual dispatch:
-- File output: `~/.local/share/psychic/app.log`
+- File output: `<data dir>/app.log`, which follows `--data-dir`. The command
+  line is parsed *before* logging is configured for that reason: the log used to
+  be written to `~/.local/share/psychic` whatever was asked for, while
+  `internal analyze-perf` and `print-log` read it from the data directory, so
+  pointing psychic elsewhere split its log from the commands that read it.
 - Memory output: mpsc channel → VecDeque (circular buffer, 50 lines max)
 
 Why dual dispatch: File for persistence, memory for debug pane. Never use eprintln (disrupts TUI).

@@ -683,18 +683,33 @@ pub fn retrain_model(data_dir: &Path, training_log_path: Option<PathBuf>) -> Res
         log::info!("Generating features...");
         let feature_start = Instant::now();
         let db_path = db::Database::get_db_path(&data_dir);
+
         let features_csv = data_dir.join("features.csv");
         let schema_json = data_dir.join("feature_schema.json");
 
         std::fs::create_dir_all(&data_dir)?;
 
-        features::generate_features(
+        let summary = features::generate_features(
             &db_path,
             &features_csv,
             &schema_json,
             features::OutputFormat::Csv,
         )?;
         let feature_duration = feature_start.elapsed();
+
+        // A fresh install has impressions but nothing clicked, so there is
+        // nothing for the model to learn from. Training anyway means a Python
+        // traceback and an ERROR in the log on the very first launch, for a
+        // state that is entirely normal: ranking runs on the simple model
+        // until the user has clicked something.
+        if summary.positives == 0 {
+            log::info!(
+                "Nothing to train on yet: {} impressions, none of them clicked. \
+                 Ranking stays on the simple model.",
+                summary.rows
+            );
+            return Ok(());
+        }
         log::info!(
             "Features generated at {:?} ({:.2}s)",
             features_csv,

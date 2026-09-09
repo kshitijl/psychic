@@ -59,6 +59,7 @@ pub struct AppOptions {
 }
 
 pub struct AppBootstrap {
+    pub session_id: String,
     pub event_tx: mpsc::Sender<crate::AppEvent>,
     pub input: crate::tty_input::TtyInput,
     pub preview_tx: mpsc::Sender<PreviewRequest>,
@@ -147,15 +148,12 @@ impl App {
         log::debug!("App::new() started");
 
         let AppBootstrap {
+            session_id,
             event_tx,
             input,
             preview_tx,
         } = bootstrap;
         let initial_filter = options.initial_filter;
-
-        // Get session ID from environment (set in main())
-        let session_id =
-            std::env::var("PSYCHIC_SESSION_ID").unwrap_or_else(|_| "unknown".to_string());
 
         let db_path = crate::db::Database::get_db_path(data_dir);
         let db = crate::db::Database::new(&db_path)?;

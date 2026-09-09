@@ -468,8 +468,11 @@ Filter+rank is ~2ms per keystroke and is not the problem.
 - **B6. Docs say LambdaRank; train.py is `objective: binary` + auc.**
   Episodes only drive the split. Pick one and make README/how-it-works say
   it. (Binary is fine; the episode machinery is then just grouping.)
-- **B7. Small ones.** Logger path ignores `--data-dir` while `analyze-perf`
-  reads `data_dir/app.log`. Two `get_eza_flags` (preview.rs: <100 cols,
+- **B7. Small ones.** ~~Logger path ignores `--data-dir`~~ DONE: the CLI is
+  parsed before logging is configured, so the log goes to the data directory
+  the rest of the program uses. The session id is captured in the formatter
+  rather than round-tripped through an environment variable, which removed the
+  program's only `unsafe` block. Two `get_eza_flags` (preview.rs: <100 cols,
   three flags; render.rs: <80 cols, two flags). Layout breakpoint is 120 in
   code, 100 in docs. Suspend-for-editor uses a 50ms sleep as a race guard;
   have the input thread ack the pause on a channel. `test_basic_feature_generation`

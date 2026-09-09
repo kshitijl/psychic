@@ -102,26 +102,31 @@ impl Database {
         let opened_at = std::time::Instant::now();
         let conn = Connection::open(db_path).context("Failed to open database")?;
 
-        // Configure SQLite for better concurrency
-        conn.execute_batch(
-            "PRAGMA journal_mode = WAL;
-             PRAGMA busy_timeout = 5000;
-             PRAGMA synchronous = NORMAL;",
-        )?;
-
         // Schema and migration are per *file*, not per connection - except that
         // `:memory:` is not a file. Every in-memory connection is its own
         // database that happens to share the name, so remembering it would
         // leave the second one empty. Tests live on that.
         let shared_by_path = db_path != Path::new(":memory:") && db_path != Path::new("");
-        let first_time = !shared_by_path || {
+
+        // The first open of a file is done holding the lock, so that a second
+        // thread arriving at the same moment waits for it rather than racing.
+        // Both halves of that first open take a write lock on the database:
+        // switching a fresh one to WAL is a write, and so is creating the
+        // tables. On a first launch four threads reach here at once, and the
+        // losers used to fail outright - a brand-new install logged a failed
+        // retrain on its very first run.
+        let first_time = {
             let mut prepared = PREPARED.lock().expect("schema registry is not poisoned");
-            prepared
-                .get_or_insert_with(Default::default)
-                .insert(db_path.to_path_buf())
+            let known = prepared.get_or_insert_with(Default::default);
+            let first = !shared_by_path || known.insert(db_path.to_path_buf());
+            if first {
+                Self::configure(&conn)?;
+                Self::prepare_schema(&conn)?;
+            }
+            first
         };
-        if first_time {
-            Self::prepare_schema(&conn)?;
+        if !first_time {
+            Self::configure(&conn)?;
         }
 
         log::info!(
@@ -131,6 +136,20 @@ impl Database {
         );
 
         Ok(Database { conn })
+    }
+
+    /// Settings every connection needs. Per connection, not per database.
+    ///
+    /// `busy_timeout` comes first because the statement after it takes a write
+    /// lock on a database that is not yet in WAL, and without a timeout already
+    /// in force that fails immediately rather than waiting.
+    fn configure(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            "PRAGMA busy_timeout = 5000;
+             PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;",
+        )?;
+        Ok(())
     }
 
     /// Create what is missing and bring what is there up to date.
@@ -244,6 +263,18 @@ impl Database {
         }
 
         Ok(())
+    }
+
+    /// The connection underneath, for the bulk read that feature generation
+    /// does.
+    ///
+    /// Narrow on purpose. Training reads the whole table into its own types,
+    /// which do not belong in this module; everything else goes through the
+    /// methods here, which is what keeps the pragmas and the schema in one
+    /// place. Before this, feature generation opened its own connection with
+    /// no pragmas at all, so it had no `busy_timeout` either.
+    pub(crate) fn connection(&self) -> &Connection {
+        &self.conn
     }
 
     pub fn get_db_path(data_dir: &Path) -> PathBuf {

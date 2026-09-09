@@ -183,6 +183,17 @@ impl Accumulator {
     }
 }
 
+/// What came out of a feature generation run.
+///
+/// `positives` is the number that matter: an impression that was clicked or
+/// scrolled. A model cannot be trained without at least one, which is the
+/// state every psychic install starts in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeatureSummary {
+    pub rows: usize,
+    pub positives: usize,
+}
+
 // Main function to generate features
 
 pub fn generate_features(
@@ -190,10 +201,14 @@ pub fn generate_features(
     output_path: &Path,
     schema_path: &Path,
     format: OutputFormat,
-) -> Result<()> {
-    let conn = Connection::open(db_path).context("Failed to open database")?;
-    let mut all_events = fetch_all_events(&conn)?;
-    let all_sessions = fetch_all_sessions(&conn)?;
+) -> Result<FeatureSummary> {
+    // Through `Database` so this gets the same pragmas as everything else,
+    // and so the schema exists when a fresh install retrains before the UI has
+    // opened anything.
+    let db = crate::db::Database::new(db_path)?;
+    let conn = db.connection();
+    let mut all_events = fetch_all_events(conn)?;
+    let all_sessions = fetch_all_sessions(conn)?;
 
     // Sort events by timestamp (critical for temporal correctness)
     all_events.sort_by_key(|e| e.timestamp);
@@ -240,7 +255,13 @@ pub fn generate_features(
     let schema_json = crate::feature_defs::export_json();
     fs::write(schema_path, schema_json).context("Failed to write feature schema")?;
 
-    Ok(())
+    Ok(FeatureSummary {
+        rows: output_rows.len(),
+        positives: output_rows
+            .iter()
+            .filter(|row| row.get("label").is_some_and(|label| label == "1"))
+            .count(),
+    })
 }
 
 // Database fetching functions
