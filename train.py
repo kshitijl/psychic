@@ -119,7 +119,15 @@ def load_data(csv_path):
     original_samples = len(df)
     original_episodes = df["episode"].nunique()
 
-    df = df[df["episode"].isin(valid_episodes)].reset_index(drop=True)
+    df = df[df["episode"].isin(valid_episodes)]
+
+    # Sort by episode. A ranking objective is handed group *sizes*, not group
+    # ids, so it reads them off consecutive rows: rows of one episode have to be
+    # together and the episodes in order. They very nearly are already - episode
+    # ids are handed out in one pass over time-sorted events - but the
+    # accumulator flushes whatever impressions are still pending at the end out
+    # of a hash map, which is enough to break it.
+    df = df.sort_values("episode", kind="stable").reset_index(drop=True)
 
     filtered_samples = original_samples - len(df)
     filtered_episodes = original_episodes - df["episode"].nunique()
@@ -187,6 +195,22 @@ def prepare_features(df, feature_names, binary_features, monotonicity_map):
     return Prepared(X, y, episodes, timestamps, [], constraints)  # No categorical features
 
 
+def group_sizes(episodes):
+    """Rows per episode, in the order they appear.
+
+    lambdarank needs to know which rows compete with each other. `episode_id` is
+    handed out in one pass over time-sorted events, so rows of one episode are
+    already contiguous and ascending - asserted here rather than assumed,
+    because getting it wrong silently trains on the wrong groups.
+    """
+    counts = episodes.value_counts().sort_index()
+    assert counts.sum() == len(episodes), "every row belongs to exactly one episode"
+    assert (episodes.values == episodes.sort_values().values).all(), (
+        "rows must be grouped by episode and in ascending order"
+    )
+    return counts.values
+
+
 def recency_weights(timestamps):
     """Weight each row by age, halving every HALF_LIFE_DAYS.
 
@@ -217,11 +241,18 @@ def make_params(monotone_constraints):
     Both fits must see identical parameters: the first one decides how many
     rounds the second one runs for, and that number means nothing if the two
     models are shaped differently.
+
+    **The objective is a ranking one.** psychic asks one question - of the files
+    on screen, which is the one - and lambdarank is trained on exactly that: its
+    gradient comes from swapping pairs *within* an episode, weighted by what the
+    swap does to NDCG. A pooled objective instead learns the level of the scores
+    as well as their order, and the level is not used for anything.
     """
     return {
-        "objective": "binary",  # Changed from 'regression'
-        "metric": "auc",  # Changed from 'rmse'
-        "class_weight": "balanced",  # Added class weight
+        "objective": "lambdarank",
+        "metric": "ndcg",
+        "eval_at": [1, 5],  # position 1 is what the user sees first
+        "lambdarank_truncation_level": 30,  # a screenful, not 243 rows
         "monotone_constraints": monotone_constraints,  # Added monotonicity
         "boosting_type": "gbdt",
         "num_leaves": 31,
@@ -249,12 +280,17 @@ def train_model(
     print(f"Applying monotonicity constraints: {monotone_constraints}")
 
     train_data = lgb.Dataset(
-        X_train, label=y_train, weight=w_train, categorical_feature=categorical_features
+        X_train,
+        label=y_train,
+        weight=w_train,
+        group=group_sizes(episodes_train),
+        categorical_feature=categorical_features,
     )
     val_data = lgb.Dataset(
         X_val,
         label=y_val,
         weight=w_val,
+        group=group_sizes(episodes_val),
         categorical_feature=categorical_features,
         reference=train_data,
     )
@@ -281,6 +317,35 @@ def train_model(
     return model, evals_result
 
 
+def ranking_quality(scores, labels, episodes):
+    """Where the clicked row landed in each episode.
+
+    top-1 is the share of episodes whose clicked row came out first, MRR the
+    mean of 1/position. Both are per episode, which is how the tool is used: one
+    list on screen, one file wanted.
+    """
+    labels = np.asarray(labels)
+    groups = np.asarray(episodes)
+
+    positions = []
+    for episode in np.unique(groups):
+        rows = groups == episode
+        ranked = labels[rows][np.argsort(-scores[rows])]
+        if ranked.max() != 1:
+            continue
+        positions.append(int(np.argmax(ranked == 1)) + 1)
+
+    if not positions:
+        return {"top1": 0.0, "mrr": 0.0, "episodes": 0, "positions": []}
+
+    return {
+        "top1": float(np.mean([p == 1 for p in positions])),
+        "mrr": float(np.mean([1.0 / p for p in positions])),
+        "episodes": len(positions),
+        "positions": positions,
+    }
+
+
 def create_visualizations(
     model,
     X_train,
@@ -299,13 +364,14 @@ def create_visualizations(
         # Page 1: Training curves
         fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
-        train_auc = evals_result["train"]["auc"]
-        val_auc = evals_result["val"]["auc"]
-        axes[0].plot(train_auc, label="Train auc", linewidth=2)
-        axes[0].plot(val_auc, label="Validation auc", linewidth=2)
+        # Whatever metric the objective was trained on, rather than a hardcoded
+        # name: this said "auc" and broke the moment the objective changed.
+        metric = next(iter(evals_result["train"]))
+        axes[0].plot(evals_result["train"][metric], label=f"Train {metric}", linewidth=2)
+        axes[0].plot(evals_result["val"][metric], label=f"Validation {metric}", linewidth=2)
         axes[0].set_xlabel("Iteration")
-        axes[0].set_ylabel("auc")
-        axes[0].set_title("Training Progress (Regression Error)")
+        axes[0].set_ylabel(metric)
+        axes[0].set_title(f"Training progress ({metric})")
         axes[0].legend()
         axes[0].grid(True)
 
@@ -452,20 +518,22 @@ def create_visualizations(
         pdf.savefig(fig)
         plt.close()
 
-        # Page 5: Regression Quality Metrics and Score Distribution
+        # Page 5: Ranking quality and score distribution
         y_pred_scores = model.predict(X_test, num_iteration=model.best_iteration)
 
-        from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-
-        # Compute regression metrics
-        rmse = np.sqrt(mean_squared_error(y_test, y_pred_scores))
-        mae = mean_absolute_error(y_test, y_pred_scores)
-        r2 = r2_score(y_test, y_pred_scores)
+        # Ranking metrics, not regression ones. The objective emits an order,
+        # not a probability, so a distance from a 0/1 label says nothing; what
+        # matters is where the clicked row landed in its own episode.
+        quality = ranking_quality(y_pred_scores, y_test, episodes_test)
 
         fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
         # Metrics summary
-        metrics_text = f"RMSE: {rmse:.4f}\nMAE: {mae:.4f}\nR²: {r2:.4f}"
+        metrics_text = (
+            f"top-1: {quality['top1']:.4f}\n"
+            f"MRR:   {quality['mrr']:.4f}\n"
+            f"episodes: {quality['episodes']}"
+        )
         axes[0, 0].text(
             0.5,
             0.5,
@@ -477,7 +545,7 @@ def create_visualizations(
         )
         axes[0, 0].set_xlim([0, 1])
         axes[0, 0].set_ylim([0, 1])
-        axes[0, 0].set_title("Regression Metrics (Test Set)")
+        axes[0, 0].set_title("Ranking quality (test set)")
         axes[0, 0].axis("off")
 
         # Score distribution for clicked vs not clicked
@@ -501,14 +569,12 @@ def create_visualizations(
         axes[0, 1].legend()
         axes[0, 1].grid(True)
 
-        # Residuals plot
-        residuals = y_test - y_pred_scores
-        axes[1, 0].scatter(y_pred_scores, residuals, alpha=0.5, s=20)
-        axes[1, 0].axhline(y=0, color="r", linestyle="--", linewidth=2)
-        axes[1, 0].set_xlabel("Predicted Score")
-        axes[1, 0].set_ylabel("Residuals (Actual - Predicted)")
-        axes[1, 0].set_title("Residual Plot")
-        axes[1, 0].grid(True)
+        # Where the clicked row actually landed, which is the thing being sold.
+        axes[1, 0].hist(quality["positions"], bins=range(1, 22), align="left")
+        axes[1, 0].set_xlabel("Position of the clicked row")
+        axes[1, 0].set_ylabel("Episodes")
+        axes[1, 0].set_title("Where the file the user wanted came out")
+        axes[1, 0].grid(True, axis="y")
 
         # Score vs label scatter
         axes[1, 1].scatter(
@@ -539,11 +605,11 @@ def create_visualizations(
         pdf.savefig(fig)
         plt.close()
 
-        # Print regression metrics
-        print("\nRegression Metrics (Test Set):")
-        print(f"  RMSE: {rmse:.4f}")
-        print(f"  MAE:  {mae:.4f}")
-        print(f"  R²:   {r2:.4f}")
+        # Print ranking metrics
+        print("\nRanking quality (test set):")
+        print(f"  top-1: {quality['top1']:.4f}")
+        print(f"  MRR:   {quality['mrr']:.4f}")
+        print(f"  over {quality['episodes']} episodes")
 
 
 def atomic_write(target_path, write_file):
@@ -599,7 +665,9 @@ def save_model(model, output_prefix):
     print(f"Model saved to: {model_path}")
 
 
-def refit_on_everything(X, y, w, categorical_features, monotone_constraints, num_boost_round):
+def refit_on_everything(
+    X, y, w, episodes, categorical_features, monotone_constraints, num_boost_round
+):
     """Retrain on every row, for the number of rounds the validated fit settled on.
 
     The time split exists to answer one question - how many trees before this
@@ -614,7 +682,11 @@ def refit_on_everything(X, y, w, categorical_features, monotone_constraints, num
 
     print(f"\nRefitting on all {len(X)} rows for {num_boost_round} rounds")
     full_data = lgb.Dataset(
-        X, label=y, weight=w, categorical_feature=categorical_features
+        X,
+        label=y,
+        weight=w,
+        group=group_sizes(episodes),
+        categorical_feature=categorical_features,
     )
     return lgb.train(
         make_params(monotone_constraints), full_data, num_boost_round=num_boost_round
@@ -737,7 +809,7 @@ def main():
     # found worth growing.
     best_iteration = model.best_iteration
     final_model = refit_on_everything(
-        X, y, weights, categorical_features, monotone_constraints, best_iteration
+        X, y, weights, episodes, categorical_features, monotone_constraints, best_iteration
     )
 
     save_model(final_model, output_prefix)

@@ -567,6 +567,15 @@ impl Ranker {
             .context("Failed to batch predict with model")?;
         let predict_ms = ms_since(predict_start);
 
+        // The ranking objective emits an unbounded score - on this developer's
+        // data it runs about -6 to +6 - while the blend below mixes it with a
+        // simple score that lives in [0, 1]. A logistic puts them on the same
+        // scale without changing the order of anything, which is the same map
+        // the old classification objective applied internally before handing
+        // back a probability.
+        let prediction_results: Vec<f64> =
+            prediction_results.iter().map(|s| logistic(*s)).collect();
+
         // Blend the two models by how much the model was trained on
         let blend_start = Instant::now();
         let num_positive_examples = self
@@ -587,7 +596,7 @@ impl Ranker {
         let mut scored_files = Vec::with_capacity(files.len());
         for (idx, (file, features)) in files.iter().zip(all_features).enumerate() {
             let simple_score = simple_scores[idx]; // Already normalized via sigmoid
-            let ml_score = prediction_results[idx]; // Binary classification probability [0, 1]
+            let ml_score = prediction_results[idx]; // ranking score, squashed to [0, 1]
             let blended_score = w_simple * simple_score + w_lightgbm * ml_score;
 
             scored_files.push(FileScore {
@@ -652,6 +661,14 @@ impl<'a> QueryClicks<'a> {
             engagements_for_query: clicks.engagements_by_episode_query_and_file.get(query),
         }
     }
+}
+
+/// The plain logistic, squashing a ranking score into `(0, 1)`.
+///
+/// Not `Ranker::sigmoid`, which carries the slope and midpoint tuned for the
+/// simple model's raw score and would flatten this one to nothing.
+fn logistic(score: f64) -> f64 {
+    1.0 / (1.0 + (-score).exp())
 }
 
 /// Milliseconds elapsed since `start`, the unit every TIMING field is in.
@@ -1230,6 +1247,27 @@ mod tests {
             FEATURE_REGISTRY.len(),
             "one timing slot per registered feature"
         );
+    }
+
+    #[test]
+    fn test_the_logistic_keeps_order_and_lands_inside_the_unit_range() {
+        // The blend adds this to a simple score that lives in [0, 1], so a
+        // ranking score has to be squashed - but the squash must not reorder
+        // anything, or it would undo the ranking it is there to carry.
+        let scores = [-6.13, -3.48, 0.0, 2.59, 5.62];
+        let squashed: Vec<f64> = scores.iter().map(|s| logistic(*s)).collect();
+
+        assert_eq!(logistic(0.0), 0.5);
+        for pair in squashed.windows(2) {
+            assert!(pair[0] < pair[1], "order is preserved: {:?}", squashed);
+        }
+        for value in &squashed {
+            assert!(*value > 0.0 && *value < 1.0, "inside the range: {}", value);
+        }
+        // The range this developer's model actually produces, so a future
+        // change that saturates everything to 0 or 1 fails here.
+        assert!(squashed[0] > 0.001, "the bottom does not collapse to zero");
+        assert!(squashed[4] < 0.999, "the top does not collapse to one");
     }
 
     #[test]

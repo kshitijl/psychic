@@ -1029,7 +1029,8 @@ The ranker uses a two-model hybrid system to handle cold-start scenarios (new in
    - Always computed for all files
 
 2. **LightGBM Model:**
-   - Sophisticated ML model trained on full feature set, predicting in [0, 1]
+   - Trained on the full feature set with a ranking objective; its score is put
+     through a logistic to land in [0, 1] for the blend
    - Requires training data (model file may not exist on first run)
    - More accurate but only useful with sufficient click history
    - If there is no model at all, ranking is 100% simple score and blending is skipped
@@ -1126,9 +1127,40 @@ from a cold uv cache: ~10s to resolve, install and run.
 `cargo install --path .` users don't need to copy ancillary files manually—the `psychic` binary embeds `train.py` and writes it into the data directory on demand (default `~/.local/share/psychic/train.py`) whenever training runs, overwriting stale copies if the script changed.
 
 **Key parameters:**
-- Objective: `binary`, with balanced class weights
-- Metric: AUC, with early stopping after 50 rounds without improvement
-- Grouping: `episode_id` (engagement-based sequences)
+- Objective: `lambdarank`, grouped by `episode_id`
+- Metric: NDCG at 1 and 5, with early stopping after 50 rounds without improvement
+- `lambdarank_truncation_level`: 30, about a screenful
+
+**The objective is a ranking one, because the question is a ranking one.**
+psychic asks "of the files on screen, which is the one" - never "what is the
+probability that this file gets clicked". lambdarank is trained on exactly that:
+its gradient comes from swapping pairs *within* an episode, weighted by what the
+swap does to NDCG, so a change that reorders nothing contributes nothing.
+
+It was `lambdarank` originally, became `regression` in `ac1b74d` ("try using
+regression instead of lambdarank") and later `binary`, with no measurement
+recorded either way. Measured now, same features, same folds, only the objective
+changing: top-1 0.7010 -> 0.7717, MRR 0.7993 -> 0.8422, all three folds up. AUC
+falls, 0.9612 -> 0.9444, which is what should happen - AUC is pooled over rows
+and is no longer what the model optimises.
+
+Two things follow from the objective being a ranking one:
+
+- **Rows have to be grouped.** LightGBM is handed group *sizes*, not group ids,
+  so it reads episode boundaries off consecutive rows. `load_data` sorts by
+  episode: they were nearly in order already, since `episode_id` is handed out
+  in one pass over time-sorted events, but the accumulator flushes whatever
+  impressions are still pending at the end out of a hash map, which is enough to
+  break it. `group_sizes` asserts the ordering rather than trusting it.
+- **The score is no longer a probability.** It comes out unbounded - about -6 to
+  +6 on this developer's data - and `rank_files` puts it through a plain
+  logistic before blending it with the simple score, which lives in `[0, 1]`.
+  That is the same map the classification objective applied internally; it
+  changes no ordering.
+
+`class_weight: "balanced"` went with the old objective. It had never done
+anything: it is a scikit-learn parameter, not a LightGBM one, and LightGBM was
+ignoring it silently.
 
 **The split is by time, not at random.** `time_split` puts the first 80% of
 episodes in train, the next 10% in validation and the last 10% in test. It used

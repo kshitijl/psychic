@@ -15,6 +15,7 @@
 """What a ranking change did to ranking quality.
 
     ./bench/model.py compare      # baseline binary vs current, same database
+    ./bench/model.py objectives   # two training objectives, one feature set
 
 Speed benchmarks cannot see a feature: it changes what the model predicts, not
 how fast it predicts it. This trains both versions the way train.py does and
@@ -72,7 +73,7 @@ def generate_features(binary, out_dir):
     return out_dir / "features.csv"
 
 
-def evaluate(train_py, csv_path, schema_dir, fixed_rounds=None):
+def evaluate(train_py, csv_path, schema_dir, fixed_rounds=None, params_override=None):
     """Rolling-origin folds over one feature set. Returns metrics and gains.
 
     With `fixed_rounds`, both sides train for the same number of rounds and
@@ -87,6 +88,10 @@ def evaluate(train_py, csv_path, schema_dir, fixed_rounds=None):
     X, y, episodes = prepared.X, prepared.y, prepared.episodes
     weights = train_py.recency_weights(prepared.timestamps)
     params = train_py.make_params(prepared.monotone_constraints)
+    if params_override:
+        params = {**params, **params_override}
+        # A pooled objective wants no groups; a ranking one cannot do without.
+        params.pop("eval_at", None) if params["objective"] != "lambdarank" else None
 
     folds = []
     for start in FOLD_STARTS:
@@ -97,8 +102,13 @@ def evaluate(train_py, csv_path, schema_dir, fixed_rounds=None):
         val = (episodes > q_train) & (episodes <= q_val)
         test = (episodes > q_val) & (episodes <= q_test)
 
-        data = lgb.Dataset(X[train], label=y[train], weight=weights[train])
-        valid = lgb.Dataset(X[val], label=y[val], weight=weights[val], reference=data)
+        # Groups, for a ranking objective: which rows competed with each other.
+        ranking = params["objective"] == "lambdarank"
+        groups = train_py.group_sizes if ranking else (lambda _: None)
+        data = lgb.Dataset(X[train], label=y[train], weight=weights[train],
+                           group=groups(episodes[train]))
+        valid = lgb.Dataset(X[val], label=y[val], weight=weights[val],
+                            group=groups(episodes[val]), reference=data)
         if fixed_rounds:
             model = lgb.train(params, data, num_boost_round=fixed_rounds)
         else:
@@ -110,7 +120,10 @@ def evaluate(train_py, csv_path, schema_dir, fixed_rounds=None):
 
     # Gains come from a fit on everything, which is what ships.
     rounds = fixed_rounds or int(np.mean([f["rounds"] for f in folds]))
-    full = lgb.train(params, lgb.Dataset(X, label=y, weight=weights), num_boost_round=rounds)
+    full_groups = train_py.group_sizes(episodes) if params["objective"] == "lambdarank" else None
+    full = lgb.train(params,
+                     lgb.Dataset(X, label=y, weight=weights, group=full_groups),
+                     num_boost_round=rounds)
     gains = dict(zip(full.feature_name(), full.feature_importance("gain")))
 
     metrics = {key: float(np.mean([f[key] for f in folds])) for key in
@@ -135,6 +148,9 @@ def score(model, X, y, episodes):
         top1.append(first == 1)
         reciprocal_rank.append(1.0 / first)
 
+    # AUC, top-1 and MRR are all rank-based and stay meaningful whatever scale
+    # the objective emits. RMSE does not: against a 0/1 label it only means
+    # something when the model outputs a probability.
     return {
         "auc": roc_auc_score(labels, predictions),
         "top1": float(np.mean(top1)),
@@ -191,10 +207,47 @@ def compare(fixed_rounds=None):
         print(f"removed feature {name!r}")
 
 
+def objectives():
+    """The same features, trained two ways.
+
+    The question this answers is whether the model is being trained on the
+    question it is asked. lambdarank's gradient comes from swapping pairs within
+    an episode; a pooled objective also learns the level of the scores, which
+    nothing uses.
+
+    RMSE is printed but means nothing for a ranking objective: it is a distance
+    from a 0/1 label, and only a probability-shaped output lives on that scale.
+    """
+    train_py = load_train_py()
+    binary = {"objective": "binary", "metric": "auc"}
+
+    with tempfile.TemporaryDirectory(prefix="psychic-objective-") as tmp:
+        out_dir = Path(tmp) / "current"
+        csv_path = generate_features(REPO / "target/release/psychic", out_dir)
+        print("--- pooled (binary) ---", flush=True)
+        pooled, _ = evaluate(train_py, csv_path, out_dir, params_override=binary)
+        print("--- ranking (lambdarank) ---", flush=True)
+        ranking, _ = evaluate(train_py, csv_path, out_dir,
+                              params_override={"objective": "lambdarank", "metric": "ndcg"})
+
+    print(f"\nrolling-origin folds at {FOLD_STARTS}, "
+          f"{pooled['episodes']} scored episodes, one feature set\n")
+    print(f"{'':<10}{'binary':>10}{'lambdarank':>12}{'change':>10}")
+    for key, label in (("auc", "AUC"), ("top1", "top-1"), ("mrr", "MRR")):
+        print(f"{label:<10}{pooled[key]:>10.4f}{ranking[key]:>12.4f}"
+              f"{ranking[key] - pooled[key]:>+10.4f}")
+    print(f"{'rounds':<10}{pooled['rounds']:>10.0f}{ranking['rounds']:>12.0f}")
+    print(f"\n{'fold':<10}{'binary':>10}{'lambdarank':>12}")
+    for start, a, b in zip(FOLD_STARTS, pooled["folds"], ranking["folds"]):
+        print(f"train<={start:<4.2f}{a['top1']:>10.4f}{b['top1']:>12.4f}")
+
+
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "compare":
         # ./bench/model.py compare [rounds]
         rounds = int(sys.argv[2]) if len(sys.argv) > 2 else None
         compare(rounds)
+    elif len(sys.argv) > 1 and sys.argv[1] == "objectives":
+        objectives()
     else:
         print(__doc__)
