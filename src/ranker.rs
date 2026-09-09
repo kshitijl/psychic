@@ -2,7 +2,6 @@ use anyhow::{Context, Result};
 use jiff::Timestamp;
 use lightgbm3::Booster;
 use rayon::prelude::*;
-use rusqlite::Connection;
 use rustc_hash::FxHashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -108,7 +107,7 @@ fn fuzzy_score_for_simple_model(fuzzy_score: i64) -> f64 {
 }
 
 impl Ranker {
-    pub fn new(model_path: &Path, db_path: &Path) -> Result<Self> {
+    pub fn new(model_path: &Path, db: &db::Database) -> Result<Self> {
         let model_load_start = std::time::Instant::now();
         let model = Booster::from_file(model_path.to_str().unwrap())
             .context("Failed to load LightGBM model")?;
@@ -118,7 +117,7 @@ impl Ranker {
         );
 
         let clicks_load_start = std::time::Instant::now();
-        let (clicks, total_clicks) = Self::load_clicks(db_path)?;
+        let (clicks, total_clicks) = Self::load_clicks(db)?;
         log::info!(
             "TIMING {{\"op\":\"load_clicks\",\"ms\":{}}}",
             clicks_load_start.elapsed().as_secs_f64() * 1000.0
@@ -148,10 +147,10 @@ impl Ranker {
         self.model.is_some()
     }
 
-    pub fn new_empty(db_path: &Path) -> Result<Self> {
+    pub fn new_empty(db: &db::Database) -> Result<Self> {
         // Load clicks even when there's no model (needed for simple scoring)
         let clicks_load_start = std::time::Instant::now();
-        let (clicks, total_clicks) = Self::load_clicks(db_path)?;
+        let (clicks, total_clicks) = Self::load_clicks(db)?;
         log::info!(
             "TIMING {{\"op\":\"load_clicks\",\"ms\":{}}}",
             clicks_load_start.elapsed().as_secs_f64() * 1000.0
@@ -187,18 +186,12 @@ impl Ranker {
 
     /// Load click events from last 30 days from database
     /// Returns (ClickData, total_clicks)
-    pub fn load_clicks(db_path: &Path) -> Result<(ClickData, usize)> {
+    pub fn load_clicks(db: &db::Database) -> Result<(ClickData, usize)> {
         let total_start = std::time::Instant::now();
 
-        let timestamp_calc_start = std::time::Instant::now();
-        let now = Timestamp::now();
-        let now_ts = now.as_second();
+        let now_ts = Timestamp::now().as_second();
         // Simple arithmetic: 30 days = 30 * 24 * 60 * 60 seconds
         let thirty_days_ago_ts = now_ts - (30 * 24 * 60 * 60);
-        log::info!(
-            "TIMING {{\"op\":\"timestamp_calc\",\"ms\":{}}}",
-            timestamp_calc_start.elapsed().as_secs_f64() * 1000.0
-        );
 
         // Pre-allocate with reasonable capacity to avoid rehashing
         let mut clicks_by_file: FxHashMap<String, Vec<ClickEvent>> =
@@ -210,63 +203,24 @@ impl Ranker {
             Vec<ClickEvent>,
         > = FxHashMap::with_capacity_and_hasher(256, Default::default());
 
-        let db_open_start = std::time::Instant::now();
-        let conn =
-            Connection::open(db_path).context("Failed to open database for preloading clicks")?;
-
-        // Configure SQLite for better concurrency
-        conn.execute_batch(
-            "PRAGMA journal_mode = WAL;
-             PRAGMA busy_timeout = 5000;
-             PRAGMA synchronous = NORMAL;",
-        )?;
-
-        log::info!(
-            "TIMING {{\"op\":\"db_open\",\"ms\":{}}}",
-            db_open_start.elapsed().as_secs_f64() * 1000.0
-        );
-
         let query_start = std::time::Instant::now();
-        // The first `action` clause is redundant and is what lets this reach
-        // `idx_events_engagement`. SQLite will only use a partial index when
-        // the query's WHERE provably implies the index's, and it does not work
-        // out that a two-item IN list implies the three-item one the index was
-        // built with. Without this line the query is a full table scan.
-        // `db::plan_tests` fails if it ever stops being used.
-        let mut stmt = conn.prepare(
-            "SELECT full_path, timestamp, query, episode_queries
-             FROM events
-             WHERE action IN ('click', 'scroll', 'startup_visit')
-               AND action IN ('click', 'scroll')
-               AND timestamp >= ?1",
-        )?;
-
-        let rows = stmt.query_map([thirty_days_ago_ts], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
-            ))
-        })?;
-        log::info!(
-            "TIMING {{\"op\":\"db_query_prepare\",\"ms\":{}}}",
-            query_start.elapsed().as_secs_f64() * 1000.0
-        );
-
-        let collect_start = std::time::Instant::now();
-        let rows: Vec<(String, i64, String, Option<String>)> =
-            rows.collect::<Result<Vec<_>, _>>()?;
+        let rows = db.engagements_since(thirty_days_ago_ts)?;
         log::info!(
             "TIMING {{\"op\":\"collect_rows\",\"ms\":{},\"count\":{}}}",
-            collect_start.elapsed().as_secs_f64() * 1000.0,
+            query_start.elapsed().as_secs_f64() * 1000.0,
             rows.len()
         );
 
         let indexing_start = std::time::Instant::now();
         let row_count = rows.len();
         let total_clicks = row_count; // Total number of engagement events (clicks + scrolls)
-        for (path, timestamp, query, episode_queries_json) in rows {
+        for db::Engagement {
+            full_path: path,
+            timestamp,
+            query,
+            episode_queries: episode_queries_json,
+        } in rows
+        {
             let click_event = ClickEvent { timestamp };
 
             // Index by (query, file_path) first
@@ -859,7 +813,8 @@ mod tests {
             .join("psychic");
         let db_path = Database::get_db_path(&data_dir);
 
-        let ranker = Ranker::new(&model_path, &db_path);
+        let db = Database::new(&db_path).expect("open db");
+        let ranker = Ranker::new(&model_path, &db);
         match &ranker {
             Ok(_) => println!("✓ Ranker loaded successfully"),
             Err(e) => {

@@ -19,6 +19,15 @@ const HISTORY_LOOKBACK_DAYS: i64 = 365;
 /// ordered most-recent-first, so hitting the cap drops the stalest paths.
 const HISTORY_MAX_PATHS: usize = 2_000;
 
+/// One click or scroll, as the ranker wants it.
+#[derive(Debug, Clone)]
+pub struct Engagement {
+    pub full_path: String,
+    pub timestamp: i64,
+    pub query: String,
+    pub episode_queries: Option<String>,
+}
+
 pub struct FileMetadata {
     pub relative_path: String,
     pub full_path: String,
@@ -75,12 +84,22 @@ pub struct EventData<'a> {
     pub episode_queries: Option<&'a str>, // JSON array of queries in this episode
 }
 
+/// Databases whose schema this process has already set up.
+///
+/// A `Connection` is `Send` but not `Sync`, so every thread that touches the
+/// database needs its own - that part is not waste. Re-running `CREATE TABLE IF
+/// NOT EXISTS` and the migration down each of them is: it cost about 700us an
+/// open, for work that can only do something the first time.
+static PREPARED: std::sync::Mutex<Option<std::collections::HashSet<PathBuf>>> =
+    std::sync::Mutex::new(None);
+
 pub struct Database {
     conn: Connection,
 }
 
 impl Database {
     pub fn new(db_path: &Path) -> Result<Self> {
+        let opened_at = std::time::Instant::now();
         let conn = Connection::open(db_path).context("Failed to open database")?;
 
         // Configure SQLite for better concurrency
@@ -90,6 +109,34 @@ impl Database {
              PRAGMA synchronous = NORMAL;",
         )?;
 
+        // Schema and migration are per *file*, not per connection - except that
+        // `:memory:` is not a file. Every in-memory connection is its own
+        // database that happens to share the name, so remembering it would
+        // leave the second one empty. Tests live on that.
+        let shared_by_path = db_path != Path::new(":memory:") && db_path != Path::new("");
+        let first_time = !shared_by_path || {
+            let mut prepared = PREPARED.lock().expect("schema registry is not poisoned");
+            prepared
+                .get_or_insert_with(Default::default)
+                .insert(db_path.to_path_buf())
+        };
+        if first_time {
+            Self::prepare_schema(&conn)?;
+        }
+
+        log::info!(
+            "TIMING {{\"op\":\"db_open\",\"ms\":{},\"schema\":{}}}",
+            opened_at.elapsed().as_secs_f64() * 1000.0,
+            first_time
+        );
+
+        Ok(Database { conn })
+    }
+
+    /// Create what is missing and bring what is there up to date.
+    ///
+    /// Runs once per database file per process; see [`PREPARED`].
+    fn prepare_schema(conn: &Connection) -> Result<()> {
         // Create tables if they don't exist
         conn.execute(
             "CREATE TABLE IF NOT EXISTS events (
@@ -137,9 +184,7 @@ impl Database {
             [],
         )?;
 
-        Self::migrate(&conn)?;
-
-        Ok(Database { conn })
+        Self::migrate(conn)
     }
 
     /// Bring an existing database up to what the code above expects.
@@ -384,6 +429,40 @@ impl Database {
             .collect::<Result<Vec<String>, _>>()?;
 
         Ok(paths)
+    }
+
+    /// Every click and scroll since `cutoff`, for the ranker's indexes.
+    ///
+    /// The SQL lives here, beside the index it depends on and the plan test
+    /// that checks it is used, rather than in `ranker.rs` with its own
+    /// connection and its own copy of the pragmas.
+    ///
+    /// **The first `action` clause is redundant and load-bearing.** SQLite uses
+    /// a partial index only when the query's WHERE provably implies the
+    /// index's, and it does not work out that a two-item `IN` list implies the
+    /// three-item one `idx_events_engagement` was built with. Without that line
+    /// this is a full table scan. See `plan_tests`.
+    pub fn engagements_since(&self, cutoff: i64) -> Result<Vec<Engagement>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT full_path, timestamp, query, episode_queries
+             FROM events
+             WHERE action IN ('click', 'scroll', 'startup_visit')
+               AND action IN ('click', 'scroll')
+               AND timestamp >= ?1",
+        )?;
+
+        let rows = stmt
+            .query_map([cutoff], |row| {
+                Ok(Engagement {
+                    full_path: row.get(0)?,
+                    timestamp: row.get(1)?,
+                    query: row.get(2)?,
+                    episode_queries: row.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(rows)
     }
 
     /// Count what is in the database, for the debug pane.

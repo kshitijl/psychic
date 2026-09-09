@@ -493,10 +493,30 @@ Filter+rank is ~2ms per keystroke and is not the problem.
   store fuzzy score on a small wrapper). `Episode` is a Vec<String> with a
   contains check; inline into `Analytics`. `Subsession.created_at` is a
   jiff Timestamp used for a 200ms debounce; use `Instant`.
-- **S4. One database open per thread.** `Database::new` runs six times at
-  startup, each executing three CREATE TABLE, an index, and the WAL pragma.
-  `Ranker::load_clicks` has its own raw `Connection::open` with the pragmas
-  copy-pasted; take a `&Database`.
+- **S4. One database open per thread.** DONE (2026-09-09), with the caveat
+  that it bought no measurable speed. `Ranker::load_clicks` no longer opens a
+  raw `Connection` with its own copy of the pragmas: the query moved to
+  `Database::engagements_since`, beside the index it needs and the plan test
+  that checks it. The worker holds one connection for its lifetime instead of
+  opening one per reload and per hide. `App::new` reads the hidden prefixes
+  from the connection it already has rather than `spawn` opening a second one
+  on the same thread, which removes one open per launch (5 -> 4). Schema
+  creation and migration now run once per database file per process rather
+  than down every connection (`PREPARED`; `:memory:` excluded, since each such
+  connection is its own database and caching it left the second one empty -
+  eight tests caught that).
+  Measured, median of 5, real database: `worker_state_new_total` 4.42ms ->
+  4.57ms, `first_query_complete` 8.87ms -> 8.55ms, RSS 291.7MB -> 292.4MB.
+  All noise: the schema work was ~0.2ms per open after the first, not the
+  ~0.7ms `App::new`'s old log line suggested. Do this for the tidiness, not
+  the speed.
+  `lsof` handles on events.db went 3 -> 4 while *live connections stayed at
+  2*. The extra one is a descriptor SQLite parks rather than closes when
+  another connection holds a lock (sqlite3.c: "that would clear those
+  locks"), because POSIX advisory locks are per-process. Verified it is not
+  the worker's held connection by building a variant without it: still 4.
+  Explained in how-it-works.md under "Why the same database is opened several
+  times".
 - **S5. Deduplicate terminal suspension.** `suspend_tui_for_editor` and
   `suspend_tui_and_run_shell` are identical except the Command;
   `cleanup_terminal` is a third copy of the teardown. One

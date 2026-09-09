@@ -157,10 +157,16 @@ impl App {
         let session_id =
             std::env::var("PSYCHIC_SESSION_ID").unwrap_or_else(|_| "unknown".to_string());
 
-        let db_start = Instant::now();
         let db_path = crate::db::Database::get_db_path(data_dir);
         let db = crate::db::Database::new(&db_path)?;
-        log::debug!("Database initialization took {:?}", db_start.elapsed());
+
+        // Read while we have it open, before it moves into `Analytics`. The
+        // worker needs these to start its walker, and opening a second
+        // connection on this thread to fetch them would be silly.
+        let hidden_prefixes = db.get_hidden_prefixes().unwrap_or_else(|e| {
+            log::error!("Failed to load hidden directories: {}", e);
+            Vec::new()
+        });
 
         // Create analytics tracker
         let analytics = Analytics::new(session_id, db, options.no_click_logging);
@@ -170,6 +176,7 @@ impl App {
             data_dir,
             event_tx.clone(),
             search_worker::WorkerOptions {
+                hidden_prefixes,
                 no_click_loading: options.no_click_loading,
                 no_model: options.no_model,
                 respect_gitignore: options.respect_gitignore,

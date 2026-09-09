@@ -284,6 +284,47 @@ of them inserts a session row that would fail against the older, wider table. It
 `VACUUM`s only when it actually dropped something, which took 83ms once on a
 67MB database.
 
+### Why the same database is opened several times
+
+A `rusqlite::Connection` is `Send` but **not `Sync`**: it can be moved to another
+thread but not shared with one. Putting it behind a mutex would not help either,
+it would just serialise the UI's impression logging against the worker's queries
+and the retrainer's full-table read. So a thread that needs the database opens
+its own. That is the design, not an oversight.
+
+Who holds one, on a normal launch:
+
+| | | |
+|---|---|---|
+| main thread | `Analytics` | for the life of the process; every click, scroll and impression |
+| worker thread | `WorkerState.db` | for the life of the thread; click history, hiding, reloads |
+| history loader | transient | one query and a `stat` per path, then gone |
+| context thread | transient | one session row and one startup visit |
+| retrainer | transient | reads every event to build training data |
+
+What is *not* per connection is the schema. `CREATE TABLE IF NOT EXISTS` and the
+migration used to run down every one of them; they now run once per database
+file per process, tracked in `PREPARED`. In-memory databases are excluded,
+because every `:memory:` connection is a separate database that happens to share
+the name, and remembering it would leave the second one empty.
+
+**The file descriptor count is not the connection count.** `lsof` shows four
+handles on `events.db` where only two connections are live (one `-shm` each).
+The others are descriptors SQLite has parked rather than closed, from its unix
+layer:
+
+> If there are outstanding locks, do not actually close the file just yet
+> because that would clear those locks. Instead, add the file descriptor to
+> `pInode->pUnused` list. It will be automatically closed when the last lock is
+> cleared.
+
+POSIX advisory locks belong to the process, not the descriptor, so closing any
+descriptor for a file drops every lock the process holds on it. A transient
+connection that closes while another still holds a lock therefore leaves its
+descriptor parked until the last connection goes. Counting `lsof` lines
+overstates how many connections are open, and closing one *fewer* connection can
+leave *more* parked descriptors.
+
 **Session ID:** Random 64-bit integer (not UUID).
 Why: UUIDs are 36 chars. 64-bit int gives 18 quintillion IDs, more compact.
 

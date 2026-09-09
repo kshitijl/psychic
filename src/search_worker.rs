@@ -302,6 +302,13 @@ impl FileInfo {
 /// A struct rather than three loose bools at the call site, which is a
 /// transposition waiting to happen.
 pub struct WorkerOptions {
+    /// Every directory the user has hidden.
+    ///
+    /// Passed in rather than read here: the caller already has a connection
+    /// open on this thread, and the walker needs these before `WorkerState`
+    /// exists, so reading them here meant a second connection to the same
+    /// database from the same thread.
+    pub hidden_prefixes: Vec<PathBuf>,
     /// Skip click history and previously interacted files.
     pub no_click_loading: bool,
     /// Skip the ranking model.
@@ -325,16 +332,7 @@ where
 
     let data_dir = data_dir.to_path_buf();
 
-    // Read once here and hand to both threads: the walker needs it before
-    // WorkerState exists, and a second connection on the startup path would
-    // buy nothing. The table only grows when the user hides something, so it
-    // is a handful of rows.
-    let hidden_prefixes = Database::new(&Database::get_db_path(&data_dir))
-        .and_then(|db| db.get_hidden_prefixes())
-        .unwrap_or_else(|e| {
-            log::error!("Failed to load hidden directories: {}", e);
-            Vec::new()
-        });
+    let hidden_prefixes = options.hidden_prefixes;
     log::info!("Loaded {} hidden directories", hidden_prefixes.len());
 
     let canonical_cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.clone());
@@ -415,7 +413,10 @@ struct WorkerState {
     root: PathBuf,
     ranker: ranker::Ranker,
     model_path: PathBuf,
-    db_path: PathBuf,
+    /// The worker's own connection, opened once. A `Connection` is `Send` but
+    /// not `Sync`, so it cannot be shared with the other threads that need one -
+    /// but this thread should not keep opening a new one either.
+    db: Database,
     walker_command_tx: Sender<WalkerCommand>,
     /// How long the last filter-and-rank took, reported back with its results.
     last_rank_ms: f64,
@@ -445,6 +446,8 @@ impl WorkerState {
         // path. So do them at once. The ranker stays on *this* thread because a
         // LightGBM `Booster` holds raw pointers and is not `Send`; what crosses
         // the boundary is a `Vec<FileInfo>`, which is.
+        let db = Database::new(&db_path)?;
+
         let (ranker, historical) = std::thread::scope(|scope| {
             let loader = (!no_click_loading).then(|| {
                 let db_path = db_path.clone();
@@ -455,9 +458,9 @@ impl WorkerState {
             let ranker_start = std::time::Instant::now();
             let ranker = if no_click_loading || _no_model {
                 // Skip loading model and clicks if either flag is set
-                ranker::Ranker::new_empty(&db_path)
+                ranker::Ranker::new_empty(&db)
             } else {
-                Self::load_ranker(&model_path, &db_path)
+                Self::load_ranker(&model_path, &db)
             };
             log::info!(
                 "TIMING {{\"op\":\"ranker_init\",\"ms\":{}}}",
@@ -501,7 +504,7 @@ impl WorkerState {
             root: canonical_root,
             ranker,
             model_path,
-            db_path,
+            db,
             walker_command_tx,
             last_rank_ms: 0.0,
             hidden_prefixes,
@@ -583,7 +586,7 @@ impl WorkerState {
             return Ok(false);
         }
 
-        Database::new(&self.db_path)?.hide_prefix(&path)?;
+        self.db.hide_prefix(&path)?;
         log::info!("Worker: hiding {:?}", path);
         self.hidden_prefixes.push(path);
         self.recompute_hidden();
@@ -841,16 +844,16 @@ impl WorkerState {
     /// model atomically so a half-written file should not arise, but a model
     /// truncated by a killed older build, a full disk, or an interrupted copy
     /// would otherwise brick startup until the user knew to delete it.
-    fn load_ranker(model_path: &Path, db_path: &Path) -> Result<ranker::Ranker> {
+    fn load_ranker(model_path: &Path, db: &Database) -> Result<ranker::Ranker> {
         if !model_path.exists() {
             log::info!(
                 "Model file not found at {:?}, using empty ranker",
                 model_path
             );
-            return ranker::Ranker::new_empty(db_path);
+            return ranker::Ranker::new_empty(db);
         }
 
-        match ranker::Ranker::new(model_path, db_path) {
+        match ranker::Ranker::new(model_path, db) {
             Ok(ranker) => {
                 log::info!("Loaded ranking model from {:?}", model_path);
                 Ok(ranker)
@@ -862,21 +865,21 @@ impl WorkerState {
                     model_path,
                     e
                 );
-                ranker::Ranker::new_empty(db_path)
+                ranker::Ranker::new_empty(db)
             }
         }
     }
 
     fn reload_model(&mut self) -> Result<()> {
         log::info!("Worker: Reloading model from disk");
-        self.ranker = Self::load_ranker(&self.model_path, &self.db_path)?;
+        self.ranker = Self::load_ranker(&self.model_path, &self.db)?;
         log::info!("Worker: Model reloaded successfully");
         Ok(())
     }
 
     fn reload_clicks(&mut self) -> Result<()> {
         log::info!("Worker: Reloading click data");
-        let (clicks, total_clicks) = ranker::Ranker::load_clicks(&self.db_path)?;
+        let (clicks, total_clicks) = ranker::Ranker::load_clicks(&self.db)?;
         self.ranker.clicks = clicks;
         self.ranker.total_clicks = total_clicks;
         log::info!(
@@ -1436,7 +1439,8 @@ mod load_ranker_tests {
     fn test_missing_model_falls_back_to_simple_ranking() {
         let dir = TempDataDir::new("missing-model");
 
-        let ranker = WorkerState::load_ranker(&dir.model_path(), &dir.db_path())
+        let db = crate::db::Database::new(&dir.db_path()).expect("open test db");
+        let ranker = WorkerState::load_ranker(&dir.model_path(), &db)
             .expect("A missing model must not stop psychic from starting");
 
         assert!(
@@ -1451,7 +1455,8 @@ mod load_ranker_tests {
         // What a write interrupted partway through leaves behind.
         std::fs::write(dir.model_path(), "").expect("Failed to write empty model");
 
-        let ranker = WorkerState::load_ranker(&dir.model_path(), &dir.db_path())
+        let db = crate::db::Database::new(&dir.db_path()).expect("open test db");
+        let ranker = WorkerState::load_ranker(&dir.model_path(), &db)
             .expect("An empty model file must not stop psychic from starting");
 
         assert!(!ranker.has_model(), "The unusable model was not loaded");
@@ -1463,7 +1468,8 @@ mod load_ranker_tests {
         std::fs::write(dir.model_path(), "this is not a LightGBM model")
             .expect("Failed to write corrupt model");
 
-        let ranker = WorkerState::load_ranker(&dir.model_path(), &dir.db_path())
+        let db = crate::db::Database::new(&dir.db_path()).expect("open test db");
+        let ranker = WorkerState::load_ranker(&dir.model_path(), &db)
             .expect("A corrupt model must not stop psychic from starting");
 
         assert!(!ranker.has_model(), "The unusable model was not loaded");
