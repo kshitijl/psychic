@@ -460,39 +460,28 @@ Filter+rank is ~2ms per keystroke and is not the problem.
 
 #### Bugs
 
-- **B1. Requests silently dropped.** `drain_latest_update_request`
-  consumes the next request and discards it if it is not an UpdateQuery.
-  Typing then Enter while the worker is busy eats the `ChangeCwd`: UI shows
-  the new dir, worker still serves the old one. Fix: drain into a Vec,
-  coalesce only consecutive UpdateQuery, and process the rest in order.
-- **B2. After navigating, the cwd row shows as "/ (cwd)" with no name.**
-  Seen in practice. Two halves, same root cause: only `WorkerState::new`
-  knows how to add the root row. `change_cwd` (`search_worker.rs` ~857)
-  does `retain(|f| f.origin != CwdWalker)`, which drops the root row `new`
-  added (it has `CwdWalker` origin) along with the walked files, and the
-  walker never reports the root itself (`walker.rs` ~89), so nothing adds
-  the new root back. With the zsh `chpwd` hook every `cd` logs a
-  `startup_visit`, so the new cwd is almost always a *historical* entry and
-  survives the retain; the display-name loop right after (~864) then does
-  `full_path.strip_prefix(&self.root)`, which for the root itself yields
-  `""`. Renderer appends `/` and ` (cwd)` -> "/ (cwd)". Without the hook
-  (dir never visited) the row is simply missing. Fix: extract one
-  `fn root_row(root: &Path) -> FileInfo` (or `display_name_for(path, root)`
-  with the `path == root` branch, used by `new`, `from_history` and
-  `change_cwd`); after the retain, upsert the new root through it. Test:
-  build a worker, `change_cwd` into a historical dir and into a fresh one,
-  assert the row for the new root exists with `display_name == dir name`.
-- **B3. Panic on non-ASCII log line.** `render.rs` ~line 1008 does
-  `&log_line[..(max_len - 3)]`, a byte slice; a multibyte char at that
-  boundary panics the UI with the debug pane open. Use `chars().take()`.
-  Same class: cursor x uses `query.len()` (bytes), `truncate_path` and the
-  list padding use `.len()`; use char/width counts.
-- **B4. Worker death is silent.** `.expect("Feature computation failed")`
-  inside the `par_iter` and the `assert!` in `WorkerState::hide` kill the
-  worker thread; the UI keeps running with frozen results. Have the main
-  loop check `worker_handle.is_finished()` on each event (or send a
-  `WorkerDied` from a drop guard) and exit with an error. `Feature::compute`
-  should return `f64`, not `Result`; nothing can fail.
+- **B1-B4. DONE (2026-09-09).** One commit each.
+  * **B1** `stop the worker throwing away requests it did not expect`.
+    Draining kept the newest `UpdateQuery` and discarded anything else it
+    found, so typing then pressing Enter on a directory while the worker was
+    busy ate the `ChangeCwd`. Requests are queued and processed in order now,
+    collapsing only *consecutive* query updates.
+  * **B2** `give the current directory a row after navigating`. There is one
+    `display_name_for(path, root)` and one `ensure_root_row()`, called by both
+    `new` and `change_cwd`. A directory you had visited before is also
+    reclassified from history to where-you-are. `change_cwd` canonicalises its
+    root like `new` does.
+  * **B3** `measure text in columns`. The debug pane's log truncation was a
+    byte slice and panicked the UI on `end byte index 57 is not a char
+    boundary; it is inside 'é'`. Same mistake in the cursor position
+    (`query.len()`) and the file list's timestamp padding. `path_display` gained
+    `display_width` and `truncate_to_width`; the test reproduces the original
+    panic.
+  * **B4** `notice when the search worker dies`. The main loop checks
+    `worker_has_died()` after each event and exits with a message; the terminal
+    is restored first. `Feature::compute` returns `f64` rather than a `Result`
+    no implementation could fail, which removes the `.expect()` that sat inside
+    the rayon loop.
 - **B5. Train/serve skew.** Training computes `is_dir` by stat-ing today's
   filesystem (`features.rs` `full_path.is_dir()`, 80k syscalls per retrain),
   so a deleted directory trains as a file. Add an `is_dir` column to events,
