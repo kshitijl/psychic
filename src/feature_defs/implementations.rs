@@ -1,7 +1,5 @@
 use super::ClickEvent;
 use super::schema::{Feature, FeatureInputs, FeatureType, Monotonicity};
-use fuzzy_matcher::FuzzyMatcher;
-use fuzzy_matcher::skim::SkimMatcherV2;
 use jiff::Span;
 use std::path::Path;
 
@@ -382,16 +380,12 @@ impl Feature for ClicksForThisQuery {
     }
 
     fn compute(&self, inputs: &FeatureInputs) -> f64 {
-        let full_path_str = inputs.full_path.to_string_lossy().to_string();
-        let key = (inputs.query.to_string(), full_path_str);
-
-        let clicks = inputs
-            .clicks_by_query_and_file
-            .get(&key)
+        let full_path = inputs.full_path.to_string_lossy();
+        inputs
+            .clicks_for_query
+            .and_then(|by_path| by_path.get(full_path.as_ref()))
             .map(|clicks| clicks.len())
-            .unwrap_or(0);
-
-        clicks as f64
+            .unwrap_or(0) as f64
     }
 }
 
@@ -415,12 +409,10 @@ impl Feature for EngagementsInEpisodeWithQuery {
     }
 
     fn compute(&self, inputs: &FeatureInputs) -> f64 {
-        let full_path_str = inputs.full_path.to_string_lossy().to_string();
-        let key = (inputs.query.to_string(), full_path_str);
-
+        let full_path = inputs.full_path.to_string_lossy();
         let engagements = inputs
-            .engagements_by_episode_query_and_file
-            .get(&key)
+            .engagements_for_query
+            .and_then(|by_path| by_path.get(full_path.as_ref()))
             .map(|engagements| engagements.len())
             .unwrap_or(0);
 
@@ -468,18 +460,14 @@ impl Feature for FuzzyScore {
     }
 
     fn compute(&self, inputs: &FeatureInputs) -> f64 {
-        // Return 0.0 for empty queries (no fuzzy match signal)
+        // The caller has already matched this file against the query - the
+        // filter did it to decide the file was a candidate at all. Redoing it
+        // here meant building a fresh SkimMatcherV2 per file per keystroke and
+        // running the match twice.
         if inputs.query.is_empty() {
-            return 0.0;
+            return 0.0; // no fuzzy match signal
         }
-
-        // Compute fuzzy match score using SkimMatcherV2
-        let matcher = SkimMatcherV2::default();
-        let score = matcher
-            .fuzzy_match(inputs.file_path, inputs.query)
-            .unwrap_or(0); // Return 0 if no match
-
-        score as f64
+        inputs.fuzzy_score as f64
     }
 }
 

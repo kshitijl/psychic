@@ -923,6 +923,29 @@ pub struct ClickData {
 }
 ```
 
+**Query-keyed indexes are nested, and resolved once per query.**
+`clicks_by_query_and_file` and `engagements_by_episode_query_and_file` are
+`query -> path -> events`, not `(query, path) -> events`. A ranking pass has one
+query and hundreds of files, so `rank_files` looks the query up once - that is
+what `QueryClicks` holds - and each file is then a lookup by path. Under the flat
+key, two features each built a `(String, String)` key for every file on every
+keystroke: four allocations per file, 972 per query here.
+
+**The fuzzy score is passed in, not recomputed.** `filter_and_rank` matches every
+file against the query to decide whether it is a candidate at all, and then
+`FuzzyScore::compute` used to build a fresh `SkimMatcherV2` and run the same
+match again, per file, per keystroke. The score the filter already has now rides
+along on `FileCandidate` and through `FeatureInputs`. Training has no filter, so
+`features.rs` does the match itself, against the same string, with one matcher
+shared across the whole pass rather than one per row. Checked by generating the
+training CSV with the previous binary and this one from the same database: byte
+for byte identical.
+
+The one wrinkle is the empty query. The filter scores it `i64::MAX` - everything
+matches - while the feature reports 0, because "no query" carries no match
+signal. `FuzzyScore::compute` still short-circuits on an empty query before
+looking at the number it was handed, so that stays true.
+
 **`FileCandidate` borrows.** It is built fresh for every keystroke, one per
 file, and owning its display name and path meant two allocations per file per
 query - 486 of them on a 243-file query here. It holds `&'a str` and `&'a Path`

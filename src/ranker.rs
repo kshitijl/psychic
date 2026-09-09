@@ -62,8 +62,14 @@ pub struct FeatureImportance {
 pub struct ClickData {
     pub clicks_by_file: FxHashMap<String, Vec<ClickEvent>>,
     pub clicks_by_parent_dir: FxHashMap<PathBuf, Vec<ClickEvent>>,
-    pub clicks_by_query_and_file: FxHashMap<(String, String), Vec<ClickEvent>>,
-    pub engagements_by_episode_query_and_file: FxHashMap<(String, String), Vec<ClickEvent>>,
+    /// query -> path -> events. Nested rather than keyed by `(query, path)`
+    /// because a ranking pass has one query and hundreds of paths: the query is
+    /// looked up once in `rank_files`, and each file is then a lookup by path
+    /// alone. The flat key had to be built - two `String`s - for every file on
+    /// every keystroke.
+    pub clicks_by_query_and_file: FxHashMap<String, FxHashMap<String, Vec<ClickEvent>>>,
+    pub engagements_by_episode_query_and_file:
+        FxHashMap<String, FxHashMap<String, Vec<ClickEvent>>>,
 }
 
 pub struct Ranker {
@@ -208,11 +214,11 @@ impl Ranker {
         // Pre-allocate with reasonable capacity to avoid rehashing
         let mut clicks_by_file: FxHashMap<String, Vec<ClickEvent>> =
             FxHashMap::with_capacity_and_hasher(128, Default::default());
-        let mut clicks_by_query_and_file: FxHashMap<(String, String), Vec<ClickEvent>> =
+        let mut clicks_by_query_and_file: FxHashMap<String, FxHashMap<String, Vec<ClickEvent>>> =
             FxHashMap::with_capacity_and_hasher(256, Default::default());
         let mut engagements_by_episode_query_and_file: FxHashMap<
-            (String, String),
-            Vec<ClickEvent>,
+            String,
+            FxHashMap<String, Vec<ClickEvent>>,
         > = FxHashMap::with_capacity_and_hasher(256, Default::default());
 
         let query_start = std::time::Instant::now();
@@ -234,9 +240,11 @@ impl Ranker {
         {
             let click_event = ClickEvent { timestamp };
 
-            // Index by (query, file_path) first
+            // Index by query, then by path
             clicks_by_query_and_file
-                .entry((query, path.clone()))
+                .entry(query)
+                .or_default()
+                .entry(path.clone())
                 .or_default()
                 .push(click_event);
 
@@ -252,7 +260,9 @@ impl Ranker {
             {
                 for episode_query in episode_queries {
                     engagements_by_episode_query_and_file
-                        .entry((episode_query, path.clone()))
+                        .entry(episode_query)
+                        .or_default()
+                        .entry(path.clone())
                         .or_default()
                         .push(click_event);
                 }
@@ -320,11 +330,13 @@ impl Ranker {
     fn compute_simple_score(&self, file: &FileCandidate<'_>, current_timestamp: i64) -> f64 {
         // Count clicks in last 7 days
         let seven_days_ago = current_timestamp - (7 * 24 * 60 * 60);
-        let full_path_str = file.full_path.to_string_lossy().to_string();
+        // Borrowed: this runs for every file on every keystroke, and an owned
+        // copy of the path bought nothing.
+        let full_path_str = file.full_path.to_string_lossy();
         let clicks_last_7_days = self
             .clicks
             .clicks_by_file
-            .get(&full_path_str)
+            .get(full_path_str.as_ref())
             .map(|clicks| {
                 clicks
                     .iter()
@@ -408,7 +420,7 @@ impl Ranker {
         // Always compute features for all files in parallel (for debugging visibility)
         let compute_start = Instant::now();
 
-        let clicks = &self.clicks;
+        let clicks = QueryClicks::resolve(&self.clicks, query);
 
         // Careful with lazily-initialized globals inside this loop. Feature code
         // runs once per file across every core, so the *first* call after launch
@@ -435,7 +447,7 @@ impl Ranker {
                         file,
                         current_timestamp,
                         cwd,
-                        clicks,
+                        &clicks,
                         &mut per_feature,
                     ));
                     (features, per_feature)
@@ -579,6 +591,28 @@ pub fn features_to_map(features: &[f64]) -> FxHashMap<String, f64> {
         .collect()
 }
 
+/// The click history with one query's slice already found.
+///
+/// Resolved once per `rank_files` rather than once per file. The two
+/// query-keyed indexes are nested query -> path -> events, so with the query
+/// resolved a feature is a lookup by path; before this, each feature built a
+/// `(String, String)` key for every file on every keystroke.
+struct QueryClicks<'a> {
+    all: &'a ClickData,
+    clicks_for_query: Option<&'a FxHashMap<String, Vec<ClickEvent>>>,
+    engagements_for_query: Option<&'a FxHashMap<String, Vec<ClickEvent>>>,
+}
+
+impl<'a> QueryClicks<'a> {
+    fn resolve(clicks: &'a ClickData, query: &str) -> Self {
+        QueryClicks {
+            all: clicks,
+            clicks_for_query: clicks.clicks_by_query_and_file.get(query),
+            engagements_for_query: clicks.engagements_by_episode_query_and_file.get(query),
+        }
+    }
+}
+
 /// Milliseconds elapsed since `start`, the unit every TIMING field is in.
 fn ms_since(start: Instant) -> f64 {
     start.elapsed().as_secs_f64() * 1000.0
@@ -632,7 +666,7 @@ fn compute_features(
         file,
         current_timestamp,
         cwd,
-        clicks,
+        &QueryClicks::resolve(clicks, query),
         &mut per_feature,
     )
 }
@@ -647,7 +681,7 @@ fn compute_features_into(
     file: &FileCandidate<'_>,
     current_timestamp: i64,
     cwd: &Path,
-    clicks: &ClickData,
+    clicks: &QueryClicks<'_>,
     per_feature: &mut [Duration],
 ) -> Vec<f64> {
     assert_eq!(
@@ -664,13 +698,14 @@ fn compute_features_into(
         mtime: file.mtime,
         file_size: file.file_size,
         cwd,
-        clicks_by_file: &clicks.clicks_by_file,
-        clicks_by_parent_dir: &clicks.clicks_by_parent_dir,
-        clicks_by_query_and_file: &clicks.clicks_by_query_and_file,
-        engagements_by_episode_query_and_file: &clicks.engagements_by_episode_query_and_file,
+        clicks_by_file: &clicks.all.clicks_by_file,
+        clicks_by_parent_dir: &clicks.all.clicks_by_parent_dir,
+        clicks_for_query: clicks.clicks_for_query,
+        engagements_for_query: clicks.engagements_for_query,
         current_timestamp,
         is_from_walker: file.is_from_walker,
         is_dir: file.is_dir,
+        fuzzy_score: file.fuzzy_score,
     };
 
     // Compute all features using the registry, tracking time for each
@@ -966,7 +1001,12 @@ mod tests {
             file_size: Some(12_288),
             is_from_walker: true,
             is_dir: false,
-            fuzzy_score: 100,
+            // What the filter would have produced for this pair: "foo/bar.txt"
+            // does not match "test", so the matcher returns None and the
+            // candidate scores 0. The fixture used to say 100 while the feature
+            // recomputed the match and reported 0 - which went unnoticed only
+            // because nothing read the candidate's own score.
+            fuzzy_score: 0,
         };
 
         // Create synthetic click data
@@ -1005,10 +1045,10 @@ mod tests {
             }
         }
 
-        // Build (query, file) index - add 2 query-specific clicks
-        let mut clicks_by_query_and_file = FxHashMap::default();
-        clicks_by_query_and_file.insert(
-            (query.to_string(), "/tmp/foo/bar.txt".to_string()),
+        // Build query -> path index - add 2 query-specific clicks
+        let mut for_this_query = FxHashMap::default();
+        for_this_query.insert(
+            "/tmp/foo/bar.txt".to_string(),
             vec![
                 ClickEvent {
                     timestamp: 1700000000,
@@ -1018,6 +1058,8 @@ mod tests {
                 },
             ],
         );
+        let mut clicks_by_query_and_file = FxHashMap::default();
+        clicks_by_query_and_file.insert(query.to_string(), for_this_query);
 
         // Build episode engagement index
         let engagements_by_episode_query_and_file = FxHashMap::default();

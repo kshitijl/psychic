@@ -32,11 +32,19 @@ pub struct FeatureInputs<'a> {
     pub cwd: &'a Path,
     pub clicks_by_file: &'a FxHashMap<String, Vec<ClickEvent>>,
     pub clicks_by_parent_dir: &'a FxHashMap<PathBuf, Vec<ClickEvent>>,
-    pub clicks_by_query_and_file: &'a FxHashMap<(String, String), Vec<ClickEvent>>,
-    pub engagements_by_episode_query_and_file: &'a FxHashMap<(String, String), Vec<ClickEvent>>,
+    /// Clicks on each path *for this query*, resolved once by the caller rather
+    /// than by every feature for every file. `None` when the query has never
+    /// been engaged with, which is the common case.
+    pub clicks_for_query: Option<&'a FxHashMap<String, Vec<ClickEvent>>>,
+    /// The same, for engagements anywhere in an episode containing this query.
+    pub engagements_for_query: Option<&'a FxHashMap<String, Vec<ClickEvent>>>,
     pub current_timestamp: i64,
     pub is_from_walker: bool,
     pub is_dir: bool,
+    /// How well the file matched the query, as the caller already computed it.
+    /// Inference gets it from the filter, which has just done this match;
+    /// training computes it once per row with a shared matcher.
+    pub fuzzy_score: i64,
 }
 
 /// Trait that all features must implement

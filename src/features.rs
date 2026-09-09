@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
 use csv::Writer;
+use fuzzy_matcher::FuzzyMatcher;
+use fuzzy_matcher::skim::SkimMatcherV2;
 use rusqlite::Connection;
 use rustc_hash::FxHashMap;
 use std::collections::HashMap;
@@ -39,8 +41,9 @@ pub enum OutputFormat {
 struct Accumulator {
     clicks_by_file: FxHashMap<String, Vec<ClickEvent>>,
     clicks_by_parent_dir: FxHashMap<std::path::PathBuf, Vec<ClickEvent>>,
-    clicks_by_query_and_file: FxHashMap<(String, String), Vec<ClickEvent>>,
-    engagements_by_episode_query_and_file: FxHashMap<(String, String), Vec<ClickEvent>>,
+    /// query -> path -> events, the same shape `Ranker::load_clicks` builds.
+    clicks_by_query_and_file: FxHashMap<String, FxHashMap<String, Vec<ClickEvent>>>,
+    engagements_by_episode_query_and_file: FxHashMap<String, FxHashMap<String, Vec<ClickEvent>>>,
     // Key: (session_id, subsession_id, full_path)
     pending_impressions: FxHashMap<(String, u64, String), PendingImpression>,
     output_rows: Vec<HashMap<String, String>>,
@@ -89,7 +92,9 @@ impl Accumulator {
 
         // Also index by (query, file_path)
         self.clicks_by_query_and_file
-            .entry((event.query.clone(), event.full_path.clone()))
+            .entry(event.query.clone())
+            .or_default()
+            .entry(event.full_path.clone())
             .or_default()
             .push(click);
 
@@ -99,7 +104,9 @@ impl Accumulator {
         {
             for episode_query in episode_queries {
                 self.engagements_by_episode_query_and_file
-                    .entry((episode_query, event.full_path.clone()))
+                    .entry(episode_query)
+                    .or_default()
+                    .entry(event.full_path.clone())
                     .or_default()
                     .push(click);
             }
@@ -214,11 +221,15 @@ pub fn generate_features(
     all_events.sort_by_key(|e| e.timestamp);
 
     let mut acc = Accumulator::new();
+    // One matcher for the whole pass. Building one per row is what inference
+    // used to do per file per keystroke, and it is not free.
+    let matcher = SkimMatcherV2::default();
 
     for event in &all_events {
         match event.action.as_str() {
             "impression" => {
-                let features = compute_features_from_accumulator(event, &acc, &all_sessions)?;
+                let features =
+                    compute_features_from_accumulator(event, &acc, &all_sessions, &matcher)?;
                 acc.add_impression(event, features);
             }
             "click" => {
@@ -315,6 +326,7 @@ fn compute_features_from_accumulator(
     impression: &Event,
     acc: &Accumulator,
     sessions: &HashMap<String, Session>,
+    matcher: &SkimMatcherV2,
 ) -> Result<HashMap<String, String>> {
     let mut features = HashMap::new();
 
@@ -351,11 +363,23 @@ fn compute_features_from_accumulator(
         cwd,
         clicks_by_file: &acc.clicks_by_file,
         clicks_by_parent_dir: &acc.clicks_by_parent_dir,
-        clicks_by_query_and_file: &acc.clicks_by_query_and_file,
-        engagements_by_episode_query_and_file: &acc.engagements_by_episode_query_and_file,
+        clicks_for_query: acc.clicks_by_query_and_file.get(&impression.query),
+        engagements_for_query: acc
+            .engagements_by_episode_query_and_file
+            .get(&impression.query),
         current_timestamp: impression.timestamp,
         is_from_walker,
         is_dir,
+        // Inference reuses the score the filter already computed; training has
+        // no filter, so it does the same match here - against the same string,
+        // with one matcher shared across every row rather than one per row.
+        fuzzy_score: if impression.query.is_empty() {
+            0
+        } else {
+            matcher
+                .fuzzy_match(&impression.file_path, &impression.query)
+                .unwrap_or(0)
+        },
     };
 
     // Compute all features using the registry
@@ -462,8 +486,13 @@ mod tests {
         for event in &events {
             match event.action.as_str() {
                 "impression" => {
-                    let features = compute_features_from_accumulator(event, &acc, &sessions)
-                        .expect("Failed to compute features");
+                    let features = compute_features_from_accumulator(
+                        event,
+                        &acc,
+                        &sessions,
+                        &SkimMatcherV2::default(),
+                    )
+                    .expect("Failed to compute features");
                     acc.add_impression(event, features);
                 }
                 "click" => {

@@ -188,13 +188,15 @@ Optimizations".
   duplicated `QueryUpdated` sends collapsed into `send_query_updated`, which is
   what guarantees the log-after-send ordering everywhere. **Not done:** a size
   cap or rotation for app.log - see P11.
-- **P5. Query-constant lookups allocate per file.** `ClicksForThisQuery`
-  and `EngagementsInEpisodeWithQuery` build a `(String, String)` key per
-  file. `FuzzyScore` constructs a new `SkimMatcherV2` per file and redoes
-  the match `filter_and_rank` already did. `compute_simple_score` allocates
-  the path string. Fix: key the two query maps as `query -> path -> events`
-  and look the query up once per `rank_files`; pass `fuzzy_score` in via
-  `FeatureInputs` (training computes it, inference reuses the filter's).
+- **P5. Query-constant lookups allocate per file.** DONE (2026-09-09). The two
+  query maps are `query -> path -> events` now, resolved once per `rank_files`
+  into `QueryClicks`; `FuzzyScore` reads the score the filter already computed,
+  carried on `FileCandidate` through `FeatureInputs`, and training computes it
+  once per row with a shared matcher. `compute_simple_score` borrows the path
+  rather than owning it. Training data is byte-identical before and after,
+  checked by generating the CSV with both binaries from the same database.
+  Steady-state filter+rank 1.02 -> 0.96ms, features 0.32 -> 0.28ms, keystroke
+  to redraw 2.66 -> 2.28ms over 60 keystrokes.
 - **P6. `get_slice` is O(results) per row.** `search_worker.rs` ~line 708:
   `file_scores.iter().find(..)` for each of 128 rows. `filtered_files` is
   built from `file_scores` in the same order; index directly and delete
