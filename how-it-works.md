@@ -1046,6 +1046,40 @@ untouched last 10% - the extra rows are worth top-1 0.664 -> 0.698 and MRR
 0.763 -> 0.777, with RMSE 0.131 -> 0.130 and AUC flat. Training takes roughly
 twice as long (~3.5s -> ~6s), in a background thread.
 
+**Rows are weighted by age.** `recency_weights` halves a row's weight every
+`HALF_LIFE_DAYS`, measured from the newest row in the CSV rather than from now,
+so a stale export is not uniformly discounted into noise. The `timestamp` column
+that feeds this is metadata, not a feature: `csv_columns` emits it and
+`prepare_features` drops it before building X.
+
+This costs a little, and was shipped knowingly. Over three rolling-origin folds -
+train on a growing prefix of episodes, early-stop on the next 10%, score the 10%
+after that, 333 held-out episodes in all - the sweep is monotone in how much
+decay is applied:
+
+| weighting | effective rows (last fold) | AUC | top-1 | MRR |
+|---|---|---|---|---|
+| uniform | 45,073 / 45,073 | 0.9611 | 0.7032 | 0.8009 |
+| half-life 365d | 44,219 | 0.9607 | 0.7035 | 0.7976 |
+| **half-life 180d** | **41,294** | **0.9601** | **0.6849** | **0.7900** |
+| half-life 120d | 36,526 | 0.9566 | 0.6790 | 0.7816 |
+| half-life 60d | 20,242 | 0.9571 | 0.6711 | 0.7753 |
+| half-life 30d | 7,730 | 0.9541 | 0.6398 | 0.7545 |
+
+The gentler the decay the better it does, and the damage tracks the effective
+sample size almost exactly. Two things explain it. Recency is already a feature -
+`clicks_last_hour` through `clicks_last_30_days` - so decay adds no information
+the model lacked and only removes rows. And with ~1.2k clicks in the entire
+history, positives are the scarce resource; a 60-day half-life leaves 224
+effective clicks of 1,162, because this developer's history is back-loaded (54%
+of rows are 240+ days old).
+
+180 days is the deliberate trade: 83% of the effective rows, ~2pt of top-1, in
+exchange for insurance the metrics cannot show yet. A week of unusual activity
+keeps a full vote forever under uniform weighting, and any future feature prone
+to memorising specific files has its grip on stale rows loosened automatically.
+Setting `HALF_LIFE_DAYS = 1000` restores uniform weighting.
+
 **Usage:**
 ```bash
 psychic generate-features  # Outputs features.csv + feature_schema.json

@@ -1,81 +1,5 @@
 ## now
 
-### Training: time-based split, refit on everything, log file size, recency weights
-
-Background. `train.py` splits episodes at random (`GroupShuffleSplit`,
-seed 42), so an episode from March 2 is validated against a model that
-trained on March 3-30. Any feature that identifies a file gets credit for
-knowing the future, memorization scores as skill, and early stopping keeps
-adding trees that memorize. Raw `file_size_bytes` is nearly a unique id per
-file and is the #3 feature by gain, which is that leak showing. Also today's
-shipped model is trained on only 64% of rows (80% train, then 80% of that).
-
-1. **Split by time: first 80% train, next 10% validation, last 10% test.**
-   The CSV has no timestamp column, but `episode_id` is assigned during a
-   single pass over time-sorted events (`features.rs`), so it is monotone in
-   time; split on it. In `train.py::main`, replace both `GroupShuffleSplit`
-   blocks with:
-   ```python
-   ep = df["episode"]
-   q80, q90 = ep.quantile(0.8), ep.quantile(0.9)
-   train_mask = ep <= q80
-   val_mask = (ep > q80) & (ep <= q90)
-   test_mask = ep > q90
-   ```
-   and build `X_train/y_train/episodes_train` etc. with `X[mask].reset_index(drop=True)`.
-   Keep the printed sample/episode/positive counts and hashes per split.
-   Remove the `GroupShuffleSplit` import. Expect validation AUC to drop:
-   that is the honest number, not a regression.
-
-2. **Refit on all rows and ship that model.** Early stopping on the time
-   split only decides the number of trees. After `train_model` returns:
-   ```python
-   best = model.best_iteration
-   full = lgb.Dataset(X, label=y, weight=w_all)   # w_all from item 4
-   final_model = lgb.train(params, full, num_boost_round=best)
-   ```
-   `params` is built inside `train_model`; hoist it into a
-   `make_params(monotone_constraints)` helper so both calls share it, or have
-   `train_model` return it. `save_model(final_model, ...)`. Keep
-   `create_visualizations` and the AUC/SHAP plots on the validated `model`
-   with the time-split test set (that is the evaluation). Use `final_model`
-   for `feature_importance` in `model_stats.json`, since that is what ships.
-   Add `"best_iteration": best` to the stats dict. Training time roughly
-   doubles (~3.5s -> ~7s); it runs in the background, fine.
-
-3. **Make file size log-scale.** In `src/feature_defs/implementations.rs`,
-   `FileSizeBytes::compute` returns the raw byte count. Change it to
-   `((1 + size) as f64).log2()` and rename the struct/name to
-   `LogFileSize` / `"log_file_size"` (update `registry.rs` and the expected
-   feature vector in `ranker.rs::test_feature_computation`: 12288 bytes ->
-   log2(12289) = 13.5851...; put the exact value the test prints). Keep type
-   Numeric, no monotonicity. Feature names are positional in the model, so
-   the existing model.txt keeps loading and is replaced at the next launch's
-   retrain. What raw size legitimately carried (tiny configs vs huge
-   logs/binaries) survives the log; the per-file lookup table does not.
-   Update the feature list in how-it-works.md.
-
-4. **Exponential decay weights on impression age.** Agreed earlier: old
-   bursts of activity should not dominate. Add a `timestamp` metadata column
-   to the CSV: in `feature_defs/registry.rs::csv_columns` add "timestamp"
-   after "session_id", and in `features.rs::compute_features_from_accumulator`
-   insert `impression.timestamp.to_string()` under that key. In
-   `train.py::prepare_features` pop it before building X (add to the drop
-   list) and return it. Then:
-   ```python
-   HALF_LIFE_DAYS = 60
-   age_days = (ts.max() - ts) / 86400
-   w = 0.5 ** (age_days / HALF_LIFE_DAYS)
-   ```
-   Pass `weight=` to every `lgb.Dataset` (train, val, and the refit in item
-   2), sliced with the same masks. Print the effective sample size
-   `w.sum()**2 / (w**2).sum()` so it is visible in training.log. 60 days is a
-   starting guess; make it a module constant.
-
-Then `just build`, `cargo test`, `cargo clippy`, and `psychic retrain`;
-check training.log shows three splits in time order, a best_iteration, and
-that model_stats.json lists `log_file_size` rather than `file_size_bytes`.
-
 ### Blend weight: ramp on training positives, not last-30-day activity
 
 Background. `Ranker::compute_blend_weights(total_clicks)` in `src/ranker.rs`
@@ -489,8 +413,9 @@ What the 15 current features cover: match quality (fuzzy_score,
 filename_starts_with_query); positive engagement counts (clicks 1h/24h/7d/30d,
 clicks_for_this_query, engagements_in_episode_with_query,
 clicks_last_week_parent_dir); file properties (modified_age,
-modified_last_24h, file_size, is_dir, is_hidden, is_under_cwd). Top three by
-gain: fuzzy_score, clicks_for_this_query, file_size_bytes.
+modified_last_24h, log_file_size, is_dir, is_hidden, is_under_cwd). Top three
+by gain, since the time split stopped rewarding memorised file sizes:
+clicks_for_this_query, fuzzy_score, filename_starts_with_query.
 
 Every feature below must be computed identically in `ranker.rs` (inference,
 from the in-memory click maps) and `features.rs` (training, from the

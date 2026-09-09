@@ -43,8 +43,24 @@ from pathlib import Path
 import os
 import tempfile
 import argparse
+from typing import NamedTuple
 
 sns.set_style("whitegrid")
+
+# How long it takes for a row to count half as much as a fresh one.
+#
+# Measured, this costs a little: over three rolling-origin folds the sweep runs
+# uniform 0.703 top-1, 365d 0.704, 180d 0.685, 120d 0.679, 60d 0.671, 30d 0.640 -
+# monotone, the gentler the better, because recency is already carried by
+# clicks_last_hour through clicks_last_30_days and decay only removes rows. With
+# ~1.2k clicks in the whole history, positives are the scarce thing.
+#
+# 180 days is the deliberate trade: it keeps 83% of the effective rows and buys
+# insurance against what the metrics cannot see yet - a week of unusual activity
+# that would otherwise keep its full vote forever, and features prone to
+# memorisation, whose grip on stale rows decays on its own. Raise this to 1000 to
+# get uniform weighting back.
+HALF_LIFE_DAYS = 180
 
 
 def load_schema(data_dir):
@@ -89,7 +105,7 @@ def load_data(csv_path):
     print(f"  CSV file hash: {csv_hash}")
     print(f"Label distribution:\n{df['label'].value_counts()}")
     print(
-        f"\nFeatures: {[c for c in df.columns if c not in ['label', 'episode_id', 'subsession_id', 'session_id']]}"
+        f"\nFeatures: {[c for c in df.columns if c not in ['label', 'episode_id', 'subsession_id', 'session_id', 'timestamp']]}"
     )
 
     # Use episode_id for LambdaRank grouping (each episode spans from one action to the next)
@@ -115,11 +131,24 @@ def load_data(csv_path):
     return df
 
 
+class Prepared(NamedTuple):
+    """Everything training needs out of the CSV, with each part named."""
+
+    X: pd.DataFrame
+    y: pd.Series
+    episodes: pd.Series
+    timestamps: pd.Series
+    categorical_features: list
+    monotone_constraints: list
+
+
 def prepare_features(df, feature_names, binary_features, monotonicity_map):
-    """Convert features to numeric and prepare X, y, episodes."""
+    """Convert features to numeric and prepare X, y, episodes, timestamps."""
     # Separate label and episode from features
     y = df["label"].astype(int)
     episodes = df["episode"]
+    # Not a feature: training weights each row by how old it is.
+    timestamps = df["timestamp"].astype(float)
 
     # Drop categorical features (query, file_path) since Rust lightgbm3 doesn't support them
     # Also drop metadata columns (including episode_id since it's used as episode)
@@ -130,6 +159,7 @@ def prepare_features(df, feature_names, binary_features, monotonicity_map):
             "episode_id",
             "subsession_id",
             "session_id",
+            "timestamp",
             "query",
             "file_path",
         ]
@@ -154,7 +184,31 @@ def prepare_features(df, feature_names, binary_features, monotonicity_map):
     # Create the monotonicity constraints list from the map
     constraints = [monotonicity_map.get(f, 0) or 0 for f in X.columns]
 
-    return X, y, episodes, [], constraints  # No categorical features
+    return Prepared(X, y, episodes, timestamps, [], constraints)  # No categorical features
+
+
+def recency_weights(timestamps):
+    """Weight each row by age, halving every HALF_LIFE_DAYS.
+
+    Ages are measured from the newest row in the CSV rather than from now, so a
+    model trained on a stale export is not uniformly discounted into noise.
+    """
+    assert len(timestamps) > 0, "there must be rows to weight"
+
+    age_days = (timestamps.max() - timestamps) / 86400.0
+    assert (age_days >= 0).all(), "no row can be newer than the newest row"
+
+    weights = 0.5 ** (age_days / HALF_LIFE_DAYS)
+
+    # How many equally weighted rows this is worth, which is the number to watch:
+    # if it collapses, the half-life is throwing away most of the data.
+    effective = weights.sum() ** 2 / (weights**2).sum()
+    print(
+        f"Recency weights: half-life {HALF_LIFE_DAYS} days, "
+        f"span {age_days.max():.1f} days, "
+        f"effective sample size {effective:.0f} of {len(weights)} rows"
+    )
+    return weights
 
 
 def make_params(monotone_constraints):
@@ -184,7 +238,7 @@ def make_params(monotone_constraints):
 
 
 def train_model(
-    X_train, y_train, episodes_train, X_val, y_val, episodes_val, categorical_features, monotone_constraints
+    X_train, y_train, episodes_train, w_train, X_val, y_val, episodes_val, w_val, categorical_features, monotone_constraints
 ):
     """Train LightGBM binary classification model with class weights and constraints."""
     # This function assumes X_train is a pandas DataFrame to get column names
@@ -195,11 +249,12 @@ def train_model(
     print(f"Applying monotonicity constraints: {monotone_constraints}")
 
     train_data = lgb.Dataset(
-        X_train, label=y_train, categorical_feature=categorical_features
+        X_train, label=y_train, weight=w_train, categorical_feature=categorical_features
     )
     val_data = lgb.Dataset(
         X_val,
         label=y_val,
+        weight=w_val,
         categorical_feature=categorical_features,
         reference=train_data,
     )
@@ -544,7 +599,7 @@ def save_model(model, output_prefix):
     print(f"Model saved to: {model_path}")
 
 
-def refit_on_everything(X, y, categorical_features, monotone_constraints, num_boost_round):
+def refit_on_everything(X, y, w, categorical_features, monotone_constraints, num_boost_round):
     """Retrain on every row, for the number of rounds the validated fit settled on.
 
     The time split exists to answer one question - how many trees before this
@@ -558,7 +613,9 @@ def refit_on_everything(X, y, categorical_features, monotone_constraints, num_bo
     assert num_boost_round > 0, "the validated fit must have produced some trees"
 
     print(f"\nRefitting on all {len(X)} rows for {num_boost_round} rounds")
-    full_data = lgb.Dataset(X, label=y, categorical_feature=categorical_features)
+    full_data = lgb.Dataset(
+        X, label=y, weight=w, categorical_feature=categorical_features
+    )
     return lgb.train(
         make_params(monotone_constraints), full_data, num_boost_round=num_boost_round
     )
@@ -648,9 +705,13 @@ def main():
     df = load_data(csv_path)
 
     # Prepare features
-    X, y, episodes, categorical_features, monotone_constraints = prepare_features(
-        df, feature_names, binary_features, monotonicity_map
-    )
+    prepared = prepare_features(df, feature_names, binary_features, monotonicity_map)
+    X, y, episodes = prepared.X, prepared.y, prepared.episodes
+    categorical_features = prepared.categorical_features
+    monotone_constraints = prepared.monotone_constraints
+
+    # Weight rows by age, so the recent weeks lead and old bursts still count.
+    weights = recency_weights(prepared.timestamps)
 
     # Split by time: the first 80% of episodes train, the next 10% validates,
     # the last 10% is the test set.
@@ -659,6 +720,8 @@ def main():
     X_train, y_train, episodes_train = take(X, y, episodes, train_mask)
     X_val, y_val, episodes_val = take(X, y, episodes, val_mask)
     X_test, y_test, episodes_test = take(X, y, episodes, test_mask)
+    w_train = weights[train_mask].reset_index(drop=True)
+    w_val = weights[val_mask].reset_index(drop=True)
 
     print("")
     describe_split("Train", X_train, y_train, episodes_train, train_mask)
@@ -667,14 +730,14 @@ def main():
 
     # Train model. This fit is the evaluation: it is the one with data held out.
     model, evals_result = train_model(
-        X_train, y_train, episodes_train, X_val, y_val, episodes_val, categorical_features, monotone_constraints
+        X_train, y_train, episodes_train, w_train, X_val, y_val, episodes_val, w_val, categorical_features, monotone_constraints
     )
 
     # Ship a model grown on every row, for as many rounds as the validated fit
     # found worth growing.
     best_iteration = model.best_iteration
     final_model = refit_on_everything(
-        X, y, categorical_features, monotone_constraints, best_iteration
+        X, y, weights, categorical_features, monotone_constraints, best_iteration
     )
 
     save_model(final_model, output_prefix)

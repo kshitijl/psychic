@@ -325,6 +325,7 @@ fn compute_features_from_accumulator(
         impression.subsession_id.to_string(),
     );
     features.insert("session_id".to_string(), impression.session_id.clone());
+    features.insert("timestamp".to_string(), impression.timestamp.to_string());
     features.insert("query".to_string(), impression.query.clone());
     features.insert("file_path".to_string(), impression.file_path.clone());
 

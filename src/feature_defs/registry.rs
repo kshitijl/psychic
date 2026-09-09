@@ -41,6 +41,9 @@ pub fn csv_columns() -> Vec<&'static str> {
         "episode_id",
         "subsession_id",
         "session_id",
+        // When the impression happened. Not a feature - training weights rows
+        // by age from it, so recent habits count for more than old ones.
+        "timestamp",
         "query",
         "file_path",
     ];
