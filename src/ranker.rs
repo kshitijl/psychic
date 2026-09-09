@@ -227,11 +227,18 @@ impl Ranker {
         );
 
         let query_start = std::time::Instant::now();
+        // The first `action` clause is redundant and is what lets this reach
+        // `idx_events_engagement`. SQLite will only use a partial index when
+        // the query's WHERE provably implies the index's, and it does not work
+        // out that a two-item IN list implies the three-item one the index was
+        // built with. Without this line the query is a full table scan.
+        // `db::plan_tests` fails if it ever stops being used.
         let mut stmt = conn.prepare(
             "SELECT full_path, timestamp, query, episode_queries
              FROM events
-             WHERE action IN ('click', 'scroll')
-             AND timestamp >= ?1",
+             WHERE action IN ('click', 'scroll', 'startup_visit')
+               AND action IN ('click', 'scroll')
+               AND timestamp >= ?1",
         )?;
 
         let rows = stmt.query_map([thirty_days_ago_ts], |row| {

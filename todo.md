@@ -404,58 +404,29 @@ Filter+rank is ~2ms per keystroke and is not the problem.
     is hidden, and deep-clones `PreviewManager` twice (render.rs
     `ctx.preview.clone()` then `text.clone()`); gate on visibility and pass
     `&mut`.
-- **P8. Database diet: 62MB, of which 35MB is `ps` output.** Measured on a
-  copy of the real events.db (2026-09-08): `sessions` 36MB, of which
-  `running_processes` is 35MB; `events` 16MB; `idx_events_click_lookup`
-  9.6MB. Nothing reads `running_processes` or `shell_history`. Doing the
-  three steps below on the copy took it from 62MB to 17MB.
-  1. *Stop collecting `ps` output.* In `src/context.rs` delete
-     `get_running_processes` and set `running_processes: String::new()` in
-     `gather_context` (the column is `NOT NULL`, so keep writing an empty
-     string rather than dropping the column; SQLite `ALTER TABLE DROP
-     COLUMN` is possible but not worth a migration). Consider doing the
-     same for `shell_history`: also unused, and it is the last 10 commands
-     the user typed, stored in plain text.
-  2. *Purge the existing rows.* One-time migration in `Database::new`, or
-     an `internal` subcommand:
-     ```sql
-     UPDATE sessions SET running_processes = '' WHERE running_processes != '';
-     VACUUM;
-     ```
-     VACUUM rewrites the file and needs free disk roughly equal to the db
-     size; run it once, not at every startup (check
-     `SELECT COUNT(*) FROM sessions WHERE running_processes != ''` first and
-     skip if zero). Back the file up first: `sqlite3 events.db ".backup x"`.
-  3. *Partial index.* Replace `idx_events_click_lookup` with
-     ```sql
-     CREATE INDEX IF NOT EXISTS idx_events_engagement
-       ON events(action, timestamp, full_path)
-       WHERE action IN ('click','scroll','startup_visit');
-     ```
-     and `DROP INDEX IF EXISTS idx_events_click_lookup`. Same columns, but
-     only the ~3.2k engagement rows are indexed instead of all 83k, so the
-     index goes from 9.6MB to 0.3MB and the startup queries seek a smaller
-     tree. **Caveat, verified with EXPLAIN QUERY PLAN:** SQLite uses a
-     partial index only when the query's WHERE clause *provably implies*
-     the index's WHERE clause, and it does not prove
-     `IN ('click','scroll')` implies `IN ('click','scroll','startup_visit')`.
-     So `get_previously_interacted_files`, whose IN list matches the index
-     exactly, uses it (SEARCH ... USING COVERING INDEX), but `load_clicks`
-     falls back to a full SCAN. Fix `load_clicks` by adding the index
-     predicate as a redundant extra term:
-     ```sql
-     WHERE action IN ('click','scroll','startup_visit')
-       AND action IN ('click','scroll')
-       AND timestamp >= ?1
-     ```
-     which was verified to give SEARCH ... USING INDEX. Add a test that
-     runs `EXPLAIN QUERY PLAN` on both queries against an in-memory db and
-     asserts the plan mentions `idx_events_engagement`, so a future edit to
-     either WHERE clause cannot silently reintroduce the scan.
-  4. *Smaller items:* `session_id` is a u64 stored as TEXT (19 bytes vs 8;
-     needs a migration, low priority). `log_impressions` runs 25 separate
-     transactions on the UI thread; wrap the loop in one
-     `BEGIN`/`COMMIT` (`conn.unchecked_transaction()`).
+- **P8. Database diet.** DONE (2026-09-09). `running_processes` and
+  `shell_history` are no longer collected and their columns are dropped;
+  `Database::migrate` does it on any open and `VACUUM`s once (83ms) when it
+  actually dropped something. The full index is replaced by a partial one on
+  the engagement actions, plus a narrow index on `action` alone for the debug
+  pane's histogram, which a partial index cannot answer. `load_clicks` states
+  the index predicate redundantly, without which SQLite cannot prove the
+  implication and silently scans; `db::plan_tests` runs EXPLAIN QUERY PLAN over
+  every query psychic issues, including one pinning why that clause is needed.
+  Impressions are one transaction rather than two dozen. Measured on a copy of
+  the real database:
+
+  | | before | after |
+  |---|---|---|
+  | file | 67.1 MB | 19.1 MB |
+  | sessions table | 40.2 MB | 0.1 MB |
+  | indexes on events | 9.9 MB | 2.0 MB |
+  | `load_clicks_total` | 0.48ms | 0.47ms |
+  | `load_historical_files` | 2.50ms | 1.93ms |
+  | `internal summarize-events` | 14.99ms | 12.47ms |
+
+  Nothing got slower. Still open from the original item: `session_id` is a u64
+  stored as TEXT.
 - **P9. Measure `num_threads=8` vs 1 in `predict_with_params`.** 180 trees,
   ~200 rows, 1.2-1.4ms; OpenMP fork/join likely exceeds the work.
 - **P10. Optional: cache query-independent features per registry entry.**

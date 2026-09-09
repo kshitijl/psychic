@@ -231,8 +231,6 @@ CREATE TABLE sessions (
     gateway TEXT,
     subnet TEXT,
     dns TEXT,
-    shell_history TEXT,
-    running_processes TEXT,
     timezone TEXT,
     created_at INTEGER
 );
@@ -252,15 +250,46 @@ model. Hiding is deliberately *not* recorded as an event and *not* a training si
 it is a rare, explicit act of curation, and treating it as a negative label would put
 weight on something the user does a handful of times a year.
 
-**Index:**
+**Indexes:**
 ```sql
-CREATE INDEX idx_events_click_lookup ON events(action, timestamp, full_path);
+CREATE INDEX idx_events_engagement
+  ON events(action, timestamp, full_path)
+  WHERE action IN ('click', 'scroll', 'startup_visit');
+
+CREATE INDEX idx_events_action ON events(action);
 ```
 
-Why: Composite index speeds up 30-day click count aggregation (O(log n) vs O(n)).
+The first serves the two queries on the start-up path, which both seek by action
+and timestamp and read `full_path`. It is **partial** because 96% of the table is
+impressions, which nothing ever looks up by action, and index entries carry
+`full_path`: covering them all cost 10MB against 0.3MB for the rows that are
+actually queried.
+
+**A partial index is only used when SQLite can prove the query's WHERE implies
+the index's**, and it does not work out that `IN ('click','scroll')` implies
+`IN ('click','scroll','startup_visit')`. `Ranker::load_clicks` therefore states
+the index's own predicate as a redundant extra clause; without it the query
+silently becomes a full table scan. `db::plan_tests` runs `EXPLAIN QUERY PLAN`
+over every query psychic actually issues and fails if one stops using its index,
+including a test that pins *why* the redundant clause is needed.
+
+The second index exists because the debug pane counts events by action, and a
+partial index cannot count the rows it excludes. It holds no `full_path`, so it
+is 1.7MB rather than 10MB.
+
+**Migration.** `Database::migrate` runs on every open and is a no-op once done.
+It lives there rather than at start-up because every entry point - the TUI,
+`retrain`, `track-visit`, `hidden` - writes through the same statements, and one
+of them inserts a session row that would fail against the older, wider table. It
+`VACUUM`s only when it actually dropped something, which took 83ms once on a
+67MB database.
 
 **Session ID:** Random 64-bit integer (not UUID).
 Why: UUIDs are 36 chars. 64-bit int gives 18 quintillion IDs, more compact.
+
+**Impressions are written as one transaction.** They arrive two dozen at a time,
+on the UI thread, after every query the user pauses on; a statement each meant a
+transaction and an fsync each.
 
 **File metadata:** Captured at event time, not discovery time.
 Why: Files can be modified between discovery and impression. Event-time metadata reflects what user actually saw.
@@ -397,11 +426,15 @@ Gathers system context at startup in background thread:
 - `gateway` - Default gateway from `netstat -nr`
 - `subnet` - First two octets of local IP
 - `dns` - First DNS nameserver from `scutil --dns`
-- `shell_history` - Last 10 commands from ~/.zsh_history or ~/.bash_history
-- `running_processes` - Output of `ps -u $USER -o pid,comm`
 - `timezone` - Multi-tier fallback: $TZ env var → /etc/localtime symlink → "UTC"
 
-Why gather this: Network context (home/office/cafe), shell history (user intent), and running processes help analyze search patterns and could become ML features.
+Why gather this: network context (home, office, cafe) may become an ML feature.
+
+`running_processes` (the output of `ps`) and `shell_history` (the last ten
+commands typed) used to be collected here too. Nothing ever read either. They
+were 40MB of a 67MB database, and the second was a plain-text copy of what the
+user had been doing, sitting in `~/.local/share`. Both are gone, and the columns
+with them.
 
 **Note on `timezone`:** still recorded per session, but no feature reads it - all
 time windows are rolling (see "Time windows are rolling, not calendar days"). It is
@@ -566,7 +599,7 @@ LIMIT ?                       -- HISTORY_MAX_PATHS = 2000
 ```
 
 - The **time cutoff bounds the work.** `action` and `timestamp` are the first two
-  columns of `idx_events_click_lookup`, so this became a range seek over one year
+  columns of `idx_events_engagement`, so this became a range seek over one year
   instead of a scan of all history - the same shape as `load_clicks`. Startup is
   now proportional to recent activity everywhere, not to database size.
 - The **limit bounds the result.** Each path returned becomes a file registry entry

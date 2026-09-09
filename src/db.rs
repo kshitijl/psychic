@@ -51,8 +51,6 @@ pub struct ContextData {
     pub gateway: String,
     pub subnet: String,
     pub dns: String,
-    pub shell_history: String,
-    pub running_processes: String,
     pub timezone: String,
 }
 
@@ -118,8 +116,6 @@ impl Database {
                 gateway TEXT NOT NULL,
                 subnet TEXT NOT NULL,
                 dns TEXT NOT NULL,
-                shell_history TEXT NOT NULL,
-                running_processes TEXT NOT NULL,
                 timezone TEXT NOT NULL,
                 created_at INTEGER NOT NULL
             )",
@@ -141,16 +137,68 @@ impl Database {
             [],
         )?;
 
-        // This index is for click count queries. We might want to do those in Rust
-        // code at some point, but this is convenient for now.
-        // The clause: WHERE action = 'click' AND timestamp >= ? GROUP BY full_path
+        Self::migrate(&conn)?;
+
+        Ok(Database { conn })
+    }
+
+    /// Bring an existing database up to what the code above expects.
+    ///
+    /// Runs on every open, so every step is a no-op once it has been done. It
+    /// lives here rather than at start-up because every path that opens the
+    /// database - the TUI, `retrain`, `track-visit`, `hidden` - writes through
+    /// the same statements, and one of them inserts a session row that would
+    /// fail against the old, wider table.
+    fn migrate(conn: &Connection) -> Result<()> {
+        let existing: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('sessions')")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<_>>()?;
+
+        // `running_processes` was the output of `ps` and `shell_history` the
+        // last ten commands typed, both collected every launch and read by
+        // nothing. Together they were 40MB of a 67MB database, and the second
+        // is a plain-text copy of what the user has been doing.
+        let mut dropped = false;
+        for column in ["running_processes", "shell_history"] {
+            if existing.iter().any(|name| name == column) {
+                log::info!("Dropping unused sessions.{} column", column);
+                conn.execute(&format!("ALTER TABLE sessions DROP COLUMN {}", column), [])?;
+                dropped = true;
+            }
+        }
+
+        // The old index covered every row, and 96% of them are impressions
+        // that nothing looks up by action. Its entries carry `full_path`, so
+        // covering them all cost 10MB.
+        conn.execute("DROP INDEX IF EXISTS idx_events_click_lookup", [])?;
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_events_click_lookup
-             ON events(action, timestamp, full_path)",
+            "CREATE INDEX IF NOT EXISTS idx_events_engagement
+             ON events(action, timestamp, full_path)
+             WHERE action IN ('click', 'scroll', 'startup_visit')",
+            [],
+        )?;
+        // The debug pane counts events by action, which the partial index
+        // cannot answer because it does not hold the rows being counted. This
+        // one has no `full_path` in it, so it is a fraction of the size.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_action ON events(action)",
             [],
         )?;
 
-        Ok(Database { conn })
+        if dropped {
+            // Dropping a column rewrites the rows but does not give the pages
+            // back. Once, and only when there was something to reclaim.
+            log::info!("Compacting the database after dropping unused columns");
+            let start = std::time::Instant::now();
+            conn.execute_batch("VACUUM")?;
+            log::info!(
+                "TIMING {{\"op\":\"vacuum\",\"ms\":{}}}",
+                start.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+
+        Ok(())
     }
 
     pub fn get_db_path(data_dir: &Path) -> PathBuf {
@@ -161,16 +209,14 @@ impl Database {
         let timestamp = jiff::Timestamp::now().as_second();
 
         self.conn.execute(
-            "INSERT INTO sessions (session_id, cwd, gateway, subnet, dns, shell_history, running_processes, timezone, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO sessions (session_id, cwd, gateway, subnet, dns, timezone, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 session_id,
                 &context.cwd,
                 &context.gateway,
                 &context.subnet,
                 &context.dns,
-                &context.shell_history,
-                &context.running_processes,
                 &context.timezone,
                 timestamp
             ],
@@ -189,9 +235,10 @@ impl Database {
             UserInteraction::StartupVisit => "startup_visit",
         };
 
-        self.conn.execute(
+        self.conn.prepare_cached(
             "INSERT INTO events (timestamp, query, file_path, full_path, mtime, atime, file_size, subsession_id, action, session_id, episode_queries)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        )?.execute(
             params![
                 timestamp,
                 event.query,
@@ -210,6 +257,11 @@ impl Database {
         Ok(())
     }
 
+    /// Log a screenful of impressions as one commit.
+    ///
+    /// These arrive two dozen at a time, on the UI thread, after every query
+    /// the user pauses on. One statement each meant a transaction and an fsync
+    /// each.
     pub fn log_impressions(
         &self,
         query: &str,
@@ -217,6 +269,8 @@ impl Database {
         subsession_id: u64,
         session_id: &str,
     ) -> Result<()> {
+        let transaction = self.conn.unchecked_transaction()?;
+
         for FileMetadata {
             relative_path,
             full_path,
@@ -238,6 +292,8 @@ impl Database {
                 episode_queries: None,
             })?;
         }
+
+        transaction.commit()?;
 
         Ok(())
     }
@@ -499,6 +555,100 @@ mod tests {
             db.get_previously_interacted_files().unwrap(),
             vec!["/clicked".to_string()],
             "Impressions are 96% of the table and none of them are history"
+        );
+    }
+}
+
+#[cfg(test)]
+mod plan_tests {
+    //! Every query psychic runs against `events`, and the index it must use.
+    //!
+    //! A partial index is only used when SQLite can prove the query's WHERE
+    //! implies the index's. That proof is easy to break by editing a WHERE
+    //! clause - narrowing an `IN` list is enough - and the failure is silent:
+    //! the query keeps working and quietly scans the table instead.
+    use super::*;
+
+    fn plan(db: &Database, query: &str) -> String {
+        db.conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", query))
+            .expect("query should parse")
+            .query_map([], |row| row.get::<_, String>(3))
+            .expect("plan should run")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("plan rows")
+            .join(" | ")
+    }
+
+    #[test]
+    fn test_the_history_query_uses_the_engagement_index() {
+        let db = Database::new(Path::new(":memory:")).unwrap();
+
+        let plan = plan(
+            &db,
+            "SELECT full_path FROM events
+             WHERE action IN ('click', 'scroll', 'startup_visit') AND timestamp >= 1
+             GROUP BY full_path ORDER BY MAX(timestamp) DESC LIMIT 10",
+        );
+
+        assert!(
+            plan.contains("idx_events_engagement"),
+            "get_previously_interacted_files must not scan the table: {}",
+            plan
+        );
+    }
+
+    #[test]
+    fn test_the_click_loading_query_uses_the_engagement_index() {
+        let db = Database::new(Path::new(":memory:")).unwrap();
+
+        // Exactly what `Ranker::load_clicks` runs, redundant clause and all.
+        let plan = plan(
+            &db,
+            "SELECT full_path, timestamp, query, episode_queries FROM events
+             WHERE action IN ('click', 'scroll', 'startup_visit')
+               AND action IN ('click', 'scroll')
+               AND timestamp >= 1",
+        );
+
+        assert!(
+            plan.contains("idx_events_engagement"),
+            "load_clicks must not scan the table: {}",
+            plan
+        );
+    }
+
+    #[test]
+    fn test_narrowing_the_list_without_the_redundant_clause_loses_the_index() {
+        // Why that redundant clause is there, written down as a test so that
+        // deleting it fails rather than silently costing a scan.
+        let db = Database::new(Path::new(":memory:")).unwrap();
+
+        let plan = plan(
+            &db,
+            "SELECT full_path FROM events
+             WHERE action IN ('click', 'scroll') AND timestamp >= 1",
+        );
+
+        assert!(
+            !plan.contains("idx_events_engagement"),
+            "if SQLite has learned to prove this, the redundant clause in \
+             load_clicks can go: {}",
+            plan
+        );
+    }
+
+    #[test]
+    fn test_the_event_histogram_uses_an_index() {
+        let db = Database::new(Path::new(":memory:")).unwrap();
+
+        let plan = plan(&db, "SELECT action, COUNT(*) FROM events GROUP BY action");
+
+        assert!(
+            plan.contains("idx_events_action"),
+            "the partial index cannot count rows it excludes, which is what \
+             the narrow index on action alone is for: {}",
+            plan
         );
     }
 }
