@@ -70,6 +70,7 @@ Otherwise, type `psychic` to open the TUI. By default, it will explore both file
 * `Alt-Up` to navigate to the parent directory.
 * `Ctrl-J` to get dropped in a shell in the current directory.
 * `Ctrl-O` will open a debug pane showing you the values of each ML feature for the currently selected file or directory.
+* `--no-ignore` shows files that `.gitignore` would hide. By default psychic respects `.gitignore`, `.ignore` and your global gitignore, which is mostly why searches stay fast: a build directory is usually the largest thing in a project and never the thing you are looking for. Dotfiles are still shown, because `.zshrc` is worth finding.
 * `Ctrl-G` (or `F1`) shows a help screen with every key and command. The list above is the short version; the help screen is generated from the keybinding registry, so it is never out of date. There is a reminder of this in the bottom right of the search box.
 
 ## LLM use disclosure

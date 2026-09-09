@@ -267,7 +267,7 @@ Why: Files can be modified between discovery and impression. Event-time metadata
 
 ### Module: `walker.rs`
 
-Background thread that walks the current directory with `walkdir`, in two passes.
+Background thread that walks the current directory in two passes.
 
 **Two passes, because the two halves of a tree are worth very different amounts.**
 
@@ -307,15 +307,61 @@ time from launch to the file list appearing, in `~`:
 A small tree is unchanged (13.7ms to 12.3ms in this repository): it never hit the
 threshold, so it never paid for the restart.
 
+**What is skipped.** The walk is built on the `ignore` crate, the one ripgrep and
+fd use, so `.gitignore`, `.ignore`, `.git/info/exclude` and the user's global
+gitignore all apply, to files as well as directories - `*.o` and `*.pyc` are most
+of the noise in a built project, and a directory-only filter never saw them.
+Gitignore semantics are not worth reimplementing: negation, `**`, directory-only
+rules, anchoring, nested files and precedence between them.
+
+Three deliberate departures from that crate's defaults:
+
+- **Dotfiles are walked.** It hides them, because that is what ripgrep wants.
+  psychic is for finding `.zshrc` as much as `main.rs`, and the model has an
+  `is_hidden` feature that would go blind if they never appeared.
+- **`.git`, `node_modules`, `.venv` and `target` are skipped by name anyway.**
+  A floor under the ignore rules rather than a replacement: outside a git
+  repository there is nothing to read, and these four are noise everywhere.
+  `.git` needs naming because no gitignore ever lists it - git excludes it
+  implicitly, and we walk dotfiles.
+- **Ignore files are honoured outside a repository** (`require_git(false)`). If
+  someone wrote one, it means what it says wherever it is.
+
+`--no-ignore` turns all of that off, spelled as ripgrep and fd spell it. The
+root itself is exempt from the name filter, so launching inside a directory
+called `target` shows its contents instead of an empty screen. Files already in
+the events database are added to the registry regardless: you chose them once,
+so they stay findable even if git would hide them.
+
+**Do not set `min_depth` on the builder.** It stops the crate applying ignore
+rules to anything shallower, so an ignored directory at depth one is never
+pruned and the whole of it is walked. Since the second pass starts at depth two,
+that is exactly the shape this walker has: with `min_depth(2)`, `target` was
+walked in full - 57,000 entries in this repository, enough on its own to pass
+the threshold and drop the repository to showing only its top level. The depth
+range is applied after the walk instead, which costs one extra `readdir` of the
+root.
+
+**Measured**, launching in three directories, before and after ignore files were
+respected:
+
+| | entries | walk | hit the limit |
+|---|---|---|---|
+| this repository, before | 21 | 57.9ms | yes |
+| this repository, after | 53 | 17.0ms | no |
+| `~/local-src`, before | 1,680 | 33.8ms | no |
+| `~/local-src`, after | 1,283 | 33.8ms | no |
+| `~`, before | 130 | 128.0ms | yes |
+| `~`, after | 130 | 80.9ms | yes |
+
+Fewer trees reaching the threshold is the point: a repository that degrades to a
+top-level listing is one where search is worth least.
+
 **Key points:**
 - Streams the root's children immediately; holds everything deeper until the walk
   is known to be small enough to keep
-- Filters: `.git`, `node_modules`, `.venv`, `target`, plus any directory the user
-  has hidden that applies to the current root (see "Hiding directories")
-- The root itself is exempt from that name filter, so launching inside a
-  directory called `target` shows its contents instead of an empty screen
 - Sends both files and directories (with `is_dir` flag)
-- Extracts mtime, atime, and file_size from walkdir's cached metadata
+- Extracts mtime, atime, and file_size from the metadata the walk already had
 - Sends `AllDone` when a walk runs to the end
 - Checks for commands every 100 entries (COMMAND_CHECK_INTERVAL)
 
@@ -1536,7 +1582,7 @@ any moment, so they could not have been fixed that way at all.
 
 - `ratatui` - TUI framework
 - `crossterm` - Terminal backend
-- `walkdir` - Recursive directory traversal
+- `ignore` - Directory traversal that respects .gitignore (ripgrep's)
 - `rusqlite` - SQLite (bundled feature for static linking)
 - `lightgbm3` - LightGBM inference
 - `anyhow` - Error handling

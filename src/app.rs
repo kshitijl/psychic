@@ -53,6 +53,8 @@ pub struct AppOptions {
     pub no_click_loading: bool,
     pub no_model: bool,
     pub no_click_logging: bool,
+    /// False when `--no-ignore` was given: show what git would hide.
+    pub respect_gitignore: bool,
     pub editor: String,
 }
 
@@ -167,8 +169,11 @@ impl App {
             root.clone(),
             data_dir,
             event_tx.clone(),
-            options.no_click_loading,
-            options.no_model,
+            search_worker::WorkerOptions {
+                no_click_loading: options.no_click_loading,
+                no_model: options.no_model,
+                respect_gitignore: options.respect_gitignore,
+            },
         )?;
 
         log::debug!("App::new() total time: {:?}", start_time.elapsed());

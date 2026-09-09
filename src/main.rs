@@ -401,6 +401,7 @@ fn main() -> Result<()> {
         no_click_loading: cli.no_click_loading,
         no_model: cli.no_model,
         no_click_logging: cli.no_click_logging,
+        respect_gitignore: !cli.no_ignore,
         editor,
     };
 

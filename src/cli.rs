@@ -138,6 +138,10 @@ pub struct Cli {
     #[arg(long)]
     pub no_click_logging: bool,
 
+    /// Show files that .gitignore and friends would hide
+    #[arg(long)]
+    pub no_ignore: bool,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 }

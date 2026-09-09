@@ -641,7 +641,6 @@ split (see training item) and compare validation AUC and per-feature gain;
 drop anything that does not move it.
 
 distribution:
-- respect .gitignore instead of hardcoding dirs to ignore
 
 - full text search mode using rg.
 

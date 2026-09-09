@@ -1,9 +1,15 @@
 use crate::metadata_ext::MetadataExt;
 use crate::search_worker::{WalkerCommand, WalkerFileMetadata, WalkerMessage};
+use ignore::WalkBuilder;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
-use walkdir::WalkDir;
 
+/// Directories never worth walking, whatever any ignore file says.
+///
+/// A floor under the gitignore rules, not a replacement for them: outside a git
+/// repository there is nothing to read, and these four are noise everywhere.
+/// `.git` is here rather than left to gitignore because no gitignore ever lists
+/// it - git excludes it implicitly, and we walk dotfiles.
 const IGNORED_DIRS: &[&str] = &[".git", "node_modules", ".venv", "target"];
 
 /// Whether the walker should descend into `entry`.
@@ -53,6 +59,7 @@ const COMMAND_CHECK_INTERVAL: usize = 100;
 pub fn start_file_walker(
     initial_root: PathBuf,
     initial_hidden: Vec<PathBuf>,
+    respect_gitignore: bool,
     command_rx: Receiver<WalkerCommand>,
     message_tx: Sender<WalkerMessage>,
 ) {
@@ -64,7 +71,10 @@ pub fn start_file_walker(
             let interrupted_by = walk_directory(
                 &root,
                 &hidden,
-                SHALLOW_MODE_THRESHOLD,
+                WalkLimits {
+                    max_below: SHALLOW_MODE_THRESHOLD,
+                    respect_gitignore,
+                },
                 &command_rx,
                 &message_tx,
             );
@@ -115,15 +125,24 @@ pub fn start_file_walker(
 /// abandoning it costs nothing already shown.
 ///
 /// Returns the command that interrupted the walk, if one did.
+/// What bounds a walk, beyond where it starts.
+#[derive(Debug, Clone, Copy)]
+struct WalkLimits {
+    /// See [`SHALLOW_MODE_THRESHOLD`].
+    max_below: usize,
+    /// Whether ignore files are consulted. `--no-ignore` clears it.
+    respect_gitignore: bool,
+}
+
 fn walk_directory(
     root: &Path,
     hidden: &[PathBuf],
-    max_below: usize,
+    limits: WalkLimits,
     command_rx: &Receiver<WalkerCommand>,
     tx: &Sender<WalkerMessage>,
 ) -> Option<WalkerCommand> {
     let mut sent = 0;
-    for entry in entries(root, hidden, 1..=1) {
+    for entry in entries(root, hidden, limits.respect_gitignore, 1..=1) {
         if sent >= MAX_FILES {
             log::warn!("Walker: {:?} has more than {} children", root, MAX_FILES);
             break;
@@ -149,12 +168,12 @@ fn walk_directory(
     }
 
     let mut below = Vec::new();
-    for entry in entries(root, hidden, 2..=usize::MAX) {
-        if below.len() >= max_below {
+    for entry in entries(root, hidden, limits.respect_gitignore, 2..=usize::MAX) {
+        if below.len() >= limits.max_below {
             log::info!(
                 "Walker: more than {} entries below the children of {:?}; \
                  showing only its children",
-                max_below,
+                limits.max_below,
                 root
             );
             return None;
@@ -175,24 +194,62 @@ fn walk_directory(
     None
 }
 
-/// The entries at depths `depth`, never entering a subtree we do not want.
-fn entries<'a>(
+/// The entries at depths `depth`, honouring ignore files and our own floor.
+///
+/// `respect_gitignore` is what `--no-ignore` turns off.
+fn entries(
     root: &Path,
-    hidden: &'a [PathBuf],
+    hidden: &[PathBuf],
+    respect_gitignore: bool,
     depth: std::ops::RangeInclusive<usize>,
-) -> impl Iterator<Item = walkdir::DirEntry> + 'a {
-    WalkDir::new(root)
+) -> impl Iterator<Item = ignore::DirEntry> {
+    // `filter_entry` wants a closure that outlives the walk, so the hidden
+    // prefixes are copied in. There are a handful of them.
+    let hidden = hidden.to_vec();
+
+    let least = *depth.start();
+
+    WalkBuilder::new(root)
         .follow_links(true)
-        .min_depth(*depth.start())
-        .max_depth(*depth.end())
-        .into_iter()
+        // Deliberately *not* `min_depth`. Setting it stops the crate applying
+        // ignore rules to anything shallower, so an ignored directory at depth
+        // one is never pruned and the entire thing is walked - `target` here is
+        // 57,000 entries, enough on its own to push a repository past the
+        // threshold and into showing only its top level. The depth range is
+        // applied at the end instead, which costs one extra `readdir` of the
+        // root on the second pass.
+        .max_depth(Some(*depth.end()))
+        // Dotfiles stay searchable. psychic is for finding `.zshrc` as much as
+        // `main.rs`, and the model has an `is_hidden` feature that would go
+        // blind if they never appeared. This is the one place we deliberately
+        // differ from ripgrep's defaults.
+        .hidden(false)
+        // Everything git would ignore, and `.ignore` files besides, so a
+        // directory can be kept out of psychic without touching `.gitignore`.
+        .git_ignore(respect_gitignore)
+        .git_exclude(respect_gitignore)
+        .git_global(respect_gitignore)
+        .ignore(respect_gitignore)
+        // A repository's root `.gitignore` applies when psychic is launched in
+        // one of its subdirectories.
+        .parents(respect_gitignore)
+        // Without this, ignore files are only consulted inside a git
+        // repository. If someone wrote one, honour it wherever it is.
+        .require_git(false)
         .filter_entry(move |entry| {
             // The root is where the user asked to be, so it is never skipped
             // for its name: running psychic inside a directory called `target`
             // used to show an empty screen.
-            entry.depth() == 0 || should_descend(entry.file_type().is_dir(), entry.path(), hidden)
+            entry.depth() == 0
+                || should_descend(
+                    entry.file_type().is_some_and(|t| t.is_dir()),
+                    entry.path(),
+                    &hidden,
+                )
         })
+        .build()
         .filter_map(Result::ok)
+        .filter(move |entry| entry.depth() >= least)
 }
 
 /// Look for a command every [`COMMAND_CHECK_INTERVAL`] entries, so that a walk
@@ -215,7 +272,7 @@ fn command_if_due(count: usize, command_rx: &Receiver<WalkerCommand>) -> Option<
 
 /// What the worker needs to know about an entry, from the metadata the walk
 /// already had to fetch. Asking again later would be a second syscall.
-fn describe(entry: &walkdir::DirEntry) -> WalkerFileMetadata {
+fn describe(entry: &ignore::DirEntry) -> WalkerFileMetadata {
     let metadata = entry.metadata().ok();
 
     WalkerFileMetadata {
@@ -223,7 +280,7 @@ fn describe(entry: &walkdir::DirEntry) -> WalkerFileMetadata {
         mtime: metadata.as_ref().and_then(|m| m.mtime_as_secs()),
         atime: metadata.as_ref().and_then(|m| m.atime_as_secs()),
         file_size: metadata.as_ref().map(|m| m.len() as i64),
-        is_dir: entry.file_type().is_dir(),
+        is_dir: entry.file_type().is_some_and(|t| t.is_dir()),
     }
 }
 
@@ -300,11 +357,11 @@ mod tests {
     ///
     /// `None` marks `ChildrenDone`, so a test can see which paths were sent
     /// before it and which after.
-    fn walk_messages(root: &Path, hidden: &[PathBuf], max_below: usize) -> Vec<Option<PathBuf>> {
+    fn walk_messages(root: &Path, hidden: &[PathBuf], limits: WalkLimits) -> Vec<Option<PathBuf>> {
         let (_command_tx, command_rx) = std::sync::mpsc::channel::<WalkerCommand>();
         let (tx, rx) = std::sync::mpsc::channel::<WalkerMessage>();
 
-        walk_directory(root, hidden, max_below, &command_rx, &tx);
+        walk_directory(root, hidden, limits, &command_rx, &tx);
         drop(tx);
 
         rx.into_iter()
@@ -316,10 +373,18 @@ mod tests {
             .collect()
     }
 
-    /// Every path the walker emitted, sorted. `max_below` is generous, so this
-    /// is the whole tree unless a test says otherwise.
+    /// Limits that get in the way of nothing: a generous budget, ignore files
+    /// respected. Tests that care about either say so.
+    fn open_limits() -> WalkLimits {
+        WalkLimits {
+            max_below: 10_000,
+            respect_gitignore: true,
+        }
+    }
+
+    /// Every path the walker emitted, sorted.
     fn walked_paths(root: &Path, hidden: &[PathBuf]) -> Vec<PathBuf> {
-        let mut paths: Vec<PathBuf> = walk_messages(root, hidden, 10_000)
+        let mut paths: Vec<PathBuf> = walk_messages(root, hidden, open_limits())
             .into_iter()
             .flatten()
             .collect();
@@ -416,11 +481,205 @@ mod tests {
         );
     }
 
+    /// A tree with a `.gitignore` in it, and the noise it describes.
+    struct IgnoredTree {
+        root: PathBuf,
+    }
+
+    impl IgnoredTree {
+        fn new(name: &str, gitignore: &str) -> Self {
+            let root = std::env::temp_dir()
+                .join(format!("psychic-ignore-{}-{}", name, std::process::id()))
+                .join("project");
+            let _ = std::fs::remove_dir_all(&root);
+            for dir in ["src", "build", "src/nested"] {
+                std::fs::create_dir_all(root.join(dir)).expect("create dir");
+            }
+            for file in [
+                ".gitignore",
+                "README.md",
+                "notes.log",
+                ".hidden-config",
+                "src/main.rs",
+                "src/main.o",
+                "src/nested/deep.rs",
+                "build/artifact.bin",
+            ] {
+                std::fs::write(root.join(file), b"x").expect("create file");
+            }
+            std::fs::write(root.join(".gitignore"), gitignore).expect("write gitignore");
+
+            let root = root.canonicalize().expect("canonicalize");
+            Self { root }
+        }
+
+        /// Paths under the root, relative and slash-separated, sorted.
+        fn walked(&self, respect_gitignore: bool) -> Vec<String> {
+            let limits = WalkLimits {
+                max_below: 10_000,
+                respect_gitignore,
+            };
+            let mut names: Vec<String> = walk_messages(&self.root, &[], limits)
+                .into_iter()
+                .flatten()
+                .map(|p| {
+                    p.strip_prefix(&self.root)
+                        .unwrap_or(&p)
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect();
+            names.sort();
+            names
+        }
+    }
+
+    impl Drop for IgnoredTree {
+        fn drop(&mut self) {
+            if let Some(parent) = self.root.parent() {
+                let _ = std::fs::remove_dir_all(parent);
+            }
+        }
+    }
+
+    #[test]
+    fn test_gitignored_files_and_directories_are_skipped() {
+        let tree = IgnoredTree::new("basic", "build/\n*.o\n*.log\n");
+
+        let walked = tree.walked(true);
+
+        assert!(!walked.contains(&"build".to_string()), "{:?}", walked);
+        assert!(
+            !walked.iter().any(|p| p.starts_with("build")),
+            "nothing inside an ignored directory either: {:?}",
+            walked
+        );
+        assert!(
+            !walked.contains(&"src/main.o".to_string()),
+            "ignoring files, not just directories, is most of the point: {:?}",
+            walked
+        );
+        assert!(!walked.contains(&"notes.log".to_string()), "{:?}", walked);
+        assert!(walked.contains(&"src/main.rs".to_string()), "{:?}", walked);
+        assert!(
+            walked.contains(&"src/nested/deep.rs".to_string()),
+            "and the walk still goes deep where it should: {:?}",
+            walked
+        );
+    }
+
+    #[test]
+    fn test_an_ignored_directory_at_the_top_is_pruned_by_the_second_pass_too() {
+        // The hazard is the split between passes. The first covers depth one
+        // and prunes `build` there; the second starts at depth two, so if it is
+        // told to *begin* at depth two rather than to skip what it finds above,
+        // nothing ever prunes `build` and everything under it is walked. That
+        // is 57,000 entries for a `target` directory, which is by itself enough
+        // to push a repository past the threshold and into showing only its top
+        // level.
+        let tree = IgnoredTree::new("depth-one", "build/\n");
+
+        let walked = tree.walked(true);
+
+        assert!(
+            !walked.iter().any(|p| p.starts_with("build")),
+            "the second pass has to prune it as well: {:?}",
+            walked
+        );
+        assert!(
+            walked.contains(&"src/nested/deep.rs".to_string()),
+            "while still reaching everything below the depth it starts at: {:?}",
+            walked
+        );
+    }
+
+    #[test]
+    fn test_dotfiles_are_still_searchable() {
+        let tree = IgnoredTree::new("dotfiles", "build/\n");
+
+        let walked = tree.walked(true);
+
+        assert!(
+            walked.contains(&".hidden-config".to_string()),
+            "psychic is for finding .zshrc as much as main.rs, so it differs \
+             from ripgrep here on purpose: {:?}",
+            walked
+        );
+        assert!(
+            walked.contains(&".gitignore".to_string()),
+            "including the ignore file itself: {:?}",
+            walked
+        );
+    }
+
+    #[test]
+    fn test_no_ignore_shows_everything() {
+        let tree = IgnoredTree::new("no-ignore", "build/\n*.o\n*.log\n");
+
+        let walked = tree.walked(false);
+
+        for expected in ["build/artifact.bin", "src/main.o", "notes.log"] {
+            assert!(
+                walked.contains(&expected.to_string()),
+                "--no-ignore means what it says, missing {}: {:?}",
+                expected,
+                walked
+            );
+        }
+    }
+
+    #[test]
+    fn test_the_built_in_floor_applies_with_no_ignore_file() {
+        // Outside a repository there is nothing to read, and these four are
+        // noise everywhere.
+        let tree = IgnoredTree::new("floor", "");
+        for dir in ["node_modules", "target", ".venv"] {
+            std::fs::create_dir_all(tree.root.join(dir)).expect("create dir");
+            std::fs::write(tree.root.join(dir).join("junk.txt"), b"x").expect("create file");
+        }
+
+        let walked = tree.walked(true);
+
+        for noise in ["node_modules", "target", ".venv"] {
+            assert!(
+                !walked.iter().any(|p| p.starts_with(noise)),
+                "{} should be skipped with no gitignore to say so: {:?}",
+                noise,
+                walked
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_parent_gitignore_applies_from_a_subdirectory() {
+        let tree = IgnoredTree::new("parents", "*.o\n");
+
+        let limits = WalkLimits {
+            max_below: 10_000,
+            respect_gitignore: true,
+        };
+        let walked: Vec<PathBuf> = walk_messages(&tree.root.join("src"), &[], limits)
+            .into_iter()
+            .flatten()
+            .collect();
+
+        assert!(
+            !walked.iter().any(|p| p.ends_with("main.o")),
+            "launching inside a repository still obeys its root .gitignore: {:?}",
+            walked
+        );
+        assert!(
+            walked.iter().any(|p| p.ends_with("main.rs")),
+            "{:?}",
+            walked
+        );
+    }
+
     #[test]
     fn test_the_children_are_sent_first_and_announced() {
         let tree = TempTree::new("children-first");
 
-        let messages = walk_messages(&tree.root, &[], 10_000);
+        let messages = walk_messages(&tree.root, &[], open_limits());
         let announced = messages
             .iter()
             .position(|m| m.is_none())
@@ -503,7 +762,7 @@ mod tests {
             })
             .expect("queue the command");
 
-        let interrupted_by = walk_directory(&tree.root, &[], 10_000, &command_rx, &tx);
+        let interrupted_by = walk_directory(&tree.root, &[], open_limits(), &command_rx, &tx);
 
         let Some(WalkerCommand::ChangeCwd { path, .. }) = interrupted_by else {
             panic!("The walk must hand back the command that stopped it");
@@ -531,7 +790,7 @@ mod tests {
                 .expect("queue the command");
         }
 
-        let interrupted_by = walk_directory(&tree.root, &[], 10_000, &command_rx, &tx);
+        let interrupted_by = walk_directory(&tree.root, &[], open_limits(), &command_rx, &tx);
 
         let Some(WalkerCommand::ChangeCwd { path, .. }) = interrupted_by else {
             panic!("The walk must hand back a command");
@@ -544,10 +803,17 @@ mod tests {
     }
 
     fn walked_paths_with_limit(root: &Path, max_below: usize) -> Vec<PathBuf> {
-        let mut paths: Vec<PathBuf> = walk_messages(root, &[], max_below)
-            .into_iter()
-            .flatten()
-            .collect();
+        let mut paths: Vec<PathBuf> = walk_messages(
+            root,
+            &[],
+            WalkLimits {
+                max_below,
+                ..open_limits()
+            },
+        )
+        .into_iter()
+        .flatten()
+        .collect();
         paths.sort();
         paths
     }

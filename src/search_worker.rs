@@ -235,12 +235,24 @@ impl FileInfo {
     }
 }
 
+/// What the worker needs at startup, beyond where to look and where to log.
+///
+/// A struct rather than three loose bools at the call site, which is a
+/// transposition waiting to happen.
+pub struct WorkerOptions {
+    /// Skip click history and previously interacted files.
+    pub no_click_loading: bool,
+    /// Skip the ranking model.
+    pub no_model: bool,
+    /// Whether the walker consults `.gitignore` and friends.
+    pub respect_gitignore: bool,
+}
+
 pub fn spawn<T>(
     cwd: PathBuf,
     data_dir: &Path,
     event_tx: Sender<T>,
-    no_click_loading: bool,
-    no_model: bool,
+    options: WorkerOptions,
 ) -> Result<(Sender<WorkerRequest>, JoinHandle<()>)>
 where
     T: From<WorkerResponse> + Send + 'static,
@@ -278,8 +290,8 @@ where
             cwd_clone,
             &data_dir,
             walker_command_tx_clone,
-            no_click_loading,
-            no_model,
+            options.no_click_loading,
+            options.no_model,
             hidden_for_worker,
         )
         .unwrap();
@@ -293,6 +305,7 @@ where
     start_file_walker(
         canonical_cwd,
         walker_hidden,
+        options.respect_gitignore,
         walker_command_rx,
         walker_message_tx,
     );
