@@ -524,6 +524,35 @@ On startup, psychic automatically logs a startup_visit event for the initial dir
 **Historical files:** Loads previously clicked/scrolled files from events.db at startup.
 Why: User can find files from other projects they've accessed before.
 
+**One `stat` per path, on its own thread.** It used to be three syscalls each -
+`exists()`, then `canonicalize()`, then `metadata()` - where the first and third
+ask the same question, since a `stat` that succeeds *is* the existence check,
+and the second answers one nothing asks: every writer of the events table stores
+a path that is already canonical, because it comes from a registry entry the
+walker canonicalised when it found it. Checked against the real database, of the
+stored paths still on disk none differed from their canonical form by anything
+but a trailing slash, and `Path` compares and hashes by component, so a trailing
+slash could not have produced a second registry entry anyway.
+
+The load also runs beside the ranker rather than after it. The two share
+nothing: one reads the model file and the click history, the other reads the
+path list and stats each path. The ranker stays on the worker thread, because a
+LightGBM `Booster` holds raw pointers and is not `Send`; what crosses the
+boundary is a `Vec<FileInfo>`, which is. Both open their own SQLite connection,
+which WAL mode is happy with.
+
+Measured against a copy of the real database, 177 historical paths, median of 7:
+
+| | before | after |
+|---|---|---|
+| `ranker_init` | 4.44ms | 4.38ms |
+| `load_historical_files` | 4.06ms | 2.37ms |
+| `worker_state_new_total` | 8.56ms | 4.49ms |
+| `first_query_complete` | 12.27ms | 8.63ms |
+
+Roughly half of that is each change: with the syscall fix alone and the loads
+still sequential, `worker_state_new_total` measured 6.79ms.
+
 The query is bounded two ways, because this is the one query on the startup path
 whose cost grew with total history (events are never purged):
 

@@ -188,6 +188,63 @@ struct FileInfo {
     hidden: bool,
 }
 
+/// Every path the user has interacted with that is still on disk, as registry
+/// entries.
+///
+/// One `stat` per path. It used to be three: `exists()`, then `canonicalize()`,
+/// then `metadata()`. The first and third ask the same question - a `stat` that
+/// succeeds *is* the existence check - and the second answers one nothing asks.
+/// Every writer of the events table stores a path that is already canonical,
+/// because it comes from a registry entry the walker canonicalised when it
+/// found it. Checked against the real database: of the stored paths still on
+/// disk, none differed from their canonical form by anything except a trailing
+/// slash, and `Path` compares and hashes by component, so a trailing slash was
+/// never going to produce a second registry entry anyway.
+fn load_historical_files(db_path: &Path, root: &Path) -> Vec<FileInfo> {
+    // Timed in here rather than around the call, which would measure the
+    // ranker load running beside it as well.
+    let start = std::time::Instant::now();
+
+    let db = match Database::new(db_path) {
+        Ok(db) => db,
+        Err(e) => {
+            log::error!("Failed to open the database for historical files: {}", e);
+            return Vec::new();
+        }
+    };
+
+    let paths = db.get_previously_interacted_files().unwrap_or_default();
+    let candidates = paths.len();
+
+    let files: Vec<FileInfo> = paths
+        .into_iter()
+        .filter_map(|path| {
+            let path = PathBuf::from(path);
+            // The one syscall. `Err` here means the path is gone, which is the
+            // answer `exists()` used to be asked for separately.
+            let metadata = std::fs::metadata(&path).ok()?;
+
+            Some(FileInfo::from_history(
+                path,
+                metadata.mtime_as_secs(),
+                metadata.atime_as_secs(),
+                Some(metadata.len() as i64),
+                metadata.is_dir(),
+                root,
+            ))
+        })
+        .collect();
+
+    log::info!(
+        "TIMING {{\"op\":\"load_historical_files\",\"ms\":{},\"count\":{},\"candidates\":{}}}",
+        start.elapsed().as_secs_f64() * 1000.0,
+        files.len(),
+        candidates
+    );
+
+    files
+}
+
 /// How a path should read in the list, given where we are standing.
 ///
 /// The root gets its own directory name. Stripping the root from itself leaves
@@ -219,7 +276,7 @@ impl FileInfo {
         atime: Option<i64>,
         file_size: Option<i64>,
         is_dir: bool,
-        root: &PathBuf,
+        root: &Path,
     ) -> Self {
         let display_name = display_name_for(&full_path, root);
         let is_under_cwd = full_path.starts_with(root);
@@ -380,66 +437,51 @@ impl WorkerState {
     ) -> Result<Self> {
         let worker_state_start = std::time::Instant::now();
 
-        let ranker_start = std::time::Instant::now();
         let model_path = data_dir.join("model.txt");
         let db_path = Database::get_db_path(data_dir);
 
-        let ranker = if no_click_loading || _no_model {
-            // Skip loading model and clicks if either flag is set
-            ranker::Ranker::new_empty(&db_path)?
-        } else {
-            Self::load_ranker(&model_path, &db_path)?
-        };
-        log::info!(
-            "TIMING {{\"op\":\"ranker_init\",\"ms\":{}}}",
-            ranker_start.elapsed().as_secs_f64() * 1000.0
-        );
+        // The two halves of start-up share nothing: one reads the model file
+        // and the click history, the other reads the path list and stats each
+        // path. So do them at once. The ranker stays on *this* thread because a
+        // LightGBM `Booster` holds raw pointers and is not `Send`; what crosses
+        // the boundary is a `Vec<FileInfo>`, which is.
+        let (ranker, historical) = std::thread::scope(|scope| {
+            let loader = (!no_click_loading).then(|| {
+                let db_path = db_path.clone();
+                let root = root.clone();
+                scope.spawn(move || load_historical_files(&db_path, &root))
+            });
 
-        // Load historical files.
-        let historical_start = std::time::Instant::now();
-        let mut file_registry = Vec::new();
+            let ranker_start = std::time::Instant::now();
+            let ranker = if no_click_loading || _no_model {
+                // Skip loading model and clicks if either flag is set
+                ranker::Ranker::new_empty(&db_path)
+            } else {
+                Self::load_ranker(&model_path, &db_path)
+            };
+            log::info!(
+                "TIMING {{\"op\":\"ranker_init\",\"ms\":{}}}",
+                ranker_start.elapsed().as_secs_f64() * 1000.0
+            );
+
+            let historical = loader
+                .map(|handle| handle.join().unwrap_or_default())
+                .unwrap_or_default();
+
+            (ranker, historical)
+        });
+        let ranker = ranker?;
+
+        let mut file_registry: Vec<FileInfo> = Vec::with_capacity(historical.len() + 1);
         let mut path_to_id: HashMap<PathBuf, FileId> = HashMap::new();
-
-        if !no_click_loading {
-            let db = Database::new(&db_path)?;
-            let historical_paths: Vec<PathBuf> = db
-                .get_previously_interacted_files()
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|p| {
-                    let path = PathBuf::from(&p);
-                    if path.exists() { Some(path) } else { None }
-                })
-                .collect();
-            log::info!("Loading {} historical paths", historical_paths.len());
-
-            for path in historical_paths {
-                // Canonicalize historical paths and get their metadata once, at
-                // startup, to minimize syscalls later during searches.
-                let canonical_path = path.canonicalize().unwrap_or(path);
-
-                path_to_id.entry(canonical_path.clone()).or_insert_with(|| {
-                    let metadata = get_file_metadata(&canonical_path);
-                    let file_info = FileInfo::from_history(
-                        canonical_path,
-                        metadata.mtime,
-                        metadata.atime,
-                        metadata.file_size,
-                        metadata.is_dir,
-                        &root,
-                    );
-                    let file_id = FileId(file_registry.len());
-                    file_registry.push(file_info);
-                    file_id
-                });
-            }
+        for file in historical {
+            let path = file.full_path.clone();
+            path_to_id.entry(path).or_insert_with(|| {
+                let file_id = FileId(file_registry.len());
+                file_registry.push(file);
+                file_id
+            });
         }
-
-        log::info!(
-            "TIMING {{\"op\":\"load_historical_files\",\"ms\":{},\"count\":{}}}",
-            historical_start.elapsed().as_secs_f64() * 1000.0,
-            file_registry.len()
-        );
 
         let canonical_root = root.canonicalize().unwrap_or_else(|_| root.clone());
 
@@ -497,14 +539,14 @@ impl WorkerState {
             return;
         }
 
-        let metadata = get_file_metadata(&root);
+        let metadata = std::fs::metadata(&root).ok();
         let file_id = FileId(self.file_registry.len());
         self.file_registry.push(FileInfo {
             full_path: root.clone(),
             display_name,
-            mtime: metadata.mtime,
-            atime: metadata.atime,
-            file_size: metadata.file_size,
+            mtime: metadata.as_ref().and_then(|m| m.mtime_as_secs()),
+            atime: metadata.as_ref().and_then(|m| m.atime_as_secs()),
+            file_size: metadata.as_ref().map(|m| m.len() as i64),
             origin: FileOrigin::CwdWalker,
             is_dir: true,
             is_under_cwd: true,
@@ -1178,37 +1220,6 @@ fn drain_requests(rx: &mpsc::Receiver<WorkerRequest>, first: WorkerRequest) -> V
     }
 
     queue
-}
-
-// Internal struct for file metadata (not exported)
-struct FileMetadata {
-    mtime: Option<i64>,
-    atime: Option<i64>,
-    file_size: Option<i64>,
-    is_dir: bool,
-}
-
-fn get_file_metadata(path: &PathBuf) -> FileMetadata {
-    if let Ok(metadata) = std::fs::metadata(path) {
-        let mtime = metadata.mtime_as_secs();
-        let atime = metadata.atime_as_secs();
-        let file_size = Some(metadata.len() as i64);
-        let is_dir = metadata.is_dir();
-
-        FileMetadata {
-            mtime,
-            atime,
-            file_size,
-            is_dir,
-        }
-    } else {
-        FileMetadata {
-            mtime: None,
-            atime: None,
-            file_size: None,
-            is_dir: false,
-        }
-    }
 }
 
 #[cfg(test)]

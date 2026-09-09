@@ -322,12 +322,16 @@ Filter+rank is ~2ms per keystroke and is not the problem.
   `psychic internal preview` times the generator with nothing around it; against
   bat we are 1.3-2.0x faster even discounting bat's entire start-up, and at a
   screenful our whole operation costs less than bat's floor alone.
-- **P3. Three syscalls per historical path at startup.** `WorkerState::new`
-  does `exists()`, then `canonicalize()`, then `metadata()` per path: 6.3ms
-  for 172 paths. Stored `full_path` values are already canonical. One
-  `metadata()` call answers all three (Err = does not exist). Also the
-  booster load (~6ms) and the history load (~6ms) are sequential on the
-  worker thread and independent; run them under `std::thread::scope`.
+- **P3. Startup syscalls and sequencing.** DONE (2026-09-09). One `stat` per
+  historical path instead of `exists()` + `canonicalize()` + `metadata()`, and
+  the history load now runs beside the ranker load rather than after it (the
+  ranker stays put: `Booster` is not `Send`). Verified against the real
+  database that no stored path differs from its canonical form by more than a
+  trailing slash, which `Path` ignores. Measured, median of 7, same 177
+  registry entries either way: `load_historical_files` 4.06ms -> 2.37ms,
+  `worker_state_new_total` 8.56ms -> 4.49ms, `first_query_complete` 12.27ms ->
+  8.63ms. About half from each change; with only the syscall fix the total was
+  6.79ms. `get_file_metadata`/`FileMetadata` fell out as dead weight.
 - **P4. Timing instrumentation: keep every number, cut the allocations and
   the line count.** `ranker.rs::compute_features_with_timing` allocates 15
   String keys and a hashmap per file per keystroke and collects a Vec of
