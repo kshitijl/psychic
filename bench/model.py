@@ -72,8 +72,14 @@ def generate_features(binary, out_dir):
     return out_dir / "features.csv"
 
 
-def evaluate(train_py, csv_path, schema_dir):
-    """Rolling-origin folds over one feature set. Returns metrics and gains."""
+def evaluate(train_py, csv_path, schema_dir, fixed_rounds=None):
+    """Rolling-origin folds over one feature set. Returns metrics and gains.
+
+    With `fixed_rounds`, both sides train for the same number of rounds and
+    early stopping is off. Early stopping watches pooled validation AUC, so a
+    feature that moves that curve changes how long training runs - and then the
+    comparison is partly two differently sized models rather than the feature.
+    """
     feature_names, binary_features, monotonicity = train_py.load_schema(schema_dir)
     df = train_py.load_data(str(csv_path))
     prepared = train_py.prepare_features(df, feature_names, binary_features, monotonicity)
@@ -93,15 +99,18 @@ def evaluate(train_py, csv_path, schema_dir):
 
         data = lgb.Dataset(X[train], label=y[train], weight=weights[train])
         valid = lgb.Dataset(X[val], label=y[val], weight=weights[val], reference=data)
-        model = lgb.train(
-            params, data, num_boost_round=1000, valid_sets=[valid],
-            callbacks=[lgb.early_stopping(50, verbose=False)],
-        )
+        if fixed_rounds:
+            model = lgb.train(params, data, num_boost_round=fixed_rounds)
+        else:
+            model = lgb.train(
+                params, data, num_boost_round=1000, valid_sets=[valid],
+                callbacks=[lgb.early_stopping(50, verbose=False)],
+            )
         folds.append(score(model, X[test], y[test], episodes[test]))
 
     # Gains come from a fit on everything, which is what ships.
-    full = lgb.train(params, lgb.Dataset(X, label=y, weight=weights),
-                     num_boost_round=int(np.mean([f["rounds"] for f in folds])))
+    rounds = fixed_rounds or int(np.mean([f["rounds"] for f in folds]))
+    full = lgb.train(params, lgb.Dataset(X, label=y, weight=weights), num_boost_round=rounds)
     gains = dict(zip(full.feature_name(), full.feature_importance("gain")))
 
     metrics = {key: float(np.mean([f[key] for f in folds])) for key in
@@ -136,7 +145,7 @@ def score(model, X, y, episodes):
     }
 
 
-def compare():
+def compare(fixed_rounds=None):
     train_py = load_train_py()
     baseline_binary = WORK / "old-src/target/release/psychic"
     current_binary = REPO / "target/release/psychic"
@@ -149,11 +158,12 @@ def compare():
             out_dir = Path(tmp) / name
             csv_path = generate_features(binary, out_dir)
             print(f"--- {name}: {binary} ---", flush=True)
-            results[name] = evaluate(train_py, csv_path, out_dir)
+            results[name] = evaluate(train_py, csv_path, out_dir, fixed_rounds)
 
     (before, before_gains), (after, after_gains) = results["before"], results["after"]
 
-    print(f"\nrolling-origin folds at {FOLD_STARTS}, "
+    how = f", {fixed_rounds} rounds fixed" if fixed_rounds else ""
+    print(f"\nrolling-origin folds at {FOLD_STARTS}{how}, "
           f"{before['episodes']} scored episodes\n")
     print(f"{'':<10}{'before':>10}{'after':>10}{'change':>10}")
     for key, label in (("auc", "AUC"), ("top1", "top-1"), ("mrr", "MRR"), ("rmse", "RMSE")):
@@ -183,6 +193,8 @@ def compare():
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "compare":
-        compare()
+        # ./bench/model.py compare [rounds]
+        rounds = int(sys.argv[2]) if len(sys.argv) > 2 else None
+        compare(rounds)
     else:
         print(__doc__)

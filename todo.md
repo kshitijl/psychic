@@ -434,9 +434,29 @@ Accumulator's fold over time-sorted events), so add the index to both
    Largest feature by gain at 22.7% of the total, ahead of
    `clicks_for_this_query`. top-1 0.6921 -> 0.7145 over three folds, but they
    disagreed: +0.010, +0.066, -0.008, so the mean leans on one fold.
-3. **Query length** (`query.chars().count()`). Fuzzy scores scale with it
-   and clicks_for_this_query only means anything past a few chars; today
-   the tree infers it from fuzzy_score magnitude. Trivial.
+3. **Query length.** TRIED AND REJECTED (2026-09-10). Implemented as
+   `query.chars().count()`, measured, reverted. Costs 3.9 points of top-1 with
+   early stopping removed and the round count fixed, in all three folds; AUC
+   moves +0.0007 the other way.
+
+   Not what it looks like. The interactions do get learned - 75 splits on it,
+   none at the root, 143 splits on other features underneath them, which is
+   exactly "for short queries trust recency, for long queries trust the fuzzy
+   score". They just do not generalise: trained on the first 70% and scored
+   both ways, top-1 goes 0.7346 -> 0.7370 on data it trained on and
+   0.7377 -> 0.6967 on the future.
+
+   **The general trap, worth remembering before adding any per-query feature:**
+   `query_length` is an episode-level attribute, and `min_data_in_leaf` counts
+   rows. Episodes here average ~48 rows, so a rule keyed to query length looks
+   supported by hundreds of rows while resting on a handful of independent
+   observations - the 3-4 character band is 102 episodes in the entire history.
+   The split-finder is confident for the wrong reason.
+
+   If per-query features are wanted later, they need something that accounts in
+   episodes rather than rows: a much larger `min_data_in_leaf`, or the
+   `lambdarank` objective with episode groups, which the doc says this used to
+   use and no longer does.
 4. **Collection change: record rank position on impressions.** Add
    `rank INTEGER` to events, set in `log_impressions` from the row's index.
    Cannot be backfilled. Enables position-aware weighting/features later
