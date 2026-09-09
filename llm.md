@@ -62,6 +62,36 @@ Why every commit and not just the performance ones:
   the tool got faster and where it got slower, which is the only way to answer
   "when did startup double" without re-deriving it.
 
+## Adding or changing a ranking feature
+
+A feature changes what the model predicts, so the performance benchmark is not
+enough on its own. Retrain and report what happened to ranking quality, as a
+table, in the commit message:
+
+```
+                      before   after
+  AUC                  0.938   0.941
+  top-1                0.664   0.681
+  MRR                  0.763   0.771
+  RMSE                 0.131   0.129
+```
+
+Measured the way `bench/` measures speed: rolling-origin folds over the episode
+timeline, so the model is always predicting the future from the past. One
+feature per commit - two at once and neither number means anything, because a
+gain and a loss cancel and both look like noise.
+
+Report the feature's own importance too (gain, from `model_stats.json`), and say
+where the data came from: a feature computed from rows the collection has never
+written is a feature that will read zero until enough time passes.
+
+The performance benchmark still applies. A feature is computed for every
+candidate on every keystroke, so it is exactly the kind of change that can cost
+a millisecond without anyone noticing.
+
+A commit that touches only documentation has nothing to measure; say so rather
+than running the harness for form's sake.
+
 **Know the noise floor before reading anything into a number.** Benchmarked
 against itself, the same binary lands within 1-3% on the big figures (walk
 complete, worker state, first full render) and within about 15% on the
