@@ -880,7 +880,6 @@ pub struct Ranker {
     model: Option<Booster>,
     clicks: ClickData,
     stats: Option<ModelStats>,
-    total_clicks: usize,
 }
 
 pub struct ClickData {
@@ -894,7 +893,6 @@ pub struct ClickData {
 - `clicks_by_file`: Indexed by full file path
 - `clicks_by_parent_dir`: Indexed by parent directory path
 - `clicks_by_query_and_file`: Indexed by (query, full_path) tuple for query-specific click tracking
-- `total_clicks`: How many of those events there were, used to weight the two models
 
 Why: O(1) lookup per file vs O(n) query per file. Database query runs once with composite index. Multiple indices enable different features without re-querying the database.
 
@@ -917,14 +915,14 @@ The ranker uses a two-model hybrid system to handle cold-start scenarios (new in
 
 3. **Blending:**
    - Final score: `w_simple * simple_score + w_ml * ml_score`
-   - Weights come from a tanh ramp over `total_clicks`, with `k = 15` and `l = 2`:
+   - Weights come from a tanh ramp over `num_positive_examples`, with `k = 15` and `l = 2`:
 
 ```rust
-let ml_weight = (1.0 + (total_clicks as f64 / k - l).tanh()) / 2.0;
+let ml_weight = (1.0 + (num_positive_examples as f64 / k - l).tanh()) / 2.0;
 let simple_weight = 1.0 - ml_weight;
 ```
 
-| `total_clicks` | w_simple | w_ml |
+| `num_positive_examples` | w_simple | w_ml |
 |---|---|---|
 | 0 | 0.982 | 0.018 |
 | 15 | 0.881 | 0.119 |
@@ -932,31 +930,33 @@ let simple_weight = 1.0 - ml_weight;
 | 45 | 0.119 | 0.881 |
 | 60 | 0.018 | 0.982 |
 
-The ramp crosses over at `k * l` = 30 events and is effectively saturated by 60, so
-the interesting range is narrow. Near the midpoint each additional event moves the
-ML weight by about `1 / (2k)` = 3.3 percentage points, so the blend can shift
-noticeably within a single session.
+The ramp crosses over at `k * l` = 30 positives and is effectively saturated by 60,
+so the interesting range is narrow, and it is crossed once on a given installation:
+the number only moves when a retrain writes new stats.
 
-**The weighting is a rolling 30-day window, not a lifetime total.**
+**The gate asks how much the model was trained on, not how busy the last month was.**
 
-`total_clicks` is a count of click and scroll events from the last 30 days only
-(see `load_clicks`), recomputed at every startup. It does not accumulate over the
-life of the installation. Consequences worth remembering:
+`num_positive_examples` is the count of clicked rows in the training data, read
+from `model_stats.json` into `ModelStats` and held on the ranker as `stats`. It
+answers the only question the blend needs answered - has this model seen enough
+to be trusted - and it changes only when a retrain writes new stats.
 
-- A month of light use pushes the blend back toward the simple model, even on an
-  installation that has been used for years and has a well-trained model. The
-  model file is unaffected; only its weight drops.
-- Heavy use of one project does not carry over as "trust" once that month passes.
-- Scrolls count the same as clicks here, so scrolling through results raises the
-  ML weight even when nothing is opened.
+It used to ramp over the number of clicks and scrolls in the last 30 days,
+recomputed at every startup. That made a quiet month hand ranking back
+to the simple model on an installation with years of history and a perfectly good
+model behind it, and it counted scrolling through results as evidence for the
+model. Staleness does need handling, but it is handled where it belongs: the
+click *data* is already a rolling 30-day window, and the model's features carry
+no file identity, so nothing in the model itself expires.
 
-Why blend this way: on a new installation the ML model either doesn't exist or has
+A model that loaded but whose stats did not gets 0, and so ~2% weight. That means
+a working model is nearly ignored, so `load_stats` logs a warning when it happens;
+`train.py` writes both files in the same run, so it should not.
+
+Why blend at all: on a new installation the ML model either doesn't exist or has
 nothing meaningful to learn from, so the simple model provides reasonable ranking
-from recency and click counts. The tanh ramp hands over to the ML model once there
-is recent evidence that it was trained on real usage. Tying that to a rolling window
-rather than a lifetime counter means a model trained on stale behaviour loses
-influence on its own, instead of being trusted forever on the strength of clicks
-from a year ago.
+from recency and click counts, and the ramp hands over once the model has been
+trained on enough clicks to beat it.
 
 **Ranking:**
 ```rust

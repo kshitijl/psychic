@@ -64,7 +64,6 @@ pub struct Ranker {
     model: Option<Booster>,
     pub clicks: ClickData,
     pub stats: Option<ModelStats>,
-    pub total_clicks: usize,
 }
 
 // Tunable constants for hybrid ranking
@@ -117,7 +116,7 @@ impl Ranker {
         );
 
         let clicks_load_start = std::time::Instant::now();
-        let (clicks, total_clicks) = Self::load_clicks(db)?;
+        let clicks = Self::load_clicks(db)?;
         log::info!(
             "TIMING {{\"op\":\"load_clicks\",\"ms\":{}}}",
             clicks_load_start.elapsed().as_secs_f64() * 1000.0
@@ -134,7 +133,6 @@ impl Ranker {
             model: Some(model),
             clicks,
             stats,
-            total_clicks,
         })
     }
 
@@ -150,7 +148,7 @@ impl Ranker {
     pub fn new_empty(db: &db::Database) -> Result<Self> {
         // Load clicks even when there's no model (needed for simple scoring)
         let clicks_load_start = std::time::Instant::now();
-        let (clicks, total_clicks) = Self::load_clicks(db)?;
+        let clicks = Self::load_clicks(db)?;
         log::info!(
             "TIMING {{\"op\":\"load_clicks\",\"ms\":{}}}",
             clicks_load_start.elapsed().as_secs_f64() * 1000.0
@@ -160,7 +158,6 @@ impl Ranker {
             model: None,
             clicks,
             stats: None,
-            total_clicks,
         })
     }
 
@@ -180,13 +177,22 @@ impl Ranker {
                 }
             }
         } else {
+            // Only reached with a model already loaded, and train.py writes both
+            // files in the same run. Without stats the blend has no idea how
+            // much the model was trained on and falls back to ~2% weight, so a
+            // model that ranks fine is nearly ignored - say so rather than
+            // silently ranking worse.
+            log::warn!(
+                "Model loaded but no stats at {}; ranking will lean on the \
+                 simple model until the next retrain writes them",
+                stats_path.display()
+            );
             None
         }
     }
 
     /// Load click events from last 30 days from database
-    /// Returns (ClickData, total_clicks)
-    pub fn load_clicks(db: &db::Database) -> Result<(ClickData, usize)> {
+    pub fn load_clicks(db: &db::Database) -> Result<ClickData> {
         let total_start = std::time::Instant::now();
 
         let now_ts = Timestamp::now().as_second();
@@ -213,7 +219,6 @@ impl Ranker {
 
         let indexing_start = std::time::Instant::now();
         let row_count = rows.len();
-        let total_clicks = row_count; // Total number of engagement events (clicks + scrolls)
         for db::Engagement {
             full_path: path,
             timestamp,
@@ -273,10 +278,7 @@ impl Ranker {
             "TIMING {{\"op\":\"load_clicks_total\",\"ms\":{}}}",
             total_start.elapsed().as_secs_f64() * 1000.0
         );
-        log::debug!(
-            "Loaded {} total engagements from last 30 days",
-            total_clicks
-        );
+        log::debug!("Loaded {} total engagements from last 30 days", row_count);
         log::debug!(
             "Loaded {} files with engagement history from last 30 days",
             clicks_by_file.len()
@@ -291,15 +293,12 @@ impl Ranker {
             engagements_by_episode_query_and_file.len()
         );
 
-        Ok((
-            ClickData {
-                clicks_by_file,
-                clicks_by_parent_dir,
-                clicks_by_query_and_file,
-                engagements_by_episode_query_and_file,
-            },
-            total_clicks,
-        ))
+        Ok(ClickData {
+            clicks_by_file,
+            clicks_by_parent_dir,
+            clicks_by_query_and_file,
+            engagements_by_episode_query_and_file,
+        })
     }
 
     /// Apply sigmoid function to normalize raw scores to [0, 1] range
@@ -350,19 +349,28 @@ impl Ranker {
         Self::sigmoid(raw_score)
     }
 
-    /// Compute blend weights with a tanh ramp over recent engagement.
+    /// Compute blend weights with a tanh ramp over how much the model was
+    /// trained on.
     ///
-    /// `total_clicks` counts clicks and scrolls from the **last 30 days only**, so
-    /// this is a rolling measure: a quiet month hands ranking back to the simple
-    /// model even on a long-lived installation. Crossover is at `k * l` = 30
-    /// events, saturating around 60.
+    /// `num_positive_examples` is the count of clicked rows in the training
+    /// data, from `model_stats.json`. It answers the only question the gate
+    /// needs to ask - has this model seen enough to be trusted - and it does not
+    /// move until the next retrain.
+    ///
+    /// It used to ramp over engagements in the last 30 days, which handed
+    /// ranking back to the simple model after a quiet month on an installation
+    /// with years of history behind it. Staleness is already handled where it
+    /// belongs: the click *data* is a rolling 30-day window, and the model's
+    /// features carry no file identity, so the model itself does not go stale.
+    ///
+    /// Crossover is at `k * l` = 30 positives, saturating around 60.
     ///
     /// Returns: (w_simple, w_lightgbm) where weights sum to 1.0
-    fn compute_blend_weights(total_clicks: usize) -> (f64, f64) {
+    fn compute_blend_weights(num_positive_examples: usize) -> (f64, f64) {
         let k = 15f64;
         let l = 2f64;
 
-        let x = total_clicks as f64;
+        let x = num_positive_examples as f64;
         let ml_weight = (1.0 + (x / k - l).tanh()) / 2.0;
 
         let simple_weight = 1.0 - ml_weight;
@@ -502,14 +510,19 @@ impl Ranker {
             files.len()
         );
 
-        // Blend the two models by how much recent engagement we have
+        // Blend the two models by how much the model was trained on
         let blend_start = Instant::now();
-        let (w_simple, w_lightgbm) = Self::compute_blend_weights(self.total_clicks);
+        let num_positive_examples = self
+            .stats
+            .as_ref()
+            .map(|s| s.num_positive_examples)
+            .unwrap_or(0);
+        let (w_simple, w_lightgbm) = Self::compute_blend_weights(num_positive_examples);
         log::debug!(
-            "Hybrid ranking weights: simple={:.4}, lightgbm={:.4} (total_clicks={})",
+            "Hybrid ranking weights: simple={:.4}, lightgbm={:.4} (num_positive_examples={})",
             w_simple,
             w_lightgbm,
-            self.total_clicks
+            num_positive_examples
         );
 
         // Build scored files with hybrid blending
@@ -999,18 +1012,20 @@ mod tests {
 
     #[test]
     fn test_compute_blend_weights() {
-        // Test sigmoid blend weights at different click counts
+        // The ramp runs over training positives - clicked rows the model was
+        // trained on, from model_stats.json - not over recent activity.
 
-        // 0 clicks: simple model should dominate (ML ≈ 2%)
+        // A model trained on nothing, or one whose stats would not load: the
+        // simple model should dominate (ML ≈ 2%)
         let (w_simple, w_lightgbm) = Ranker::compute_blend_weights(0);
         assert!(
             w_simple > 0.97 && w_simple < 0.99,
-            "At 0 clicks, w_simple should be ~0.98, got {}",
+            "With no training positives, w_simple should be ~0.98, got {}",
             w_simple
         );
         assert!(
             w_lightgbm > 0.01 && w_lightgbm < 0.03,
-            "At 0 clicks, w_lightgbm should be ~0.02, got {}",
+            "With no training positives, w_lightgbm should be ~0.02, got {}",
             w_lightgbm
         );
         assert!(
@@ -1019,29 +1034,39 @@ mod tests {
             w_simple + w_lightgbm
         );
 
-        // 100 clicks: ML model should dominate (simple nearly zero)
+        // 100 positives: ML model should dominate (simple nearly zero)
         let (w_simple, w_lightgbm) = Ranker::compute_blend_weights(100);
         assert!(
             w_simple < 0.01,
-            "At 100 clicks, w_simple should be near 0.0, got {}",
+            "At 100 positives, w_simple should be near 0.0, got {}",
             w_simple
         );
         assert!(
             w_lightgbm > 0.99,
-            "At 100 clicks, w_lightgbm should be near 1.0, got {}",
+            "At 100 positives, w_lightgbm should be near 1.0, got {}",
             w_lightgbm
         );
 
-        // 1000 clicks: ML model should dominate completely
+        // 1000 positives: ML model should dominate completely
         let (w_simple, w_lightgbm) = Ranker::compute_blend_weights(1000);
         assert!(
             w_simple < 0.001,
-            "At 1000 clicks, w_simple should be ~0.0, got {}",
+            "At 1000 positives, w_simple should be ~0.0, got {}",
             w_simple
         );
         assert!(
             w_lightgbm > 0.999,
-            "At 1000 clicks, w_lightgbm should be ~1.0, got {}",
+            "At 1000 positives, w_lightgbm should be ~1.0, got {}",
+            w_lightgbm
+        );
+
+        // 30 positives is the documented crossover, k * l, where the two models
+        // carry equal weight.
+        let (w_simple, w_lightgbm) = Ranker::compute_blend_weights(30);
+        assert!(
+            (w_simple - 0.5).abs() < 0.0001 && (w_lightgbm - 0.5).abs() < 0.0001,
+            "At the crossover the weights should both be 0.5, got {} and {}",
+            w_simple,
             w_lightgbm
         );
     }
@@ -1153,7 +1178,6 @@ mod tests {
                 engagements_by_episode_query_and_file: FxHashMap::default(),
             },
             stats: None,
-            total_clicks: 10,
         };
 
         let current_timestamp = 1700604800; // Nov 22, 2023
@@ -1268,7 +1292,6 @@ mod tests {
                 engagements_by_episode_query_and_file: FxHashMap::default(),
             },
             stats: None,
-            total_clicks: 2,
         };
 
         let current_timestamp = 1700604800; // Nov 22, 2023
@@ -1354,7 +1377,6 @@ mod tests {
                 engagements_by_episode_query_and_file: FxHashMap::default(),
             },
             stats: None,
-            total_clicks: 3,
         };
 
         let current_timestamp = 1700604800;

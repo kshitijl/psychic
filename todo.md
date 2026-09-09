@@ -1,50 +1,19 @@
 ## now
 
-### Blend weight: ramp on training positives, not last-30-day activity
+### Blend weight: ramp on recent positives once there is a reason to
 
-Background. `Ranker::compute_blend_weights(total_clicks)` in `src/ranker.rs`
-ramps the ML weight with a tanh over `total_clicks`, which `load_clicks`
-counts as click+scroll events in the last 30 days. So a quiet month drops a
-well-trained model to ~2% weight for no reason: the click *data* is already a
-rolling window, so staleness is handled there, and the features carry no
-file identity, so the model itself does not go stale. What the ramp should
-measure is "was this model trained on enough data", and that number already
-exists: `num_positive_examples` in `model_stats.json`, parsed into
-`ModelStats` and stored on the ranker as `stats`.
+The blend now ramps on `num_positive_examples` from model_stats.json, which
+counts every clicked row the model trained on, however old. Recency weights
+ship at a 180-day half-life, so train.py already knows how much of that
+evidence is recent: it could also write `recent_positive_examples` (the
+weight-sum over positives, or positives in the last 60 days) and have
+`compute_blend_weights` ramp on that instead, so a model trained mostly on
+one old burst is trusted slightly less.
 
-1. In `src/ranker.rs`, change `compute_blend_weights` to take the positive
-   example count from stats. Keep the same tanh ramp and constants (k=15,
-   l=2, crossover at 30, saturated ~60); they are fine for "how many clicks
-   has this model seen". In `rank_files`, call it with
-   `self.stats.as_ref().map(|s| s.num_positive_examples).unwrap_or(0)`.
-   A model that loaded but has no readable stats file therefore gets ~2%
-   weight; log a warning in `load_stats` when the model exists but the stats
-   do not, so this is visible in app.log. (Both files are written
-   atomically by the same train.py run, so this should not happen.)
-
-2. Delete the `total_clicks` plumbing:
-   - `Ranker.total_clicks` field; the `usize` half of the tuple returned by
-     `load_clicks` (return `ClickData` alone); the assignments in
-     `Ranker::new` and `new_empty`; the `total_clicks=` in the "Hybrid
-     ranking weights" debug log line.
-   - `total_clicks:` in every hand-built `Ranker { .. }` in the ranker tests.
-   - `test_compute_blend_weights` keeps working with the new argument name.
-
-3. how-it-works.md: in "Module: ranker.rs", replace the "**The weighting is
-   a rolling 30-day window, not a lifetime total.**" paragraph and its bullet
-   list with a short paragraph saying the weight ramps on
-   `num_positive_examples` from model_stats.json, and why: staleness lives in
-   the click data (rolling 30 days) not in the model, so the gate only needs
-   to answer "trained on enough". Update the `Ranker` struct listing there,
-   which still shows `total_clicks`.
-
-Optional follow-up once recency weights exist (training item 4 above): have
-train.py also write `recent_positive_examples` (positives in the last 60
-days, or the weight-sum) and ramp on that instead, so a model trained mostly
-on an old burst is trusted a little less. Not needed for the first cut.
-
-Then `just build`, `cargo test`, `cargo clippy`. `grep -rn total_clicks src/
-how-it-works.md` must come back empty.
+Not obviously worth doing. The ramp saturates at 60 positives and this
+install sits at 1163, so nothing would change today; it only matters for an
+installation that was used hard once and then went quiet for a year. Revisit
+if that ever shows up.
 
 ### 2026-09-08 review: remaining findings and suggested order
 
