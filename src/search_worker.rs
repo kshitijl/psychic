@@ -179,7 +179,7 @@ struct FileInfo {
     is_under_cwd: bool,
     /// Set when the path was found missing from disk at the moment the user
     /// acted on it. Evicted entries stay in the registry so `FileId` indices
-    /// (held by `filtered_files` and the UI's page cache) remain valid, but
+    /// (held by `file_scores` and the UI's page cache) remain valid, but
     /// `filter_and_rank` never emits them again.
     evicted: bool,
     /// Set when this path sits under a hidden prefix that does not contain the
@@ -405,7 +405,6 @@ fn active_hidden_for(hidden: &[PathBuf], root: &Path) -> Vec<PathBuf> {
 struct WorkerState {
     file_registry: Vec<FileInfo>,
     path_to_id: HashMap<PathBuf, FileId>,
-    filtered_files: Vec<FileId>,
     file_scores: Vec<ranker::FileScore>,
     current_query: String,
     current_query_id: u64,
@@ -498,7 +497,6 @@ impl WorkerState {
         let mut state = WorkerState {
             file_registry,
             path_to_id,
-            filtered_files: Vec::new(),
             file_scores: Vec::new(),
             current_query: String::new(),
             current_query_id: 0,
@@ -722,16 +720,27 @@ impl WorkerState {
                 .rank_files(query, &file_candidates, current_timestamp, &self.root)
             {
                 Ok(ranking) => {
-                    self.filtered_files =
-                        ranking.scores.iter().map(|fs| FileId(fs.file_id)).collect();
                     self.file_scores = ranking.scores;
                     Some(ranking.timings)
                 }
                 Err(e) => {
                     log::warn!("Ranking failed: {}, falling back to simple filtering", e);
-                    self.file_scores.clear();
-                    self.filtered_files =
-                        matching_files.iter().map(|&(file_id, _)| file_id).collect();
+                    // The filter's own order, with nothing scored. This used to
+                    // leave `file_scores` empty beside a populated list of ids,
+                    // which is the one case where the two disagreed.
+                    self.file_scores = matching_files
+                        .iter()
+                        .map(|&(file_id, fuzzy_score)| ranker::FileScore {
+                            file_id: file_id.0,
+                            score: 0.0,
+                            features: Vec::new(),
+                            simple_score: None,
+                            ml_score: None,
+                            simple_weight: None,
+                            ml_weight: None,
+                            fuzzy_score,
+                        })
+                        .collect();
                     None
                 }
             };
@@ -762,35 +771,38 @@ impl WorkerState {
     fn get_slice(&self, start: usize, count: usize) -> Vec<DisplayFileInfo> {
         // Precondition: start must be within bounds
         assert!(
-            start <= self.filtered_files.len(),
-            "get_slice: start {} exceeds filtered_files length {}",
+            start <= self.file_scores.len(),
+            "get_slice: start {} exceeds result count {}",
             start,
-            self.filtered_files.len()
+            self.file_scores.len()
         );
 
-        self.filtered_files
+        // Each row's score sits at the row's own position. This used to search
+        // `file_scores` for a matching `file_id` per row, which made drawing a
+        // 128-row page O(results * 128) - the whole result set walked, 128
+        // times, on every keystroke.
+        self.file_scores
             .iter()
             .skip(start)
             .take(count)
-            .map(|&file_id| {
+            .map(|file_score| {
+                let file_id = file_score.file_id;
                 // Precondition: file_id must be valid index into registry
                 assert!(
-                    file_id.0 < self.file_registry.len(),
+                    file_id < self.file_registry.len(),
                     "Invalid file_id {} (registry size: {})",
-                    file_id.0,
+                    file_id,
                     self.file_registry.len()
                 );
 
-                let file_info = &self.file_registry[file_id.0];
-                let file_score = self.file_scores.iter().find(|fs| fs.file_id == file_id.0);
-
-                let score = file_score.map(|fs| fs.score).unwrap_or(0.0);
-                let features = file_score.map(|fs| fs.features.clone()).unwrap_or_default();
-                let simple_score = file_score.and_then(|fs| fs.simple_score);
-                let ml_score = file_score.and_then(|fs| fs.ml_score);
-                let simple_weight = file_score.and_then(|fs| fs.simple_weight);
-                let ml_weight = file_score.and_then(|fs| fs.ml_weight);
-                let fuzzy_score = file_score.map(|fs| fs.fuzzy_score).unwrap_or(0);
+                let file_info = &self.file_registry[file_id];
+                let score = file_score.score;
+                let features = file_score.features.clone();
+                let simple_score = file_score.simple_score;
+                let ml_score = file_score.ml_score;
+                let simple_weight = file_score.simple_weight;
+                let ml_weight = file_score.ml_weight;
+                let fuzzy_score = file_score.fuzzy_score;
 
                 // Check if this is the current working directory
                 let is_cwd = file_info.full_path == self.root;
@@ -828,7 +840,7 @@ impl WorkerState {
         let page_size = crate::app::PAGE_SIZE;
 
         let start_index = page_num * page_size;
-        let end_index = (start_index + page_size).min(self.filtered_files.len());
+        let end_index = (start_index + page_size).min(self.file_scores.len());
         let count = end_index.saturating_sub(start_index);
 
         let files = self.get_slice(start_index, count);
@@ -895,7 +907,7 @@ impl WorkerState {
     /// Stop showing `path`, which the UI found missing from disk.
     ///
     /// The registry entry is marked rather than removed: `FileId` is an index
-    /// into `file_registry`, and those indices are held by `filtered_files` and
+    /// into `file_registry`, and those indices are held by `file_scores` and
     /// by the pages already sent to the UI.
     ///
     /// Returns whether a registered path was actually evicted.
@@ -1024,7 +1036,7 @@ where
     let _ = event_tx.send(
         WorkerResponse::QueryUpdated {
             query_id,
-            total_results: state.filtered_files.len(),
+            total_results: state.file_scores.len(),
             total_files: state.file_registry.len(),
             initial_page,
             model_stats: state.ranker.stats.clone(),
@@ -1519,6 +1531,72 @@ pub(super) mod fresh_install_tests_support {
 }
 
 #[cfg(test)]
+mod page_tests {
+    //! A page of results is a slice of `file_scores`, by position.
+    //!
+    //! It used to search `file_scores` for a row whose `file_id` matched, once
+    //! per row, against a parallel `Vec<FileId>` that held the same order. These
+    //! pin that the two really were the same order, so indexing is safe.
+
+    use super::eviction_tests::worker_with_three_files;
+
+    #[test]
+    fn test_each_row_carries_its_own_score() {
+        let (mut state, _dir, _rx) = worker_with_three_files("page-scores");
+        state.filter_and_rank("").expect("ranking");
+
+        let page = state.get_page(0);
+        assert_eq!(page.files.len(), state.file_scores.len());
+
+        for (row, scored) in page.files.iter().zip(&state.file_scores) {
+            assert_eq!(
+                row.full_path, state.file_registry[scored.file_id].full_path,
+                "row {} is not the file its score belongs to",
+                row.display_name
+            );
+            assert_eq!(row.score, scored.score, "and carries that file's score");
+            assert_eq!(row.fuzzy_score, scored.fuzzy_score);
+        }
+    }
+
+    #[test]
+    fn test_the_page_is_in_ranked_order() {
+        let (mut state, _dir, _rx) = worker_with_three_files("page-order");
+        state.filter_and_rank("").expect("ranking");
+
+        let scores: Vec<f64> = state.get_page(0).files.iter().map(|f| f.score).collect();
+        let mut descending = scores.clone();
+        descending.sort_by(|a, b| b.partial_cmp(a).unwrap());
+        assert_eq!(scores, descending, "best first, as ranked");
+    }
+
+    #[test]
+    fn test_the_last_page_stops_at_the_last_result() {
+        let (mut state, _dir, _rx) = worker_with_three_files("page-short");
+        state.filter_and_rank("").expect("ranking");
+
+        // Three results in a 128-row page: the page ends where they do.
+        let page = state.get_page(0);
+        assert_eq!(page.start_index, 0);
+        assert_eq!(page.end_index, 3);
+        assert_eq!(page.files.len(), 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds result count")]
+    fn test_asking_for_a_page_past_the_end_is_a_bug_and_says_so() {
+        // The UI only asks for pages it has been told exist, so this is a
+        // precondition rather than a case to handle: a page number out of range
+        // means the UI and the worker disagree about how many results there
+        // are, and quietly returning nothing would hide that.
+        let (mut state, _dir, _rx) = worker_with_three_files("page-past-end");
+        state.filter_and_rank("").expect("ranking");
+
+        state.get_page(9);
+    }
+}
+
+#[cfg(test)]
 mod query_timing_tests {
     //! One line per query, in a shape `analyze_perf.rs` can read back.
 
@@ -1731,7 +1809,7 @@ mod fresh_install_tests {
         state.filter_and_rank("").expect("first query");
 
         assert_eq!(
-            state.filtered_files.len(),
+            state.file_scores.len(),
             3,
             "two files and the directory the user is standing in"
         );
@@ -2170,9 +2248,9 @@ mod eviction_tests {
 
     pub(super) fn results(state: &WorkerState) -> Vec<String> {
         state
-            .filtered_files
+            .file_scores
             .iter()
-            .map(|id| state.file_registry[id.0].display_name.clone())
+            .map(|fs| state.file_registry[fs.file_id].display_name.clone())
             .collect()
     }
 

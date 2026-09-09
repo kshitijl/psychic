@@ -197,10 +197,14 @@ Optimizations".
   checked by generating the CSV with both binaries from the same database.
   Steady-state filter+rank 1.02 -> 0.96ms, features 0.32 -> 0.28ms, keystroke
   to redraw 2.66 -> 2.28ms over 60 keystrokes.
-- **P6. `get_slice` is O(results) per row.** `search_worker.rs` ~line 708:
-  `file_scores.iter().find(..)` for each of 128 rows. `filtered_files` is
-  built from `file_scores` in the same order; index directly and delete
-  `filtered_files`.
+- **P6. `get_slice` is O(results) per row.** DONE (2026-09-10). `file_scores`
+  is the result list; the parallel `Vec<FileId>` is gone and a page is a slice
+  by position. Because the two lists held the same order, the old search found
+  row *k* after *k* comparisons, so the cost grew with scroll depth rather than
+  page size: over 8,000 results, page 0 cost 0.019ms and page 60 cost 0.761ms,
+  against a flat 0.012ms now. The one place the lists disagreed - ranking
+  failing, which left the ids populated and the scores empty - now builds
+  unscored rows in the filter's order instead.
 - **P7. Idle wakeups and input latency.** Three loops poll. The input one is
   DONE (2026-09-09); the other two are independent of it and still open.
   - *DONE: the input thread.* Rewritten as `src/tty_input.rs`: it waits with

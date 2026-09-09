@@ -594,6 +594,28 @@ Worker thread owns all file data and processes queries asynchronously.
 3. Process work requests with 5ms timeout
 4. Debounce queries (drain channel, keep latest)
 
+**One result list, not two.** `file_scores` is the result set: ranked order,
+with each row's score and features at that row's position. There used to be a
+parallel `Vec<FileId>` beside it holding the same order, and building a page
+searched `file_scores` for a row whose `file_id` matched - once per row. Because
+the two lists agreed, that search found row *k* after *k* comparisons, so the
+cost grew with how far the user had scrolled rather than with the page size.
+
+Measured over 8,000 results, the size a project under the walker's shallow-mode
+threshold reaches:
+
+| page | before | after |
+|---|---|---|
+| 0 | 0.019ms | 0.013ms |
+| 30 | 0.380ms | 0.012ms |
+| 60 | 0.761ms | 0.012ms |
+
+The two lists disagreed in exactly one case: when ranking failed,
+`filter_and_rank` filled the id list and left `file_scores` empty, and every row
+then drew with a score of 0 and no features. That path now builds unscored
+`FileScore` rows in the filter's own order, which says the same thing without a
+second list to keep in step.
+
 **Eviction:** `WorkerRequest::Evict { path, query_id }` drops a path the UI found
 missing from disk, then re-runs the current query so the row disappears at once. The
 `FileInfo` is *marked* `evicted`, not removed: `FileId` is an index into
