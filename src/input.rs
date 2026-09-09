@@ -611,15 +611,11 @@ fn handle_file_click(
 ) -> Result<()> {
     suspend_tui_for_editor(app, &file_path, terminal)?;
 
-    // Reload model and rerank after editing
-    let query_id_model = app.next_query_id();
-    if let Err(e) = app.reload_model(query_id_model) {
-        log::error!("Failed to reload model: {}", e);
-    }
-
-    let query_id_clicks = app.next_query_id();
-    if let Err(e) = app.reload_and_rerank(query_id_clicks) {
-        log::error!("Failed to reload and rerank: {}", e);
+    // Returning from the editor redraws everything anyway, so this is a safe
+    // moment to pick up the retrained model and the click just recorded.
+    let query_id = app.next_query_id();
+    if let Err(e) = app.reload_ranker(query_id) {
+        log::error!("Failed to reload ranker: {}", e);
     }
 
     Ok(())

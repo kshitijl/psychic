@@ -202,7 +202,7 @@ To solve this, a robust request-response protocol was implemented:
 
 1.  **UI as Client:** The UI thread acts as the client, and is the sole source of truth for request identity.
 2.  **UI-Generated IDs:** For any action that will result in a new set of filtered files (typing, reloading the model, or an auto-refresh from file changes), the UI generates a new, unique `query_id`. This ID is reused from the existing `subsession_id` mechanism.
-3.  **ID'd Requests:** Every request from the UI to the worker (`UpdateQuery`, `GetPage`, `ReloadModel`) carries the relevant `query_id`.
+3.  **ID'd Requests:** Every request from the UI to the worker (`UpdateQuery`, `GetPage`, `Reload`) carries the relevant `query_id`.
 4.  **ID'd Responses:** Every response from the worker back to the UI (`QueryUpdated`, `Page`) also carries the `query_id` of the request it is responding to.
 
 This ensures that both the UI and the worker can safely discard stale messages, preventing state corruption and crashes.
@@ -1372,7 +1372,14 @@ Now a clean ~600-line event loop and application glue (down from 2000+ lines bef
 - Spawns a background thread to retrain the model using collected events
 - Training runs asynchronously and doesn't block the UI
 - Training output is appended to `~/.local/share/psychic/training.log`
-- Worker loads the new model automatically when retraining completes
+- When retraining finishes, the worker does NOT reload the model. The list on
+  screen must never reorder without user input; a reorder several seconds after
+  launch, unprompted, is jarring (Spotlight does this and people hate it).
+  Reordering during the initial fill-in is acceptable, later it is not. So the
+  new model is picked up at the next moment the screen changes anyway: opening a
+  file (on return from the editor) or entering a directory. Both go through
+  `WorkerRequest::Reload` / `reload_model` in `search_worker.rs`, which reloads
+  the click history along with the model in a single rerank.
 
 **Why:** Fresh model on every launch ensures ranking improves as you use the tool. Background execution means no startup delay.
 

@@ -103,10 +103,8 @@ pub enum WorkerRequest {
         query_id: u64,
         page_num: usize,
     },
-    ReloadModel {
-        query_id: u64,
-    },
-    ReloadClicks {
+    /// Pick up the newly retrained model and the latest click history.
+    Reload {
         query_id: u64,
     },
     ChangeCwd {
@@ -877,18 +875,6 @@ impl WorkerState {
         Ok(())
     }
 
-    fn reload_clicks(&mut self) -> Result<()> {
-        log::info!("Worker: Reloading click data");
-        let (clicks, total_clicks) = ranker::Ranker::load_clicks(&self.db)?;
-        self.ranker.clicks = clicks;
-        self.ranker.total_clicks = total_clicks;
-        log::info!(
-            "Worker: Click data reloaded successfully (total_clicks={})",
-            total_clicks
-        );
-        Ok(())
-    }
-
     /// Stop showing `path`, which the UI found missing from disk.
     ///
     /// The registry entry is marked rather than removed: `FileId` is an index
@@ -1066,8 +1052,11 @@ fn worker_thread_loop<T>(
                         .into(),
                     );
                 }
-                WorkerRequest::ReloadModel { query_id } => {
+                WorkerRequest::Reload { query_id } => {
                     state.current_query_id = query_id;
+                    // `reload_model` reloads the clicks too: it goes through
+                    // `load_ranker`, and both `Ranker::new` and
+                    // `Ranker::new_empty` call `Ranker::load_clicks`.
                     if let Err(e) = state.reload_model() {
                         log::error!("Failed to reload model: {}", e);
                     } else {
@@ -1091,33 +1080,14 @@ fn worker_thread_loop<T>(
                         }
                     }
                 }
-                WorkerRequest::ReloadClicks { query_id } => {
-                    state.current_query_id = query_id;
-                    if let Err(e) = state.reload_clicks() {
-                        log::error!("Failed to reload clicks: {}", e);
-                    } else {
-                        // Re-filter and rank with new clicks
-                        let query = state.current_query.clone();
-                        if let Err(e) = state.filter_and_rank(&query) {
-                            log::error!("Filter/rank failed after clicks reload: {}", e);
-                        } else {
-                            let initial_page = state.get_page(0, 128);
-                            let _ = event_tx.send(
-                                WorkerResponse::QueryUpdated {
-                                    query_id,
-                                    total_results: state.filtered_files.len(),
-                                    total_files: state.file_registry.len(),
-                                    initial_page,
-                                    model_stats: state.ranker.stats.clone(),
-                                    rank_ms: state.last_rank_ms,
-                                }
-                                .into(),
-                            );
-                        }
-                    }
-                }
                 WorkerRequest::ChangeCwd { new_cwd, query_id } => {
                     state.current_query_id = query_id;
+                    // Entering a directory refilters from scratch and redraws
+                    // the whole list, so it is a safe moment to pick up a
+                    // newly retrained model: nothing reorders unprompted.
+                    if let Err(e) = state.reload_model() {
+                        log::error!("Failed to reload model on cwd change: {}", e);
+                    }
                     if let Err(e) = state.change_cwd(new_cwd) {
                         log::error!("Failed to change cwd: {}", e);
                     } else {
@@ -1507,6 +1477,76 @@ pub(super) mod fresh_install_tests_support {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
         }
+    }
+}
+
+#[cfg(test)]
+mod reload_tests {
+    //! `WorkerRequest::Reload` is one request because one reload does both
+    //! jobs: `reload_model` goes through `load_ranker`, and `Ranker::new` and
+    //! `Ranker::new_empty` both read the click history. A separate
+    //! `ReloadClicks` request re-read the same rows and reranked a second
+    //! time for nothing.
+
+    use super::fresh_install_tests_support::*;
+    use super::*;
+    use crate::db::Database;
+
+    fn worker_state(dir: &FreshDataDir) -> WorkerState {
+        let (walker_tx, _walker_rx) = mpsc::channel::<WalkerCommand>();
+        WorkerState::new(
+            PathBuf::from("/test"),
+            &dir.path,
+            walker_tx,
+            false,
+            false,
+            Vec::new(),
+        )
+        .expect("worker must start")
+    }
+
+    #[test]
+    fn test_reloading_the_model_also_picks_up_clicks_logged_since_startup() {
+        let dir = FreshDataDir::new("reload-clicks");
+        let mut state = worker_state(&dir);
+
+        assert!(
+            state.ranker.clicks.clicks_by_file.is_empty(),
+            "nothing has been clicked before the worker starts"
+        );
+
+        // What the UI writes when the user opens a file, after the worker has
+        // already loaded its click history.
+        let db = Database::new(&dir.db_path()).expect("open the same database");
+        db.log_event(crate::db::EventData {
+            query: "al",
+            file_path: "alpha.rs",
+            full_path: "/test/alpha.rs",
+            mtime: Some(1_700_000_000),
+            atime: None,
+            file_size: Some(100),
+            subsession_id: 1,
+            action: crate::db::UserInteraction::Click,
+            session_id: "session-1",
+            episode_queries: None,
+        })
+        .expect("log the click");
+
+        state
+            .reload_model()
+            .expect("the reload a file click or a cwd change triggers");
+
+        assert_eq!(
+            state
+                .ranker
+                .clicks
+                .clicks_by_file
+                .keys()
+                .collect::<Vec<_>>(),
+            vec!["/test/alpha.rs"],
+            "reloading the model reloads the clicks with it, so no second \
+             request is needed"
+        );
     }
 }
 

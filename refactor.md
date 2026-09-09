@@ -130,8 +130,7 @@ pub const PREFETCH_MARGIN: usize = 32;
 
 impl App {
     pub fn new(...) -> Result<Self>;
-    pub fn reload_model(&mut self, query_id: u64) -> Result<()>;
-    pub fn reload_and_rerank(&mut self, query_id: u64) -> Result<()>;
+    pub fn reload_ranker(&mut self, query_id: u64) -> Result<()>;
     pub fn get_file_at_index(&self, index: usize) -> Option<&DisplayFileInfo>;
     pub fn check_and_log_impressions(&mut self, force: bool) -> Result<()>;
     pub fn move_selection(&mut self, delta: isize);

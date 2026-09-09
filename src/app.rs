@@ -295,19 +295,13 @@ impl App {
         });
     }
 
-    pub fn reload_model(&mut self, query_id: u64) -> Result<()> {
-        log::info!("Requesting model reload from worker");
+    /// Ask the worker to pick up the retrained model and the latest clicks,
+    /// then rerank under `query_id`. One request does both.
+    pub fn reload_ranker(&mut self, query_id: u64) -> Result<()> {
+        log::info!("Requesting ranker reload from worker");
         self.worker_tx
-            .send(WorkerRequest::ReloadModel { query_id })
-            .context("Failed to send ReloadModel request to worker")?;
-        Ok(())
-    }
-
-    pub fn reload_and_rerank(&mut self, query_id: u64) -> Result<()> {
-        log::info!("Requesting clicks reload from worker");
-        self.worker_tx
-            .send(WorkerRequest::ReloadClicks { query_id })
-            .context("Failed to send ReloadClicks request to worker")?;
+            .send(WorkerRequest::Reload { query_id })
+            .context("Failed to send Reload request to worker")?;
         Ok(())
     }
 

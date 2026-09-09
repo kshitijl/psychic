@@ -1,55 +1,5 @@
 ## now
 
-### Model reload: one request, also on directory change, and fix the doc
-
-Background. Retraining runs at startup. The worker deliberately does NOT
-reload the new model when training finishes: the visible list must never
-reorder without user input (jarring, like Spotlight). Instead the model is
-reloaded at a moment the screen changes anyway. Today that moment is only a
-file click, and it is done wastefully. Three changes:
-
-1. **Merge `ReloadModel` and `ReloadClicks` into one request.**
-   - `src/search_worker.rs`: `WorkerRequest` has `ReloadModel { query_id }` and
-     `ReloadClicks { query_id }`. Replace both with a single
-     `Reload { query_id }`. In `worker_thread_loop`, its arm calls
-     `state.reload_model()` and then does the usual filter_and_rank + page 0 +
-     `QueryUpdated` once. Delete `WorkerState::reload_clicks` and the
-     `ReloadClicks` arm entirely: `reload_model` calls `load_ranker`, which
-     calls `Ranker::new` / `Ranker::new_empty`, and both already call
-     `Ranker::load_clicks`, so clicks are reloaded as part of the model reload.
-   - `src/app.rs`: replace `App::reload_model` and `App::reload_and_rerank`
-     with one `App::reload_ranker(&mut self, query_id)` that sends
-     `WorkerRequest::Reload { query_id }`.
-   - `src/input.rs`, `handle_file_click`: after `suspend_tui_for_editor`, take
-     ONE `app.next_query_id()` and call `app.reload_ranker(query_id)`. Remove
-     the second query id and the second call. Net effect: one DB read of
-     clicks and one rerank per file open instead of two of each.
-
-2. **Also reload when the directory changes.** Entering a directory refilters
-   from scratch and redraws the whole list, so it is an equally safe moment.
-   In `src/search_worker.rs`, in the `ChangeCwd` arm of `worker_thread_loop`,
-   call `state.reload_model()` (log and continue on error, same as the Reload
-   arm) before `filter_and_rank("")`. No new request type and no UI change is
-   needed. Make sure `reload_model` stays cheap enough for this: it is
-   ~7ms today (booster 6ms + clicks 1ms), which is fine for a navigation.
-
-3. **Fix how-it-works.md.** In the `### Module: main.rs` section, under
-   "Startup behavior", the bullet "Worker loads the new model automatically
-   when retraining completes" is wrong. Replace it with something like:
-   "When retraining finishes, the worker does NOT reload the model. The list
-   on screen must never reorder without user input; a reorder several seconds
-   after launch, unprompted, is jarring (Spotlight does this and people hate
-   it). Reordering during the initial fill-in is acceptable, later it is not.
-   So the new model is picked up at the next moment the screen changes anyway:
-   opening a file (on return from the editor) or entering a directory. Both
-   go through `WorkerRequest::Reload` / `reload_model` in `search_worker.rs`."
-   Also remove the mention of `ReloadClicks` in the "Robust Communication
-   with Query IDs" section's list of ID'd requests, and update the
-   `Analytics`/`App` method lists if they name `reload_and_rerank`.
-
-Then: `just build`, `cargo test`, `cargo clippy`. There are no tests for the
-reload path; `grep -rn ReloadClicks src/` must come back empty when done.
-
 ### Training: time-based split, refit on everything, log file size, recency weights
 
 Background. `train.py` splits episodes at random (`GroupShuffleSplit`,
@@ -153,8 +103,6 @@ exists: `num_positive_examples` in `model_stats.json`, parsed into
      `load_clicks` (return `ClickData` alone); the assignments in
      `Ranker::new` and `new_empty`; the `total_clicks=` in the "Hybrid
      ranking weights" debug log line.
-   - `WorkerState::reload_clicks` if it still exists (the "Model reload"
-     item above removes it).
    - `total_clicks:` in every hand-built `Ranker { .. }` in the ranker tests.
    - `test_compute_blend_weights` keeps working with the new argument name.
 
