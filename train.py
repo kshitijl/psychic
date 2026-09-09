@@ -157,6 +157,32 @@ def prepare_features(df, feature_names, binary_features, monotonicity_map):
     return X, y, episodes, [], constraints  # No categorical features
 
 
+def make_params(monotone_constraints):
+    """The LightGBM parameters, shared by the validated fit and the refit.
+
+    Both fits must see identical parameters: the first one decides how many
+    rounds the second one runs for, and that number means nothing if the two
+    models are shaped differently.
+    """
+    return {
+        "objective": "binary",  # Changed from 'regression'
+        "metric": "auc",  # Changed from 'rmse'
+        "class_weight": "balanced",  # Added class weight
+        "monotone_constraints": monotone_constraints,  # Added monotonicity
+        "boosting_type": "gbdt",
+        "num_leaves": 31,
+        "learning_rate": 0.05,
+        "feature_fraction": 0.9,
+        "bagging_fraction": 0.8,
+        "bagging_freq": 5,
+        "verbose": -1,
+        "seed": 42,
+        "bagging_seed": 42,
+        "feature_fraction_seed": 42,
+        "data_random_seed": 42,
+    }
+
+
 def train_model(
     X_train, y_train, episodes_train, X_val, y_val, episodes_val, categorical_features, monotone_constraints
 ):
@@ -178,24 +204,7 @@ def train_model(
         reference=train_data,
     )
 
-    # --- MODIFIED: Updated params dictionary ---
-    params = {
-        "objective": "binary",  # Changed from 'regression'
-        "metric": "auc",  # Changed from 'rmse'
-        "class_weight": "balanced",  # Added class weight
-        "monotone_constraints": monotone_constraints,  # Added monotonicity
-        "boosting_type": "gbdt",
-        "num_leaves": 31,
-        "learning_rate": 0.05,
-        "feature_fraction": 0.9,
-        "bagging_fraction": 0.8,
-        "bagging_freq": 5,
-        "verbose": -1,
-        "seed": 42,
-        "bagging_seed": 42,
-        "feature_fraction_seed": 42,
-        "data_random_seed": 42,
-    }
+    params = make_params(monotone_constraints)
 
     evals_result = {}
     model = lgb.train(
@@ -535,6 +544,26 @@ def save_model(model, output_prefix):
     print(f"Model saved to: {model_path}")
 
 
+def refit_on_everything(X, y, categorical_features, monotone_constraints, num_boost_round):
+    """Retrain on every row, for the number of rounds the validated fit settled on.
+
+    The time split exists to answer one question - how many trees before this
+    starts fitting noise - and it costs the last 20% of the data to answer it.
+    Shipping that model would ship one that has never seen the most recent
+    fortnight, which is the part most like what the user is about to search for.
+    So the round count comes from the validated fit and the shipped model is
+    grown on everything, with no early stopping because there is nothing held
+    out to stop against.
+    """
+    assert num_boost_round > 0, "the validated fit must have produced some trees"
+
+    print(f"\nRefitting on all {len(X)} rows for {num_boost_round} rounds")
+    full_data = lgb.Dataset(X, label=y, categorical_feature=categorical_features)
+    return lgb.train(
+        make_params(monotone_constraints), full_data, num_boost_round=num_boost_round
+    )
+
+
 def time_split(episodes):
     """Split episode ids into train / validation / test by time.
 
@@ -636,13 +665,19 @@ def main():
     describe_split("Validation", X_val, y_val, episodes_val, val_mask)
     describe_split("Test", X_test, y_test, episodes_test, test_mask)
 
-    # Train model
+    # Train model. This fit is the evaluation: it is the one with data held out.
     model, evals_result = train_model(
         X_train, y_train, episodes_train, X_val, y_val, episodes_val, categorical_features, monotone_constraints
     )
 
-    # Save model
-    save_model(model, output_prefix)
+    # Ship a model grown on every row, for as many rounds as the validated fit
+    # found worth growing.
+    best_iteration = model.best_iteration
+    final_model = refit_on_everything(
+        X, y, categorical_features, monotone_constraints, best_iteration
+    )
+
+    save_model(final_model, output_prefix)
 
     # Generate visualizations
     create_visualizations(
@@ -660,9 +695,10 @@ def main():
     # Calculate training duration
     training_duration = time.time() - training_start
 
-    # Get feature importance (top 3)
-    importance = model.feature_importance(importance_type="gain")
-    feature_names_list = model.feature_name()
+    # Get feature importance (top 3) from the model that ships, not the one
+    # that was only there to find the round count.
+    importance = final_model.feature_importance(importance_type="gain")
+    feature_names_list = final_model.feature_name()
     feature_importance_df = pd.DataFrame(
         {"feature": feature_names_list, "importance": importance}
     ).sort_values("importance", ascending=False)
@@ -680,6 +716,7 @@ def main():
         "num_total_examples": len(df),
         "num_positive_examples": int(y.sum()),
         "num_negative_examples": int(len(y) - y.sum()),
+        "best_iteration": best_iteration,
         "top_3_features": top_3_features,
     }
 

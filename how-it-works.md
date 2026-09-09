@@ -1014,6 +1014,25 @@ numbers were the leak being scored, not quality that was lost. Early stopping
 also settles sooner (177 rounds -> 96), which is the memorising trees no longer
 paying off.
 
+**The model that ships is refit on every row.** The split answers one question -
+how many trees before this starts fitting noise - and it pays the last 20% of
+the data to answer it. Shipping the validated fit would ship a model that has
+never seen the most recent fortnight, which is the part most like what the user
+is about to search for. So `refit_on_everything` regrows the model on all rows
+for exactly the round count early stopping settled on, with no early stopping of
+its own (nothing is held out to stop against), and that is what `save_model`
+writes. `make_params` is shared by both fits, because a round count chosen under
+one set of parameters means nothing under another. `model_stats.json` reports
+`best_iteration` and takes its feature importances from the shipped model.
+
+Evaluation still belongs to the validated fit: `create_visualizations` and the
+printed metrics use it against the time-split test set, since the shipped model
+has seen every row and cannot be scored on any of them. Measured one step
+earlier - validated on the first 80%, refit on the first 90%, both scored on the
+untouched last 10% - the extra rows are worth top-1 0.664 -> 0.698 and MRR
+0.763 -> 0.777, with RMSE 0.131 -> 0.130 and AUC flat. Training takes roughly
+twice as long (~3.5s -> ~6s), in a background thread.
+
 **Usage:**
 ```bash
 psychic generate-features  # Outputs features.csv + feature_schema.json
