@@ -1150,16 +1150,39 @@ it was several times slower *and* produced a larger binary:
 | generate, worst seen | 102.57ms | 25.79ms |
 | binary | 12.7MB | 11.2MB |
 
-Measured, moving the selection one row, which is what regenerates a preview:
+**The syntaxes and theme come from `two-face`, which packages the set `bat`
+ships.** Syntect's own defaults are Sublime Text's, and they have no TOML, no
+TypeScript and no Dockerfile - `Cargo.toml` rendered as one flat colour. The
+theme is `MonokaiExtended`, bat's default, which gives markdown headings some
+weight where `base16-ocean.dark` renders them a grey barely distinct from body
+text. Output is now byte-identical to bat's on the files checked. Costs about
+0.6MB of binary and a millisecond or two of load.
 
-| | before | after |
-|---|---|---|
-| median | 25.95ms | 1.71ms |
-| p90 | 37.45ms | 3.06ms |
-| first full draw | 37.0ms | 3.3ms |
+**Is it actually faster, or only spared the process spawn?** Both, and the
+second question is the interesting one. `psychic internal preview` exists to
+answer it: it runs the generator with no UI, thread or channel in the way, and
+reports the syntax load separately, because psychic pays that once at startup
+while bat pays it on every invocation. bat's floor below is a one-line file
+*with the same extension*, since bat loads grammars lazily and a `.txt` floor
+would flatter it.
 
-The syntax definitions take 3ms to deserialize, once, on the preview thread
-while the walker is still running.
+| file | lines | ours | bat | bat floor | bat's work | ours vs its work |
+|---|---|---|---|---|---|---|
+| Cargo.toml | 38 | 0.55ms | 8.15ms | 7.29ms | 0.87ms | 1.6x |
+| src/render.rs | 80 | 1.77ms | 12.59ms | 9.10ms | 3.49ms | 2.0x |
+| how-it-works.md | 80 | 1.46ms | 12.60ms | 10.04ms | 2.56ms | 1.8x |
+| src/render.rs | 1283 | 33.95ms | 52.68ms | 9.58ms | 43.10ms | 1.3x |
+| how-it-works.md | 1655 | 35.14ms | 62.56ms | 10.05ms | 52.51ms | 1.5x |
+
+So the spawn is not the whole story. Discount bat's entire start-up and its
+remaining work is still 1.3 to 2.0 times ours, because it formats and serialises
+ANSI for a terminal and psychic builds ratatui spans in memory. The old code
+then had to *parse* that ANSI back into spans, which is not in the bat column at
+all. At the size that matters - a screenful, the common case - psychic's whole
+operation costs less than bat's floor alone.
+
+The syntax definitions take one to four milliseconds to deserialize, once, on
+the preview thread while the walker is still running.
 
 **Complex implementation:**
 - syntect highlighting, with the theme's foreground colours only: a theme
@@ -1587,7 +1610,7 @@ any moment, so they could not have been fixed that way at all.
 - `lightgbm3` - LightGBM inference
 - `anyhow` - Error handling
 - `jiff` - Timestamps
-- `syntect` - syntax highlighting, in process
+- `syntect` + `two-face` - syntax highlighting in process, with bat's syntax and theme set
 - `clap` - CLI argument parsing
 - `fern` - Logging dispatch
 - `log` - Logging facade
@@ -1638,6 +1661,7 @@ psychic internal analyze-perf
 psychic internal print-log
 psychic internal clear-log
 psychic internal summarize-events
+psychic internal preview <path> [--lines N] [--repeat N] [--show]
 
 # Train model (standalone Python script)
 python train.py features.csv output

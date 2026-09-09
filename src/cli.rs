@@ -70,6 +70,23 @@ pub enum InternalCommands {
     ClearLog,
     /// Summarize events in the database by action type
     SummarizeEvents,
+    /// Time the preview generator on a path, with no UI in the way
+    ///
+    /// Comparable to `bat --color=always --style=numbers --line-range :N`,
+    /// which is what this replaced.
+    Preview {
+        /// File or directory to preview
+        path: PathBuf,
+        /// How many lines to generate
+        #[arg(long, default_value_t = 80)]
+        lines: usize,
+        /// How many times to generate it, after one warm-up
+        #[arg(long, default_value_t = 20)]
+        repeat: usize,
+        /// Print the preview instead of timing it
+        #[arg(long)]
+        show: bool,
+    },
 }
 
 /// Filter type for initial filter

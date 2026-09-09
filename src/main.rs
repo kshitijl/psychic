@@ -96,6 +96,80 @@ use cli::{Cli, Commands, FilterArg, InternalCommands, OutputFormat};
 /// Initialized by the first statement of `main`, so it really is process start.
 pub static PROCESS_START: once_cell::sync::Lazy<Instant> = once_cell::sync::Lazy::new(Instant::now);
 
+/// Time the preview generator, or print what it produces.
+///
+/// The point is to be measurable from outside: the generator with no thread,
+/// channel or terminal around it, so it can be put beside `bat` directly.
+/// Loading the syntax definitions is reported separately because the running
+/// app pays it once, at startup, on the preview thread - unlike `bat`, which
+/// pays it on every invocation.
+fn preview_command(path: &std::path::Path, lines: usize, repeat: usize, show: bool) -> Result<()> {
+    assert!(repeat > 0, "nothing to measure in zero runs");
+
+    let load_start = Instant::now();
+    let generator = preview::Generator::new();
+    let load_ms = load_start.elapsed().as_secs_f64() * 1000.0;
+
+    let is_dir = path.is_dir();
+    let width = 120;
+
+    if show {
+        print!(
+            "{}",
+            to_ansi(&generator.generate(path, is_dir, width, lines))
+        );
+        return Ok(());
+    }
+
+    // One run outside the measurement: the first touch of a file is a page
+    // fault or a disk read, and that is not what is being compared.
+    let _ = generator.generate(path, is_dir, width, lines);
+
+    let mut timings: Vec<f64> = (0..repeat)
+        .map(|_| {
+            let start = Instant::now();
+            let text = generator.generate(path, is_dir, width, lines);
+            std::hint::black_box(&text);
+            start.elapsed().as_secs_f64() * 1000.0
+        })
+        .collect();
+    timings.sort_by(|a, b| a.partial_cmp(b).expect("no NaN timings"));
+
+    let produced = generator.generate(path, is_dir, width, lines).lines.len();
+    println!("{}", path.display());
+    println!("  syntax load   {:>8.2}ms  (once per process)", load_ms);
+    println!(
+        "  generate      {:>8.2}ms  median of {} runs, min {:.2}ms, max {:.2}ms",
+        timings[timings.len() / 2],
+        repeat,
+        timings[0],
+        timings[timings.len() - 1]
+    );
+    println!("  produced      {:>8} lines", produced);
+
+    Ok(())
+}
+
+/// Styled text back out as ANSI, so `--show` can be eyeballed beside `bat`.
+fn to_ansi(text: &ratatui::text::Text<'_>) -> String {
+    use ratatui::style::Color;
+
+    let mut out = String::new();
+    for line in &text.lines {
+        for span in &line.spans {
+            match span.style.fg {
+                Some(Color::Rgb(r, g, b)) => out.push_str(&format!(
+                    "\x1b[38;2;{};{};{}m{}\x1b[0m",
+                    r, g, b, span.content
+                )),
+                _ => out.push_str(&span.content),
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
 /// Generate a unique session ID using a random u64.
 fn create_session_id() -> String {
     rand::random::<u64>().to_string()
@@ -304,6 +378,15 @@ fn main() -> Result<()> {
                     } else {
                         println!("No log file found at {}", log_path.display());
                     }
+                    return Ok(());
+                }
+                InternalCommands::Preview {
+                    path,
+                    lines,
+                    repeat,
+                    show,
+                } => {
+                    preview_command(&path, lines, repeat, show)?;
                     return Ok(());
                 }
                 InternalCommands::SummarizeEvents => {

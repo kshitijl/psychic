@@ -316,7 +316,12 @@ Filter+rank is ~2ms per keystroke and is not the problem.
   scrolled, which is worse still - syntect state means every pass restarts at
   line one, so a growing budget costs ~2x the work in a series of hiccups. Syntect is built with `oniguruma`, not `fancy-regex`: measured on
   markdown it is ~5x faster (median 11.81ms -> 2.53ms, worst 102.57 -> 25.79)
-  and the binary is *smaller* (12.7MB -> 11.2MB).
+  and the binary is *smaller* (12.7MB -> 11.2MB). Syntaxes and theme come from
+  `two-face` (bat's set): syntect's own defaults have no TOML, TypeScript or
+  Dockerfile, and its themes render markdown headings as near-invisible grey.
+  `psychic internal preview` times the generator with nothing around it; against
+  bat we are 1.3-2.0x faster even discounting bat's entire start-up, and at a
+  screenful our whole operation costs less than bat's floor alone.
 - **P3. Three syscalls per historical path at startup.** `WorkerState::new`
   does `exists()`, then `canonicalize()`, then `metadata()` per path: 6.3ms
   for 172 paths. Stored `full_path` values are already canonical. One

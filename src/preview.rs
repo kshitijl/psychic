@@ -33,7 +33,7 @@ use ratatui::text::{Line, Span, Text};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
 use syntect::easy::HighlightLines;
-use syntect::highlighting::{Theme, ThemeSet};
+use syntect::highlighting::Theme;
 use syntect::parsing::SyntaxSet;
 
 use crate::path_display::{human_bytes, printable};
@@ -101,20 +101,20 @@ where
         // per file. It happens while the walker is still running, so it is off
         // everyone's critical path.
         let start = std::time::Instant::now();
-        let highlighter = Highlighter::new();
+        let generator = Generator::new();
         log::info!(
             "TIMING {{\"op\":\"syntax_set_load\",\"ms\":{}}}",
             start.elapsed().as_secs_f64() * 1000.0
         );
 
-        serve(&highlighter, request_rx, event_tx);
+        serve(&generator, request_rx, event_tx);
         log::debug!("Preview thread exiting");
     });
 
     request_tx
 }
 
-fn serve<T>(highlighter: &Highlighter, request_rx: Receiver<PreviewRequest>, event_tx: Sender<T>)
+fn serve<T>(generator: &Generator, request_rx: Receiver<PreviewRequest>, event_tx: Sender<T>)
 where
     T: From<Preview>,
 {
@@ -127,11 +127,8 @@ where
         }
 
         let start = std::time::Instant::now();
-        let generated = if request.is_dir {
-            directory(&request.path, request.width)
-        } else {
-            highlighter.file(&request.path, request.lines)
-        };
+        let generated =
+            generator.preview(&request.path, request.is_dir, request.width, request.lines);
         log::info!(
             "TIMING {{\"op\":\"preview_generate\",\"ms\":{},\"lines\":{},\"dir\":{}}}",
             start.elapsed().as_secs_f64() * 1000.0,
@@ -311,24 +308,56 @@ impl PreviewState {
     }
 }
 
-/// Syntax definitions and a theme, loaded once.
-struct Highlighter {
+/// Everything needed to turn a path into styled text: syntax definitions and a
+/// theme, loaded once because loading them is not free.
+///
+/// The preview thread owns one. `psychic internal preview` makes one directly,
+/// so the generator can be timed with no UI, thread or channel in the way.
+pub struct Generator {
     syntaxes: SyntaxSet,
     theme: Theme,
 }
 
-impl Highlighter {
-    fn new() -> Self {
-        let mut themes = ThemeSet::load_defaults();
-        let theme = themes
-            .themes
-            .remove("base16-ocean.dark")
-            .or_else(|| themes.themes.values().next().cloned())
-            .expect("syntect ships with themes");
+impl Default for Generator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Generator {
+    pub fn new() -> Self {
+        // bat's default. syntect's own themes are all present too, but this one
+        // gives markdown headings and the like some weight, where
+        // `base16-ocean.dark` renders them a grey barely distinct from body
+        // text. The theme is also the reason previews only ever set a
+        // foreground colour: its background would paint over the terminal's.
+        let theme = two_face::theme::extra()
+            .get(two_face::theme::EmbeddedThemeName::MonokaiExtended)
+            .clone();
 
         Self {
-            syntaxes: SyntaxSet::load_defaults_newlines(),
+            syntaxes: two_face::syntax::extra_newlines(),
             theme,
+        }
+    }
+
+    /// A preview of `path`: a listing if it is a directory, otherwise the
+    /// first `max_lines` of the file, highlighted.
+    pub fn generate(
+        &self,
+        path: &Path,
+        is_dir: bool,
+        width: u16,
+        max_lines: usize,
+    ) -> Text<'static> {
+        self.preview(path, is_dir, width, max_lines).text
+    }
+
+    fn preview(&self, path: &Path, is_dir: bool, width: u16, max_lines: usize) -> Generated {
+        if is_dir {
+            directory(path, width)
+        } else {
+            self.file(path, max_lines)
         }
     }
 
@@ -657,7 +686,7 @@ mod tests {
 
     /// A file preview, with room for anything a test writes.
     fn preview_of(path: &Path) -> Generated {
-        Highlighter::new().file(path, MAX_LINES)
+        Generator::new().file(path, MAX_LINES)
     }
 
     /// The visible text of a preview, one string per line.
@@ -874,7 +903,7 @@ mod tests {
         let dir = TempDir::new("budget");
         let path = dir.write("long.md", "# heading\n".repeat(2_000).as_bytes());
 
-        let generated = Highlighter::new().file(&path, 40);
+        let generated = Generator::new().file(&path, 40);
 
         assert_eq!(
             generated.text.lines.len(),
@@ -893,7 +922,7 @@ mod tests {
         let dir = TempDir::new("short");
         let path = dir.write("short.txt", b"one\ntwo\n");
 
-        let generated = Highlighter::new().file(&path, 100);
+        let generated = Generator::new().file(&path, 100);
 
         assert_eq!(rendered(&generated), vec!["1 one", "2 two"]);
         assert!(
