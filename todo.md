@@ -542,8 +542,15 @@ the same idea again.
     directory as well as Makefile and LICENSE, and counting it made the feature
     *negative* (-1.0 point of top-1). Cleaning the numerator instead needs
     `is_dir` on events, which is item 5.
-11. **Depth below cwd** (component count; large constant for historical
-    files outside cwd). Shallow things get clicked more; helps `~`.
+11. **Depth below cwd.** TRIED AND REJECTED (2026-09-10). Component count
+    below cwd, 32 for anything outside it. Rounds fixed at 120: top-1
+    0.7977 -> 0.7876, MRR 0.8656 -> 0.8616, folds -0.031, -0.016, +0.017.
+    Gain 1.4%, rank 12 of 21.
+
+    The likely reason it adds nothing: `is_under_cwd` already exists, and the
+    "outside the tree" constant is exactly that binary said again. What is left
+    is the depth *within* cwd, and the model would rather read that off
+    `fuzzy_score`, which already penalises long paths through the match.
 12. **Mentioned in recent shell commands** (binary): filename or its dir
     appears as a token in the last 10 shell commands of this session. To
     make it trainable and less of a privacy problem, change `context.rs` to
