@@ -992,9 +992,27 @@ from a cold uv cache: ~10s to resolve, install and run.
 `cargo install --path .` users don't need to copy ancillary files manually—the `psychic` binary embeds `train.py` and writes it into the data directory on demand (default `~/.local/share/psychic/train.py`) whenever training runs, overwriting stale copies if the script changed.
 
 **Key parameters:**
-- Objective: `lambdarank`
-- Metric: NDCG (Normalized Discounted Cumulative Gain)
+- Objective: `binary`, with balanced class weights
+- Metric: AUC, with early stopping after 50 rounds without improvement
 - Grouping: `episode_id` (engagement-based sequences)
+
+**The split is by time, not at random.** `time_split` puts the first 80% of
+episodes in train, the next 10% in validation and the last 10% in test. It used
+to be a `GroupShuffleSplit`, which held out a random fifth of episodes: an
+episode from March 2 was then validated against a model that had trained on
+March 3-30. Under that split any feature that identifies a file is rewarded for
+knowing the future, memorisation scores as skill, and early stopping happily
+keeps adding trees that memorise - the tell was raw `file_size_bytes`, nearly a
+unique id per file, ranking third by gain. There is no timestamp column in the
+CSV, but `episode_id` is handed out in a single pass over time-sorted events
+(`features.rs`), so it is monotone in time and splitting on it splits on time.
+
+Measured on this developer's own 84k-row CSV, the change moves the last 10% of
+episodes from "seen during training" to genuinely held out: AUC on those
+episodes 0.966 -> 0.938, top-1 0.690 -> 0.664, RMSE 0.110 -> 0.131. The old
+numbers were the leak being scored, not quality that was lost. Early stopping
+also settles sooner (177 rounds -> 96), which is the memorising trees no longer
+paying off.
 
 **Usage:**
 ```bash

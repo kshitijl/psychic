@@ -34,7 +34,6 @@ import sys
 import pandas as pd
 import numpy as np
 import lightgbm as lgb
-from sklearn.model_selection import GroupShuffleSplit  # Groups episodes together during splits
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 import seaborn as sns
@@ -536,6 +535,58 @@ def save_model(model, output_prefix):
     print(f"Model saved to: {model_path}")
 
 
+def time_split(episodes):
+    """Split episode ids into train / validation / test by time.
+
+    A random split leaks the future into the past: an episode from March 2 gets
+    validated against a model that trained on March 3-30, so any feature that
+    identifies a file is rewarded for memorising it, and early stopping keeps
+    adding trees that memorise. `episode_id` is handed out in a single pass over
+    time-sorted events (`features.rs`), so it is monotone in time and splitting
+    on it splits on time. There is no timestamp column in the CSV to use instead.
+
+    The three masks partition the rows, and every episode lands whole in one of
+    them, because the boundary is drawn between episode ids.
+    """
+    q80, q90 = episodes.quantile(0.8), episodes.quantile(0.9)
+
+    train_mask = episodes <= q80
+    val_mask = (episodes > q80) & (episodes <= q90)
+    test_mask = episodes > q90
+
+    assert (train_mask.sum() + val_mask.sum() + test_mask.sum()) == len(episodes), (
+        "the three splits must cover every row exactly once"
+    )
+    assert train_mask.any() and val_mask.any() and test_mask.any(), (
+        f"every split needs rows; episode ids {episodes.min()}..{episodes.max()} "
+        f"gave {train_mask.sum()}/{val_mask.sum()}/{test_mask.sum()}"
+    )
+    return train_mask, val_mask, test_mask
+
+
+def take(X, y, episodes, mask):
+    """The rows a split mask selects, reindexed from zero."""
+    return (
+        X[mask].reset_index(drop=True),
+        y[mask].reset_index(drop=True),
+        episodes[mask].reset_index(drop=True),
+    )
+
+
+def describe_split(name, X_split, y_split, episodes_split, mask):
+    """Print the size of a split and a hash of exactly which rows it holds."""
+    import hashlib
+
+    rows = np.flatnonzero(mask.to_numpy())
+    split_hash = hashlib.md5(str(rows.tolist()).encode()).hexdigest()[:8]
+
+    print(
+        f"{name} set: {len(X_split)} samples, {episodes_split.nunique()} episodes "
+        f"({y_split.sum()} positive), episodes {episodes_split.min()}-{episodes_split.max()}"
+    )
+    print(f"  {name} split hash: {split_hash}")
+
+
 def main():
     import time
 
@@ -572,52 +623,18 @@ def main():
         df, feature_names, binary_features, monotonicity_map
     )
 
-    # Split data by episodes (so each episode stays together)
-    splitter = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
-    train_idx, test_idx = next(splitter.split(X, y, groups=episodes))
+    # Split by time: the first 80% of episodes train, the next 10% validates,
+    # the last 10% is the test set.
+    train_mask, val_mask, test_mask = time_split(episodes)
 
-    X_train = X.iloc[train_idx].reset_index(drop=True)
-    X_test = X.iloc[test_idx].reset_index(drop=True)
-    y_train = y.iloc[train_idx].reset_index(drop=True)
-    y_test = y.iloc[test_idx].reset_index(drop=True)
-    episodes_train = episodes.iloc[train_idx].reset_index(drop=True)
-    episodes_test = episodes.iloc[test_idx].reset_index(drop=True)
+    X_train, y_train, episodes_train = take(X, y, episodes, train_mask)
+    X_val, y_val, episodes_val = take(X, y, episodes, val_mask)
+    X_test, y_test, episodes_test = take(X, y, episodes, test_mask)
 
-    # Compute hashes to verify deterministic splits
-    import hashlib
-
-    train_hash = hashlib.md5(str(sorted(train_idx)).encode()).hexdigest()[:8]
-    test_hash = hashlib.md5(str(sorted(test_idx)).encode()).hexdigest()[:8]
-
-    print(
-        f"\nTrain set: {len(X_train)} samples, {episodes_train.nunique()} episodes ({y_train.sum()} positive)"
-    )
-    print(f"  Train split hash: {train_hash}")
-    print(
-        f"Test set: {len(X_test)} samples, {episodes_test.nunique()} episodes ({y_test.sum()} positive)"
-    )
-    print(f"  Test split hash: {test_hash}")
-
-    # Further split train into train/val for early stopping
-    splitter_val = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
-    train_idx2, val_idx = next(
-        splitter_val.split(X_train, y_train, groups=episodes_train)
-    )
-
-    X_val = X_train.iloc[val_idx].reset_index(drop=True)
-    y_val = y_train.iloc[val_idx].reset_index(drop=True)
-    episodes_val = episodes_train.iloc[val_idx].reset_index(drop=True)
-
-    X_train = X_train.iloc[train_idx2].reset_index(drop=True)
-    y_train = y_train.iloc[train_idx2].reset_index(drop=True)
-    episodes_train = episodes_train.iloc[train_idx2].reset_index(drop=True)
-
-    # Print validation split hash
-    val_hash = hashlib.md5(str(sorted(val_idx)).encode()).hexdigest()[:8]
-    print(
-        f"Validation set: {len(X_val)} samples, {episodes_val.nunique()} episodes ({y_val.sum()} positive)"
-    )
-    print(f"  Validation split hash: {val_hash}")
+    print("")
+    describe_split("Train", X_train, y_train, episodes_train, train_mask)
+    describe_split("Validation", X_val, y_val, episodes_val, val_mask)
+    describe_split("Test", X_test, y_test, episodes_test, test_mask)
 
     # Train model
     model, evals_result = train_model(
