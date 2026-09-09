@@ -209,14 +209,21 @@ impl Feature for IsHidden {
 }
 
 // ============================================================================
-// Feature: file_size_bytes
+// Feature: log_file_size
 // ============================================================================
 
-pub struct FileSizeBytes;
+/// How big the file is, on a log scale.
+///
+/// Raw byte counts are close to a unique id per file, so a tree can memorise
+/// "the 47,312-byte one is the one they click" and score that as skill; under
+/// the old random split it did, ranking third by gain. What size legitimately
+/// carries is order of magnitude - tiny configs against huge logs and binaries -
+/// and the log keeps that while collapsing the lookup table.
+pub struct LogFileSize;
 
-impl Feature for FileSizeBytes {
+impl Feature for LogFileSize {
     fn name(&self) -> &'static str {
-        "file_size_bytes"
+        "log_file_size"
     }
 
     fn feature_type(&self) -> FeatureType {
@@ -224,7 +231,8 @@ impl Feature for FileSizeBytes {
     }
 
     fn compute(&self, inputs: &FeatureInputs) -> f64 {
-        inputs.file_size.unwrap_or(0) as f64
+        // 1 + size, so an empty file is 0 rather than -inf.
+        ((1 + inputs.file_size.unwrap_or(0)) as f64).log2()
     }
 }
 

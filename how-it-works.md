@@ -760,6 +760,19 @@ Why: Python training script reads schema to know feature order, types, and can a
 - `modified_age`: decreasing (older files → lower relevance)
 - `filename_starts_with_query`: no monotonicity (binary feature)
 
+**File size is stored as a log, not a byte count.** `log_file_size` is
+`log2(1 + size)`. A raw byte count is close to a unique id per file, and reads
+as one: it says "the 47,312-byte one" where what it should say is "a small
+config rather than a huge log". The log keeps the order of magnitude and drops
+the pretence of precision, and it is the number that appears in the SHAP and
+dependence plots, where a log axis is the readable one.
+
+It does not change what the model predicts. A gradient-boosted tree splits on
+order, and binning is quantile-based, so any strictly increasing transform of a
+feature gives back the identical model - checked by training both ways on the
+same 85k rows: same 71 trees, predictions equal to the last bit. The leak that
+put raw size third by gain was fixed by the time split above, not here.
+
 **Time windows are rolling, not calendar days.**
 
 Every time-based feature counts backwards from the moment being scored:
@@ -816,7 +829,7 @@ Measured effect, before -> after:
 
 Feature computation is no longer the expensive part of ranking - at 0.69ms it now
 costs less than the model inference it feeds (0.71ms), and the most expensive
-single feature is `file_size_bytes` at 0.25ms total, which is a `stat` syscall
+single feature is `log_file_size` at 0.25ms total, which is a `stat` syscall
 doing real work.
 
 **Query-specific features:** The `clicks_for_this_query` feature tracks clicks for specific (query, file) pairs. This distinguishes between files clicked for different search contexts - e.g., a file clicked 10 times for query "config" vs 0 times for query "test" is more relevant for "config" searches.
@@ -854,7 +867,7 @@ Why: LambdaRank needs episodes (groups of impressions). Each episode = impressio
 **Features computed:** See `feature_defs/implementations.rs` for full list. Examples:
 - Query matching: filename_starts_with_query
 - Click history: clicks_last_30_days, clicks_last_7_days, clicks_last_24h, clicks_last_hour, clicks_for_this_query
-- File properties: is_hidden, is_under_cwd
+- File properties: is_hidden, is_under_cwd, log_file_size
 - Temporal: modified_last_24h, modified_age
 - Directory features: clicks_last_week_parent_dir
 

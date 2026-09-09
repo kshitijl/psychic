@@ -970,13 +970,13 @@ mod tests {
         // Format as string for expect-test style comparison
         let actual = format!("{:?}", features);
 
-        // Expected output: [filename_starts_with_query, clicks_last_30_days, modified_last_24h, is_under_cwd, is_hidden, file_size_bytes, clicks_last_week_parent_dir, clicks_last_hour, clicks_last_24h, clicks_last_7_days, modified_age, clicks_for_this_query, engagements_in_episode_with_query, is_dir, fuzzy_score]
+        // Expected output: [filename_starts_with_query, clicks_last_30_days, modified_last_24h, is_under_cwd, is_hidden, log_file_size, clicks_last_week_parent_dir, clicks_last_hour, clicks_last_24h, clicks_last_7_days, modified_age, clicks_for_this_query, engagements_in_episode_with_query, is_dir, fuzzy_score]
         // filename_starts_with_query=0 (bar.txt doesn't start with "test")
         // clicks_last_30_days=3 (3 clicks on bar.txt itself)
         // modified_last_24h=0 (mtime is exactly 24h before current_timestamp, so outside)
         // is_under_cwd=1 (is_from_walker=true, so guaranteed to be under cwd)
         // is_hidden=0 (no dot-prefixed components)
-        // file_size_bytes=12288 (12 KB file)
+        // log_file_size=13.585079902767108 (log2 of 1 + 12288, a 12 KB file)
         // clicks_last_week_parent_dir=4 (3 clicks on bar.txt + 1 click on other.txt in /tmp/foo/)
         // clicks_last_hour=0 (oldest click is 18.4h before current_timestamp)
         // clicks_last_24h=3 (all 3 clicks land in the window; the earliest sits exactly
@@ -992,8 +992,7 @@ mod tests {
         // clicks_last_24h was "clicks_today" it counted clicks since local midnight,
         // giving 0 in America/New_York, 2 in UTC and 3 in Asia/Kolkata for exactly
         // this data. Rolling windows are the same number everywhere.
-        let expected =
-            "[0.0, 3.0, 0.0, 1.0, 0.0, 12288.0, 4.0, 0.0, 3.0, 3.0, 86400.0, 2.0, 0.0, 0.0, 0.0]";
+        let expected = "[0.0, 3.0, 0.0, 1.0, 0.0, 13.585079902767108, 4.0, 0.0, 3.0, 3.0, 86400.0, 2.0, 0.0, 0.0, 0.0]";
 
         assert_eq!(actual, expected, "Feature vector mismatch");
     }
