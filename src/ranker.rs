@@ -383,9 +383,12 @@ impl Ranker {
         files: &[FileCandidate],
         current_timestamp: i64,
         cwd: &Path,
-    ) -> Result<Vec<FileScore>> {
+    ) -> Result<Ranking> {
         if files.is_empty() {
-            return Ok(Vec::new());
+            return Ok(Ranking {
+                scores: Vec::new(),
+                timings: RankTimings::empty(),
+            });
         }
 
         // Compute simple scores for all files (used for cold-start or blending)
@@ -394,11 +397,7 @@ impl Ranker {
             .iter()
             .map(|file| self.compute_simple_score(file, current_timestamp))
             .collect();
-        log::info!(
-            "TIMING {{\"op\":\"simple_score_compute\",\"ms\":{},\"count\":{}}}",
-            simple_start.elapsed().as_secs_f64() * 1000.0,
-            files.len()
-        );
+        let simple_ms = ms_since(simple_start);
 
         // Always compute features for all files in parallel (for debugging visibility)
         let compute_start = Instant::now();
@@ -426,53 +425,59 @@ impl Ranker {
         // and 2us on every one after, which was 75ms of a 97ms time-to-first-result.
         // If a feature needs something expensive to set up, resolve it once outside
         // this loop and pass it in.
-        let results: Vec<(Vec<f64>, FxHashMap<String, Duration>)> = files
+        // fold/reduce rather than map/collect: each rayon chunk keeps one timing
+        // accumulator and folds its files into it, so the per-feature totals cost
+        // one `Vec<Duration>` per chunk instead of a map per file. The chunks are
+        // contiguous and are recombined in order, so the features come back
+        // aligned with `files`.
+        let feature_count = FEATURE_REGISTRY.len();
+        let (all_features, per_feature_totals) = files
             .par_iter()
-            .map(|file| {
-                compute_features_with_timing(query, file, current_timestamp, cwd, &click_indexes)
-            })
-            .collect();
-
-        // Extract features and aggregate timings
-        let all_features: Vec<Vec<f64>> = results.iter().map(|(f, _)| f.clone()).collect();
-
-        // Aggregate per-feature timings across all files
-        let mut aggregated_timings: FxHashMap<String, Duration> = FxHashMap::default();
-        for (_features, timings) in &results {
-            for (feature_name, duration) in timings {
-                *aggregated_timings
-                    .entry(feature_name.clone())
-                    .or_insert(Duration::ZERO) += *duration;
-            }
-        }
-
-        log::info!(
-            "TIMING {{\"op\":\"ml_compute_features\",\"ms\":{},\"count\":{}}}",
-            compute_start.elapsed().as_secs_f64() * 1000.0,
-            files.len()
-        );
-
-        // Log per-feature timings (average per file)
-        let num_files = files.len() as f64;
-        for (feature_name, total_duration) in &aggregated_timings {
-            let avg_ms = total_duration.as_secs_f64() * 1000.0 / num_files;
-            log::info!(
-                "TIMING {{\"op\":\"ml_feature_{}\",\"avg_ms\":{},\"total_ms\":{}}}",
-                feature_name,
-                avg_ms,
-                total_duration.as_secs_f64() * 1000.0
+            .fold(
+                || (Vec::new(), vec![Duration::ZERO; feature_count]),
+                |(mut features, mut per_feature), file| {
+                    features.push(compute_features_into(
+                        query,
+                        file,
+                        current_timestamp,
+                        cwd,
+                        &click_indexes,
+                        &mut per_feature,
+                    ));
+                    (features, per_feature)
+                },
+            )
+            .reduce(
+                || (Vec::new(), vec![Duration::ZERO; feature_count]),
+                |(mut features, mut per_feature), (more_features, more_per_feature)| {
+                    features.extend(more_features);
+                    for (total, add) in per_feature.iter_mut().zip(more_per_feature) {
+                        *total += add;
+                    }
+                    (features, per_feature)
+                },
             );
-        }
+        assert_eq!(
+            all_features.len(),
+            files.len(),
+            "every file must come back with a feature vector, in order"
+        );
+        let features_ms = ms_since(compute_start);
+        let per_feature_ms: Vec<f64> = per_feature_totals
+            .iter()
+            .map(|d| d.as_secs_f64() * 1000.0)
+            .collect();
 
         // If no model, use only simple scores (but keep the computed features for debugging)
         if self.model.is_none() {
             let mut scored_files: Vec<FileScore> = files
                 .iter()
+                .zip(all_features)
                 .enumerate()
-                .map(|(idx, file)| FileScore {
+                .map(|(idx, (file, features))| FileScore {
                     file_id: file.file_id,
                     score: simple_scores[idx],
-                    features: all_features[idx].clone(),
+                    features,
                     simple_score: Some(simple_scores[idx]),
                     ml_score: None,
                     simple_weight: Some(1.0), // 100% simple model when no ML model
@@ -485,7 +490,16 @@ impl Ranker {
                     .partial_cmp(&a.score)
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
-            return Ok(scored_files);
+            return Ok(Ranking {
+                scores: scored_files,
+                timings: RankTimings {
+                    simple_ms,
+                    features_ms,
+                    predict_ms: 0.0,
+                    blend_ms: 0.0,
+                    per_feature_ms,
+                },
+            });
         }
 
         // Batch predict all files at once (we have a model)
@@ -504,11 +518,7 @@ impl Ranker {
             .unwrap()
             .predict_with_params(&flat_features, num_features as i32, true, "num_threads=8")
             .context("Failed to batch predict with model")?;
-        log::info!(
-            "TIMING {{\"op\":\"ml_predict\",\"ms\":{},\"count\":{}}}",
-            predict_start.elapsed().as_secs_f64() * 1000.0,
-            files.len()
-        );
+        let predict_ms = ms_since(predict_start);
 
         // Blend the two models by how much the model was trained on
         let blend_start = Instant::now();
@@ -528,7 +538,7 @@ impl Ranker {
         // Build scored files with hybrid blending
         // Both simple_score and ml_score are now in [0, 1] range
         let mut scored_files = Vec::with_capacity(files.len());
-        for (idx, file) in files.iter().enumerate() {
+        for (idx, (file, features)) in files.iter().zip(all_features).enumerate() {
             let simple_score = simple_scores[idx]; // Already normalized via sigmoid
             let ml_score = prediction_results[idx]; // Binary classification probability [0, 1]
             let blended_score = w_simple * simple_score + w_lightgbm * ml_score;
@@ -536,7 +546,7 @@ impl Ranker {
             scored_files.push(FileScore {
                 file_id: file.file_id,
                 score: blended_score,
-                features: all_features[idx].clone(),
+                features,
                 simple_score: Some(simple_score),
                 ml_score: Some(ml_score),
                 simple_weight: Some(w_simple),
@@ -544,11 +554,7 @@ impl Ranker {
                 fuzzy_score: file.fuzzy_score,
             });
         }
-        log::info!(
-            "TIMING {{\"op\":\"hybrid_blend\",\"ms\":{},\"count\":{}}}",
-            blend_start.elapsed().as_secs_f64() * 1000.0,
-            files.len()
-        );
+        let blend_ms = ms_since(blend_start);
 
         // Sort by score descending (higher scores first)
         scored_files.sort_by(|a, b| {
@@ -557,7 +563,16 @@ impl Ranker {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        Ok(scored_files)
+        Ok(Ranking {
+            scores: scored_files,
+            timings: RankTimings {
+                simple_ms,
+                features_ms,
+                predict_ms,
+                blend_ms,
+                per_feature_ms,
+            },
+        })
     }
 }
 
@@ -570,6 +585,44 @@ pub fn features_to_map(features: &[f64]) -> FxHashMap<String, f64> {
         .collect()
 }
 
+/// Milliseconds elapsed since `start`, the unit every TIMING field is in.
+fn ms_since(start: Instant) -> f64 {
+    start.elapsed().as_secs_f64() * 1000.0
+}
+
+/// Where the time went inside one `rank_files` call.
+///
+/// Timings are returned rather than logged here: the worker logs one line per
+/// query, after the results are on their way to the UI. `per_feature_ms` is
+/// indexed by position in `FEATURE_REGISTRY` and totals every file.
+pub struct RankTimings {
+    pub simple_ms: f64,
+    pub features_ms: f64,
+    pub predict_ms: f64,
+    pub blend_ms: f64,
+    pub per_feature_ms: Vec<f64>,
+}
+
+/// What one ranking pass produced: the scored files, and where the time went.
+impl RankTimings {
+    /// What a ranking pass that did no work took: nothing, everywhere.
+    fn empty() -> Self {
+        RankTimings {
+            simple_ms: 0.0,
+            features_ms: 0.0,
+            predict_ms: 0.0,
+            blend_ms: 0.0,
+            per_feature_ms: vec![0.0; FEATURE_REGISTRY.len()],
+        }
+    }
+}
+
+/// What one ranking pass produced: the scored files, and where the time went.
+pub struct Ranking {
+    pub scores: Vec<FileScore>,
+    pub timings: RankTimings,
+}
+
 struct FeatureClickIndexes<'a> {
     clicks_by_file: &'a FxHashMap<String, Vec<ClickEvent>>,
     clicks_by_parent_dir: &'a FxHashMap<PathBuf, Vec<ClickEvent>>,
@@ -578,7 +631,7 @@ struct FeatureClickIndexes<'a> {
 }
 
 #[cfg(test)]
-/// Compute features for a file (for tests, no timing)
+/// Compute features for a file (for tests, discarding the timings)
 fn compute_features(
     query: &str,
     file: &FileCandidate,
@@ -586,19 +639,36 @@ fn compute_features(
     cwd: &Path,
     click_indexes: &FeatureClickIndexes<'_>,
 ) -> Vec<f64> {
-    let (features, _timings) =
-        compute_features_with_timing(query, file, current_timestamp, cwd, click_indexes);
-    features
+    let mut per_feature = vec![Duration::ZERO; FEATURE_REGISTRY.len()];
+    compute_features_into(
+        query,
+        file,
+        current_timestamp,
+        cwd,
+        click_indexes,
+        &mut per_feature,
+    )
 }
 
-/// Compute features with timing for each feature
-fn compute_features_with_timing(
+/// Compute every feature for one file, adding each one's time into `per_feature`.
+///
+/// `per_feature` is indexed by position in `FEATURE_REGISTRY` and is a running
+/// total across files, so a whole ranking pass costs one accumulator per rayon
+/// chunk rather than a map of 15 freshly allocated `String` keys per file.
+fn compute_features_into(
     query: &str,
     file: &FileCandidate,
     current_timestamp: i64,
     cwd: &Path,
     click_indexes: &FeatureClickIndexes<'_>,
-) -> (Vec<f64>, FxHashMap<String, Duration>) {
+    per_feature: &mut [Duration],
+) -> Vec<f64> {
+    assert_eq!(
+        per_feature.len(),
+        FEATURE_REGISTRY.len(),
+        "the timing accumulator has one slot per registered feature"
+    );
+
     // Create FeatureInputs for inference
     let inputs = FeatureInputs {
         query,
@@ -618,18 +688,16 @@ fn compute_features_with_timing(
 
     // Compute all features using the registry, tracking time for each
     let mut features = Vec::with_capacity(FEATURE_REGISTRY.len());
-    let mut timings = FxHashMap::default();
 
-    for feature in FEATURE_REGISTRY.iter() {
+    for (idx, feature) in FEATURE_REGISTRY.iter().enumerate() {
         let start = Instant::now();
         let value = feature.compute(&inputs);
-        let elapsed = start.elapsed();
+        per_feature[idx] += start.elapsed();
 
         features.push(value);
-        timings.insert(feature.name().to_string(), elapsed);
     }
 
-    (features, timings)
+    features
 }
 
 /// Ensure train.py is materialized in the data directory and return its path.
@@ -872,9 +940,9 @@ mod tests {
             &PathBuf::from("/tmp"),
         );
         match &result {
-            Ok(file_scores) => {
+            Ok(ranking) => {
                 println!("✓ Ranking succeeded");
-                for fs in file_scores {
+                for fs in &ranking.scores {
                     println!(
                         "  file_id {} - score: {:.4}, features: {:?}",
                         fs.file_id, fs.score, fs.features
@@ -1008,6 +1076,69 @@ mod tests {
         let expected = "[0.0, 3.0, 0.0, 1.0, 0.0, 13.585079902767108, 4.0, 0.0, 3.0, 3.0, 86400.0, 2.0, 0.0, 0.0, 0.0]";
 
         assert_eq!(actual, expected, "Feature vector mismatch");
+    }
+
+    #[test]
+    fn test_features_come_back_aligned_with_their_files() {
+        // The per-file feature work runs as a rayon fold/reduce so the timing
+        // accumulator can be per chunk rather than per file. That only holds
+        // together if the chunks are recombined in order, so pin it: give each
+        // file a size no other file has, and check every scored file carries its
+        // own size back.
+        let ranker = Ranker {
+            model: None,
+            clicks: ClickData {
+                clicks_by_file: FxHashMap::default(),
+                clicks_by_parent_dir: FxHashMap::default(),
+                clicks_by_query_and_file: FxHashMap::default(),
+                engagements_by_episode_query_and_file: FxHashMap::default(),
+            },
+            stats: None,
+        };
+
+        // Enough files that rayon splits them across more than one chunk.
+        let sizes: Vec<i64> = (0..512).map(|i| 1024 + i * 7).collect();
+        let files: Vec<FileCandidate> = sizes
+            .iter()
+            .enumerate()
+            .map(|(i, &size)| FileCandidate {
+                file_id: i,
+                relative_path: format!("file{}.txt", i),
+                full_path: PathBuf::from(format!("/tmp/file{}.txt", i)),
+                mtime: Some(1_700_500_000),
+                file_size: Some(size),
+                is_from_walker: true,
+                is_dir: false,
+                fuzzy_score: 50,
+            })
+            .collect();
+
+        let mut ranker = ranker;
+        let ranking = ranker
+            .rank_files("file", &files, 1_700_604_800, &PathBuf::from("/tmp"))
+            .expect("ranking without a model");
+
+        assert_eq!(ranking.scores.len(), files.len());
+
+        let size_idx = feature_names()
+            .iter()
+            .position(|name| *name == "log_file_size")
+            .expect("log_file_size is a registered feature");
+
+        for score in &ranking.scores {
+            let expected = ((1 + sizes[score.file_id]) as f64).log2();
+            assert_eq!(
+                score.features[size_idx], expected,
+                "file_id {} carried the wrong file's features",
+                score.file_id
+            );
+        }
+
+        assert_eq!(
+            ranking.timings.per_feature_ms.len(),
+            FEATURE_REGISTRY.len(),
+            "one timing slot per registered feature"
+        );
     }
 
     #[test]
@@ -1405,7 +1536,8 @@ mod tests {
 
         let result = ranker
             .rank_files("", &files, current_timestamp, &PathBuf::from("/tmp"))
-            .expect("Ranking should succeed");
+            .expect("Ranking should succeed")
+            .scores;
 
         assert_eq!(result.len(), 2, "Should have 2 ranked files");
 

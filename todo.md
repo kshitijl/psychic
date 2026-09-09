@@ -159,22 +159,23 @@ Filter+rank is ~2ms per keystroke and is not the problem.
   8.63ms. About half from each change; with only the syscall fix the total was
   6.79ms. `get_file_metadata`/`FileMetadata` fell out as dead weight.
 - **P4. Timing instrumentation: keep every number, cut the allocations and
-  the line count.** `ranker.rs::compute_features_with_timing` allocates 15
-  String keys and a hashmap per file per keystroke and collects a Vec of
-  them; then each query emits ~23 log lines (8 op lines + 15 per-feature
-  lines), and fern flushes per record, so each is a write syscall from the
-  worker before the response goes out. `Instant::now` itself is tens of ns
-  and is NOT the cost; per-use timing data stays. Fix: (a) per file, a
-  `[Duration; N]` indexed by registry position (N = `FEATURE_REGISTRY.len()`),
-  summed inside the rayon fold/reduce rather than collecting per-file maps;
-  (b) one `TIMING` line per query, a single JSON object with filter_ms,
-  simple_ms, features_ms, predict_ms, blend_ms, total_ms, count and a
-  `per_feature: {name: total_ms}` map, and teach `analyze_perf.rs` the
-  nested shape; (c) in `worker_thread_loop` send `QueryUpdated` first, then
-  log, so the write syscall is after the user's results are on their way;
-  (d) capture the session id once in the fern formatter closure in main.rs
-  instead of `std::env::var` per line, which also removes the `unsafe
-  set_var`. Consider a size cap/rotation for app.log (31MB now).
+  the line count.** DONE (2026-09-09). Ranking returns a `Ranking` (scores plus
+  `RankTimings`) instead of logging as it goes, and the worker writes one
+  `TIMING {"op":"query",...}` line per query - filter/simple/features/predict/
+  blend/total, count, and a nested `per_feature` map - after `QueryUpdated` has
+  been sent, so the write syscall is behind the user's results. A three-query
+  session dropped from 66 per-query lines to 3. Per-file feature timing is now
+  a `&mut [Duration]` indexed by registry position, folded per rayon chunk
+  rather than a `FxHashMap` of 15 fresh `String` keys per file; feature
+  computation over 171 files went 0.329ms -> 0.225ms (median of 4, same
+  results). Every number is still collected, `Instant::now` included.
+  `analyze_perf.rs` learned the nested shape and prints it as an indented
+  block, slowest feature first; the line's shape is pinned by expect tests on
+  both sides. (d) was already done in an earlier commit: the session id is
+  captured in the fern closure and the `unsafe set_var` is gone. The five
+  duplicated `QueryUpdated` sends collapsed into `send_query_updated`, which is
+  what guarantees the log-after-send ordering everywhere. **Not done:** a size
+  cap or rotation for app.log - see P11.
 - **P5. Query-constant lookups allocate per file.** `ClicksForThisQuery`
   and `EngagementsInEpisodeWithQuery` build a `(String, String)` key per
   file. `FuzzyScore` constructs a new `SkimMatcherV2` per file and redoes
@@ -258,6 +259,12 @@ Filter+rank is ~2ms per keystroke and is not the problem.
 - **P10. Optional: cache query-independent features per registry entry.**
   12 of 15 features do not depend on the query. Irrelevant at 200 files,
   ~25ms/keystroke at the 8000 the shallow threshold allows.
+- **P11. app.log grows without bound.** 31MB when P4 was measured, and it is
+  read start-to-finish by `internal analyze-perf` and `print-log`. Cutting the
+  per-query lines by 22x slowed the growth but did not bound it. Wants a size
+  cap with one level of rotation (app.log -> app.log.1), which means deciding
+  what the readers do with the rotated file; `fern` has no built-in rotation,
+  so this is a custom `Dispatch` chain or a size check at startup.
 
 #### Bugs
 

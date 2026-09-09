@@ -1,4 +1,5 @@
 use crate::db::Database;
+use crate::feature_defs::feature_names;
 use crate::metadata_ext::MetadataExt;
 use crate::ranker;
 use crate::walker::start_file_walker;
@@ -6,6 +7,7 @@ use anyhow::Result;
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
 use mpsc::Sender;
+use serde_json::json;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -418,6 +420,8 @@ struct WorkerState {
     walker_command_tx: Sender<WalkerCommand>,
     /// How long the last filter-and-rank took, reported back with its results.
     last_rank_ms: f64,
+    /// Where the last query's time went, held until its results have been sent.
+    last_query_timings: Option<QueryTimings>,
     /// Every directory the user has hidden, as stored.
     hidden_prefixes: Vec<PathBuf>,
     /// The subset of `hidden_prefixes` that suppresses anything right now:
@@ -505,6 +509,7 @@ impl WorkerState {
             db,
             walker_command_tx,
             last_rank_ms: 0.0,
+            last_query_timings: None,
             hidden_prefixes,
             active_hidden: Vec::new(),
         };
@@ -706,41 +711,52 @@ impl WorkerState {
                 }
             })
             .collect();
-        log::info!(
-            "TIMING {{\"op\":\"filter_files\",\"ms\":{},\"count\":{}}}",
-            filter_start.elapsed().as_secs_f64() * 1000.0,
-            file_candidates.len()
-        );
+        let filter_ms = filter_start.elapsed().as_secs_f64() * 1000.0;
+        let count = file_candidates.len();
 
         // Rank them with the model
-        let rank_start = std::time::Instant::now();
         let current_timestamp = jiff::Timestamp::now().as_second();
-        match self
-            .ranker
-            .rank_files(query, &file_candidates, current_timestamp, &self.root)
-        {
-            Ok(scored) => {
-                log::info!(
-                    "TIMING {{\"op\":\"rank_files\",\"ms\":{},\"count\":{}}}",
-                    rank_start.elapsed().as_secs_f64() * 1000.0,
-                    scored.len()
-                );
-                self.filtered_files = scored.iter().map(|fs| FileId(fs.file_id)).collect();
-                self.file_scores = scored;
-            }
-            Err(e) => {
-                log::warn!("Ranking failed: {}, falling back to simple filtering", e);
-                self.file_scores.clear();
-                self.filtered_files = matching_files.iter().map(|&(file_id, _)| file_id).collect();
-            }
-        }
+        let rank_timings =
+            match self
+                .ranker
+                .rank_files(query, &file_candidates, current_timestamp, &self.root)
+            {
+                Ok(ranking) => {
+                    self.filtered_files =
+                        ranking.scores.iter().map(|fs| FileId(fs.file_id)).collect();
+                    self.file_scores = ranking.scores;
+                    Some(ranking.timings)
+                }
+                Err(e) => {
+                    log::warn!("Ranking failed: {}, falling back to simple filtering", e);
+                    self.file_scores.clear();
+                    self.filtered_files =
+                        matching_files.iter().map(|&(file_id, _)| file_id).collect();
+                    None
+                }
+            };
 
         self.last_rank_ms = filter_rank_start.elapsed().as_secs_f64() * 1000.0;
-        log::info!(
-            "TIMING {{\"op\":\"filter_and_rank_total\",\"ms\":{}}}",
-            self.last_rank_ms
-        );
+        // Logged once the results have been sent - see `log_query_timings`.
+        self.last_query_timings = Some(QueryTimings {
+            filter_ms,
+            rank: rank_timings,
+            total_ms: self.last_rank_ms,
+            count,
+        });
         Ok(())
+    }
+
+    /// Write the last query's timings out, as one line.
+    ///
+    /// This used to be ~23 lines per query - eight op lines plus one per
+    /// feature - and fern flushes per record, so every one of them was a write
+    /// syscall on the worker thread standing between the user's keystroke and
+    /// their results. Now it is one line, after the send.
+    fn log_query_timings(&mut self) {
+        if let Some(timings) = self.last_query_timings.take() {
+            log::info!("TIMING {}", timings.to_json());
+        }
     }
 
     fn get_slice(&self, start: usize, count: usize) -> Vec<DisplayFileInfo> {
@@ -941,6 +957,83 @@ impl WorkerState {
     }
 }
 // Worker thread main loop
+/// Where one query's time went. Held on the worker until its results are sent,
+/// then written out as a single `TIMING` line by `log_query_timings`.
+struct QueryTimings {
+    filter_ms: f64,
+    /// `None` when ranking failed and the results are the filter's own order.
+    rank: Option<ranker::RankTimings>,
+    total_ms: f64,
+    count: usize,
+}
+
+impl QueryTimings {
+    /// The one line a query writes, as JSON.
+    ///
+    /// Kept separate from logging so the shape can be pinned by a test;
+    /// `analyze_perf.rs` parses exactly this.
+    fn to_json(&self) -> String {
+        let per_feature: serde_json::Map<String, serde_json::Value> = match &self.rank {
+            Some(rank) => feature_names()
+                .iter()
+                .zip(&rank.per_feature_ms)
+                .map(|(name, ms)| (name.to_string(), json!(round_us(*ms))))
+                .collect(),
+            None => serde_json::Map::new(),
+        };
+
+        // A query whose ranking failed still reports the filter and the total;
+        // the stages that never ran report nothing rather than a misleading zero.
+        let stage = |pick: fn(&ranker::RankTimings) -> f64| {
+            self.rank.as_ref().map(|rank| round_us(pick(rank)))
+        };
+
+        json!({
+            "op": "query",
+            "filter_ms": round_us(self.filter_ms),
+            "simple_ms": stage(|r| r.simple_ms),
+            "features_ms": stage(|r| r.features_ms),
+            "predict_ms": stage(|r| r.predict_ms),
+            "blend_ms": stage(|r| r.blend_ms),
+            "total_ms": round_us(self.total_ms),
+            "count": self.count,
+            "per_feature": per_feature,
+        })
+        .to_string()
+    }
+}
+
+/// Round a millisecond figure to microseconds.
+///
+/// Full f64 precision here is noise - `Instant` does not resolve it and nobody
+/// reads it - and it makes the line several times longer than the numbers in it.
+fn round_us(ms: f64) -> f64 {
+    (ms * 1000.0).round() / 1000.0
+}
+
+/// Send a finished query's results, then log where its time went.
+///
+/// The log write is a syscall on the worker thread, so it goes after the
+/// response rather than in front of it.
+fn send_query_updated<T>(state: &mut WorkerState, event_tx: &mpsc::Sender<T>, query_id: u64)
+where
+    T: From<WorkerResponse> + Send,
+{
+    let initial_page = state.get_page(0, 128);
+    let _ = event_tx.send(
+        WorkerResponse::QueryUpdated {
+            query_id,
+            total_results: state.filtered_files.len(),
+            total_files: state.file_registry.len(),
+            initial_page,
+            model_stats: state.ranker.stats.clone(),
+            rank_ms: state.last_rank_ms,
+        }
+        .into(),
+    );
+    state.log_query_timings();
+}
+
 fn worker_thread_loop<T>(
     task_rx: mpsc::Receiver<WorkerRequest>,
     event_tx: mpsc::Sender<T>,
@@ -1024,19 +1117,7 @@ fn worker_thread_loop<T>(
                         continue;
                     }
 
-                    // Send back results with initial page (page 0)
-                    let initial_page = state.get_page(0, 128);
-                    let _ = event_tx.send(
-                        WorkerResponse::QueryUpdated {
-                            query_id: latest_req.query_id,
-                            total_results: state.filtered_files.len(),
-                            total_files: state.file_registry.len(),
-                            initial_page,
-                            model_stats: state.ranker.stats.clone(),
-                            rank_ms: state.last_rank_ms,
-                        }
-                        .into(),
-                    );
+                    send_query_updated(&mut state, &event_tx, latest_req.query_id);
                 }
                 WorkerRequest::GetPage { query_id, page_num } => {
                     // If the request is for an old query, ignore it.
@@ -1065,18 +1146,7 @@ fn worker_thread_loop<T>(
                         if let Err(e) = state.filter_and_rank(&query) {
                             log::error!("Filter/rank failed after model reload: {}", e);
                         } else {
-                            let initial_page = state.get_page(0, 128);
-                            let _ = event_tx.send(
-                                WorkerResponse::QueryUpdated {
-                                    query_id,
-                                    total_results: state.filtered_files.len(),
-                                    total_files: state.file_registry.len(),
-                                    initial_page,
-                                    model_stats: state.ranker.stats.clone(),
-                                    rank_ms: state.last_rank_ms,
-                                }
-                                .into(),
-                            );
+                            send_query_updated(&mut state, &event_tx, query_id);
                         }
                     }
                 }
@@ -1096,18 +1166,7 @@ fn worker_thread_loop<T>(
                         if let Err(e) = state.filter_and_rank("") {
                             log::error!("Filter/rank failed after cwd change: {}", e);
                         } else {
-                            let initial_page = state.get_page(0, 128);
-                            let _ = event_tx.send(
-                                WorkerResponse::QueryUpdated {
-                                    query_id,
-                                    total_results: state.filtered_files.len(),
-                                    total_files: state.file_registry.len(),
-                                    initial_page,
-                                    model_stats: state.ranker.stats.clone(),
-                                    rank_ms: state.last_rank_ms,
-                                }
-                                .into(),
-                            );
+                            send_query_updated(&mut state, &event_tx, query_id);
                         }
                     }
                 }
@@ -1120,18 +1179,7 @@ fn worker_thread_loop<T>(
                         if let Err(e) = state.filter_and_rank(&query) {
                             log::error!("Filter/rank failed after eviction: {}", e);
                         } else {
-                            let initial_page = state.get_page(0, 128);
-                            let _ = event_tx.send(
-                                WorkerResponse::QueryUpdated {
-                                    query_id,
-                                    total_results: state.filtered_files.len(),
-                                    total_files: state.file_registry.len(),
-                                    initial_page,
-                                    model_stats: state.ranker.stats.clone(),
-                                    rank_ms: state.last_rank_ms,
-                                }
-                                .into(),
-                            );
+                            send_query_updated(&mut state, &event_tx, query_id);
                         }
                     }
                 }
@@ -1145,18 +1193,7 @@ fn worker_thread_loop<T>(
                             if let Err(e) = state.filter_and_rank(&query) {
                                 log::error!("Filter/rank failed after hiding: {}", e);
                             } else {
-                                let initial_page = state.get_page(0, 128);
-                                let _ = event_tx.send(
-                                    WorkerResponse::QueryUpdated {
-                                        query_id,
-                                        total_results: state.filtered_files.len(),
-                                        total_files: state.file_registry.len(),
-                                        initial_page,
-                                        model_stats: state.ranker.stats.clone(),
-                                        rank_ms: state.last_rank_ms,
-                                    }
-                                    .into(),
-                                );
+                                send_query_updated(&mut state, &event_tx, query_id);
                             }
                         }
                         Err(e) => log::error!("Failed to hide directory: {}", e),
@@ -1477,6 +1514,73 @@ pub(super) mod fresh_install_tests_support {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
         }
+    }
+}
+
+#[cfg(test)]
+mod query_timing_tests {
+    //! One line per query, in a shape `analyze_perf.rs` can read back.
+
+    use super::*;
+    use crate::feature_defs::FEATURE_REGISTRY;
+
+    fn timings() -> QueryTimings {
+        QueryTimings {
+            filter_ms: 1.5,
+            rank: Some(ranker::RankTimings {
+                simple_ms: 0.25,
+                features_ms: 0.75,
+                predict_ms: 0.5,
+                blend_ms: 0.125,
+                // Registry order: give the sixth feature all the time, so the
+                // line shows which feature each number belongs to.
+                per_feature_ms: (0..FEATURE_REGISTRY.len())
+                    .map(|i| if i == 5 { 0.5 } else { 0.0 })
+                    .collect(),
+            }),
+            total_ms: 3.25,
+            count: 171,
+        }
+    }
+
+    #[test]
+    fn test_a_query_writes_one_line_with_its_whole_breakdown() {
+        assert_eq!(
+            timings().to_json(),
+            r#"{"blend_ms":0.125,"count":171,"features_ms":0.75,"filter_ms":1.5,"op":"query","per_feature":{"clicks_for_this_query":0.0,"clicks_last_24h":0.0,"clicks_last_30_days":0.0,"clicks_last_7_days":0.0,"clicks_last_hour":0.0,"clicks_last_week_parent_dir":0.0,"engagements_in_episode_with_query":0.0,"filename_starts_with_query":0.0,"fuzzy_score":0.0,"is_dir":0.0,"is_hidden":0.0,"is_under_cwd":0.0,"log_file_size":0.5,"modified_age":0.0,"modified_last_24h":0.0},"predict_ms":0.5,"simple_ms":0.25,"total_ms":3.25}"#
+        );
+    }
+
+    #[test]
+    fn test_a_failed_ranking_reports_the_filter_and_nothing_it_did_not_do() {
+        let mut timings = timings();
+        timings.rank = None;
+
+        assert_eq!(
+            timings.to_json(),
+            r#"{"blend_ms":null,"count":171,"features_ms":null,"filter_ms":1.5,"op":"query","per_feature":{},"predict_ms":null,"simple_ms":null,"total_ms":3.25}"#
+        );
+    }
+
+    #[test]
+    fn test_the_numbers_are_rounded_to_microseconds() {
+        // Instant does not resolve past this and nobody reads it; full f64
+        // precision made the line several times longer than the numbers in it.
+        let mut timings = timings();
+        timings.filter_ms = 1.234_567_891_23;
+        timings.total_ms = 0.000_499;
+
+        let json = timings.to_json();
+        assert!(
+            json.contains(r#""filter_ms":1.235"#),
+            "filter_ms should round to microseconds: {}",
+            json
+        );
+        assert!(
+            json.contains(r#""total_ms":0.0"#),
+            "half a nanosecond rounds away: {}",
+            json
+        );
     }
 }
 
@@ -1836,7 +1940,8 @@ mod trained_model_tests {
                 jiff::Timestamp::now().as_second(),
                 Path::new("/test"),
             )
-            .expect("ranking with a model");
+            .expect("ranking with a model")
+            .scores;
 
         let top = scored.first().expect("something was ranked");
         let simple = top

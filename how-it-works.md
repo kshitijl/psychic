@@ -50,14 +50,48 @@ The codebase follows John Ousterhout's "deep modules" philosophy: simple interfa
 **Development Tools:**
 20. **`analyze_perf.rs`** - Performance analysis for timing logs
 
+**One TIMING line per query.** Ranking used to write about 23 lines per query -
+eight op lines plus one per feature - and fern flushes per record, so each was a
+write syscall on the worker thread standing between the user's keystroke and
+their results. A three-query session left 66 of them in app.log. Now
+`WorkerState::log_query_timings` writes one:
+
+```
+TIMING {"op":"query","filter_ms":1.5,"simple_ms":0.25,"features_ms":0.75,
+        "predict_ms":0.5,"blend_ms":0.125,"total_ms":3.25,"count":171,
+        "per_feature":{"fuzzy_score":0.25, ...}}
+```
+
+Three things follow from that, all deliberate:
+
+- **The line is written after the results are sent.** `rank_files` returns a
+  `Ranking` - scores plus a `RankTimings` - instead of logging as it goes, and
+  `send_query_updated` sends `QueryUpdated` first and logs second, so the write
+  syscall is behind the user's results rather than in front of them.
+- **Per-feature timing costs an accumulator per rayon chunk, not a map per
+  file.** It used to build a `FxHashMap` with 15 freshly allocated `String` keys
+  for every file on every keystroke. `compute_features_into` adds into a
+  `&mut [Duration]` indexed by registry position, and the parallel pass is a
+  `fold`/`reduce` so each chunk carries one accumulator. Measured over 171 files,
+  feature computation went from 0.329ms to 0.225ms a pass, a third of it gone.
+  The chunks recombine in order, which
+  `test_features_come_back_aligned_with_their_files` pins by giving every file a
+  unique size and checking each scored file gets its own back.
+- **`Instant::now` was never the cost** and per-feature timing is still on. It is
+  tens of nanoseconds; the allocations and the syscalls were the expense.
+
+`QueryTimings::to_json` builds the line, and its shape is pinned from both sides:
+by expect tests in `search_worker.rs` and by `analyze_perf.rs`'s own tests, which
+parse the same string back. Numbers are rounded to microseconds, which is past
+what `Instant` resolves and several times shorter than full f64 precision.
+
 `internal analyze-perf` reports the most recent **TUI** session, found by looking
 for the last `first_render` line. Every invocation logs under its own session id,
 including CLI subcommands like `retrain`, which emit no startup timings; anchoring
 on the last session id in the file instead produced an empty report whenever the
 most recent run was a CLI one. It also stops reading at `startup_complete`, so
-per-query timings after startup (`filter_and_rank_total` for later searches,
-`query_round_trip`) reach the log but not this report - the debug pane is where
-those are meant to be read.
+per-query timings after startup (later `query` lines, `query_round_trip`) reach
+the log but not this report - the debug pane is where those are meant to be read.
 
 **Timing convention:** every latency is measured from `PROCESS_START` (a `Lazy<Instant>`
 in `main.rs`, forced by the first statement of `main`). The worker uses it too, via
@@ -1521,16 +1555,16 @@ Why adaptive layout: Narrow terminals benefit from vertical stacking (file list 
   **These are the same measurements the TIMING log lines carry**, not a parallel
   implementation. Each value is computed once and then both logged and displayed:
   `first paint` and `first results` in the main loop, `fs walk` by the worker and
-  shipped back on `WalkerDone`, `of it, rank` by the worker as
-  `filter_and_rank_total` and shipped back on `QueryUpdated`. The two the worker
+  shipped back on `WalkerDone`, `of it, rank` by the worker as the `query` line's
+  `total_ms` and shipped back on `QueryUpdated`. The two the worker
   measures are passed through the response rather than re-measured on arrival,
   which would have made the pane read a channel hop slower than the log. Every
   latency in psychic - pane, log and `internal analyze-perf` - starts from the
   single `PROCESS_START` instant in `main.rs`.
 
   Two differences remain between the pane and `analyze-perf`, both by design:
-  `analyze-perf` stops reading at `startup_complete`, so the `filter_and_rank_total`
-  it prints is the one from startup while the pane's `of it, rank` is the most
+  `analyze-perf` stops reading at `startup_complete`, so the `query` line it
+  prints is the one from startup while the pane's `of it, rank` is the most
   recent query; and `query_round_trip` ("this search") happens after startup, so it
   reaches the log but never the `analyze-perf` output. The last two are the interesting pair - `this search` is the
   round trip the user actually feels (request sent to results in hand), and
