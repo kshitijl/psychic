@@ -518,8 +518,21 @@ Accumulator's fold over time-sorted events), so add the index to both
    (2,312 visits against 1,165 clicks). This was the collinearity risk noted
    when the two were compared before either was built; worth knowing it
    resolved this way rather than the other.
-8. **Clicks for this query in this directory.** Generalizes
-   clicks_for_this_query to siblings: map keyed (query, parent_dir).
+8. **Clicks for this query in this directory.** TRIED AND REJECTED
+   (2026-09-10). Built as specified, keyed query -> parent dir -> events and
+   resolved once per query like its per-file sibling. Rounds fixed at 120:
+   top-1 0.7977 -> 0.7834, MRR 0.8656 -> 0.8578, folds -0.052, -0.008, +0.017.
+   Gain 0.9%, rank 12 of 21 - used, and the use costs.
+
+**Three directory generalisations in a row measured negative** (6b, 7, 8), and
+that is the useful finding rather than any of them individually. Taking a
+signal that works per file - clicks, visits, per-query clicks - and spreading it
+over a directory does not transfer on this data, whatever the signal.
+The directory features that *do* work are the ones about directories as rows in
+their own right: `visits_last_7_days` and `visits_last_30_days`, which describe
+a thing the user actually did to that directory rather than an average of what
+they did to its contents. Before building a fourth, have a reason why it is not
+the same idea again.
 9. **Modified since last click** (binary: mtime > last click ts). "Something
    new here" for files you have opened before.
 10. **Extension click share.** DONE (2026-09-10). Fraction of recent
