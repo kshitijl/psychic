@@ -254,6 +254,18 @@ impl App {
         }
     }
 
+    /// Has the search worker stopped?
+    ///
+    /// It runs for as long as its request channel is open, which `App` holds,
+    /// so while the UI is up a finished worker means a dead one. Without this
+    /// the UI carried on with whatever results it had last been given, and
+    /// nothing typed made any difference - a frozen list that still redraws.
+    pub fn worker_has_died(&self) -> bool {
+        self.worker_handle
+            .as_ref()
+            .is_some_and(|handle| handle.is_finished())
+    }
+
     /// Load database statistics in the background, once.
     ///
     /// Counting rows scans the whole action index, so this is deliberately not

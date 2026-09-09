@@ -916,6 +916,17 @@ fn run_app(
                 }
             }
         }
+
+        // Checked here rather than trusted to be impossible: the worker owns
+        // the file registry and the model, so if it stops, every keystroke
+        // silently does nothing and the list on screen is frozen but still
+        // redrawing. Saying so and leaving beats looking merely slow.
+        if app.worker_has_died() {
+            anyhow::bail!(
+                "The search worker stopped unexpectedly. See the log at \
+                 ~/.local/share/psychic/app.log"
+            );
+        }
     }
 }
 

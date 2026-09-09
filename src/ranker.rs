@@ -461,7 +461,6 @@ impl Ranker {
             .par_iter()
             .map(|file| {
                 compute_features_with_timing(query, file, current_timestamp, cwd, &click_indexes)
-                    .expect("Feature computation failed")
             })
             .collect();
 
@@ -612,10 +611,10 @@ fn compute_features(
     current_timestamp: i64,
     cwd: &Path,
     click_indexes: &FeatureClickIndexes<'_>,
-) -> Result<Vec<f64>> {
+) -> Vec<f64> {
     let (features, _timings) =
-        compute_features_with_timing(query, file, current_timestamp, cwd, click_indexes)?;
-    Ok(features)
+        compute_features_with_timing(query, file, current_timestamp, cwd, click_indexes);
+    features
 }
 
 /// Compute features with timing for each feature
@@ -625,7 +624,7 @@ fn compute_features_with_timing(
     current_timestamp: i64,
     cwd: &Path,
     click_indexes: &FeatureClickIndexes<'_>,
-) -> Result<(Vec<f64>, FxHashMap<String, Duration>)> {
+) -> (Vec<f64>, FxHashMap<String, Duration>) {
     // Create FeatureInputs for inference
     let inputs = FeatureInputs {
         query,
@@ -649,14 +648,14 @@ fn compute_features_with_timing(
 
     for feature in FEATURE_REGISTRY.iter() {
         let start = Instant::now();
-        let value = feature.compute(&inputs)?;
+        let value = feature.compute(&inputs);
         let elapsed = start.elapsed();
 
         features.push(value);
         timings.insert(feature.name().to_string(), elapsed);
     }
 
-    Ok((features, timings))
+    (features, timings)
 }
 
 /// Ensure train.py is materialized in the data directory and return its path.
@@ -989,8 +988,7 @@ mod tests {
                 clicks_by_query_and_file: &clicks_by_query_and_file,
                 engagements_by_episode_query_and_file: &engagements_by_episode_query_and_file,
             },
-        )
-        .expect("Failed to compute features");
+        );
 
         // Format as string for expect-test style comparison
         let actual = format!("{:?}", features);

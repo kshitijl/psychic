@@ -1,6 +1,5 @@
 use super::ClickEvent;
 use super::schema::{Feature, FeatureInputs, FeatureType, Monotonicity};
-use anyhow::Result;
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
 use jiff::Span;
@@ -86,23 +85,21 @@ impl Feature for FilenameStartsWithQuery {
         FeatureType::Binary
     }
 
-    fn compute(&self, inputs: &FeatureInputs) -> Result<f64> {
+    fn compute(&self, inputs: &FeatureInputs) -> f64 {
         let filename = Path::new(inputs.file_path)
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("");
 
-        Ok(
-            if !inputs.query.is_empty()
-                && filename
-                    .to_lowercase()
-                    .starts_with(&inputs.query.to_lowercase())
-            {
-                1.0
-            } else {
-                0.0
-            },
-        )
+        if !inputs.query.is_empty()
+            && filename
+                .to_lowercase()
+                .starts_with(&inputs.query.to_lowercase())
+        {
+            1.0
+        } else {
+            0.0
+        }
     }
 }
 
@@ -121,8 +118,8 @@ impl Feature for ClicksLast30Days {
         FeatureType::Numeric
     }
 
-    fn compute(&self, inputs: &FeatureInputs) -> Result<f64> {
-        Ok(clicks_for_file(inputs, 30 * SECONDS_PER_DAY))
+    fn compute(&self, inputs: &FeatureInputs) -> f64 {
+        clicks_for_file(inputs, 30 * SECONDS_PER_DAY)
     }
 }
 
@@ -141,13 +138,13 @@ impl Feature for ModifiedLast24h {
         FeatureType::Binary
     }
 
-    fn compute(&self, inputs: &FeatureInputs) -> Result<f64> {
+    fn compute(&self, inputs: &FeatureInputs) -> f64 {
         let Some(mtime) = inputs.mtime else {
-            return Ok(0.0);
+            return 0.0;
         };
 
         let modified_within_a_day = inputs.current_timestamp - mtime < SECONDS_PER_DAY;
-        Ok(if modified_within_a_day { 1.0 } else { 0.0 })
+        if modified_within_a_day { 1.0 } else { 0.0 }
     }
 }
 
@@ -166,19 +163,19 @@ impl Feature for IsUnderCwd {
         FeatureType::Binary
     }
 
-    fn compute(&self, inputs: &FeatureInputs) -> Result<f64> {
+    fn compute(&self, inputs: &FeatureInputs) -> f64 {
         // Files from walker are guaranteed to be under cwd
         if inputs.is_from_walker {
-            return Ok(1.0);
+            return 1.0;
         }
 
         // Historical files have already been canonicalized at startup
         // so we can do a simple prefix check
-        Ok(if inputs.full_path.starts_with(inputs.cwd) {
+        if inputs.full_path.starts_with(inputs.cwd) {
             1.0
         } else {
             0.0
-        })
+        }
     }
 }
 
@@ -197,7 +194,7 @@ impl Feature for IsHidden {
         FeatureType::Binary
     }
 
-    fn compute(&self, inputs: &FeatureInputs) -> Result<f64> {
+    fn compute(&self, inputs: &FeatureInputs) -> f64 {
         // Check if any component in the path starts with a dot (hidden)
         let has_hidden_component = inputs.full_path.components().any(|component| {
             component
@@ -207,7 +204,7 @@ impl Feature for IsHidden {
                 .unwrap_or(false)
         });
 
-        Ok(if has_hidden_component { 1.0 } else { 0.0 })
+        if has_hidden_component { 1.0 } else { 0.0 }
     }
 }
 
@@ -226,8 +223,8 @@ impl Feature for FileSizeBytes {
         FeatureType::Numeric
     }
 
-    fn compute(&self, inputs: &FeatureInputs) -> Result<f64> {
-        Ok(inputs.file_size.unwrap_or(0) as f64)
+    fn compute(&self, inputs: &FeatureInputs) -> f64 {
+        inputs.file_size.unwrap_or(0) as f64
     }
 }
 
@@ -250,8 +247,8 @@ impl Feature for ClicksLastWeekParentDir {
         Some(Monotonicity::Increasing)
     }
 
-    fn compute(&self, inputs: &FeatureInputs) -> Result<f64> {
-        Ok(clicks_for_parent_dir(inputs, 7 * SECONDS_PER_DAY))
+    fn compute(&self, inputs: &FeatureInputs) -> f64 {
+        clicks_for_parent_dir(inputs, 7 * SECONDS_PER_DAY)
     }
 }
 
@@ -274,8 +271,8 @@ impl Feature for ClicksLastHour {
         Some(Monotonicity::Increasing)
     }
 
-    fn compute(&self, inputs: &FeatureInputs) -> Result<f64> {
-        Ok(clicks_for_file(inputs, SECONDS_PER_HOUR))
+    fn compute(&self, inputs: &FeatureInputs) -> f64 {
+        clicks_for_file(inputs, SECONDS_PER_HOUR)
     }
 }
 
@@ -298,8 +295,8 @@ impl Feature for ClicksLast24h {
         Some(Monotonicity::Increasing)
     }
 
-    fn compute(&self, inputs: &FeatureInputs) -> Result<f64> {
-        Ok(clicks_for_file(inputs, SECONDS_PER_DAY))
+    fn compute(&self, inputs: &FeatureInputs) -> f64 {
+        clicks_for_file(inputs, SECONDS_PER_DAY)
     }
 }
 
@@ -322,8 +319,8 @@ impl Feature for ClicksLast7Days {
         Some(Monotonicity::Increasing)
     }
 
-    fn compute(&self, inputs: &FeatureInputs) -> Result<f64> {
-        Ok(clicks_for_file(inputs, 7 * SECONDS_PER_DAY))
+    fn compute(&self, inputs: &FeatureInputs) -> f64 {
+        clicks_for_file(inputs, 7 * SECONDS_PER_DAY)
     }
 }
 
@@ -346,13 +343,13 @@ impl Feature for ModifiedAge {
         Some(Monotonicity::Decreasing)
     }
 
-    fn compute(&self, inputs: &FeatureInputs) -> Result<f64> {
+    fn compute(&self, inputs: &FeatureInputs) -> f64 {
         if let Some(mtime) = inputs.mtime {
             let seconds_since_mod = inputs.current_timestamp - mtime;
-            Ok(seconds_since_mod as f64)
+            seconds_since_mod as f64
         } else {
             // If mtime is not available, return a large age
-            Ok(Span::new().days(365).get_seconds() as f64)
+            Span::new().days(365).get_seconds() as f64
         }
     }
 }
@@ -376,7 +373,7 @@ impl Feature for ClicksForThisQuery {
         Some(Monotonicity::Increasing)
     }
 
-    fn compute(&self, inputs: &FeatureInputs) -> Result<f64> {
+    fn compute(&self, inputs: &FeatureInputs) -> f64 {
         let full_path_str = inputs.full_path.to_string_lossy().to_string();
         let key = (inputs.query.to_string(), full_path_str);
 
@@ -386,7 +383,7 @@ impl Feature for ClicksForThisQuery {
             .map(|clicks| clicks.len())
             .unwrap_or(0);
 
-        Ok(clicks as f64)
+        clicks as f64
     }
 }
 
@@ -409,7 +406,7 @@ impl Feature for EngagementsInEpisodeWithQuery {
         Some(Monotonicity::Increasing)
     }
 
-    fn compute(&self, inputs: &FeatureInputs) -> Result<f64> {
+    fn compute(&self, inputs: &FeatureInputs) -> f64 {
         let full_path_str = inputs.full_path.to_string_lossy().to_string();
         let key = (inputs.query.to_string(), full_path_str);
 
@@ -419,7 +416,7 @@ impl Feature for EngagementsInEpisodeWithQuery {
             .map(|engagements| engagements.len())
             .unwrap_or(0);
 
-        Ok(engagements as f64)
+        engagements as f64
     }
 }
 
@@ -438,8 +435,8 @@ impl Feature for IsDir {
         FeatureType::Binary
     }
 
-    fn compute(&self, inputs: &FeatureInputs) -> Result<f64> {
-        Ok(if inputs.is_dir { 1.0 } else { 0.0 })
+    fn compute(&self, inputs: &FeatureInputs) -> f64 {
+        if inputs.is_dir { 1.0 } else { 0.0 }
     }
 }
 
@@ -462,10 +459,10 @@ impl Feature for FuzzyScore {
         Some(Monotonicity::Increasing) // Higher fuzzy score = better match
     }
 
-    fn compute(&self, inputs: &FeatureInputs) -> Result<f64> {
+    fn compute(&self, inputs: &FeatureInputs) -> f64 {
         // Return 0.0 for empty queries (no fuzzy match signal)
         if inputs.query.is_empty() {
-            return Ok(0.0);
+            return 0.0;
         }
 
         // Compute fuzzy match score using SkimMatcherV2
@@ -474,7 +471,7 @@ impl Feature for FuzzyScore {
             .fuzzy_match(inputs.file_path, inputs.query)
             .unwrap_or(0); // Return 0 if no match
 
-        Ok(score as f64)
+        score as f64
     }
 }
 

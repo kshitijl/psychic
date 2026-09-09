@@ -1,4 +1,3 @@
-use anyhow::Result;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -55,5 +54,11 @@ pub trait Feature: Send + Sync {
 
     /// Compute feature value from inputs
     /// Used for both training and inference
-    fn compute(&self, inputs: &FeatureInputs) -> Result<f64>;
+    ///
+    /// Infallible on purpose. Every feature is arithmetic over a struct that
+    /// already holds everything it needs, so there is nothing here that can
+    /// fail - and saying otherwise put a `Result` in a `rayon` loop, where the
+    /// only thing to do with it was `.expect()`, which would take the search
+    /// worker down without a word.
+    fn compute(&self, inputs: &FeatureInputs) -> f64;
 }

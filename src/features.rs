@@ -338,7 +338,7 @@ fn compute_features_from_accumulator(
 
     // Compute all features using the registry
     for feature in FEATURE_REGISTRY.iter() {
-        let value = feature.compute(&inputs)?;
+        let value = feature.compute(&inputs);
         features.insert(feature.name().to_string(), value.to_string());
     }
 
