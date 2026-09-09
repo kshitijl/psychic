@@ -488,6 +488,23 @@ Accumulator's fold over time-sorted events), so add the index to both
    or accept a scan of one month) or a small counts table maintained at
    write time. Measure the startup cost first. Rank position (item 4) will
    later let this become position-debiased.
+6b. **Visits credited to the files inside a directory.** TRIED AND REJECTED
+   (2026-09-10). `visits_to_parent_dir_7_days` / `_30_days`: a file gets the
+   visit count of the directory it lives in, 0 for directories (which have
+   `visits_last_*`). The idea being that a file in a directory you `cd` into
+   daily is more likely to be the one you want.
+
+   With the round count fixed at 120 so early stopping cannot move: top-1
+   0.7977 -> 0.7820, MRR 0.8656 -> 0.8589, two folds down and one unchanged.
+   Gain 0.5% and 0.1%, ranks 14 and 21 of 22 - the model does reach for it, and
+   the reaching is what costs.
+
+   Not the "constant within an episode" failure that sank `query_length`: the
+   median episode spans 12 distinct parent directories, so this one genuinely
+   can reorder a list. It is just thin. Only ~130 directories have ever been
+   visited, so a rule keyed to a directory's visit count rests on very few
+   distinct values, and it does not transfer.
+
 7. **Clicks under this directory.** TRIED AND REJECTED (2026-09-10). Built as
    specified - every clicked path credited to its 8 nearest ancestors at index
    time, 7d and 30d windows, 0 for files - and the model would not use it: gain
