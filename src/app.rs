@@ -83,6 +83,9 @@ pub struct App {
     pub path_bar_scroll: u16,
     pub path_bar_scroll_direction: i8,
     pub last_path_bar_update: Instant,
+    /// Width of the path bar as the last frame laid it out. Only the renderer
+    /// knows it, and the marquee cannot advance without it.
+    pub path_bar_width: u16,
 
     // For debug pane
     pub model_stats_cache: Option<ranker::ModelStats>, // Cached from worker, refreshed periodically
@@ -197,6 +200,7 @@ impl App {
             num_results_to_log_as_impressions: 25,
             path_bar_scroll: 0,
             path_bar_scroll_direction: 1,
+            path_bar_width: 0,
             last_path_bar_update: Instant::now(),
             model_stats_cache: None,
             currently_retraining: false,
@@ -520,7 +524,127 @@ impl App {
         Ok(())
     }
 
-    pub fn update_scroll(&mut self, visible_height: u16, override_scroll: Option<usize>) {
+    /// An `App` with nothing behind it, for tests that render a frame.
+    ///
+    /// Render takes `&App`, so a render test needs one; going through
+    /// `App::new` would want a data directory, a worker thread and a terminal.
+    /// This wires an in-memory database and a detached input handle instead,
+    /// and leaves everything else at its default - the caller sets the two or
+    /// three fields its case is about.
+    #[cfg(test)]
+    pub fn for_test() -> Self {
+        let (event_tx, _event_rx) = mpsc::channel();
+        let (preview_tx, _preview_rx) = mpsc::channel();
+        let (worker_tx, _worker_rx) = mpsc::channel();
+        let db = crate::db::Database::new(Path::new(":memory:")).expect("in-memory database");
+        let root = PathBuf::from("/tmp");
+
+        App {
+            query: String::new(),
+            page_cache: HashMap::new(),
+            total_results: 0,
+            total_files: 0,
+            selected_index: 0,
+            file_list_scroll: 0,
+            preview: PreviewState::new(preview_tx),
+            cwd: root.clone(),
+            history: history::History::new(root),
+            history_selected: 0,
+            num_results_to_log_as_impressions: 25,
+            path_bar_scroll: 0,
+            path_bar_scroll_direction: 1,
+            path_bar_width: 0,
+            last_path_bar_update: Instant::now(),
+            model_stats_cache: None,
+            currently_retraining: false,
+            recent_logs: VecDeque::new(),
+            current_filter: search_worker::FilterType::None,
+            status_message: None,
+            ui_state: ui_state::UiState::new(),
+            options: AppOptions {
+                on_dir_click: OnDirClickAction::Navigate,
+                on_cwd_visit: OnCwdVisitAction::DropIntoShell,
+                initial_filter: search_worker::FilterType::None,
+                no_preview: false,
+                no_click_loading: true,
+                no_model: true,
+                no_click_logging: true,
+                respect_gitignore: true,
+                editor: "true".to_string(),
+            },
+            analytics: Analytics::new("test-session".to_string(), db, true),
+            worker_tx,
+            worker_handle: None,
+            input: crate::tty_input::TtyInput::detached(),
+            tick_paused: Arc::new(AtomicBool::new(false)),
+            walker_done: false,
+            startup_complete_logged: false,
+            timings: Timings::default(),
+            db_stats: None,
+            db_stats_requested: false,
+            data_dir: PathBuf::from("/tmp"),
+            event_tx,
+            query_sent_at: None,
+        }
+    }
+
+    /// Move the path-bar marquee on by one step, if it is time.
+    ///
+    /// Called from the tick, not from the draw: the animation should be driven
+    /// by the clock rather than by how often the screen happens to be redrawn,
+    /// and having render mutate this was the last thing stopping it taking
+    /// `&App`. It needs the bar's width, which only the layout knows, so the
+    /// renderer reports that back in `FrameLayout`.
+    pub fn advance_marquee(&mut self, delay: std::time::Duration, speed: std::time::Duration) {
+        let width = self.path_bar_width as usize;
+        if width == 0 {
+            return; // no frame drawn yet
+        }
+
+        let Some(file) = self.get_file_at_index(self.selected_index) else {
+            return;
+        };
+        // Borrowed, not owned: this runs on every tick, and a path that is valid
+        // UTF-8 with nothing to escape - which is nearly all of them - costs no
+        // allocation at all.
+        let path = file.full_path.to_string_lossy();
+        // Same padding the path bar draws, so the two agree on when it overflows.
+        let padded_len = crate::path_display::printable(&path).chars().count() + 4;
+        if padded_len <= width {
+            return;
+        }
+        drop(path);
+
+        let max_scroll = padded_len.saturating_sub(width) as u16;
+        let at_an_end = self.path_bar_scroll == 0 || self.path_bar_scroll >= max_scroll;
+        let waited = self.last_path_bar_update.elapsed();
+        if waited <= if at_an_end { delay } else { speed } {
+            return;
+        }
+
+        let (scroll, direction) = if self.path_bar_scroll_direction == 1 {
+            if self.path_bar_scroll < max_scroll {
+                (self.path_bar_scroll + 1, self.path_bar_scroll_direction)
+            } else {
+                (self.path_bar_scroll, -1) // turn around
+            }
+        } else if self.path_bar_scroll > 0 {
+            (self.path_bar_scroll - 1, self.path_bar_scroll_direction)
+        } else {
+            (self.path_bar_scroll, 1) // turn around
+        };
+        self.path_bar_scroll = scroll;
+        self.path_bar_scroll_direction = direction;
+        self.last_path_bar_update = Instant::now();
+    }
+
+    /// Take the scroll position the frame was drawn at, and prefetch around it.
+    ///
+    /// The scroll itself is computed by the renderer, which is the only place
+    /// that knows how many rows fit. This used to carry a second copy of that
+    /// calculation for when the renderer had not supplied one - a branch that
+    /// nothing could reach, since every caller comes straight from a frame.
+    pub fn update_scroll(&mut self, visible_height: u16, scroll: usize) {
         let visible_height = visible_height as usize;
 
         // If we can't render any rows, skip scroll updates but keep selection.
@@ -532,39 +656,8 @@ impl App {
             return;
         }
 
-        // If all results fit on screen, don't scroll at all
-        if self.total_results <= visible_height {
-            self.file_list_scroll = 0;
-            // Even if everything fits, still ensure current page is cached.
-        } else if let Some(scroll) = override_scroll {
-            // Render pass already computed desired scroll position.
-            let max_scroll = self.total_results.saturating_sub(1);
-            self.file_list_scroll = scroll.min(max_scroll);
-        } else {
-            // Auto-scroll the file list when selection is near top or bottom
-            let selected = self.selected_index;
-            let scroll = self.file_list_scroll;
-
-            // If selected item is above visible area, scroll up
-            if selected < scroll {
-                self.file_list_scroll = selected;
-            }
-            // If selected item is below visible area, scroll down
-            else if selected >= scroll + visible_height {
-                // Smart positioning: leave some space from bottom (5 lines)
-                // This makes wrap-around more comfortable
-                let margin = 5usize;
-                self.file_list_scroll = selected.saturating_sub(
-                    visible_height
-                        .saturating_sub(margin)
-                        .min(visible_height - 1),
-                );
-            }
-            // If we're in the bottom 5 items and there's more to see, keep scrolling
-            else if selected >= scroll + visible_height.saturating_sub(5) {
-                self.file_list_scroll = selected.saturating_sub(visible_height.saturating_sub(5));
-            }
-        }
+        let max_scroll = self.total_results.saturating_sub(1);
+        self.file_list_scroll = scroll.min(max_scroll);
 
         let active_query_id = self.analytics.current_subsession_id();
 
@@ -618,5 +711,115 @@ impl App {
                 });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod marquee_tests {
+    //! The path bar scrolls long paths back and forth. The tick drives it, so
+    //! it is testable without drawing anything - which is the point of having
+    //! moved it out of render.
+
+    use super::*;
+    use std::time::Duration;
+
+    /// An app showing one file, with the path bar as wide as `width`.
+    fn app_showing(path: &str, width: u16) -> App {
+        let mut app = App::for_test();
+        app.total_results = 1;
+        app.path_bar_width = width;
+        app.page_cache.insert(
+            0,
+            Page {
+                start_index: 0,
+                end_index: 1,
+                files: vec![crate::search_worker::DisplayFileInfo {
+                    display_name: path.to_string(),
+                    full_path: PathBuf::from(path),
+                    score: 0.0,
+                    features: Vec::new(),
+                    mtime: None,
+                    atime: None,
+                    file_size: None,
+                    is_dir: false,
+                    is_cwd: false,
+                    is_historical: false,
+                    is_under_cwd: true,
+                    simple_score: None,
+                    ml_score: None,
+                    simple_weight: None,
+                    ml_weight: None,
+                    fuzzy_score: 0,
+                }],
+            },
+        );
+        app
+    }
+
+    /// Long enough to overflow a 20-column bar: 24 characters plus 4 of padding.
+    const LONG: &str = "/tmp/a/long/path/one.txt";
+    const NOW: Duration = Duration::ZERO;
+
+    #[test]
+    fn test_a_path_that_fits_does_not_scroll() {
+        let mut app = app_showing("/tmp/short.txt", 80);
+        app.advance_marquee(NOW, NOW);
+        assert_eq!(app.path_bar_scroll, 0, "nothing to scroll to");
+    }
+
+    #[test]
+    fn test_a_long_path_scrolls_one_column_at_a_time() {
+        let mut app = app_showing(LONG, 20);
+
+        app.advance_marquee(NOW, NOW);
+        assert_eq!(app.path_bar_scroll, 1);
+        app.advance_marquee(NOW, NOW);
+        assert_eq!(app.path_bar_scroll, 2);
+    }
+
+    #[test]
+    fn test_it_turns_around_at_the_far_end_and_comes_back() {
+        let mut app = app_showing(LONG, 20);
+        // 24 characters + 4 of padding, in 20 columns, leaves 8 to scroll.
+        let max_scroll = 8;
+
+        for _ in 0..max_scroll {
+            app.advance_marquee(NOW, NOW);
+        }
+        assert_eq!(app.path_bar_scroll, max_scroll, "walked to the end");
+        assert_eq!(app.path_bar_scroll_direction, 1, "still facing forwards");
+
+        app.advance_marquee(NOW, NOW);
+        assert_eq!(app.path_bar_scroll, max_scroll, "the turn costs a step");
+        assert_eq!(app.path_bar_scroll_direction, -1, "now facing back");
+
+        app.advance_marquee(NOW, NOW);
+        assert_eq!(app.path_bar_scroll, max_scroll - 1, "and comes back");
+    }
+
+    #[test]
+    fn test_it_waits_the_long_delay_at_the_ends_and_the_short_one_between() {
+        let mut app = app_showing(LONG, 20);
+        let delay = Duration::from_secs(3600);
+        let speed = Duration::ZERO;
+
+        // At rest at column 0, so the long delay applies and nothing moves.
+        app.advance_marquee(delay, speed);
+        assert_eq!(app.path_bar_scroll, 0, "paused at the end");
+
+        // Once moving, the short one does.
+        app.advance_marquee(speed, speed);
+        assert_eq!(app.path_bar_scroll, 1);
+        app.advance_marquee(delay, speed);
+        assert_eq!(app.path_bar_scroll, 2, "mid-scroll uses the scroll speed");
+    }
+
+    #[test]
+    fn test_nothing_moves_before_the_first_frame() {
+        // path_bar_width is 0 until a frame has been laid out, and a marquee
+        // that guessed a width would scroll to the wrong place.
+        let mut app = app_showing(LONG, 0);
+        app.advance_marquee(NOW, NOW);
+        assert_eq!(app.path_bar_scroll, 0);
     }
 }

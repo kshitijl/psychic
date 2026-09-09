@@ -674,7 +674,7 @@ fn run_app(
 
         // Draw UI
         let draw_start = Instant::now();
-        let mut render_updates = None;
+        let mut frame_layout = None;
         let mut help_scroll_max = None;
         let mut preview_pane = None;
         terminal.draw(|f| {
@@ -707,32 +707,12 @@ fn run_app(
                 return;
             }
 
-            // Render normal mode UI using render module
-            let normal_ctx = render::NormalRenderContext {
-                selected_index: app.selected_index,
-                file_list_scroll: app.file_list_scroll,
-                total_results: app.total_results,
-                total_files: app.total_files,
-                current_filter: app.current_filter,
-                no_preview: app.options.no_preview,
-                preview: &app.preview,
-                currently_retraining: app.currently_retraining,
-                model_stats_cache: app.model_stats_cache.as_ref(),
-                timings: &app.timings,
-                db_stats: app.db_stats.as_ref(),
-                page_cache: &app.page_cache,
-                ui_state: &app.ui_state,
-                recent_logs: &app.recent_logs,
-                last_path_bar_update: app.last_path_bar_update,
-                path_bar_scroll: app.path_bar_scroll,
-                path_bar_scroll_direction: app.path_bar_scroll_direction,
-                cwd: app.cwd.as_path(),
-                query: &app.query,
-                status_message: app.status_message.as_deref(),
-            };
-            let updates = render::render_normal_mode(f, normal_ctx, marquee_delay, marquee_speed);
-            preview_pane = updates.preview_pane;
-            render_updates = Some(updates);
+            // Render normal mode UI using render module. It reads `&App` and
+            // writes nothing back; what it works out from the geometry comes
+            // back in the layout.
+            let layout = render::render_normal_mode(f, app);
+            preview_pane = layout.preview_pane;
+            frame_layout = Some(layout);
 
             if app.ui_state.help_visible {
                 help_scroll_max = Some(render::render_help_overlay(f, app.ui_state.help_scroll));
@@ -757,15 +737,10 @@ fn run_app(
             app.update_preview(pane);
         }
 
-        // Apply render updates to app state after rendering is complete
-        if let Some(mut updates) = render_updates {
-            let visible_height = updates.visible_list_height;
-            let scroll_override = updates.file_list_scroll;
-            updates.visible_list_height = None;
-            updates.apply_to(app);
-            if let Some(height) = visible_height {
-                app.update_scroll(height, scroll_override);
-            }
+        // Take what only the layout knew, now that the frame is drawn.
+        if let Some(layout) = frame_layout {
+            app.path_bar_width = layout.path_bar_width;
+            app.update_scroll(layout.visible_list_height, layout.file_list_scroll);
         }
 
         // Log draw time and check for first full render (with data)
@@ -816,7 +791,10 @@ fn run_app(
                 app.preview.ready(*generated);
             }
             AppEvent::Tick => {
-                // Tick event - just triggers a redraw for marquee animation
+                // The tick is what moves the marquee along. Drawing a frame used
+                // to do it, which made the animation a side effect of rendering
+                // and meant render could not take `&App`.
+                app.advance_marquee(marquee_delay, marquee_speed);
             }
             AppEvent::Worker(response) => {
                 // Handle worker response

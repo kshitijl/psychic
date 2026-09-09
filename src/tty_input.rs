@@ -80,6 +80,25 @@ pub struct TtyInput {
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
+#[cfg(test)]
+impl TtyInput {
+    /// A handle with no thread behind it, for tests that need an `App` but not
+    /// a terminal. Pausing or resuming it does nothing, which is what a test
+    /// wants: reading /dev/tty from a test runner is not a thing to do.
+    pub fn detached() -> Self {
+        let (wake, _dead_end) = std::os::unix::net::UnixStream::pair()
+            .expect("a socket pair for a detached input handle");
+        let (_ack_tx, ack_rx) = std::sync::mpsc::channel();
+        let (resume_tx, _resume_rx) = std::sync::mpsc::channel();
+        TtyInput {
+            wake,
+            ack_rx,
+            resume_tx,
+            handle: None,
+        }
+    }
+}
+
 /// Proof that the input thread has stopped reading the terminal.
 ///
 /// The thread starts again when this is dropped, so the terminal cannot be left

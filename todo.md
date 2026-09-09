@@ -327,12 +327,16 @@ Optimizations".
 
 #### Simplifications
 
-- **S1. Make render pure.** `NormalRenderContext` copies ~20 fields out of
-  `App`, `RenderUpdates` copies 5 back, only because render mutates the
-  preview and the marquee. Advance the marquee in the Tick handler, generate
-  previews on the preview thread (P2), and render takes `&App`. Deletes the
-  duplicate `get_file_at_index` and `compute_scroll`; the non-override
-  branch of `App::update_scroll` is already dead.
+- **S1. Make render pure.** DONE (2026-09-09). `render_normal_mode(f, &App)
+  -> FrameLayout`, where the layout carries the four things only the renderer
+  knows: preview pane size, visible list height, the scroll it drew at, and the
+  path bar's width. `NormalRenderContext` (20 fields in) and `RenderUpdates`
+  (5 fields back) are gone, as are the duplicate `get_file_at_index` and the
+  unreachable auto-scroll branch of `App::update_scroll`. The marquee advances
+  in the Tick handler via `App::advance_marquee`, which made it testable: five
+  tests cover overflow, turning around at the ends, the two delays, and doing
+  nothing before the first frame. `App::for_test` and `TtyInput::detached` are
+  new, since a render test now needs an `App`.
 - **S2. One response path in the worker.** Five arms each do "set id,
   mutate, filter_and_rank, get_page(0, 128), send QueryUpdated". One helper,
   and use `app::PAGE_SIZE` instead of the literal 128.

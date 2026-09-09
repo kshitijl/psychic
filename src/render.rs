@@ -5,11 +5,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
 };
-use std::{
-    collections::{HashMap, VecDeque},
-    path::{Path, PathBuf},
-    time::Instant,
-};
+use std::path::PathBuf;
 
 use crate::help::{self, HelpLine};
 use crate::keymap::{self, Action};
@@ -65,80 +61,6 @@ pub struct HistoryRenderContext<'a> {
     pub total_history_items: usize,
     pub preview: &'a crate::preview::PreviewState,
     pub query: &'a str,
-}
-
-/// Input data required to render the normal mode UI.
-pub struct NormalRenderContext<'a> {
-    pub selected_index: usize,
-    pub file_list_scroll: usize,
-    pub total_results: usize,
-    pub total_files: usize,
-    pub current_filter: crate::search_worker::FilterType,
-    pub no_preview: bool,
-    pub preview: &'a crate::preview::PreviewState,
-    pub currently_retraining: bool,
-    pub model_stats_cache: Option<&'a crate::ranker::ModelStats>,
-    pub timings: &'a crate::app::Timings,
-    pub db_stats: Option<&'a crate::db::DbStats>,
-    pub page_cache: &'a HashMap<usize, crate::app::Page>,
-    pub ui_state: &'a crate::ui_state::UiState,
-    pub recent_logs: &'a VecDeque<String>,
-    pub last_path_bar_update: Instant,
-    pub path_bar_scroll: u16,
-    pub path_bar_scroll_direction: i8,
-    pub cwd: &'a Path,
-    pub query: &'a str,
-    pub status_message: Option<&'a str>,
-}
-
-impl<'a> NormalRenderContext<'a> {
-    /// Look up a file in the paged cache by its global index.
-    pub fn get_file_at_index(
-        &self,
-        index: usize,
-    ) -> Option<&'a crate::search_worker::DisplayFileInfo> {
-        if index >= self.total_results {
-            return None;
-        }
-
-        let page_num = index / crate::app::PAGE_SIZE;
-        let page = self.page_cache.get(&page_num)?;
-
-        // Preconditions mirror App::get_file_at_index to keep invariants local.
-        assert!(
-            page.start_index < page.end_index,
-            "Page has invalid range: [{}, {})",
-            page.start_index,
-            page.end_index
-        );
-        assert_eq!(
-            page.end_index - page.start_index,
-            page.files.len(),
-            "Page length mismatch: expected {}, found {}",
-            page.end_index - page.start_index,
-            page.files.len()
-        );
-
-        assert!(
-            index >= page.start_index && index < page.end_index,
-            "Index {} outside page {} range [{}, {})",
-            index,
-            page_num,
-            page.start_index,
-            page.end_index
-        );
-
-        let rel_index = index - page.start_index;
-        assert!(
-            rel_index < page.files.len(),
-            "Relative index {} out of bounds for page starting at {} with {} files",
-            rel_index,
-            page.start_index,
-            page.files.len()
-        );
-
-        page.files.get(rel_index)
-    }
 }
 
 /// Compute the scroll offset for the file list based on selection and visible area
@@ -445,55 +367,25 @@ fn styled_help_lines(lines: &[HelpLine]) -> Vec<Line<'static>> {
         .collect()
 }
 /// State updates computed during rendering that need to be applied to App after rendering
-pub struct RenderUpdates {
-    pub file_list_scroll: Option<usize>,
-    /// Size of the preview pane, which only the layout knows. The main loop
-    /// uses it to ask for the preview after the frame is drawn.
+/// What the frame's layout decided, which only the renderer knows.
+///
+/// Render reads `&App` and writes nothing back: everything it works out from
+/// the geometry comes back here, and the main loop decides what to do with it.
+pub struct FrameLayout {
+    /// Size of the preview pane. The main loop uses it to ask for the preview
+    /// after the frame is drawn, rather than reading a file mid-draw.
     pub preview_pane: Option<PreviewPane>,
-    pub path_bar_scroll: Option<u16>,
-    pub path_bar_scroll_direction: Option<i8>,
-    pub last_path_bar_update: Option<std::time::Instant>,
-    pub visible_list_height: Option<u16>,
-}
-
-impl RenderUpdates {
-    pub fn new() -> Self {
-        Self {
-            file_list_scroll: None,
-            preview_pane: None,
-            path_bar_scroll: None,
-            path_bar_scroll_direction: None,
-            last_path_bar_update: None,
-            visible_list_height: None,
-        }
-    }
-
-    /// Apply the computed updates to the App
-    pub fn apply_to(self, app: &mut crate::app::App) {
-        if let Some(scroll) = self.file_list_scroll {
-            app.file_list_scroll = scroll;
-        }
-        if let Some(scroll) = self.path_bar_scroll {
-            app.path_bar_scroll = scroll;
-        }
-        if let Some(dir) = self.path_bar_scroll_direction {
-            app.path_bar_scroll_direction = dir;
-        }
-        if let Some(time) = self.last_path_bar_update {
-            app.last_path_bar_update = time;
-        }
-    }
+    /// Rows of file list, borders excluded.
+    pub visible_list_height: u16,
+    /// Where the list was scrolled to for this frame.
+    pub file_list_scroll: usize,
+    /// Width of the path bar, which the marquee needs to know how far to go.
+    pub path_bar_width: u16,
 }
 
 /// Render the normal mode UI (file list, preview, debug pane)
 /// Returns computed state updates that should be applied to App after rendering
-pub fn render_normal_mode(
-    f: &mut Frame,
-    ctx: NormalRenderContext<'_>,
-    marquee_delay: std::time::Duration,
-    marquee_speed: std::time::Duration,
-) -> RenderUpdates {
-    let mut updates = RenderUpdates::new();
+pub fn render_normal_mode(f: &mut Frame, app: &crate::app::App) -> FrameLayout {
     use std::path::PathBuf;
 
     use crate::app::PAGE_SIZE;
@@ -528,7 +420,7 @@ pub fn render_normal_mode(
             .split(main_chunks[0])
     } else {
         // Horizontal layout for wide terminals
-        match ctx.ui_state.debug_pane_mode {
+        match app.ui_state.debug_pane_mode {
             ui_state::DebugPaneMode::Expanded => {
                 // Debug expanded: give it most of the space
                 Layout::default()
@@ -567,14 +459,13 @@ pub fn render_normal_mode(
 
     // Compute scroll position based on selection and visible height
     let visible_height = top_chunks[0].height.saturating_sub(2); // subtract border
-    updates.visible_list_height = Some(visible_height);
+
     let file_list_scroll = compute_scroll(
-        ctx.selected_index,
-        ctx.file_list_scroll,
-        ctx.total_results,
+        app.selected_index,
+        app.file_list_scroll,
+        app.total_results,
         visible_height as usize,
     );
-    updates.file_list_scroll = Some(file_list_scroll);
 
     // File list on the left
     let list_width = top_chunks[0].width.saturating_sub(2) as usize; // subtract borders
@@ -584,11 +475,11 @@ pub fn render_normal_mode(
     let items: Vec<ListItem> = (0..visible_height as usize)
         .map(|display_idx| {
             let i = scroll_offset + display_idx;
-            if i >= ctx.total_results {
+            if i >= app.total_results {
                 return ListItem::new("");
             }
 
-            if let Some(display_info) = ctx.get_file_at_index(i) {
+            if let Some(display_info) = app.get_file_at_index(i) {
                 let time_ago = get_time_ago(display_info.mtime);
                 let rank = i + 1;
 
@@ -628,7 +519,7 @@ pub fn render_normal_mode(
                 let truncated_path = printable(&truncated_path).into_owned();
 
                 // Build line with styled spans
-                let base_style = if i == ctx.selected_index {
+                let base_style = if i == app.selected_index {
                     Style::default()
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD)
@@ -643,7 +534,7 @@ pub fn render_normal_mode(
                 let rank_style = if is_outside_cwd {
                     // Historical outside cwd: gray rank number
                     Style::default().fg(Color::DarkGray)
-                } else if i == ctx.selected_index {
+                } else if i == app.selected_index {
                     // Selected: match base style
                     base_style
                 } else {
@@ -651,7 +542,7 @@ pub fn render_normal_mode(
                     base_style
                 };
 
-                let cwd_style = if i == ctx.selected_index {
+                let cwd_style = if i == app.selected_index {
                     // If selected, keep yellow but make it even more visible
                     Style::default()
                         .fg(Color::Yellow)
@@ -699,7 +590,7 @@ pub fn render_normal_mode(
         .collect();
 
     // Create title with filter indicator
-    let filter_name = match ctx.current_filter {
+    let filter_name = match app.current_filter {
         search_worker::FilterType::None => "All",
         search_worker::FilterType::OnlyCwd => "CWD",
         search_worker::FilterType::DirectCwd => "Direct",
@@ -707,11 +598,11 @@ pub fn render_normal_mode(
         search_worker::FilterType::OnlyFiles => "Files",
     };
 
-    let title_line = if ctx.current_filter == search_worker::FilterType::None {
+    let title_line = if app.current_filter == search_worker::FilterType::None {
         // No filter active - no highlight
         Line::from(vec![Span::raw(format!(
             "{} ({}/{})",
-            filter_name, ctx.total_results, ctx.total_files
+            filter_name, app.total_results, app.total_files
         ))])
     } else {
         // Filter active - highlight in green
@@ -722,7 +613,7 @@ pub fn render_normal_mode(
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(format!(" ({}/{})", ctx.total_results, ctx.total_files)),
+            Span::raw(format!(" ({}/{})", app.total_results, app.total_files)),
         ])
     };
 
@@ -730,19 +621,19 @@ pub fn render_normal_mode(
     f.render_widget(list, top_chunks[0]);
 
     // Get current file from page cache - clone the info we need to avoid borrow issues
-    let current_file_info: Option<(PathBuf, String, bool)> = ctx
-        .get_file_at_index(ctx.selected_index)
+    let current_file_info: Option<(PathBuf, String, bool)> = app
+        .get_file_at_index(app.selected_index)
         .map(|f| (f.full_path.clone(), f.display_name.clone(), f.is_dir));
 
     // The preview is generated on its own thread; this only shows whatever has
     // arrived for the row that is selected right now. Anything else would mean
     // a spawn or a file read inside the draw.
-    updates.preview_pane = Some(PreviewPane {
+    let preview_pane = Some(PreviewPane {
         width: top_chunks[1].width,
         height: top_chunks[1].height.saturating_sub(2),
     });
     let preview_text = match &current_file_info {
-        Some((path, _, _)) if !ctx.no_preview && ctx.total_results > 0 => ctx
+        Some((path, _, _)) if !app.options.no_preview && app.total_results > 0 => app
             .preview
             .visible(path, top_chunks[1].height.saturating_sub(2)),
         _ => Text::default(),
@@ -766,7 +657,7 @@ pub fn render_normal_mode(
     let mut debug_lines = Vec::new();
 
     // Show current selection info - need another lookup to get score/features
-    if let Some(display_info) = ctx.get_file_at_index(ctx.selected_index) {
+    if let Some(display_info) = app.get_file_at_index(app.selected_index) {
         debug_lines.push(String::from("Scores:"));
         debug_lines.push(format!("  Final: {:.4}", display_info.score));
         if let Some(simple) = display_info.simple_score {
@@ -809,7 +700,7 @@ pub fn render_normal_mode(
         } else {
             debug_lines.push(String::from("  (no features)"));
         }
-    } else if ctx.total_results > 0 {
+    } else if app.total_results > 0 {
         debug_lines.push(String::from("(loading...)"));
     } else {
         debug_lines.push(String::from("No results"));
@@ -818,13 +709,13 @@ pub fn render_normal_mode(
     debug_lines.push(String::from("")); // Separator
 
     // Add retraining status
-    if ctx.currently_retraining {
+    if app.currently_retraining {
         debug_lines.push(String::from("Retraining model..."));
         debug_lines.push(String::from("")); // Separator
     }
 
     // Add model stats
-    if let Some(stats) = ctx.model_stats_cache {
+    if let Some(stats) = app.model_stats_cache.as_ref() {
         debug_lines.push(String::from("Model Stats:"));
         let formatter = timeago::Formatter::new();
 
@@ -859,15 +750,15 @@ pub fn render_normal_mode(
     // The first three are measured once from process start; the last two are
     // replaced on every query, so they describe the search just performed.
     debug_lines.push(String::from("Latency:"));
-    debug_lines.push(latency_line("first paint", ctx.timings.first_paint_ms));
-    debug_lines.push(latency_line("first results", ctx.timings.first_results_ms));
-    debug_lines.push(latency_line("fs walk", ctx.timings.walk_complete_ms));
-    debug_lines.push(latency_line("this search", ctx.timings.last_search_ms));
-    debug_lines.push(latency_line("  of it, rank", ctx.timings.last_rank_ms));
+    debug_lines.push(latency_line("first paint", app.timings.first_paint_ms));
+    debug_lines.push(latency_line("first results", app.timings.first_results_ms));
+    debug_lines.push(latency_line("fs walk", app.timings.walk_complete_ms));
+    debug_lines.push(latency_line("this search", app.timings.last_search_ms));
+    debug_lines.push(latency_line("  of it, rank", app.timings.last_rank_ms));
     debug_lines.push(String::from(""));
 
     // Database contents, loaded in the background the first time this pane opens.
-    match ctx.db_stats {
+    match app.db_stats.as_ref() {
         Some(stats) => {
             let history = match stats.history_days {
                 Some(days) => format!(", {}d", days),
@@ -899,7 +790,7 @@ pub fn render_normal_mode(
 
     // Add preview cache status
     if let Some((file_path, _, _)) = &current_file_info {
-        debug_lines.push(format!("Preview: {}", ctx.preview.status(file_path)));
+        debug_lines.push(format!("Preview: {}", app.preview.status(file_path)));
     } else {
         debug_lines.push(String::from("Preview: N/A"));
     }
@@ -907,11 +798,11 @@ pub fn render_normal_mode(
     debug_lines.push(String::from("")); // Separator
 
     // Add page cache status
-    if ctx.total_results > 0 {
-        let current_page = ctx.selected_index / PAGE_SIZE;
+    if app.total_results > 0 {
+        let current_page = app.selected_index / PAGE_SIZE;
         debug_lines.push(format!("Current page: {}", current_page));
 
-        let mut cached_pages: Vec<usize> = ctx.page_cache.keys().copied().collect();
+        let mut cached_pages: Vec<usize> = app.page_cache.keys().copied().collect();
         cached_pages.sort_unstable();
         let pages_str = cached_pages
             .iter()
@@ -929,15 +820,15 @@ pub fn render_normal_mode(
     // Add recent logs
     debug_lines.push(String::from("Recent Logs:"));
     // Show more log lines when debug is maximized
-    let log_count = if ctx.ui_state.is_debug_pane_expanded() {
+    let log_count = if app.ui_state.is_debug_pane_expanded() {
         30
     } else {
         10
     };
-    let log_start = ctx.recent_logs.len().saturating_sub(log_count);
-    for log_line in ctx.recent_logs.iter().skip(log_start) {
+    let log_start = app.recent_logs.len().saturating_sub(log_count);
+    for log_line in app.recent_logs.iter().skip(log_start) {
         // Truncate long lines to fit
-        let max_len = if ctx.ui_state.is_debug_pane_expanded() {
+        let max_len = if app.ui_state.is_debug_pane_expanded() {
             120
         } else {
             60
@@ -949,7 +840,7 @@ pub fn render_normal_mode(
 
     let debug_text = debug_lines.join("\n");
 
-    let debug_title = match ctx.ui_state.debug_pane_mode {
+    let debug_title = match app.ui_state.debug_pane_mode {
         ui_state::DebugPaneMode::Small => "Debug (Ctrl-O: expand)",
         ui_state::DebugPaneMode::Expanded => "Debug (Ctrl-O: hide)",
         ui_state::DebugPaneMode::Hidden => "Debug (Ctrl-O: show)",
@@ -959,8 +850,8 @@ pub fn render_normal_mode(
     f.render_widget(debug_pane, top_chunks[2]);
 
     // Get path of currently selected file for marquee
-    let selected_path_str = ctx
-        .get_file_at_index(ctx.selected_index)
+    let selected_path_str = app
+        .get_file_at_index(app.selected_index)
         .map(|f| f.full_path.to_string_lossy().to_string())
         .unwrap_or_default();
 
@@ -969,62 +860,18 @@ pub fn render_normal_mode(
 
     let path_bar_width = main_chunks[1].width as usize;
 
-    // Marquee animation logic
-    let (path_bar_scroll, path_bar_scroll_direction, last_path_bar_update) =
-        if padded_path.len() > path_bar_width {
-            let now = Instant::now();
-            let time_since_update = now.duration_since(ctx.last_path_bar_update);
-
-            let max_scroll = padded_path.len().saturating_sub(path_bar_width) as u16;
-
-            // Pause at the ends of the scroll
-            let should_scroll = if ctx.path_bar_scroll == 0 || ctx.path_bar_scroll >= max_scroll {
-                time_since_update > marquee_delay
-            } else {
-                time_since_update > marquee_speed
-            };
-
-            if should_scroll {
-                let (new_scroll, new_direction) = if ctx.path_bar_scroll_direction == 1 {
-                    if ctx.path_bar_scroll < max_scroll {
-                        (ctx.path_bar_scroll + 1, ctx.path_bar_scroll_direction)
-                    } else {
-                        (ctx.path_bar_scroll, -1) // Change direction
-                    }
-                } else if ctx.path_bar_scroll > 0 {
-                    (ctx.path_bar_scroll - 1, ctx.path_bar_scroll_direction)
-                } else {
-                    (ctx.path_bar_scroll, 1) // Change direction
-                };
-                (Some(new_scroll), Some(new_direction), Some(now))
-            } else {
-                (None, None, None)
-            }
-        } else {
-            (None, None, None)
-        };
-
-    // Store marquee updates
-    if let Some(scroll) = path_bar_scroll {
-        updates.path_bar_scroll = Some(scroll);
-    }
-    if let Some(dir) = path_bar_scroll_direction {
-        updates.path_bar_scroll_direction = Some(dir);
-    }
-    if let Some(time) = last_path_bar_update {
-        updates.last_path_bar_update = Some(time);
-    }
-
-    // Path bar - use current context value for rendering since updates will be applied later
-    let current_path_bar_scroll = path_bar_scroll.unwrap_or(ctx.path_bar_scroll);
+    // The marquee is advanced by the Tick handler, not here: drawing a frame
+    // should not be what moves the animation on. Render only reports how wide
+    // the bar came out, which is the one thing the advance cannot work out for
+    // itself.
     let path_bar = Paragraph::new(padded_path)
         .style(Style::default().fg(Color::DarkGray))
-        .scroll((0, current_path_bar_scroll));
+        .scroll((0, app.path_bar_scroll));
     f.render_widget(path_bar, main_chunks[1]);
 
     // Search input at the bottom
-    let cwd_str = ctx.cwd.to_string_lossy();
-    let filter_indicator = match ctx.current_filter {
+    let cwd_str = app.cwd.to_string_lossy();
+    let filter_indicator = match app.current_filter {
         search_worker::FilterType::None => "",
         search_worker::FilterType::OnlyCwd => " [CWD]",
         search_worker::FilterType::DirectCwd => " [DIRECT]",
@@ -1034,7 +881,7 @@ pub fn render_normal_mode(
     // A status message replaces the title rather than sharing the line with it:
     // the cwd is already on screen in the path bar above, and a message that
     // gets truncated away by a long path is not worth showing.
-    let search_title = match ctx.status_message {
+    let search_title = match app.status_message.as_deref() {
         Some(message) => Span::styled(
             message.to_string(),
             Style::default()
@@ -1043,7 +890,7 @@ pub fn render_normal_mode(
         ),
         None => Span::raw(format!("Search: {}{}", cwd_str, filter_indicator)),
     };
-    let input = Paragraph::new(ctx.query).block(
+    let input = Paragraph::new(app.query.as_str()).block(
         Block::default()
             .borders(Borders::ALL)
             .title(search_title)
@@ -1058,7 +905,7 @@ pub fn render_normal_mode(
     f.render_widget(input, main_chunks[2]);
 
     // Filter picker overlay (rendered on top if visible)
-    if ctx.ui_state.filter_picker_visible {
+    if app.ui_state.filter_picker_visible {
         // Create a popup in the bottom-right
         let popup_width = 35;
         let popup_height = 7; // 5 options + top/bottom borders
@@ -1093,7 +940,7 @@ pub fn render_normal_mode(
         ];
 
         for (filter_type, label) in options.iter() {
-            if *filter_type == ctx.current_filter {
+            if *filter_type == app.current_filter {
                 lines.push(format!("> {}", label));
             } else {
                 lines.push(format!("  {}", label));
@@ -1114,14 +961,19 @@ pub fn render_normal_mode(
     // Account for border (1 char) + query length.
     // The help screen covers the input, so leaving a cursor on it would be a
     // stray block floating over the help text.
-    if !ctx.ui_state.help_visible {
+    if !app.ui_state.help_visible {
         // Columns, not bytes: the cursor belongs after what is drawn.
-        let cursor_x = main_chunks[2].x + 1 + display_width(ctx.query) as u16;
+        let cursor_x = main_chunks[2].x + 1 + display_width(&app.query) as u16;
         let cursor_y = main_chunks[2].y + 1; // 1 for top border
         f.set_cursor_position((cursor_x, cursor_y));
     }
 
-    updates
+    FrameLayout {
+        preview_pane,
+        visible_list_height: visible_height,
+        file_list_scroll,
+        path_bar_width: path_bar_width as u16,
+    }
 }
 
 #[cfg(test)]
@@ -1174,21 +1026,20 @@ mod test {
 #[cfg(test)]
 mod non_ascii_tests {
     use super::*;
-    use crate::ui_state::{DebugPaneMode, UiState};
+    use crate::ui_state::DebugPaneMode;
     use ratatui::{Terminal, backend::TestBackend};
-    use std::time::Duration;
+    use std::collections::VecDeque;
 
     /// Draw the normal-mode UI with whatever is passed in, and read it back.
     fn draw(logs: VecDeque<String>, query: &str, name: &str) -> Vec<String> {
-        let (preview_tx, _preview_rx) = std::sync::mpsc::channel();
-        let preview = crate::preview::PreviewState::new(preview_tx);
-        let ui_state = UiState {
-            debug_pane_mode: DebugPaneMode::Small,
-            ..UiState::new()
-        };
-        let timings = crate::app::Timings::default();
-        let mut page_cache = HashMap::new();
-        page_cache.insert(
+        let mut app = crate::app::App::for_test();
+        app.query = query.to_string();
+        app.recent_logs = logs;
+        app.total_results = 1;
+        app.total_files = 1;
+        app.options.no_preview = true;
+        app.ui_state.debug_pane_mode = DebugPaneMode::Small;
+        app.page_cache.insert(
             0,
             crate::app::Page {
                 start_index: 0,
@@ -1217,34 +1068,7 @@ mod non_ascii_tests {
         let mut terminal = Terminal::new(TestBackend::new(160, 60)).unwrap();
         terminal
             .draw(|f| {
-                let ctx = NormalRenderContext {
-                    selected_index: 0,
-                    file_list_scroll: 0,
-                    total_results: 1,
-                    total_files: 1,
-                    current_filter: crate::search_worker::FilterType::None,
-                    no_preview: true,
-                    preview: &preview,
-                    currently_retraining: false,
-                    model_stats_cache: None,
-                    timings: &timings,
-                    db_stats: None,
-                    page_cache: &page_cache,
-                    ui_state: &ui_state,
-                    recent_logs: &logs,
-                    last_path_bar_update: Instant::now(),
-                    path_bar_scroll: 0,
-                    path_bar_scroll_direction: 1,
-                    cwd: Path::new("/tmp"),
-                    query,
-                    status_message: None,
-                };
-                render_normal_mode(
-                    f,
-                    ctx,
-                    Duration::from_millis(500),
-                    Duration::from_millis(80),
-                );
+                render_normal_mode(f, &app);
             })
             .unwrap();
 

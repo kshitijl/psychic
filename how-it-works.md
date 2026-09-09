@@ -1351,9 +1351,31 @@ the UI hidden behind it.
 
 **Simple interface:**
 ```rust
-pub fn render_normal_mode(f: &mut Frame, app: &mut App, marquee_delay: Duration, marquee_speed: Duration)
-pub fn render_history_mode(f: &mut Frame, app: &App)
+pub fn render_normal_mode(f: &mut Frame, app: &App) -> FrameLayout
+pub fn render_history_mode(f: &mut Frame, ctx: HistoryRenderContext<'_>) -> PreviewPane
 ```
+
+**Rendering is a pure function of `&App`.** It reads the app and writes nothing
+back. What it works out from the geometry - and only the renderer knows the
+geometry - comes back in `FrameLayout`: the preview pane's size, the visible list
+height, the scroll offset the frame was drawn at, and the width of the path bar.
+The main loop takes those after the frame is drawn.
+
+It used to take a `NormalRenderContext` of about twenty fields copied out of
+`App` and return a `RenderUpdates` of five copied back, and the only reason for
+any of it was that render mutated two things as it drew: the preview, and the
+marquee. Previews moved to their own thread; the marquee now advances in the
+`Tick` handler, which is where an animation belongs - it should be driven by the
+clock, not by how often the screen happens to be redrawn. `App::advance_marquee`
+is the whole of it, and being off the draw path makes it testable, which it now
+is. The renderer reports `path_bar_width` because the advance cannot work out
+for itself how far there is to scroll.
+
+Two duplicated pieces went with the context: `NormalRenderContext` carried its
+own copy of `get_file_at_index`, and `App::update_scroll` carried a second copy
+of `compute_scroll` for the case where the renderer had not supplied a scroll
+position - a branch nothing could reach, since every caller arrives straight
+from a frame.
 
 **Complex implementation:**
 - Layout calculation (horizontal vs vertical, adaptive based on terminal width)
