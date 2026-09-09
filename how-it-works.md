@@ -1859,6 +1859,49 @@ Why worker sends page 0: Avoids extra round-trip. Main thread has immediate resu
 8. **Preview off the UI thread:** generated once per path on its own thread and sliced when drawn.
    Why: the redraw never waits for a file read, and scrolling re-copies only what is on screen.
 
+### What the 2026-09-09 performance work is worth, end to end
+
+Measured against `1d4d767`, the last commit before any of it. Both binaries run
+from `$HOME` on a 40x120 pty, against their own copy of the same 19MB
+`events.db`, with the same pinned `model.txt` - a launch retrains in the
+background and would otherwise leave each version predicting with a differently
+sized model. Medians; startup figures are 10 alternating trials each, keystroke
+latency is 50 keystrokes each.
+
+| | baseline | current | |
+|---|---|---|---|
+| keystroke -> redraw | 12.20ms | **2.45ms** | 4.98x |
+| first full render | 29.92ms | **11.55ms** | 2.59x |
+| - of it, the draw | 18.23ms | **3.08ms** | 5.91x |
+| first results | 11.54ms | **8.28ms** | 1.39x |
+| worker state ready | 8.50ms | **3.96ms** | 2.15x |
+| load history | 4.92ms | **2.48ms** | 1.99x |
+| load clicks | 0.56ms | **0.38ms** | 1.47x |
+| filter+rank, steady state | 1.57ms | **1.05ms** | 1.50x |
+| - of it, features | 0.61ms | **0.31ms** | 1.95x |
+| query round trip, steady state | 1.61ms | **1.16ms** | 1.39x |
+| walk complete | 68.9ms | 77.4ms | 1.12x *slower* |
+
+Three things the raw numbers hide:
+
+- **First results is better than 1.39x looks.** The baseline ranks 126 files at
+  its first query; the current one ranks all 243, because the two-phase walk has
+  already delivered the root's children. It is doing the complete job in less
+  time, not the same job.
+- **Per-query numbers must be compared in the steady state,** after the walk
+  finishes and both hold the same 243 files. Comparing first queries compares
+  126 files against 243 and reads as a regression.
+- **The walk really is slower,** and it is the gitignore support that costs it:
+  the same binary with `--no-ignore` walks in 70.6ms against the baseline's
+  68.9ms, so ~7ms of the ~9ms is reading and applying ignore rules. That is a
+  feature being paid for, not a regression to fix, and it happens after the
+  results are already on screen.
+
+The baseline reproduces the profile recorded when this work was scoped, scaled
+by about 0.6 - that session ran in a larger terminal. The shape is what matters
+and it holds: the draw was 61% of the first full render here against 63% then,
+and first results landed at 18% of walk-complete against 20% then.
+
 ## Shutdown Sequence
 
 **The rule: the log sink must outlive everything that logs.**

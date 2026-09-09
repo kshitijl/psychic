@@ -79,6 +79,17 @@ complete 92.6ms. In an isolated data dir from this 44-file repo the walk
 completes at 11ms, so the ~90ms is specific to the shallow-mode restart.
 Filter+rank is ~2ms per keystroke and is not the problem.
 
+**Re-measured 2026-09-09 against `1d4d767`, the commit before any of this
+work.** Both binaries from `$HOME` on a 40x120 pty, same events.db copy, same
+pinned model. Keystroke to redraw 12.20ms -> 2.45ms; first full render
+29.92 -> 11.55ms, its draw 18.23 -> 3.08ms; first results 11.54 -> 8.28ms
+while ranking 243 files rather than 126; worker state 8.50 -> 3.96ms;
+steady-state filter+rank 1.57 -> 1.05ms. Walk complete went 68.9 -> 77.4ms,
+of which ~7ms is gitignore support (`--no-ignore` walks in 70.6ms). The
+numbers above reproduce at about 0.6x scale - that session ran in a larger
+terminal - with the same shape. Full table in how-it-works.md under
+"Performance Optimizations".
+
 #### Performance
 
 - **P1. Two-phase walk.** DONE (2026-09-09). The walker now sends the root's
