@@ -306,8 +306,9 @@ anyone noticing.
 - **Once the user has clicked, it trains and the model is used.** The blend
   hands over as engagement accumulates, crossing at 30. That whole loop -
   use it, train, load, rank with the trained model outweighing the simple one -
-  is `trained_model_tests`, which is `#[ignore]`d because it runs `train.py`
-  through `uv`.
+  is `trained_model_tests`. It runs `train.py` for real, which costs about seven
+  seconds of the suite's eight; that is the price of the only test that covers
+  the loop end to end, and `uv` is required to use psychic regardless.
 
 **Two ordering bugs lived here**, both only reachable on a first launch, which
 is why nothing caught them:

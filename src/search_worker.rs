@@ -1707,9 +1707,12 @@ mod trained_model_tests {
     //! something to learn from, and check the model that comes out is actually
     //! the one used.
     //!
-    //! Ignored by default because it runs `train.py` through `uv`, which wants
-    //! a package cache and, the first time, a network. Run it with
-    //! `cargo test --release trained_model -- --ignored --nocapture`.
+    //! This runs `train.py` through `uv`, so it takes about seven seconds and
+    //! wants a network the first time, when uv has to populate its cache. It
+    //! runs by default anyway. `uv` is already required to build and use
+    //! psychic at all (see the README), and a test that has to be asked for is
+    //! a test nobody runs: this suite already carries two of those, which look
+    //! like coverage and are not.
 
     use super::fresh_install_tests_support::*;
     use super::*;
@@ -1722,7 +1725,6 @@ mod trained_model_tests {
     const SESSIONS: usize = 40;
 
     #[test]
-    #[ignore]
     fn test_a_used_install_trains_and_then_ranks_with_the_model() {
         let dir = FreshDataDir::new("trained");
         let db = Database::new(&dir.db_path()).unwrap();
