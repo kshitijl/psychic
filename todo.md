@@ -453,10 +453,13 @@ Accumulator's fold over time-sorted events), so add the index to both
    observations - the 3-4 character band is 102 episodes in the entire history.
    The split-finder is confident for the wrong reason.
 
-   If per-query features are wanted later, they need something that accounts in
-   episodes rather than rows: a much larger `min_data_in_leaf`, or the
-   `lambdarank` objective with episode groups, which the doc says this used to
-   use and no longer does.
+   **Retried under lambdarank (2026-09-10), which was the suspected cause.** The
+   harm is gone: top-1 -0.0386 -> +0.0005, MRR +0.0071, so a ranking objective
+   does stop rewarding the uses of an episode-constant feature that cannot
+   reorder anything. But nothing is left over either - one fold still down
+   (-0.025), gain 1.1%, rank 12 of 20 - so it stays out. The finding was the
+   point: the objective was the problem, not the feature, and that is fixed
+   for every feature rather than this one.
 4. **Collection change: record rank position on impressions.** Add
    `rank INTEGER` to events, set in `log_impressions` from the row's index.
    Cannot be backfilled. Enables position-aware weighting/features later
