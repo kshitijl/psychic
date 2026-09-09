@@ -308,22 +308,35 @@ file per process, tracked in `PREPARED`. In-memory databases are excluded,
 because every `:memory:` connection is a separate database that happens to share
 the name, and remembering it would leave the second one empty.
 
-**The file descriptor count is not the connection count.** `lsof` shows four
-handles on `events.db` where only two connections are live (one `-shm` each).
-The others are descriptors SQLite has parked rather than closed, from its unix
-layer:
+**The file descriptor count is not the connection count. Do not tune this by
+reading `lsof`.** A normal run shows four handles on `events.db` while only two
+connections are live. The other two are descriptors SQLite has parked rather
+than closed. From `unixClose` in its unix layer (`setPendingFd`, and the comment
+above the call in `sqlite3.c`):
 
 > If there are outstanding locks, do not actually close the file just yet
 > because that would clear those locks. Instead, add the file descriptor to
 > `pInode->pUnused` list. It will be automatically closed when the last lock is
 > cleared.
 
-POSIX advisory locks belong to the process, not the descriptor, so closing any
-descriptor for a file drops every lock the process holds on it. A transient
-connection that closes while another still holds a lock therefore leaves its
-descriptor parked until the last connection goes. Counting `lsof` lines
-overstates how many connections are open, and closing one *fewer* connection can
-leave *more* parked descriptors.
+POSIX advisory locks belong to the *process*, not to the descriptor, so closing
+any descriptor for a file drops every lock the process holds on it. SQLite
+therefore cannot close a connection's descriptor while another connection is
+holding a lock on the same file; it parks it and closes it when the last one
+goes. Consequences worth knowing before anyone tries to "fix" a count:
+
+- **Count the `-shm` files, not the `events.db` lines.** Each live connection to
+  a WAL database has one shared-memory file open, so `lsof -p <pid> | grep -c
+  'events.db-shm'` is the number that means something. The `events.db` count
+  includes the parked ones.
+- **It is timing-dependent.** Whether a transient connection's descriptor gets
+  parked depends on whether another connection happened to hold a lock at the
+  moment it closed, so the number moves between runs and between builds for
+  reasons that have nothing to do with how many connections the code opens.
+- **Fewer connections can mean more parked descriptors.** Removing an open
+  moved this count from three to four, with the live count unchanged at two.
+  That is measured, not hypothetical: a variant built without the worker's
+  long-lived connection showed four as well.
 
 **Session ID:** Random 64-bit integer (not UUID).
 Why: UUIDs are 36 chars. 64-bit int gives 18 quintillion IDs, more compact.
