@@ -44,6 +44,10 @@ struct Accumulator {
     /// the same fold over time-sorted events, so an impression only ever sees
     /// the visits that had happened by then.
     visits_by_dir: FxHashMap<String, Vec<ClickEvent>>,
+    /// Engagements per extension, and the running total, the same pair
+    /// `Ranker::load_clicks` builds.
+    clicks_by_extension: FxHashMap<String, usize>,
+    clicks_indexed: usize,
     clicks_by_parent_dir: FxHashMap<std::path::PathBuf, Vec<ClickEvent>>,
     /// query -> path -> events, the same shape `Ranker::load_clicks` builds.
     clicks_by_query_and_file: FxHashMap<String, FxHashMap<String, Vec<ClickEvent>>>,
@@ -68,6 +72,8 @@ impl Accumulator {
         Self {
             clicks_by_file: FxHashMap::default(),
             visits_by_dir: FxHashMap::default(),
+            clicks_by_extension: FxHashMap::default(),
+            clicks_indexed: 0,
             clicks_by_parent_dir: FxHashMap::default(),
             clicks_by_query_and_file: FxHashMap::default(),
             engagements_by_episode_query_and_file: FxHashMap::default(),
@@ -86,6 +92,15 @@ impl Accumulator {
             .entry(event.full_path.clone())
             .or_default()
             .push(click);
+
+        // Also index by extension, and count the total the shares divide by
+        *self
+            .clicks_by_extension
+            .entry(crate::feature_defs::extension_key(Path::new(
+                &event.full_path,
+            )))
+            .or_default() += 1;
+        self.clicks_indexed += 1;
 
         // Also index by parent directory
         if let Some(parent) = Path::new(&event.full_path).parent() {
@@ -380,6 +395,8 @@ fn compute_features_from_accumulator(
         cwd,
         clicks_by_file: &acc.clicks_by_file,
         visits_by_dir: &acc.visits_by_dir,
+        clicks_by_extension: &acc.clicks_by_extension,
+        clicks_indexed: acc.clicks_indexed,
         clicks_by_parent_dir: &acc.clicks_by_parent_dir,
         clicks_for_query: acc.clicks_by_query_and_file.get(&impression.query),
         engagements_for_query: acc

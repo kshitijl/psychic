@@ -33,6 +33,11 @@ pub struct FeatureInputs<'a> {
     pub clicks_by_file: &'a FxHashMap<String, Vec<ClickEvent>>,
     /// Directories the user has changed into, by directory.
     pub visits_by_dir: &'a FxHashMap<String, Vec<ClickEvent>>,
+    /// How many engagements landed on each file extension, and how many there
+    /// were in total. The feature is the ratio; both sides are carried so that
+    /// training and inference divide the same two numbers.
+    pub clicks_by_extension: &'a FxHashMap<String, usize>,
+    pub clicks_indexed: usize,
     pub clicks_by_parent_dir: &'a FxHashMap<PathBuf, Vec<ClickEvent>>,
     /// Clicks on each path *for this query*, resolved once by the caller rather
     /// than by every feature for every file. `None` when the query has never
@@ -47,6 +52,19 @@ pub struct FeatureInputs<'a> {
     /// Inference gets it from the filter, which has just done this match;
     /// training computes it once per row with a shared matcher.
     pub fuzzy_score: i64,
+}
+
+/// The extension bucket a path belongs to, lowercased, `""` when it has none.
+///
+/// One definition, used both to build the index and to look a row up in it: two
+/// spellings of "what counts as an extension" would silently never match.
+/// Directories land in the empty bucket alongside `Makefile` and `README`,
+/// because the events table does not record whether a clicked path was a
+/// directory - see the todo item about recording `is_dir` on events.
+pub fn extension_key(path: &Path) -> String {
+    path.extension()
+        .map(|ext| ext.to_string_lossy().to_lowercase())
+        .unwrap_or_default()
 }
 
 /// Trait that all features must implement

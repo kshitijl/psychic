@@ -496,9 +496,13 @@ Accumulator's fold over time-sorted events), so add the index to both
    clicks_for_this_query to siblings: map keyed (query, parent_dir).
 9. **Modified since last click** (binary: mtime > last click ts). "Something
    new here" for files you have opened before.
-10. **Extension click share.** Fraction of the user's clicks (30d) on files
-    with this extension; captures "never opens .lock/.png" without
-    memorizing files. Map ext -> count at load time.
+10. **Extension click share.** DONE (2026-09-10). Fraction of recent
+    engagements on this file's extension, counted at load time.
+    top-1 0.7717 -> 0.7949, MRR 0.8422 -> 0.8644, 6th of 20 by gain.
+    Files with no extension deliberately get 0: the empty bucket holds every
+    directory as well as Makefile and LICENSE, and counting it made the feature
+    *negative* (-1.0 point of top-1). Cleaning the numerator instead needs
+    `is_dir` on events, which is item 5.
 11. **Depth below cwd** (component count; large constant for historical
     files outside cwd). Shallow things get clicked more; helps `~`.
 12. **Mentioned in recent shell commands** (binary): filename or its dir

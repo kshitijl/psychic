@@ -472,6 +472,57 @@ impl Feature for FuzzyScore {
 }
 
 // ============================================================================
+// Feature: extension_click_share
+// ============================================================================
+
+/// What share of the user's recent engagements landed on this file's extension.
+///
+/// "You open `.rs` files and never open `.lock` files" as one number, without
+/// naming a single file. The click counts are per path and can only speak about
+/// paths already clicked; this generalises across every file the user has never
+/// touched, which is nearly all of them on any given query.
+///
+/// A share rather than a count, so it says the same thing on the first day and
+/// the thousandth: a count would climb forever and the thresholds a tree learns
+/// early would rot.
+pub struct ExtensionClickShare;
+
+impl Feature for ExtensionClickShare {
+    fn name(&self) -> &'static str {
+        "extension_click_share"
+    }
+
+    fn feature_type(&self) -> FeatureType {
+        FeatureType::Numeric
+    }
+
+    fn monotonicity(&self) -> Option<Monotonicity> {
+        Some(Monotonicity::Increasing)
+    }
+
+    fn compute(&self, inputs: &FeatureInputs) -> f64 {
+        if inputs.clicks_indexed == 0 {
+            return 0.0; // nothing clicked yet, so no extension is preferred
+        }
+
+        let extension = crate::feature_defs::extension_key(inputs.full_path);
+        if extension.is_empty() {
+            // The empty bucket is not one kind of file. Every directory lands
+            // in it, and directories are clicked constantly to navigate, so its
+            // share says more about navigation than about Makefiles.
+            return 0.0;
+        }
+        let clicks = inputs
+            .clicks_by_extension
+            .get(&extension)
+            .copied()
+            .unwrap_or(0);
+
+        clicks as f64 / inputs.clicks_indexed as f64
+    }
+}
+
+// ============================================================================
 // Feature: seconds_since_last_click, seconds_since_last_click_parent_dir
 // ============================================================================
 
@@ -639,6 +690,8 @@ mod tests {
         empty_clicks: &'a FxHashMap<String, Vec<ClickEvent>>,
         empty_dirs: &'a FxHashMap<PathBuf, Vec<ClickEvent>>,
     ) -> FeatureInputs<'a> {
+        static NO_EXTENSIONS: std::sync::LazyLock<FxHashMap<String, usize>> =
+            std::sync::LazyLock::new(FxHashMap::default);
         FeatureInputs {
             query: "",
             file_path: "row",
@@ -648,6 +701,8 @@ mod tests {
             cwd: Path::new("/tmp"),
             clicks_by_file: empty_clicks,
             visits_by_dir: visits,
+            clicks_by_extension: &NO_EXTENSIONS,
+            clicks_indexed: 0,
             clicks_by_parent_dir: empty_dirs,
             clicks_for_query: None,
             engagements_for_query: None,
@@ -656,6 +711,98 @@ mod tests {
             is_dir,
             fuzzy_score: 0,
         }
+    }
+
+    /// Inputs carrying an extension index, for the share feature.
+    fn inputs_with_extensions<'a>(
+        full_path: &'a Path,
+        extensions: &'a FxHashMap<String, usize>,
+        total: usize,
+        empty_clicks: &'a FxHashMap<String, Vec<ClickEvent>>,
+        empty_dirs: &'a FxHashMap<PathBuf, Vec<ClickEvent>>,
+        empty_visits: &'a FxHashMap<String, Vec<ClickEvent>>,
+    ) -> FeatureInputs<'a> {
+        let mut inputs = inputs_for(full_path, false, empty_visits, empty_clicks, empty_dirs);
+        inputs.clicks_by_extension = extensions;
+        inputs.clicks_indexed = total;
+        inputs
+    }
+
+    #[test]
+    fn test_extension_share_is_the_fraction_of_clicks_on_that_kind_of_file() {
+        let mut extensions = FxHashMap::default();
+        extensions.insert("rs".to_string(), 70usize);
+        extensions.insert("md".to_string(), 25usize);
+        extensions.insert("lock".to_string(), 0usize);
+        let (clicks, dirs, visits) = (
+            FxHashMap::default(),
+            FxHashMap::default(),
+            FxHashMap::default(),
+        );
+
+        let rust = PathBuf::from("/tmp/main.rs");
+        let inputs = inputs_with_extensions(&rust, &extensions, 100, &clicks, &dirs, &visits);
+        assert_eq!(ExtensionClickShare.compute(&inputs), 0.70);
+
+        let notes = PathBuf::from("/tmp/notes.md");
+        let inputs = inputs_with_extensions(&notes, &extensions, 100, &clicks, &dirs, &visits);
+        assert_eq!(ExtensionClickShare.compute(&inputs), 0.25);
+
+        // The point of the feature: a kind of file the user never opens scores
+        // zero even though this exact path has never been seen before.
+        let lock = PathBuf::from("/tmp/never/seen/Cargo.lock");
+        let inputs = inputs_with_extensions(&lock, &extensions, 100, &clicks, &dirs, &visits);
+        assert_eq!(ExtensionClickShare.compute(&inputs), 0.0);
+    }
+
+    #[test]
+    fn test_extension_matching_ignores_case_and_handles_no_extension() {
+        let mut extensions = FxHashMap::default();
+        extensions.insert("md".to_string(), 10usize);
+        extensions.insert(String::new(), 30usize);
+        let (clicks, dirs, visits) = (
+            FxHashMap::default(),
+            FxHashMap::default(),
+            FxHashMap::default(),
+        );
+
+        let shouty = PathBuf::from("/tmp/README.MD");
+        let inputs = inputs_with_extensions(&shouty, &extensions, 100, &clicks, &dirs, &visits);
+        assert_eq!(
+            ExtensionClickShare.compute(&inputs),
+            0.10,
+            "an extension is the same extension in any case"
+        );
+
+        // Makefile, LICENSE and every directory land in the empty bucket
+        // together, so the bucket describes navigation more than it describes
+        // a kind of file. Measured both ways: counting it cost 1.0 point of
+        // top-1, skipping it gained 2.3.
+        let makefile = PathBuf::from("/tmp/Makefile");
+        let inputs = inputs_with_extensions(&makefile, &extensions, 100, &clicks, &dirs, &visits);
+        assert_eq!(
+            ExtensionClickShare.compute(&inputs),
+            0.0,
+            "a file with no extension gets no share, even though the bucket has clicks"
+        );
+    }
+
+    #[test]
+    fn test_nothing_clicked_yet_means_no_extension_is_preferred() {
+        let extensions = FxHashMap::default();
+        let (clicks, dirs, visits) = (
+            FxHashMap::default(),
+            FxHashMap::default(),
+            FxHashMap::default(),
+        );
+        let path = PathBuf::from("/tmp/main.rs");
+        let inputs = inputs_with_extensions(&path, &extensions, 0, &clicks, &dirs, &visits);
+
+        assert_eq!(
+            ExtensionClickShare.compute(&inputs),
+            0.0,
+            "a fresh install divides by nothing"
+        );
     }
 
     #[test]

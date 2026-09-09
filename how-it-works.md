@@ -888,6 +888,23 @@ costs less than the model inference it feeds (0.71ms), and the most expensive
 single feature is `log_file_size` at 0.25ms total, which is a `stat` syscall
 doing real work.
 
+**What kind of file you open, without naming a file.**
+`extension_click_share` is the fraction of recent engagements that landed on
+this file's extension. The click counts are per path and can only speak about
+paths already clicked; this generalises to every file the user has never
+touched, which on any given query is nearly all of them. It is a share rather
+than a count so that it says the same thing on the first day and the thousandth
+- a count climbs forever and the thresholds a tree learns early would rot.
+
+**Files with no extension get no share**, and that detail is the whole feature.
+`Makefile`, `LICENSE` and *every directory* land in the same empty bucket, and
+directories are clicked constantly just to navigate, so the bucket's share
+describes navigation rather than a kind of file. Counting it cost 1.0 point of
+top-1; skipping it gained 2.3, and the feature went from 14th by gain to 6th.
+The events table does not record whether a clicked path was a directory, which
+is what would let the numerator be cleaned up instead - see the todo item about
+recording `is_dir` on events.
+
 **How long since, not how many.** `seconds_since_last_click` is
 `ln(1 + seconds)` since the most recent engagement with this exact file, and
 `seconds_since_last_click_parent_dir` the same for its directory. The count
