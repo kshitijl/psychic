@@ -13,7 +13,9 @@ use std::{
 
 use crate::help::{self, HelpLine};
 use crate::keymap::{self, Action};
-use crate::path_display::{human_bytes, printable, truncate_absolute_path};
+use crate::path_display::{
+    display_width, human_bytes, printable, truncate_absolute_path, truncate_to_width,
+};
 use crate::preview::PreviewPane;
 
 /// Group digits so six-figure counts stay readable in a narrow pane.
@@ -661,8 +663,12 @@ pub fn render_normal_mode(
                         .add_modifier(Modifier::BOLD)
                 };
 
-                // Calculate padding to right-justify time
-                let padding_len = adjusted_file_width.saturating_sub(truncated_path.len());
+                // Right-justify the timestamp. Measured in columns: bytes
+                // over-count a non-ASCII name and `{:<width$}` under-counts a
+                // wide one, and either way the column comes out ragged.
+                let padding_len = adjusted_file_width
+                    .saturating_sub(display_width(&truncated_path))
+                    .saturating_sub(cwd_suffix_len);
                 let padding = " ".repeat(padding_len);
 
                 let line = if display_info.is_cwd {
@@ -678,12 +684,7 @@ pub fn render_normal_mode(
                     Line::from(vec![
                         Span::styled(rank_prefix.clone(), rank_style),
                         Span::styled(
-                            format!(
-                                "{:<width$}  {}",
-                                truncated_path,
-                                time_ago,
-                                width = adjusted_file_width
-                            ),
+                            format!("{}{}  {}", truncated_path, padding, time_ago),
                             base_style,
                         ),
                     ])
@@ -941,11 +942,9 @@ pub fn render_normal_mode(
         } else {
             60
         };
-        if log_line.len() > max_len {
-            debug_lines.push(format!("  {}...", &log_line[..(max_len - 3)]));
-        } else {
-            debug_lines.push(format!("  {}", log_line));
-        }
+        // Not a byte slice: a log line carries paths, and a path carries
+        // whatever is on disk. Cutting one mid-character panics the UI.
+        debug_lines.push(format!("  {}", truncate_to_width(log_line, max_len)));
     }
 
     let debug_text = debug_lines.join("\n");
@@ -1116,7 +1115,8 @@ pub fn render_normal_mode(
     // The help screen covers the input, so leaving a cursor on it would be a
     // stray block floating over the help text.
     if !ctx.ui_state.help_visible {
-        let cursor_x = main_chunks[2].x + 1 + ctx.query.len() as u16;
+        // Columns, not bytes: the cursor belongs after what is drawn.
+        let cursor_x = main_chunks[2].x + 1 + display_width(ctx.query) as u16;
         let cursor_y = main_chunks[2].y + 1; // 1 for top border
         f.set_cursor_position((cursor_x, cursor_y));
     }
@@ -1168,6 +1168,133 @@ mod test {
                 line.len()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod non_ascii_tests {
+    use super::*;
+    use crate::ui_state::{DebugPaneMode, UiState};
+    use ratatui::{Terminal, backend::TestBackend};
+    use std::time::Duration;
+
+    /// Draw the normal-mode UI with whatever is passed in, and read it back.
+    fn draw(logs: VecDeque<String>, query: &str, name: &str) -> Vec<String> {
+        let (preview_tx, _preview_rx) = std::sync::mpsc::channel();
+        let preview = crate::preview::PreviewState::new(preview_tx);
+        let ui_state = UiState {
+            debug_pane_mode: DebugPaneMode::Small,
+            ..UiState::new()
+        };
+        let timings = crate::app::Timings::default();
+        let mut page_cache = HashMap::new();
+        page_cache.insert(
+            0,
+            crate::app::Page {
+                start_index: 0,
+                end_index: 1,
+                files: vec![crate::search_worker::DisplayFileInfo {
+                    display_name: name.to_string(),
+                    full_path: std::path::PathBuf::from("/tmp").join(name),
+                    score: 0.0,
+                    features: Vec::new(),
+                    mtime: None,
+                    atime: None,
+                    file_size: None,
+                    is_dir: false,
+                    is_cwd: false,
+                    is_historical: false,
+                    is_under_cwd: true,
+                    simple_score: None,
+                    ml_score: None,
+                    simple_weight: None,
+                    ml_weight: None,
+                    fuzzy_score: 0,
+                }],
+            },
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(160, 60)).unwrap();
+        terminal
+            .draw(|f| {
+                let ctx = NormalRenderContext {
+                    selected_index: 0,
+                    file_list_scroll: 0,
+                    total_results: 1,
+                    total_files: 1,
+                    current_filter: crate::search_worker::FilterType::None,
+                    no_preview: true,
+                    preview: &preview,
+                    currently_retraining: false,
+                    model_stats_cache: None,
+                    timings: &timings,
+                    db_stats: None,
+                    page_cache: &page_cache,
+                    ui_state: &ui_state,
+                    recent_logs: &logs,
+                    last_path_bar_update: Instant::now(),
+                    path_bar_scroll: 0,
+                    path_bar_scroll_direction: 1,
+                    cwd: Path::new("/tmp"),
+                    query,
+                    status_message: None,
+                };
+                render_normal_mode(
+                    f,
+                    ctx,
+                    Duration::from_millis(500),
+                    Duration::from_millis(80),
+                );
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        (0..60)
+            .map(|y| (0..160).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn test_a_log_line_with_an_accent_in_it_does_not_take_the_ui_down() {
+        // The truncation was a byte slice, and the cut landed inside this
+        // character. A log line carries paths, and a path carries whatever is
+        // on disk, so this was a matter of when rather than whether.
+        let line = format!("{}\u{e9}{}", "a".repeat(56), "b".repeat(20));
+        let mut logs = VecDeque::new();
+        logs.push_back(line);
+
+        let screen = draw(logs, "", "plain.txt");
+
+        assert!(
+            screen.iter().any(|row| row.contains("aaaa")),
+            "the log line should still be shown, just shortened: {:#?}",
+            screen.last()
+        );
+    }
+
+    #[test]
+    fn test_a_wide_filename_does_not_take_the_ui_down() {
+        let screen = draw(VecDeque::new(), "", "日本語のファイル名.txt");
+
+        // A wide character occupies two cells, and the second reads back
+        // blank, so the row is checked one glyph at a time.
+        assert!(
+            screen.iter().any(|row| row.contains("日")),
+            "a name in wide characters should be drawn: {:?}",
+            screen.first()
+        );
+    }
+
+    #[test]
+    fn test_the_cursor_follows_a_non_ascii_query() {
+        // Not a panic, a misplacement: the cursor sat at a byte offset, so it
+        // drifted right of the text by one column per extra byte.
+        let screen = draw(VecDeque::new(), "café", "plain.txt");
+
+        assert!(
+            screen.iter().any(|row| row.contains("café")),
+            "the query is drawn as typed"
+        );
     }
 }
 

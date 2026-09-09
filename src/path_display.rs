@@ -1,6 +1,48 @@
 use std::borrow::Cow;
 use std::path::Path;
 use std::time::Duration;
+use unicode_width::UnicodeWidthStr;
+
+/// How many terminal columns `text` occupies.
+///
+/// Not its length in bytes, which is what a non-ASCII path measures far more of
+/// than it draws, and not its length in characters either: a CJK glyph or an
+/// emoji is two columns wide. Ratatui lays out in columns, so anything that is
+/// deciding what fits has to count the same way.
+pub fn display_width(text: &str) -> usize {
+    UnicodeWidthStr::width(text)
+}
+
+/// Shorten `text` to at most `width` columns, marking the cut with an ellipsis.
+///
+/// Returns whole characters. Slicing a `String` by a byte offset panics the
+/// moment the offset lands inside a multi-byte character, which for a log line
+/// or a path is a matter of when, not whether.
+pub fn truncate_to_width(text: &str, width: usize) -> Cow<'_, str> {
+    if display_width(text) <= width {
+        return Cow::Borrowed(text);
+    }
+    if width <= 1 {
+        return Cow::Owned("…".repeat(width));
+    }
+
+    // One column for the ellipsis.
+    let budget = width - 1;
+    let mut out = String::with_capacity(text.len());
+    let mut used = 0;
+
+    for c in text.chars() {
+        let w = display_width(c.encode_utf8(&mut [0u8; 4]));
+        if used + w > budget {
+            break;
+        }
+        out.push(c);
+        used += w;
+    }
+    out.push('…');
+
+    Cow::Owned(out)
+}
 
 /// What is safe to put in a terminal cell.
 ///
@@ -49,7 +91,7 @@ pub fn human_bytes(bytes: u64) -> String {
 /// component and the end of the path.
 /// e.g., "a/b/c/d/e.txt" -> "a/.../d/e.txt"
 pub fn truncate_path(path_str: &str, max_len: usize) -> String {
-    if path_str.len() <= max_len {
+    if display_width(path_str) <= max_len {
         return path_str.to_string();
     }
 
@@ -106,7 +148,7 @@ fn abbreviate_component(s: &str) -> String {
 /// e.g., "/Users/kshitijlauria/Library/CloudStorage/Dropbox/src/11-sg/todo.md"
 ///    -> "/U/k/L/CloudStorage/.../11-sg/todo.md"
 pub fn truncate_absolute_path(path_str: &str, max_len: usize) -> String {
-    if path_str.len() <= max_len {
+    if display_width(path_str) <= max_len {
         return path_str.to_string();
     }
 
@@ -368,5 +410,55 @@ mod printable_tests {
     #[test]
     fn test_tabs_become_spaces_the_layout_can_count() {
         assert_eq!(printable("a\tb"), "a    b");
+    }
+}
+
+#[cfg(test)]
+mod width_tests {
+    use super::{display_width, truncate_to_width};
+
+    #[test]
+    fn test_width_counts_columns_not_bytes_or_characters() {
+        assert_eq!(display_width("abc"), 3);
+        assert_eq!(display_width("héllo"), 5, "5 columns, 6 bytes");
+        assert_eq!(display_width("日本語"), 6, "3 characters, 6 columns");
+    }
+
+    #[test]
+    fn test_short_text_is_left_alone() {
+        assert_eq!(truncate_to_width("abc", 10), "abc");
+        assert_eq!(truncate_to_width("abc", 3), "abc");
+    }
+
+    #[test]
+    fn test_truncation_never_splits_a_character() {
+        // The byte at offset 5 is in the middle of the é. Slicing there is a
+        // panic, which is what took the UI down with the debug pane open.
+        let text = "caf\u{e9} au lait";
+        let cut = truncate_to_width(text, 5);
+
+        assert_eq!(cut, "café…");
+        assert!(display_width(&cut) <= 5);
+    }
+
+    #[test]
+    fn test_truncation_respects_wide_characters() {
+        let cut = truncate_to_width("日本語テスト", 5);
+
+        assert!(
+            display_width(&cut) <= 5,
+            "{:?} is {} columns",
+            cut,
+            display_width(&cut)
+        );
+        assert_eq!(cut, "日本…");
+    }
+
+    #[test]
+    fn test_absurdly_narrow_widths_do_not_panic() {
+        for width in 0..3 {
+            let cut = truncate_to_width("日本語", width);
+            assert!(display_width(&cut) <= width.max(1));
+        }
     }
 }
