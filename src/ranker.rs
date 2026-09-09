@@ -117,11 +117,31 @@ fn fuzzy_score_for_simple_model(fuzzy_score: i64) -> f64 {
     }
 }
 
+/// Does a model trained with `model_features` inputs fit today's registry?
+///
+/// Adding a feature changes the length of the vector `rank_files` builds, and a
+/// booster asked to predict from the wrong number of columns fails on every
+/// call. The first launch after an upgrade always hits this: `model.txt` was
+/// written by the previous version, and the retrain that replaces it has not
+/// finished yet.
+pub fn model_fits_registry(model_features: usize) -> bool {
+    model_features == FEATURE_REGISTRY.len()
+}
+
 impl Ranker {
     pub fn new(model_path: &Path, db: &db::Database) -> Result<Self> {
         let model_load_start = std::time::Instant::now();
         let model = Booster::from_file(model_path.to_str().unwrap())
             .context("Failed to load LightGBM model")?;
+
+        let model_features = model.num_features() as usize;
+        if !model_fits_registry(model_features) {
+            anyhow::bail!(
+                "model expects {} features but this build computes {}",
+                model_features,
+                FEATURE_REGISTRY.len()
+            );
+        }
         log::info!(
             "TIMING {{\"op\":\"booster_from_file\",\"ms\":{}}}",
             model_load_start.elapsed().as_secs_f64() * 1000.0
@@ -1179,6 +1199,18 @@ mod tests {
             FEATURE_REGISTRY.len(),
             "one timing slot per registered feature"
         );
+    }
+
+    #[test]
+    fn test_a_model_from_a_different_feature_set_is_rejected() {
+        // The first launch after a feature is added loads a model.txt written
+        // by the previous build. A booster asked for the wrong number of
+        // columns fails on every predict, so this has to be caught at load
+        // time, where the fallback to the simple model lives.
+        assert!(model_fits_registry(FEATURE_REGISTRY.len()));
+        assert!(!model_fits_registry(FEATURE_REGISTRY.len() - 1));
+        assert!(!model_fits_registry(FEATURE_REGISTRY.len() + 1));
+        assert!(!model_fits_registry(0));
     }
 
     #[test]

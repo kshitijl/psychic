@@ -886,6 +886,11 @@ impl WorkerState {
                 Ok(ranker)
             }
             Err(e) => {
+                // Includes a model from a build with a different feature set,
+                // which is what the first launch after an upgrade loads. The
+                // simple model is the right answer to all of these: ranking
+                // degrades to what a fresh install runs on, rather than failing
+                // per query and handing back the filter's own order unscored.
                 log::error!(
                     "Failed to load model at {:?} ({}); falling back to the simple \
                      model until the next retrain finishes",
