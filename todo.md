@@ -77,6 +77,20 @@ here), and click-through rate, rejected partly for having too thin a base.
 should hold several times the clicks it does now, which is the axis these
 choices are most sensitive to.
 
+### 3. Smaller, still open
+
+- **P10.** Cache query-independent features per registry entry. 12 of 20 features
+  do not depend on the query. Irrelevant at 244 files and 0.24ms; it would
+  matter at the 8,000 the shallow-mode threshold allows. Revisit only if
+  someone launches in a big-but-under-threshold tree and it feels slow.
+- **Feature: mentioned in recent shell commands.** Speculative, and needs
+  `context.rs` to store extracted path-like tokens - which it no longer collects
+  at all, so this now means adding collection back deliberately, in the reduced
+  form, rather than reusing something already there.
+- **Feature: git status flags.** `is_git_modified`, `is_git_untracked`. Strong
+  for developers, but needs a background `git status --porcelain` per repo at
+  walk time. Belongs with the gitignore machinery, which now exists.
+
 ## measurement discipline
 
 Three things this repo learned the hard way in September. All three are in
@@ -174,6 +188,12 @@ Kept because the measurements cost real time and the reasoning generalises.
   Taking a signal that works per file and spreading it over a directory does not
   transfer here, whatever the signal. The directory features that *do* work
   describe something the user did to that directory itself.
+- **Modified since last click** (binary, `mtime > last_click_ts`). Four seeds a
+  side read top-1 +0.0056, MRR +0.0031, AUC +0.0010 - positive on every metric,
+  about 1.6 sigma, and nearly shipped. Eight seeds read top-1 -0.0008 and MRR
+  -0.0010. Gain 0.1%, rank 19 of 21. Keep this as the worked example of why
+  `--seeds` exists and why eight is the number when a call is close: the failure
+  mode is not a wild number, it is a plausible one.
 - **Depth below cwd.** -0.010 top-1. `is_under_cwd` already carries the useful
   half, and `fuzzy_score` already leans against long paths.
 
