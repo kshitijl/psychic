@@ -4,33 +4,54 @@ Ordered by what a user would feel, then by risk removed. Every item ends with
 its own check. Read `llm.md` first: every change gets benchmarked against its
 parent, and a ranking change gets `./bench/model.py compare --seeds 5` as well.
 
-### 1. Click-through rate per file
+### 1. Click-through rate: built, measured, not shipped
 
-The one substantial feature idea left from the September review, and the only
-one that gives the model per-file memory of *negatives*. Impressions are the
-training labels, but no feature says how often this file has been shown and
-passed over, so two files with identical click counts score identically whether
-one has been ignored 200 times or never shown at all.
+Built in full - `impressions_last_30_days` and a smoothed
+`click_through_rate`, indexed on both sides, four tests - and then not
+shipped, because the startup cost is real and the quality gain is not.
 
-Two columns: `impressions_last_30_days` for confidence, and a **smoothed** rate,
-because raw clicks/impressions is 1.0 for one-shown-one-clicked and 0.5 for
-100-of-200, which is backwards:
+The model *likes* it: `click_through_rate` came out **3rd of 22 by gain** at
+14.7%, `impressions_last_30_days` 7th at 4.5%. But over four seeds a side:
 
-```
-ctr = (clicks_30d + k * global_ctr) / (impressions_30d + k)      k = 5..10
-```
+| | before | after |
+|---|---|---|
+| AUC | 0.9421 | 0.9491 |
+| top-1 | 0.7968 | 0.7999 |
+| MRR | 0.8671 | 0.8664 |
 
-`global_ctr` is total clicks over total impressions in the same window, about
-1.4% on today's data. An unseen file sits at the global rate; an often-shown,
-never-clicked file drifts toward zero. Training side: `impressions_by_file` and
-running totals in the `Accumulator`, counted before the current impression.
-Runtime: 30 days of impression counts per path at startup, either a `GROUP BY`
-with its own partial index or a counts table maintained at write time -
-**measure the startup cost before choosing**, since `worker_state_new_total` is
-5.9ms today and this could easily double it.
+top-1 +0.0031 against a standard error of 0.0034, and MRR flat. AUC is the
+only clear movement, and AUC is a pooled metric we deliberately stopped
+optimising when the objective became `lambdarank`.
 
-Once `rank` (done) has accumulated history, this becomes position-debiased: an
-unclicked row at position 1 is a far stronger negative than one at position 24.
+The cost is not small. Impressions are 96% of the table and deliberately not
+in the engagement index, so counting them is a scan:
+
+| | before | after |
+|---|---|---|
+| load clicks | 0.62ms | **14.62ms** |
+| worker state ready | 3.46ms | 17.40ms |
+| first results | 6.71ms | **20.81ms** |
+
+A partial index on `action='impression'` roughly halves the query, at 27.2MB
+of database against 18.6MB - re-adding most of what P8 removed for the same
+reason.
+
+**What would change the answer**, in order of how much it would change it:
+
+1. **Position debiasing.** The rate is measured over rows *this ranker chose
+   to show*, which is a feedback loop: a file the model ranks low is shown
+   less, so its rate stays low. `events.rank` started being collected on
+   2026-09-10 and is the input for correcting that. Retry when there are a
+   few months of it.
+2. **A cheaper count.** A counts table maintained at write time, if the
+   30-day window can be aged out correctly, or loading the counts off the
+   critical path after the first query - at the price of the first query not
+   having them.
+3. **More data.** 1,173 clicks over 10k impressions in the window is a thin
+   base for a per-file rate.
+
+The code is in `git show` for the commit that reverted it; rebuilding from
+that is an hour, and the measurement above is the thing worth keeping.
 
 ### 2. P7 leftovers: the worker and tick loops
 
