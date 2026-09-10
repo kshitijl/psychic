@@ -111,6 +111,33 @@ beside it.
 
 ### Thread Architecture
 
+**The worker and the walker share one channel.** `WorkerRequest::Walker` wraps
+a `WalkerMessage`, and the walker is generic over `T: From<WalkerMessage>` so it
+can send straight into the worker's request channel. The worker then blocks on a
+single `recv()` with no timeout. It used to poll two channels with a 5ms
+`recv_timeout` - 200 wakeups a second for the life of the process, nearly all of
+them finding nothing.
+
+Two things that fall out of sharing the channel:
+
+- Walker messages are handled as a batch before the requests in the same drain,
+  because a walk delivers thousands of files and re-filtering between them would
+  be pointless work.
+- `drain_requests` ignores walker messages when deciding whether a newer query
+  supersedes an older one. Without that, a burst of files arriving between two
+  keystrokes would make the worker rank for a query the user had already typed
+  past.
+
+The `FilesChanged` debounce is safe without a timer because `AllDone` arrives at
+the end of every walk and always publishes, so a change cannot sit unannounced.
+
+**The tick only fires while something moves.** A tick is a full redraw, and the
+only thing on screen that animates is the path bar when the selected path is too
+long for it. The renderer reports `path_bar_overflows` in `FrameLayout`, the main
+loop stores it in an `AtomicBool`, and the tick thread stays quiet otherwise.
+Measured on an idle psychic: **5.8 writes a second to the terminal, down to
+0.2**.
+
 **Five that live for the session:**
 - **Main (UI)**: Renders UI, blocks on unified event channel, owns visible file slice only
 - **Worker**: Owns all file data, does filtering/ranking, sends results to unified channel

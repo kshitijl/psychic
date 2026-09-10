@@ -126,6 +126,11 @@ pub struct App {
 
     // Tick thread control (for pausing when launching child processes)
     pub tick_paused: Arc<AtomicBool>,
+    /// Whether anything on screen is animating - today, whether the path bar
+    /// has more path than room. The tick thread reads it and stays quiet when
+    /// there is nothing to drive, so an idle psychic stops redrawing itself
+    /// five times a second.
+    pub something_animates: Arc<AtomicBool>,
 
     // Startup tracking
     pub walker_done: bool,
@@ -216,6 +221,7 @@ impl App {
             worker_handle: Some(worker_handle),
             input,
             tick_paused: Arc::new(AtomicBool::new(false)),
+            something_animates: Arc::new(AtomicBool::new(false)),
             walker_done: false,
             startup_complete_logged: false,
             timings: Timings::default(),
@@ -593,6 +599,7 @@ impl App {
             worker_handle: None,
             input: crate::tty_input::TtyInput::detached(),
             tick_paused: Arc::new(AtomicBool::new(false)),
+            something_animates: Arc::new(AtomicBool::new(false)),
             walker_done: false,
             startup_complete_logged: false,
             timings: Timings::default(),

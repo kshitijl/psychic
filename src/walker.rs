@@ -56,13 +56,18 @@ const SHALLOW_MODE_THRESHOLD: usize = 8_000;
 /// How often, in entries, to look for a command telling us to go elsewhere.
 const COMMAND_CHECK_INTERVAL: usize = 100;
 
-pub fn start_file_walker(
+/// `message_tx` is generic so the walker can send straight into the worker's
+/// own request channel, which is what lets the worker block on one `recv()`
+/// instead of polling two channels.
+pub fn start_file_walker<T>(
     initial_root: PathBuf,
     initial_hidden: Vec<PathBuf>,
     respect_gitignore: bool,
     command_rx: Receiver<WalkerCommand>,
-    message_tx: Sender<WalkerMessage>,
-) {
+    message_tx: Sender<T>,
+) where
+    T: From<WalkerMessage> + Send + 'static,
+{
     std::thread::spawn(move || {
         let mut root = initial_root;
         let mut hidden = initial_hidden;
@@ -89,7 +94,7 @@ pub fn start_file_walker(
                 Some(command) => Some(command),
                 None => {
                     // Only a walk that ran to the end gets to say so.
-                    let _ = message_tx.send(WalkerMessage::AllDone);
+                    let _ = message_tx.send(WalkerMessage::AllDone.into());
                     command_rx.recv().ok()
                 }
             };
@@ -134,13 +139,16 @@ struct WalkLimits {
     respect_gitignore: bool,
 }
 
-fn walk_directory(
+fn walk_directory<T>(
     root: &Path,
     hidden: &[PathBuf],
     limits: WalkLimits,
     command_rx: &Receiver<WalkerCommand>,
-    tx: &Sender<WalkerMessage>,
-) -> Option<WalkerCommand> {
+    tx: &Sender<T>,
+) -> Option<WalkerCommand>
+where
+    T: From<WalkerMessage>,
+{
     let mut sent = 0;
     for entry in entries(root, hidden, limits.respect_gitignore, 1..=1) {
         if sent >= MAX_FILES {
@@ -148,7 +156,7 @@ fn walk_directory(
             break;
         }
         if tx
-            .send(WalkerMessage::FileMetadata(describe(&entry)))
+            .send(WalkerMessage::FileMetadata(describe(&entry)).into())
             .is_err()
         {
             return None;
@@ -163,7 +171,7 @@ fn walk_directory(
     // The worker publishes these without waiting for its debounce: they are
     // the whole answer for a directory with nothing much under it, and the
     // first useful answer for one with a lot.
-    if tx.send(WalkerMessage::ChildrenDone).is_err() {
+    if tx.send(WalkerMessage::ChildrenDone.into()).is_err() {
         return None;
     }
 
@@ -186,7 +194,7 @@ fn walk_directory(
     }
 
     for item in below {
-        if tx.send(WalkerMessage::FileMetadata(item)).is_err() {
+        if tx.send(WalkerMessage::FileMetadata(item).into()).is_err() {
             return None;
         }
     }

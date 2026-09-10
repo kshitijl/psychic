@@ -53,26 +53,7 @@ reason.
 The code is in `git show` for the commit that reverted it; rebuilding from
 that is an hour, and the measurement above is the thing worth keeping.
 
-### 2. P7 leftovers: the worker and tick loops
-
-The input thread is done - `tty_input.rs` blocks in `libc::poll` and is woken by
-a self-pipe. Two polling loops remain, and neither touches the terminal, so
-neither carries the risk that made the input one hard:
-
-- **Worker.** `recv_timeout(5ms)` in `worker_thread_loop` exists only because
-  the walker has its own channel. Give the walker a clone of the worker's
-  request sender and add `WorkerRequest::Walker(WalkerMessage)`; the worker then
-  blocks on one `recv()` with no timeout. Keep the `FilesChanged` debounce.
-- **Tick.** Send ticks only while something animates, which today means only
-  when the path bar overflows. `App::advance_marquee` already knows - it returns
-  early when `path_bar_width` is not exceeded. Note the tick is no longer the
-  resize fallback: the input thread wakes on SIGWINCH itself.
-
-Neither is a measurable CPU win - both binaries used 0.02s over 20s idle when
-this was checked - so do them for simplicity, and because the tick one is a
-prerequisite for the UI ever being genuinely idle.
-
-### 3. P11. app.log grows without bound
+### 2. P11. app.log grows without bound
 
 31MB when it was last measured, read start-to-finish by `internal analyze-perf`
 and `print-log`. Cutting the per-query lines 22x slowed the growth without
@@ -81,7 +62,7 @@ bounding it. Wants a size cap and one level of rotation (`app.log` ->
 `fern` has no rotation, so this is a custom `Dispatch` chain or a size check at
 startup.
 
-### 4. S7. `context.rs` still shells out three times per launch
+### 3. S7. `context.rs` still shells out three times per launch
 
 `gather_context` runs `netstat`, `ifconfig` and a DNS lookup through `sh -c` on
 every launch, and nothing reads gateway, subnet or dns - the columns survive in
@@ -89,7 +70,7 @@ every launch, and nothing reads gateway, subnet or dns - the columns survive in
 `shell_history`. Keep `cwd` and `timezone`, delete the other three and their
 columns, and the context thread stops needing to exist.
 
-### 5. S8, and the tests that only look like tests
+### 4. S8, and the tests that only look like tests
 
 `check_and_log_impressions` builds the 25-row Vec on every event before checking
 `already_logged`; check first.
@@ -117,7 +98,7 @@ data, runs the real thing, and takes seven seconds.
   for developers, but needs a background `git status --porcelain` per repo at
   walk time. Belongs with the gitignore machinery, which now exists.
 
-### 6. Check how fragile the September tuning is, and redo it in a year
+### 5. Check how fragile the September tuning is, and redo it in a year
 
 Every choice made in September - objective, tree size, learning rate, half-life,
 which features are in - was measured against one history at one moment: about a

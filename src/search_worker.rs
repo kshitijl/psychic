@@ -123,6 +123,19 @@ pub enum WorkerRequest {
         path: PathBuf,
         query_id: u64,
     },
+    /// Something the walker found, or a milestone it reached.
+    ///
+    /// The walker sends on this channel rather than its own so that the worker
+    /// can block on a single `recv()` with no timeout. It used to poll both
+    /// with a 5ms `recv_timeout`, which is 200 wakeups a second for the life of
+    /// the process, most of them finding nothing.
+    Walker(WalkerMessage),
+}
+
+impl From<WalkerMessage> for WorkerRequest {
+    fn from(message: WalkerMessage) -> Self {
+        WorkerRequest::Walker(message)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -327,8 +340,10 @@ where
     T: From<WorkerResponse> + Send + 'static,
 {
     let (worker_tx, worker_task_rx) = mpsc::channel::<WorkerRequest>();
-    let (walker_message_tx, walker_message_rx) = mpsc::channel::<WalkerMessage>();
     let (walker_command_tx, walker_command_rx) = mpsc::channel::<WalkerCommand>();
+    // The walker sends into the worker's own request channel, so the worker has
+    // one thing to wait on.
+    let walker_message_tx = worker_tx.clone();
 
     let data_dir = data_dir.to_path_buf();
 
@@ -355,7 +370,7 @@ where
             hidden_for_worker,
         )
         .unwrap();
-        worker_thread_loop(worker_task_rx, event_tx, walker_message_rx, worker_state);
+        worker_thread_loop(worker_task_rx, event_tx, worker_state);
     });
 
     // Start walker thread
@@ -1054,27 +1069,41 @@ where
 fn worker_thread_loop<T>(
     task_rx: mpsc::Receiver<WorkerRequest>,
     event_tx: mpsc::Sender<T>,
-    walker_rx: mpsc::Receiver<WalkerMessage>,
     mut state: WorkerState,
 ) where
     T: From<WorkerResponse> + Send,
 {
-    use std::sync::mpsc::RecvTimeoutError;
     use std::time::Instant;
 
     let mut last_files_changed_notification = Instant::now();
 
     loop {
-        // Process walker updates (non-blocking)
+        // One blocking wait, because the walker sends on this channel too.
+        // This used to be a 5ms `recv_timeout` looping over a second channel -
+        // 200 wakeups a second for the life of the process, nearly all of them
+        // finding nothing.
+        let pending = match task_rx.recv() {
+            Ok(first) => drain_requests(&task_rx, first),
+            Err(_) => {
+                log::debug!("Worker thread channel disconnected");
+                break;
+            }
+        };
+
+        // Walker messages first, and as a batch: a walk delivers thousands of
+        // files, and re-filtering between them would be pointless work.
         let mut files_changed = false;
         // Set by the milestones worth showing at once, rather than whenever the
         // debounce below next comes round.
         let mut publish_now = false;
-        while let Ok(message) = walker_rx.try_recv() {
+        for message in pending.iter().filter_map(|request| match request {
+            WorkerRequest::Walker(message) => Some(message),
+            _ => None,
+        }) {
             match message {
                 WalkerMessage::FileMetadata(metadata) => {
                     state.add_file(
-                        metadata.path,
+                        metadata.path.clone(),
                         metadata.mtime,
                         metadata.atime,
                         metadata.file_size,
@@ -1103,6 +1132,10 @@ fn worker_thread_loop<T>(
         // If files changed, notify the UI so it can decide to trigger a refresh.
         // Debounced to avoid spamming the UI thread, unless this is one of the
         // milestones that should reach the screen the moment it happens.
+        //
+        // Safe to debounce even though nothing wakes this loop on a timer:
+        // `AllDone` always arrives at the end of a walk and always publishes, so
+        // a change cannot be left sitting unannounced.
         if files_changed
             && (publish_now
                 || last_files_changed_notification.elapsed() > Duration::from_millis(200))
@@ -1111,18 +1144,9 @@ fn worker_thread_loop<T>(
             last_files_changed_notification = Instant::now();
         }
 
-        // Wait for worker requests with timeout
-        let pending = match task_rx.recv_timeout(Duration::from_millis(5)) {
-            Ok(first) => drain_requests(&task_rx, first),
-            Err(RecvTimeoutError::Timeout) => continue,
-            Err(RecvTimeoutError::Disconnected) => {
-                log::debug!("Worker thread channel disconnected");
-                break;
-            }
-        };
-
         for request in pending {
             match request {
+                WorkerRequest::Walker(_) => {} // handled above, as a batch
                 WorkerRequest::UpdateQuery(latest_req) => {
                     state.current_query = latest_req.query.clone();
                     state.current_query_id = latest_req.query_id;
@@ -1233,15 +1257,23 @@ fn drain_requests(rx: &mpsc::Receiver<WorkerRequest>, first: WorkerRequest) -> V
     let mut queue = vec![first];
 
     while let Ok(request) = rx.try_recv() {
-        let supersedes_the_last = matches!(
-            (queue.last(), &request),
+        // A newer query replaces an older one - ranking for a query the user has
+        // already typed past is work nobody will see. Walker messages are
+        // ignored when deciding that: they share this channel now, and a walk
+        // delivering files between two keystrokes must not stop the second
+        // keystroke from superseding the first.
+        let last_request = queue
+            .iter()
+            .rposition(|queued| !matches!(queued, WorkerRequest::Walker(_)));
+        let supersedes = matches!(
+            (last_request.map(|at| &queue[at]), &request),
             (
                 Some(WorkerRequest::UpdateQuery(_)),
                 WorkerRequest::UpdateQuery(_)
             )
         );
-        if supersedes_the_last {
-            queue.pop();
+        if let (true, Some(at)) = (supersedes, last_request) {
+            queue.remove(at);
         }
         queue.push(request);
     }
@@ -1260,6 +1292,50 @@ mod tests {
             query_id: 0,
             filter: FilterType::None,
         })
+    }
+
+    fn walker_file(name: &str) -> WorkerRequest {
+        WorkerRequest::Walker(WalkerMessage::FileMetadata(WalkerFileMetadata {
+            path: PathBuf::from(name),
+            mtime: None,
+            atime: None,
+            file_size: None,
+            is_dir: false,
+        }))
+    }
+
+    #[test]
+    fn test_a_walk_between_two_keystrokes_does_not_stop_the_second_superseding() {
+        // The walker shares this channel now. A burst of files arriving between
+        // two keystrokes must not make the worker rank for a query the user has
+        // already typed past.
+        let (tx, rx) = mpsc::channel();
+        tx.send(walker_file("/a.rs")).unwrap();
+        tx.send(update("ps")).unwrap();
+        tx.send(walker_file("/b.rs")).unwrap();
+        tx.send(walker_file("/c.rs")).unwrap();
+        tx.send(update("psy")).unwrap();
+        drop(tx);
+
+        let first = rx.recv().unwrap();
+        let queue = drain_requests(&rx, first);
+
+        let queries: Vec<String> = queue
+            .iter()
+            .filter_map(|request| match request {
+                WorkerRequest::UpdateQuery(update) => Some(update.query.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(queries, vec!["psy"], "only the query still being typed");
+        assert_eq!(
+            queue
+                .iter()
+                .filter(|r| matches!(r, WorkerRequest::Walker(_)))
+                .count(),
+            3,
+            "and every file the walker found is still there"
+        );
     }
 
     #[test]

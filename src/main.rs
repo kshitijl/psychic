@@ -502,14 +502,21 @@ fn main() -> Result<()> {
     // Thread 2: Tick timer for periodic tasks (spawned after app creation to access tick_paused)
     let tick_tx = event_tx.clone();
     let tick_paused = app.tick_paused.clone();
+    let something_animates = app.something_animates.clone();
     std::thread::spawn(move || {
         loop {
             std::thread::sleep(Duration::from_millis(200));
 
-            // Skip sending tick if paused (e.g., during editor/shell suspension)
-            if !tick_paused.load(std::sync::atomic::Ordering::Relaxed)
-                && tick_tx.send(AppEvent::Tick).is_err()
-            {
+            // Paused during editor and shell suspension, and quiet whenever
+            // nothing on screen is moving. A tick is a full redraw, so sending
+            // one with nothing to animate costs a redraw five times a second
+            // for as long as psychic sits open.
+            let idle = !something_animates.load(std::sync::atomic::Ordering::Relaxed);
+            let paused = tick_paused.load(std::sync::atomic::Ordering::Relaxed);
+            if paused || idle {
+                continue;
+            }
+            if tick_tx.send(AppEvent::Tick).is_err() {
                 break; // Main thread died, exit
             }
         }
@@ -735,6 +742,10 @@ fn run_app(
         if let Some(layout) = frame_layout {
             app.path_bar_width = layout.path_bar_width;
             app.visible_list_height = layout.visible_list_height;
+            app.something_animates.store(
+                layout.path_bar_overflows,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             app.update_scroll(layout.visible_list_height, layout.file_list_scroll);
         }
 

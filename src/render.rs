@@ -381,6 +381,10 @@ pub struct FrameLayout {
     pub file_list_scroll: usize,
     /// Width of the path bar, which the marquee needs to know how far to go.
     pub path_bar_width: u16,
+    /// Whether the selected path is too long for the bar, which is the only
+    /// thing on screen that animates. When nothing does, the tick has nothing
+    /// to drive and stops being sent.
+    pub path_bar_overflows: bool,
 }
 
 /// Render the normal mode UI (file list, preview, debug pane)
@@ -864,6 +868,7 @@ pub fn render_normal_mode(f: &mut Frame, app: &crate::app::App) -> FrameLayout {
     // should not be what moves the animation on. Render only reports how wide
     // the bar came out, which is the one thing the advance cannot work out for
     // itself.
+    let padded_path_len = padded_path.chars().count();
     let path_bar = Paragraph::new(padded_path)
         .style(Style::default().fg(Color::DarkGray))
         .scroll((0, app.path_bar_scroll));
@@ -973,6 +978,7 @@ pub fn render_normal_mode(f: &mut Frame, app: &crate::app::App) -> FrameLayout {
         visible_list_height: visible_height,
         file_list_scroll,
         path_bar_width: path_bar_width as u16,
+        path_bar_overflows: padded_path_len > path_bar_width,
     }
 }
 
