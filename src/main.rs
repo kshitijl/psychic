@@ -632,6 +632,11 @@ fn main() -> Result<()> {
     // Joining threads one at a time only ever fixed the thread being joined;
     // the retraining and context threads are detached and can log at any moment.
     let worker_tx = std::mem::replace(&mut app.worker_tx, mpsc::channel().0);
+    // Ask the worker to stop, rather than relying on this being the last
+    // sender: the walker holds a clone so it can send into the same channel,
+    // and it blocks forever waiting for its next command, so dropping this one
+    // leaves the worker waiting on a channel that never disconnects.
+    let _ = worker_tx.send(WorkerRequest::Shutdown);
     drop(worker_tx);
 
     if let Some(handle) = app.worker_handle.take() {

@@ -123,6 +123,14 @@ pub enum WorkerRequest {
         path: PathBuf,
         query_id: u64,
     },
+    /// Stop the worker thread.
+    ///
+    /// Sent by main before it joins the worker. Dropping the sender is not
+    /// enough any more: the walker holds a clone of it so that it can send into
+    /// this channel, and the walker blocks forever waiting for its next
+    /// command, so `recv` here would never see a disconnect and the join would
+    /// hang. Which it did.
+    Shutdown,
     /// Something the walker found, or a milestone it reached.
     ///
     /// The walker sends on this channel rather than its own so that the worker
@@ -1146,6 +1154,10 @@ fn worker_thread_loop<T>(
 
         for request in pending {
             match request {
+                WorkerRequest::Shutdown => {
+                    log::debug!("Worker thread shutting down");
+                    return;
+                }
                 WorkerRequest::Walker(_) => {} // handled above, as a batch
                 WorkerRequest::UpdateQuery(latest_req) => {
                     state.current_query = latest_req.query.clone();
@@ -1607,6 +1619,61 @@ pub(super) mod fresh_install_tests_support {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
         }
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    //! Quitting has to actually quit.
+
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn test_the_worker_stops_when_asked_even_though_the_walker_holds_a_sender() {
+        // The regression this exists for: the walker sends into the worker's
+        // own request channel, so it holds a clone of the sender and blocks
+        // forever waiting for its next command. Dropping main's sender
+        // therefore never disconnects the channel, the worker waited in recv()
+        // for a message that could not come, and the join on quit hung - the
+        // UI was gone and the process had to be killed from another terminal.
+        let dir = std::env::temp_dir().join(format!("psychic-shutdown-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let (event_tx, _event_rx) = mpsc::channel::<WorkerResponse>();
+        let (worker_tx, handle) = spawn(
+            PathBuf::from("/test"),
+            &dir,
+            event_tx,
+            WorkerOptions {
+                hidden_prefixes: Vec::new(),
+                no_click_loading: true,
+                no_model: true,
+                respect_gitignore: true,
+            },
+        )
+        .expect("worker should start");
+
+        worker_tx
+            .send(WorkerRequest::Shutdown)
+            .expect("the worker is listening");
+        drop(worker_tx);
+
+        // join() has no timeout, so do the waiting here: a worker that ignores
+        // Shutdown must fail this test rather than hang the whole suite.
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = handle.join();
+            let _ = done_tx.send(());
+        });
+
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(10)).is_ok(),
+            "the worker thread did not stop when asked"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
 
