@@ -66,9 +66,6 @@ pub struct DbStats {
 #[derive(Debug, Clone)]
 pub struct ContextData {
     pub cwd: String,
-    pub gateway: String,
-    pub subnet: String,
-    pub dns: String,
     pub timezone: String,
 }
 
@@ -196,9 +193,6 @@ impl Database {
             "CREATE TABLE IF NOT EXISTS sessions (
                 session_id TEXT PRIMARY KEY,
                 cwd TEXT NOT NULL,
-                gateway TEXT NOT NULL,
-                subnet TEXT NOT NULL,
-                dns TEXT NOT NULL,
                 timezone TEXT NOT NULL,
                 created_at INTEGER NOT NULL
             )",
@@ -259,6 +253,17 @@ impl Database {
         if !event_columns.iter().any(|name| name == "rank") {
             log::info!("Adding events.rank for impression positions");
             conn.execute("ALTER TABLE events ADD COLUMN rank INTEGER", [])?;
+        }
+
+        // The network columns went with the shell-outs that filled them: a
+        // `netstat`, an `ifconfig` and a DNS lookup per launch, into columns no
+        // query ever read.
+        for column in ["gateway", "subnet", "dns"] {
+            if existing.iter().any(|name| name == column) {
+                log::info!("Dropping unused sessions.{} column", column);
+                conn.execute(&format!("ALTER TABLE sessions DROP COLUMN {}", column), [])?;
+                dropped = true;
+            }
         }
 
         // Whether the row was a directory, as the UI knew it at the time.
@@ -323,17 +328,9 @@ impl Database {
         let timestamp = jiff::Timestamp::now().as_second();
 
         self.conn.execute(
-            "INSERT INTO sessions (session_id, cwd, gateway, subnet, dns, timezone, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                session_id,
-                &context.cwd,
-                &context.gateway,
-                &context.subnet,
-                &context.dns,
-                &context.timezone,
-                timestamp
-            ],
+            "INSERT INTO sessions (session_id, cwd, timezone, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![session_id, &context.cwd, &context.timezone, timestamp],
         )?;
 
         Ok(())
@@ -750,6 +747,76 @@ mod tests {
             vec!["/clicked".to_string()],
             "Impressions are 96% of the table and none of them are history"
         );
+    }
+}
+
+#[cfg(test)]
+mod session_column_tests {
+    //! The session row records where psychic was launched, and nothing else.
+
+    use super::*;
+
+    #[test]
+    fn test_an_older_database_loses_the_network_columns() {
+        // What every existing install does on its first launch after this.
+        let dir = std::env::temp_dir().join(format!("psychic-ctx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("events.db");
+
+        {
+            let old = Connection::open(&path).unwrap();
+            old.execute(
+                "CREATE TABLE sessions (
+                     session_id TEXT PRIMARY KEY, cwd TEXT NOT NULL, gateway TEXT NOT NULL,
+                     subnet TEXT NOT NULL, dns TEXT NOT NULL, timezone TEXT NOT NULL,
+                     created_at INTEGER NOT NULL)",
+                [],
+            )
+            .unwrap();
+            old.execute(
+                "INSERT INTO sessions VALUES ('s', '/tmp', '10.0.0.1', '10.0', '1.1.1.1', 'UTC', 1)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let db = Database::new(&path).expect("an older database still opens");
+
+        let columns: Vec<String> = db
+            .conn
+            .prepare("SELECT name FROM pragma_table_info('sessions')")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(!columns.iter().any(|c| c == "gateway"));
+        assert!(!columns.iter().any(|c| c == "subnet"));
+        assert!(!columns.iter().any(|c| c == "dns"));
+
+        let (cwd, timezone): (String, String) = db
+            .conn
+            .query_row("SELECT cwd, timezone FROM sessions", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!((cwd.as_str(), timezone.as_str()), ("/tmp", "UTC"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_a_session_row_records_where_psychic_started() {
+        let db = Database::new(Path::new(":memory:")).unwrap();
+        db.log_session("s", &crate::context::gather_context())
+            .unwrap();
+
+        let cwd: String = db
+            .conn
+            .query_row("SELECT cwd FROM sessions", [], |row| row.get(0))
+            .unwrap();
+        assert!(!cwd.is_empty(), "the launch directory, whatever it is");
     }
 }
 

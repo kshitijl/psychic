@@ -53,15 +53,7 @@ reason.
 The code is in `git show` for the commit that reverted it; rebuilding from
 that is an hour, and the measurement above is the thing worth keeping.
 
-### 2. S7. `context.rs` still shells out three times per launch
-
-`gather_context` runs `netstat`, `ifconfig` and a DNS lookup through `sh -c` on
-every launch, and nothing reads gateway, subnet or dns - the columns survive in
-`sessions` only because dropping them was scoped to `running_processes` and
-`shell_history`. Keep `cwd` and `timezone`, delete the other three and their
-columns, and the context thread stops needing to exist.
-
-### 3. S8, and the tests that only look like tests
+### 2. S8, and the tests that only look like tests
 
 `check_and_log_impressions` builds the 25-row Vec on every event before checking
 `already_logged`; check first.
@@ -73,7 +65,7 @@ additionally asserts a stale CSV header. Delete them or give them fixtures - the
 trained-model test (`search_worker.rs`) is the model to copy: it builds its own
 data, runs the real thing, and takes seven seconds.
 
-### 5. Smaller, still open
+### 4. Smaller, still open
 
 - **P10.** Cache query-independent features per registry entry. 12 of 20 features
   do not depend on the query. Irrelevant at 244 files and 0.24ms; it would
@@ -89,7 +81,7 @@ data, runs the real thing, and takes seven seconds.
   for developers, but needs a background `git status --porcelain` per repo at
   walk time. Belongs with the gitignore machinery, which now exists.
 
-### 4. Check how fragile the September tuning is, and redo it in a year
+### 3. Check how fragile the September tuning is, and redo it in a year
 
 Every choice made in September - objective, tree size, learning rate, half-life,
 which features are in - was measured against one history at one moment: about a

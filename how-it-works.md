@@ -20,7 +20,7 @@ The codebase follows John Ousterhout's "deep modules" philosophy: simple interfa
 
 **File Discovery & Ranking:**
 3. **`walker.rs`** - Background file discovery via walkdir
-4. **`context.rs`** - System context gathering for ML features
+4. **`context.rs`** - Where psychic was launched, and the timezone
 5. **`features.rs`** - ML feature generation for training
 6. **`feature_defs/`** - Trait-based feature registry
 7. **`ranker.rs`** - LightGBM model inference
@@ -91,6 +91,14 @@ Three things follow from that, all deliberate:
 by expect tests in `search_worker.rs` and by `analyze_perf.rs`'s own tests, which
 parse the same string back. Numbers are rounded to microseconds, which is past
 what `Instant` resolves and several times shorter than full f64 precision.
+
+**A session records where it started, and nothing else.** `gather_context` used
+to shell out three times per launch - `netstat` for the default gateway,
+`ifconfig` for the subnet, and a DNS lookup - on the theory that a laptop's
+network stands in for "home or work". Nothing was ever built on it: no query,
+feature or view read those columns in the whole life of the program. They are
+dropped by migration, the way `running_processes` and `shell_history` were, and
+what remains needs no subprocess at all.
 
 **The log is bounded, with one generation.** `rotate_log_if_large` runs once at
 startup: past 8MB, `app.log` becomes `app.log.1` and logging starts a fresh file.
