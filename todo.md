@@ -4,32 +4,7 @@ Ordered by what a user would feel, then by risk removed. Every item ends with
 its own check. Read `llm.md` first: every change gets benchmarked against its
 parent, and a ranking change gets `./bench/model.py compare --seeds 5` as well.
 
-### 1. Predict is now most of the per-keystroke budget
-
-Ranking a 244-file query from `$HOME` costs 2.35ms, and **1.9-2.1ms of that is
-one `predict_with_params` call**. Feature computation, which used to be the
-expensive half, is 0.24ms. This is the cost of the ranking work in September:
-the lambdarank model settles at ~156 trees where the old classification one
-stopped at ~90, and predict is proportional to trees.
-
-Measured directly, on the real model and real feature rows,
-`num_threads` does nothing at all - 1.888, 1.896, 1.888, 1.889ms for 1, 2, 4 and
-8. The parameter is inert at this call site, so **P9 is answered: there is no
-threading win to take.** The only lever left is a smaller model.
-
-What to try, in order, measuring ranking quality *and* latency for each:
-
-- `learning_rate` 0.05 -> 0.1, which should roughly halve the tree count. If
-  top-1 holds within the seed noise, this is a straight 2x on predict.
-- `num_leaves` 31 -> 15. Smaller trees, shallower traversal.
-- A hard cap on `num_boost_round` for the refit, accepting whatever early
-  stopping asks for only up to that cap.
-
-This is a quality-for-latency trade, so it needs the quality number beside the
-latency number: `./bench/model.py compare --seeds 5` and `./bench/run.py startup`.
-Do not take a 2x on predict for a point of top-1 without saying so in the commit.
-
-### 2. B5. Train/serve skew on `is_dir`, and impressions that were never seen
+### 1. B5. Train/serve skew on `is_dir`, and impressions that were never seen
 
 Two separate things, both making the training data describe something other
 than what happened.
@@ -50,7 +25,7 @@ so a negative means "shown and not chosen" rather than "would have been shown".
 files are always under cwd - and having training compute it one way and
 inference another is the same class of skew. Drop the field.
 
-### 3. Click-through rate per file
+### 2. Click-through rate per file
 
 The one substantial feature idea left from the September review, and the only
 one that gives the model per-file memory of *negatives*. Impressions are the
@@ -78,7 +53,7 @@ with its own partial index or a counts table maintained at write time -
 Once `rank` (done) has accumulated history, this becomes position-debiased: an
 unclicked row at position 1 is a far stronger negative than one at position 24.
 
-### 4. P7 leftovers: the worker and tick loops
+### 3. P7 leftovers: the worker and tick loops
 
 The input thread is done - `tty_input.rs` blocks in `libc::poll` and is woken by
 a self-pipe. Two polling loops remain, and neither touches the terminal, so
@@ -97,7 +72,7 @@ Neither is a measurable CPU win - both binaries used 0.02s over 20s idle when
 this was checked - so do them for simplicity, and because the tick one is a
 prerequisite for the UI ever being genuinely idle.
 
-### 5. P11. app.log grows without bound
+### 4. P11. app.log grows without bound
 
 31MB when it was last measured, read start-to-finish by `internal analyze-perf`
 and `print-log`. Cutting the per-query lines 22x slowed the growth without
@@ -106,7 +81,7 @@ bounding it. Wants a size cap and one level of rotation (`app.log` ->
 `fern` has no rotation, so this is a custom `Dispatch` chain or a size check at
 startup.
 
-### 6. S7. `context.rs` still shells out three times per launch
+### 5. S7. `context.rs` still shells out three times per launch
 
 `gather_context` runs `netstat`, `ifconfig` and a DNS lookup through `sh -c` on
 every launch, and nothing reads gateway, subnet or dns - the columns survive in
@@ -114,7 +89,7 @@ every launch, and nothing reads gateway, subnet or dns - the columns survive in
 `shell_history`. Keep `cwd` and `timezone`, delete the other three and their
 columns, and the context thread stops needing to exist.
 
-### 7. S8, and the tests that only look like tests
+### 6. S8, and the tests that only look like tests
 
 `check_and_log_impressions` builds the 25-row Vec on every event before checking
 `already_logged`; check first.
@@ -126,7 +101,7 @@ additionally asserts a stale CSV header. Delete them or give them fixtures - the
 trained-model test (`search_worker.rs`) is the model to copy: it builds its own
 data, runs the real thing, and takes seven seconds.
 
-### 8. Smaller, still open
+### 7. Smaller, still open
 
 - **P10.** Cache query-independent features per registry entry. 12 of 20 features
   do not depend on the query. Irrelevant at 244 files and 0.24ms; it would

@@ -243,6 +243,12 @@ def compare(fixed_rounds=None, seed_count=1):
 
     new = [name for name in after_gains if name not in before_gains]
     gone = [name for name in before_gains if name not in after_gains]
+
+    if not new and not gone:
+        print("\nNote: both sides have the same features, and train.py is taken from the\n"
+              "working tree for both arms - so a change to the training parameters cannot\n"
+              "show up here. This mode compares feature sets. To compare parameters, train\n"
+              "one feature set twice with different params, as `objectives` does.")
     if new or gone:
         print()
     for name in new:

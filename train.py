@@ -255,8 +255,15 @@ def make_params(monotone_constraints):
         "lambdarank_truncation_level": 30,  # a screenful, not 243 rows
         "monotone_constraints": monotone_constraints,  # Added monotonicity
         "boosting_type": "gbdt",
-        "num_leaves": 31,
-        "learning_rate": 0.05,
+        # Smaller, shallower trees than the LightGBM defaults, because they are
+        # both better here and cheaper to evaluate. Swept over three seeds and
+        # three folds: 31 leaves at 0.05 gives 93 trees and 0.7754 top-1, while
+        # 15 leaves at 0.1 gives 67 trees and 0.7960. Predict is proportional to
+        # trees times depth and is most of the cost of ranking a query, so the
+        # smaller model is the faster one as well as the better one - the usual
+        # story when there are 1,200 positives to learn from.
+        "num_leaves": 15,
+        "learning_rate": 0.1,
         "feature_fraction": 0.9,
         "bagging_fraction": 0.8,
         "bagging_freq": 5,

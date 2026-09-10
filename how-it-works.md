@@ -1178,6 +1178,28 @@ from a cold uv cache: ~10s to resolve, install and run.
 - Objective: `lambdarank`, grouped by `episode_id`
 - Metric: NDCG at 1 and 5, with early stopping after 50 rounds without improvement
 - `lambdarank_truncation_level`: 30, about a screenful
+- `num_leaves`: 15, `learning_rate`: 0.1 - smaller and shallower than the
+  LightGBM defaults
+
+**Small trees, because they are better here and cheaper too.** Swept over three
+seeds and three folds:
+
+| | trees | top-1 | MRR |
+|---|---|---|---|
+| 31 leaves, lr 0.05 (the defaults) | 93 | 0.7754 | 0.8520 |
+| 15 leaves, lr 0.1 | **67** | **0.7960** | **0.8656** |
+| 15 leaves, lr 0.2 | 33 | 0.7942 | 0.8636 |
+| 7 leaves, lr 0.1 | 83 | 0.7965 | 0.8674 |
+
+Every smaller setting beat the default one on quality. That is what 1,200
+positives look like: a model with room for 31-leaf trees uses that room to
+memorise. And because predict is proportional to trees times depth, and predict
+had become 85% of the cost of ranking a query, the better model is also the fast
+one - `predict` went 1.99ms to 0.45ms and the whole filter-and-rank 2.33ms to
+0.83ms.
+
+`lr 0.2` shaves the tree count in half again for a difference in top-1 well
+inside the seed noise, and is there if the millisecond is ever wanted back.
 
 **The objective is a ranking one, because the question is a ranking one.**
 psychic asks "of the files on screen, which is the one" - never "what is the
@@ -2138,25 +2160,24 @@ and first results landed at 18% of walk-complete against 20% then.
 | steady: round trip | 1.73ms | 2.43ms | **1.4x slower** |
 | walk complete | 62.9ms | 75.7ms | **1.2x slower** |
 
-**The per-keystroke path got slower, and it was worth it.** The ranking work in
-September traded latency for quality twice over. `lambdarank` settles at about
-156 trees where the classification objective stopped at 90, and predict is
-proportional to trees; five more features add rows to every vector. That is
-2.06ms of a 2.43ms round trip - **prediction is now 85% of the cost of ranking a
-query**, where feature computation used to be the expensive half.
+**The per-keystroke path got slower, and then got it back.** The ranking work in
+September traded latency for quality: `lambdarank` settled at about 156 trees
+where the classification objective stopped at 90, and predict is proportional to
+trees. At that point predict was 2.06ms of a 2.43ms round trip - 85% of the cost
+of ranking a query, where feature computation used to be the expensive half.
 
-It bought seven points of top-1 from the objective alone. And the number the
-user actually feels, keystroke to redraw, is still three times better than
-before any of this, because the draw and the input thread gave back far more
-than the model took.
+Shrinking the trees took it back and then some. With 15 leaves at `lr 0.1` the
+model settles at ~70 trees, predict is 0.45ms, and the round trip is 0.91ms -
+below the 1.73ms it was before any of this work, with better ranking than
+either. The regression is gone; the seven points of top-1 the objective bought
+are not.
 
-Two things worth knowing before trying to win the 2ms back. `num_threads` on
-`predict_with_params` does nothing - measured on the real model and real feature
-rows at 1, 2, 4 and 8 threads: 1.888, 1.896, 1.888, 1.889ms. And synthetic
-feature values understate it badly, because they take short paths through the
-trees; the same benchmark on made-up numbers reported 0.96ms. The only lever
-left is a smaller model, which is a trade against ranking quality and belongs in
-`todo.md`, not in a quiet parameter change.
+One thing worth knowing before trying to win time back this way again.
+`num_threads` on `predict_with_params` does nothing - measured on the real model
+and real feature rows at 1, 2, 4 and 8 threads: 1.888, 1.896, 1.888, 1.889ms.
+And synthetic feature values understate predict badly, because they take short
+paths through the trees; the same benchmark on made-up numbers reported 0.96ms
+against a true 1.89ms.
 
 ### The benchmark harness: `bench/`
 
