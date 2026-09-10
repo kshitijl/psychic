@@ -1549,7 +1549,14 @@ impl Analytics {
 
 **Complex implementation:**
 - Subsession tracking (query changes create new subsessions)
-- 200ms impression debouncing (don't log on every keystroke)
+- 200ms impression debouncing (don't log on every keystroke). `wants_impressions`
+  answers that question and records the episode query; `log_impressions` writes
+  the rows. Split in two because most calls answer no - the query has already
+  been logged, or has not been on screen long enough - and the caller would
+  otherwise build a list of every visible row, two allocations each, before
+  finding out. The episode bookkeeping happens either way: a query typed on the
+  way to a click counts towards that click whether or not its own impressions
+  were logged.
 - Scroll deduplication (HashSet tracks scrolled files to avoid duplicates)
 - Episode tracking: `episode_queries` is every distinct query typed since the
   last engagement, so a click on the file the user reached by typing "tc", then

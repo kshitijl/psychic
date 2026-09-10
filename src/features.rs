@@ -605,28 +605,68 @@ mod tests {
     }
 
     #[test]
-    fn test_basic_feature_generation() {
-        use std::path::PathBuf;
+    fn test_generated_features_match_the_schema_the_trainer_reads() {
+        // This used to read a `test/events.db` that is not in the repository,
+        // return early when it was missing - which was always - and assert a
+        // header six columns long that the code stopped producing years ago. It
+        // builds its own database now, so it runs.
+        use crate::db::{Database, EventData, FileMetadata, UserInteraction};
 
-        let db_path = PathBuf::from("test/events.db");
-        if !db_path.exists() {
-            eprintln!("Skipping test - test/events.db not found");
-            return;
+        let dir = std::env::temp_dir().join(format!("psychic-feat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("events.db");
+
+        {
+            let db = Database::new(&db_path).unwrap();
+            let shown: Vec<FileMetadata> = ["alpha.rs", "beta.rs"]
+                .iter()
+                .map(|name| FileMetadata {
+                    relative_path: name.to_string(),
+                    full_path: format!("/test/{}", name),
+                    mtime: Some(1_700_000_000),
+                    atime: None,
+                    size: Some(100),
+                    is_dir: false,
+                })
+                .collect();
+            db.log_impressions("al", &shown, 1, "session-1").unwrap();
+            db.log_event(EventData {
+                query: "al",
+                file_path: "alpha.rs",
+                full_path: "/test/alpha.rs",
+                mtime: Some(1_700_000_000),
+                atime: None,
+                file_size: Some(100),
+                subsession_id: 1,
+                action: UserInteraction::Click,
+                session_id: "session-1",
+                episode_queries: None,
+                rank: None,
+                is_dir: Some(false),
+            })
+            .unwrap();
         }
 
-        let output_path = PathBuf::from("test/features_test.csv");
-        let schema_path = PathBuf::from("test/feature_schema_test.json");
-        generate_features(&db_path, &output_path, &schema_path, OutputFormat::Csv)
-            .expect("Failed to generate features");
+        let csv_path = dir.join("features.csv");
+        let schema_path = dir.join("feature_schema.json");
+        let summary =
+            generate_features(&db_path, &csv_path, &schema_path, OutputFormat::Csv).unwrap();
 
-        // Verify CSV was created
-        let csv_content = std::fs::read_to_string(&output_path).expect("Failed to read CSV");
-        let lines: Vec<&str> = csv_content.lines().collect();
+        let csv = std::fs::read_to_string(&csv_path).unwrap();
+        let mut lines = csv.lines();
 
-        assert!(!lines.is_empty(), "CSV should not be empty");
         assert_eq!(
-            lines[0],
-            "label,query,file_path,filename_starts_with_query,clicks_last_30_days,modified_today"
+            lines.next().unwrap(),
+            csv_columns().join(","),
+            "the header is the column list the trainer reads, not a copy of it"
         );
+        assert_eq!(summary.rows, 2, "one row per impression");
+        assert_eq!(summary.positives, 1, "the one that was clicked");
+
+        let labels: Vec<&str> = lines.map(|line| line.split(',').next().unwrap()).collect();
+        assert_eq!(labels, ["1", "0"], "the clicked row is the positive one");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

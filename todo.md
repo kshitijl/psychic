@@ -53,35 +53,7 @@ reason.
 The code is in `git show` for the commit that reverted it; rebuilding from
 that is an hour, and the measurement above is the thing worth keeping.
 
-### 2. S8, and the tests that only look like tests
-
-`check_and_log_impressions` builds the 25-row Vec on every event before checking
-`already_logged`; check first.
-
-`test_basic_feature_generation` returns early unless `test/events.db` exists and
-`test_ranker_basic` unless `output.txt` does. Neither file is in the repo, so
-both have always passed by doing nothing, and `test_basic_feature_generation`
-additionally asserts a stale CSV header. Delete them or give them fixtures - the
-trained-model test (`search_worker.rs`) is the model to copy: it builds its own
-data, runs the real thing, and takes seven seconds.
-
-### 4. Smaller, still open
-
-- **P10.** Cache query-independent features per registry entry. 12 of 20 features
-  do not depend on the query. Irrelevant at 244 files and 0.24ms; it would
-  matter at the 8,000 the shallow-mode threshold allows. Revisit only if
-  someone launches in a big-but-under-threshold tree and it feels slow.
-- **Feature: modified since last click** (binary, `mtime > last_click_ts`).
-  "Something changed here since you last looked." Cheap: both numbers are in
-  memory already.
-- **Feature: mentioned in recent shell commands.** Speculative, and needs
-  `context.rs` to store extracted path-like tokens rather than raw commands -
-  which is a privacy improvement in its own right. Do after the CTR work.
-- **Feature: git status flags.** `is_git_modified`, `is_git_untracked`. Strong
-  for developers, but needs a background `git status --porcelain` per repo at
-  walk time. Belongs with the gitignore machinery, which now exists.
-
-### 3. Check how fragile the September tuning is, and redo it in a year
+### 2. Check how fragile the September tuning is, and redo it in a year
 
 Every choice made in September - objective, tree size, learning rate, half-life,
 which features are in - was measured against one history at one moment: about a

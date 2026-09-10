@@ -371,6 +371,12 @@ impl App {
         let last_visible =
             (first_visible + self.visible_list_height as usize).min(self.total_results);
 
+        // Ask before building the list: most calls do not log, and the list
+        // costs two allocations per visible row.
+        if !self.analytics.wants_impressions(force) {
+            return Ok(());
+        }
+
         let mut top_n = Vec::new();
         for i in first_visible..last_visible {
             if let Some(display_info) = self.get_file_at_index(i) {
@@ -385,8 +391,7 @@ impl App {
             }
         }
 
-        // Delegate to analytics module
-        self.analytics.check_and_log_impressions(force, top_n)
+        self.analytics.log_impressions(top_n)
     }
 
     /// Ask for the preview of whatever is selected.

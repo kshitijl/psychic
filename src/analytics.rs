@@ -80,45 +80,42 @@ impl Analytics {
         &self.session_id
     }
 
-    /// Check if impressions should be logged and log them if so
-    /// - force: if true, log even if <200ms old
-    /// - Returns Ok(()) even if logging is disabled
-    pub fn check_and_log_impressions(
-        &mut self,
-        force: bool,
-        top_n_files: Vec<FileMetadata>,
-    ) -> Result<()> {
+    /// Record the current query as part of this episode, and say whether the
+    /// impressions of that query are worth collecting.
+    ///
+    /// Split from the logging so the caller does not have to build the row list
+    /// first. Most calls answer `false` - the query has already been logged, or
+    /// has not been on screen long enough - and the list is one clone of a path
+    /// and a display name per visible row, built on every event.
+    ///
+    /// The episode bookkeeping happens either way: a query the user typed on the
+    /// way to a click counts towards that click whether or not its own
+    /// impressions were logged.
+    pub fn wants_impressions(&mut self, force: bool) -> bool {
         if self.no_logging {
-            return Ok(());
+            return false;
         }
 
-        // Extract values we need before borrowing subsession mutably
-        let (subsession_id, subsession_query, created_at, already_logged) =
-            match &self.current_subsession {
-                Some(s) => (
-                    s.id,
-                    s.query.clone(),
-                    s.created_at,
-                    s.events_have_been_logged,
-                ),
-                None => return Ok(()),
-            };
+        let Some(subsession) = &self.current_subsession else {
+            return false;
+        };
+        let (created_at, already_logged) =
+            (subsession.created_at, subsession.events_have_been_logged);
+        let query = subsession.query.clone();
 
-        // Add query to episode (deduplicates automatically)
-        if !self.episode_queries.contains(&subsession_query) {
-            self.episode_queries.push(subsession_query.clone());
+        if !self.episode_queries.contains(&query) {
+            self.episode_queries.push(query);
         }
 
-        // Skip if already logged
-        if already_logged {
-            return Ok(());
-        }
+        !already_logged && (force || created_at.elapsed() >= IMPRESSION_AGE)
+    }
 
-        // Check if we should log: either forced or >200ms old
-        let should_log = force || created_at.elapsed() >= IMPRESSION_AGE;
-        if !should_log {
-            return Ok(());
-        }
+    /// Log the rows that were on screen. Call `wants_impressions` first.
+    pub fn log_impressions(&mut self, top_n_files: Vec<FileMetadata>) -> Result<()> {
+        let (subsession_id, subsession_query) = match &self.current_subsession {
+            Some(s) => (s.id, s.query.clone()),
+            None => return Ok(()),
+        };
 
         // Log impressions
         if !top_n_files.is_empty() {
@@ -229,9 +226,11 @@ mod episode_tests {
     fn typed(analytics: &mut Analytics, query: &str) {
         let id = analytics.next_subsession_id;
         analytics.new_subsession(id, query.to_string());
-        analytics
-            .check_and_log_impressions(true, shown("a.rs"))
-            .expect("impressions");
+        if analytics.wants_impressions(true) {
+            analytics
+                .log_impressions(shown("a.rs"))
+                .expect("impressions");
+        }
     }
 
     fn clicked(analytics: &mut Analytics) {
