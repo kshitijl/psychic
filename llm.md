@@ -23,7 +23,12 @@ After adding implementing a feature or fixing a bug:
 * run `cargo test`
 * also `cargo clippy`.
 * add new tests for the feature just added, if possible
-* update how-it-works.md so that it reflects current state.
+* **update how-it-works.md so that it reflects current state, in the same
+  commit.** Not "later", not a follow-up: a commit that changes behaviour and
+  leaves the document describing the old behaviour has made the document
+  actively misleading, which is worse than a gap. If the change is genuinely
+  invisible there - a test, a benchmark script, a comment - say so in the commit
+  message rather than leaving the reader to wonder whether it was forgotten.
 * **benchmark the change against the commit before it, and put the numbers in
   the commit message.**
 
