@@ -92,6 +92,19 @@ by expect tests in `search_worker.rs` and by `analyze_perf.rs`'s own tests, whic
 parse the same string back. Numbers are rounded to microseconds, which is past
 what `Instant` resolves and several times shorter than full f64 precision.
 
+**The log is bounded, with one generation.** `rotate_log_if_large` runs once at
+startup: past 8MB, `app.log` becomes `app.log.1` and logging starts a fresh file.
+Checked at launch rather than per write, because `fern` has no rotation and a
+size check per line would put a `stat` in front of every log call on the worker
+thread - once per launch is plenty for a file that grows by a few hundred
+kilobytes a day. It had reached 34.7MB before this existed.
+
+One generation, not a pile. The log is a debugging aid that `internal
+analyze-perf` and `print-log` read for the current session; the previous file is
+there for when something went wrong last time and psychic has since restarted.
+Both readers still open `app.log` only, so the rotated file is for reading by
+hand.
+
 `internal analyze-perf` reports the most recent **TUI** session, found by looking
 for the last `first_render` line. Every invocation logs under its own session id,
 including CLI subcommands like `retrain`, which emit no startup timings; anchoring

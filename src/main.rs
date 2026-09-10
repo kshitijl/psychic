@@ -196,6 +196,7 @@ fn main() -> Result<()> {
     if let Some(dir) = &data_dir {
         let _ = std::fs::create_dir_all(dir);
         let log_file = dir.join("app.log");
+        rotate_log_if_large(&log_file);
 
         // The session id is captured, not read from the environment on every
         // line. It also means nothing has to `set_var` before the threads
@@ -214,7 +215,7 @@ fn main() -> Result<()> {
                 ))
             })
             .level(log::LevelFilter::Debug)
-            .chain(fern::log_file(log_file).expect("Failed to open log file"))
+            .chain(fern::log_file(&log_file).expect("Failed to open log file"))
             .chain(log_tx)
             .apply()
             .expect("Failed to initialize logger");
@@ -653,6 +654,34 @@ fn main() -> Result<()> {
     result
 }
 
+/// Move `app.log` aside once it gets big, keeping one generation.
+///
+/// Checked at startup rather than on every write: `fern` has no rotation, and a
+/// size check per line would put a `stat` in front of every log call on the
+/// worker thread. Once per launch is enough for a file that grows by a few
+/// hundred kilobytes a day.
+///
+/// One generation, not many. The log is a debugging aid read by
+/// `internal analyze-perf` and `print-log`, both of which want the current
+/// session; the previous file is there for the case where something went wrong
+/// last time and psychic has since been restarted.
+fn rotate_log_if_large(log_file: &std::path::Path) {
+    const MAX_LOG_BYTES: u64 = 8 * 1024 * 1024;
+
+    let Ok(metadata) = std::fs::metadata(log_file) else {
+        return; // no log yet, which is the common case on a first launch
+    };
+    if metadata.len() < MAX_LOG_BYTES {
+        return;
+    }
+
+    let previous = log_file.with_extension("log.1");
+    if let Err(e) = std::fs::rename(log_file, &previous) {
+        // Not fatal: logging to an oversized file beats not starting.
+        eprintln!("Could not rotate {}: {}", log_file.display(), e);
+    }
+}
+
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<std::fs::File>>,
     app: &mut App,
@@ -921,3 +950,70 @@ fn run_app(
 }
 
 // Tests for path display functions moved to src/path_display.rs
+
+#[cfg(test)]
+mod log_rotation_tests {
+    use super::*;
+
+    fn dir(name: &str) -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("psychic-log-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn test_a_small_log_is_left_alone() {
+        let dir = dir("small");
+        let log = dir.join("app.log");
+        std::fs::write(&log, "one line\n").unwrap();
+
+        rotate_log_if_large(&log);
+
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "one line\n");
+        assert!(!dir.join("app.log.1").exists(), "nothing to rotate");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_a_big_log_moves_aside_and_the_next_launch_starts_clean() {
+        let dir = dir("big");
+        let log = dir.join("app.log");
+        std::fs::write(&log, vec![b'x'; 9 * 1024 * 1024]).unwrap();
+
+        rotate_log_if_large(&log);
+
+        assert!(!log.exists(), "the current log is out of the way");
+        assert_eq!(
+            std::fs::metadata(dir.join("app.log.1")).unwrap().len(),
+            9 * 1024 * 1024,
+            "and is kept as one previous generation"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_rotating_twice_keeps_only_the_previous_one() {
+        // One generation, not a growing pile: the older file is what gets
+        // overwritten, which is the point of bounding the log at all.
+        let dir = dir("twice");
+        let log = dir.join("app.log");
+
+        std::fs::write(&log, vec![b'a'; 9 * 1024 * 1024]).unwrap();
+        rotate_log_if_large(&log);
+        std::fs::write(&log, vec![b'b'; 9 * 1024 * 1024]).unwrap();
+        rotate_log_if_large(&log);
+
+        let kept = std::fs::read(dir.join("app.log.1")).unwrap();
+        assert_eq!(kept[0], b'b', "the newer of the two is the one kept");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_a_missing_log_is_not_an_error() {
+        let dir = dir("missing");
+        rotate_log_if_large(&dir.join("app.log")); // a first launch
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
