@@ -646,7 +646,10 @@ impl App {
         let max_scroll = padded_len.saturating_sub(width) as u16;
         let at_an_end = self.path_bar_scroll == 0 || self.path_bar_scroll >= max_scroll;
         let waited = self.last_path_bar_update.elapsed();
-        if waited <= if at_an_end { delay } else { speed } {
+        // `>=`, not `>`: the caller is the tick, so `waited` arrives in
+        // multiples of the tick interval. With a strict comparison a delay set
+        // to exactly one tick would wait for two.
+        if waited < if at_an_end { delay } else { speed } {
             return;
         }
 

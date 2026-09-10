@@ -152,12 +152,36 @@ Two things that fall out of sharing the channel:
 The `FilesChanged` debounce is safe without a timer because `AllDone` arrives at
 the end of every walk and always publishes, so a change cannot sit unannounced.
 
-**The tick only fires while something moves.** A tick is a full redraw, and the
-only thing on screen that animates is the path bar when the selected path is too
-long for it. The renderer reports `path_bar_overflows` in `FrameLayout`, the main
-loop stores it in an `AtomicBool`, and the tick thread stays quiet otherwise.
-Measured on an idle psychic: **5.8 writes a second to the terminal, down to
-0.2**.
+**The tick redraws at two rates.** A tick is a full redraw, so the tick rate is
+the rate the screen refreshes itself with nobody touching it.
+
+- **Every 200ms while the marquee is running**, or the scrolling stutters. The
+  renderer reports `path_bar_overflows` in `FrameLayout`, the main loop stores it
+  in an `AtomicBool`, and the tick thread reads it.
+- **Once a second otherwise**, because the list shows relative times and "2m ago"
+  is wrong a minute later. Before this the screen only redrew on events, so those
+  times sat frozen until the next keypress.
+
+It used to redraw five times a second unconditionally. Measured over a 60-second
+idle window:
+
+| | CPU | terminal writes |
+|---|---|---|
+| unconditional 5/s | 0.87s (1.45% of a core) | 523 |
+| silent when idle | 0.01s (0.02%) | 0 |
+| **1/s when idle** | **0.14s (0.23%)** | **80** |
+
+The middle row is what the tick change alone bought; the last is what keeping
+the clock honest costs back. Still six times cheaper than before, for a screen
+that stays truthful.
+
+`TICK_INTERVAL`, `MARQUEE_DELAY`, `MARQUEE_SPEED` and `TICKS_PER_IDLE_REDRAW` are
+constants in `main.rs`, and two tests hold them to their relationships: the
+marquee durations must be whole multiples of the tick, and the idle rate must
+come out at exactly one second. Those tests exist because the marquee constants
+had drifted into describing an animation the code could not produce - they read
+500ms and 80ms against a 200ms tick, so the 80ms was inert and the "0.5s pause"
+actually lasted 600ms.
 
 **Five that live for the session:**
 - **Main (UI)**: Renders UI, blocks on unified event channel, owns visible file slice only

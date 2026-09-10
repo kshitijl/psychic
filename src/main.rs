@@ -505,18 +505,32 @@ fn main() -> Result<()> {
     let tick_paused = app.tick_paused.clone();
     let something_animates = app.something_animates.clone();
     std::thread::spawn(move || {
+        let mut elapsed_ticks = 0u32;
         loop {
-            std::thread::sleep(Duration::from_millis(200));
+            std::thread::sleep(TICK_INTERVAL);
 
-            // Paused during editor and shell suspension, and quiet whenever
-            // nothing on screen is moving. A tick is a full redraw, so sending
-            // one with nothing to animate costs a redraw five times a second
-            // for as long as psychic sits open.
-            let idle = !something_animates.load(std::sync::atomic::Ordering::Relaxed);
-            let paused = tick_paused.load(std::sync::atomic::Ordering::Relaxed);
-            if paused || idle {
+            // Paused outright during editor and shell suspension: ticks would
+            // otherwise pile up in the channel and arrive in a burst on the way
+            // back.
+            if tick_paused.load(std::sync::atomic::Ordering::Relaxed) {
+                elapsed_ticks = 0;
                 continue;
             }
+
+            // A tick is a full redraw, so the rate is the rate the screen
+            // redraws itself with nobody touching it. While the marquee is
+            // running that has to be every tick or the scrolling stutters.
+            // Otherwise once a second, which is enough to keep the relative
+            // times in the list ("2m ago") honest as the clock moves - they
+            // used to update only when a key was pressed - and cheap enough not
+            // to matter.
+            elapsed_ticks += 1;
+            let animating = something_animates.load(std::sync::atomic::Ordering::Relaxed);
+            if !animating && elapsed_ticks < TICKS_PER_IDLE_REDRAW {
+                continue;
+            }
+            elapsed_ticks = 0;
+
             if tick_tx.send(AppEvent::Tick).is_err() {
                 break; // Main thread died, exit
             }
@@ -670,6 +684,30 @@ fn main() -> Result<()> {
 /// `internal analyze-perf` and `print-log`, both of which want the current
 /// session; the previous file is there for the case where something went wrong
 /// last time and psychic has since been restarted.
+/// How often the tick thread wakes.
+///
+/// The tick is what advances the marquee and what refreshes the relative times
+/// in the list ("2m ago"), so it is the granularity of every animation. Nothing
+/// else is keyed off it.
+const TICK_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Ticks between redraws when nothing is animating.
+///
+/// The screen still has to refresh slowly even at rest: the list shows relative
+/// times, and "2m ago" is wrong a minute later. Five ticks is one second, which
+/// keeps them honest at a fifth of the redraw rate the marquee needs.
+const TICKS_PER_IDLE_REDRAW: u32 = 5;
+
+/// How long the marquee pauses at each end of a path before turning round.
+const MARQUEE_DELAY: Duration = Duration::from_millis(600);
+
+/// How long the marquee waits between columns while scrolling.
+///
+/// Both marquee constants must be whole multiples of `TICK_INTERVAL`: the tick
+/// is the only thing that advances the marquee, so a value in between rounds up
+/// to the next tick. `marquee_constants_are_whole_ticks` checks that.
+const MARQUEE_SPEED: Duration = Duration::from_millis(200);
+
 fn rotate_log_if_large(log_file: &std::path::Path) {
     const MAX_LOG_BYTES: u64 = 8 * 1024 * 1024;
 
@@ -700,8 +738,8 @@ fn run_app(
     let mut first_query_complete_logged = false;
     let mut first_full_render_logged = false;
 
-    let marquee_delay = Duration::from_millis(500); // 0.5s pause at ends
-    let marquee_speed = Duration::from_millis(80); // scroll every 80ms
+    let marquee_delay = MARQUEE_DELAY;
+    let marquee_speed = MARQUEE_SPEED;
 
     loop {
         // Log impressions for this subsession if >200ms old
@@ -955,6 +993,44 @@ fn run_app(
 }
 
 // Tests for path display functions moved to src/path_display.rs
+
+#[cfg(test)]
+mod tick_tests {
+    use super::*;
+
+    #[test]
+    fn an_idle_redraw_lands_on_a_whole_second() {
+        // The list shows relative times, so the idle rate is really "how stale
+        // is 2m ago allowed to be". A second is the unit those are printed in.
+        assert_eq!(
+            TICK_INTERVAL * TICKS_PER_IDLE_REDRAW,
+            Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn marquee_constants_are_whole_ticks() {
+        // The tick is the only thing that advances the marquee, so a duration
+        // that is not a whole number of ticks describes an animation the code
+        // cannot produce. These once read 500ms and 80ms against a 200ms tick:
+        // the 80ms was inert - any value below one tick behaves the same - and
+        // the "0.5s pause" actually lasted 600ms.
+        for (name, value) in [
+            ("MARQUEE_DELAY", MARQUEE_DELAY),
+            ("MARQUEE_SPEED", MARQUEE_SPEED),
+        ] {
+            assert_eq!(
+                value.as_millis() % TICK_INTERVAL.as_millis(),
+                0,
+                "{} is {:?}, which is not a whole number of {:?} ticks",
+                name,
+                value,
+                TICK_INTERVAL
+            );
+            assert!(value >= TICK_INTERVAL, "{} is shorter than a tick", name);
+        }
+    }
+}
 
 #[cfg(test)]
 mod log_rotation_tests {
