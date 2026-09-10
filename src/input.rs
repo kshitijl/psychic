@@ -346,6 +346,7 @@ fn log_selection_click(app: &mut App, selection: &Selection) -> Result<()> {
         session_id: &session_id,
         episode_queries: None,
         rank: None, // not an impression
+        is_dir: Some(selection.is_dir),
     })
 }
 

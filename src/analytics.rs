@@ -221,6 +221,7 @@ mod episode_tests {
             mtime: Some(1_700_000_000),
             atime: None,
             size: Some(100),
+            is_dir: false,
         }]
     }
 
@@ -247,6 +248,7 @@ mod episode_tests {
                 session_id: "test-session",
                 episode_queries: None,
                 rank: None, // not an impression
+                is_dir: Some(false),
             })
             .expect("click");
     }

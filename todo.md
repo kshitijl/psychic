@@ -4,28 +4,7 @@ Ordered by what a user would feel, then by risk removed. Every item ends with
 its own check. Read `llm.md` first: every change gets benchmarked against its
 parent, and a ranking change gets `./bench/model.py compare --seeds 5` as well.
 
-### 1. B5. Train/serve skew on `is_dir`, and impressions that were never seen
-
-Two separate things, both making the training data describe something other
-than what happened.
-
-`is_dir` is computed at training time by stat-ing today's filesystem
-(`features.rs`, `full_path.is_dir()`), which is 80k syscalls per retrain and
-gets the answer wrong for anything since deleted or replaced. Add an `is_dir`
-column to events, set from `DisplayFileInfo.is_dir` at log time - it is known
-there - and read it back. Cannot be backfilled, so the sooner the better; the
-`rank` column (done 2026-09-10) is the pattern to copy, migration and all.
-
-Impressions log the top 25 rows by rank (`num_results_to_log_as_impressions`),
-not the rows actually on screen. `visible_list_height` is already known and
-already reported by the renderer in `FrameLayout`. Log exactly the visible rows,
-so a negative means "shown and not chosen" rather than "would have been shown".
-
-`is_from_walker` in `FeatureInputs` is redundant with `is_under_cwd` - walker
-files are always under cwd - and having training compute it one way and
-inference another is the same class of skew. Drop the field.
-
-### 2. Click-through rate per file
+### 1. Click-through rate per file
 
 The one substantial feature idea left from the September review, and the only
 one that gives the model per-file memory of *negatives*. Impressions are the
@@ -53,7 +32,7 @@ with its own partial index or a counts table maintained at write time -
 Once `rank` (done) has accumulated history, this becomes position-debiased: an
 unclicked row at position 1 is a far stronger negative than one at position 24.
 
-### 3. P7 leftovers: the worker and tick loops
+### 2. P7 leftovers: the worker and tick loops
 
 The input thread is done - `tty_input.rs` blocks in `libc::poll` and is woken by
 a self-pipe. Two polling loops remain, and neither touches the terminal, so
@@ -72,7 +51,7 @@ Neither is a measurable CPU win - both binaries used 0.02s over 20s idle when
 this was checked - so do them for simplicity, and because the tick one is a
 prerequisite for the UI ever being genuinely idle.
 
-### 4. P11. app.log grows without bound
+### 3. P11. app.log grows without bound
 
 31MB when it was last measured, read start-to-finish by `internal analyze-perf`
 and `print-log`. Cutting the per-query lines 22x slowed the growth without
@@ -81,7 +60,7 @@ bounding it. Wants a size cap and one level of rotation (`app.log` ->
 `fern` has no rotation, so this is a custom `Dispatch` chain or a size check at
 startup.
 
-### 5. S7. `context.rs` still shells out three times per launch
+### 4. S7. `context.rs` still shells out three times per launch
 
 `gather_context` runs `netstat`, `ifconfig` and a DNS lookup through `sh -c` on
 every launch, and nothing reads gateway, subnet or dns - the columns survive in
@@ -89,7 +68,7 @@ every launch, and nothing reads gateway, subnet or dns - the columns survive in
 `shell_history`. Keep `cwd` and `timezone`, delete the other three and their
 columns, and the context thread stops needing to exist.
 
-### 6. S8, and the tests that only look like tests
+### 5. S8, and the tests that only look like tests
 
 `check_and_log_impressions` builds the 25-row Vec on every event before checking
 `already_logged`; check first.
@@ -101,7 +80,7 @@ additionally asserts a stale CSV header. Delete them or give them fixtures - the
 trained-model test (`search_worker.rs`) is the model to copy: it builds its own
 data, runs the real thing, and takes seven seconds.
 
-### 7. Smaller, still open
+### 6. Smaller, still open
 
 - **P10.** Cache query-independent features per registry entry. 12 of 20 features
   do not depend on the query. Irrelevant at 244 files and 0.24ms; it would

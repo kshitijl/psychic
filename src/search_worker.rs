@@ -703,7 +703,6 @@ impl WorkerState {
                     full_path: &file_info.full_path,
                     mtime: file_info.mtime,
                     file_size: file_info.file_size,
-                    is_from_walker: file_info.origin == FileOrigin::CwdWalker,
                     is_dir: file_info.is_dir,
                     fuzzy_score,
                 }
@@ -1718,6 +1717,7 @@ mod reload_tests {
             session_id: "session-1",
             episode_queries: None,
             rank: None, // not an impression
+            is_dir: Some(false),
         })
         .expect("log the click");
 
@@ -1839,6 +1839,7 @@ mod fresh_install_tests {
                 mtime: Some(1_700_000_000),
                 atime: None,
                 size: Some(100),
+                is_dir: false,
             },
             crate::db::FileMetadata {
                 relative_path: "beta.rs".to_string(),
@@ -1846,6 +1847,7 @@ mod fresh_install_tests {
                 mtime: Some(1_700_000_000),
                 atime: None,
                 size: Some(100),
+                is_dir: false,
             },
         ];
         db.log_impressions("al", &seen, 1, "session-1").unwrap();
@@ -1861,6 +1863,7 @@ mod fresh_install_tests {
             session_id: "session-1",
             episode_queries: None,
             rank: None, // not an impression
+            is_dir: Some(false),
         })
         .unwrap();
 
@@ -1902,6 +1905,7 @@ mod fresh_install_tests {
                 mtime: None,
                 atime: None,
                 size: None,
+                is_dir: false,
             }],
             1,
             "session-1",
@@ -1969,6 +1973,7 @@ mod trained_model_tests {
                     mtime: Some(1_700_000_000),
                     atime: None,
                     size: Some(100 + n as i64),
+                    is_dir: false,
                 })
                 .collect();
             db.log_impressions("fi", &shown, i as u64, "session-1")
@@ -1985,6 +1990,7 @@ mod trained_model_tests {
                 session_id: "session-1",
                 episode_queries: None,
                 rank: None, // not an impression
+                is_dir: Some(false),
             })
             .unwrap();
         }
@@ -2026,7 +2032,6 @@ mod trained_model_tests {
                 full_path,
                 mtime: Some(1_700_000_000),
                 file_size: Some(100),
-                is_from_walker: true,
                 is_dir: false,
                 fuzzy_score: 50,
             })

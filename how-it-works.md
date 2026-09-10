@@ -257,9 +257,26 @@ This ensures that both the UI and the worker can safely discard stale messages, 
 
 ### Module: `db.rs`
 
-**Impressions record where they were shown.** `events.rank` is the row's
-position in the list, counting from 1, and it is set only for impressions -
-a click has no position because a click is not a list. It matters because a row
+**Impressions are the rows that were on screen.** Not the top 25, which is what
+they used to be: `check_and_log_impressions` walks
+`file_list_scroll .. file_list_scroll + visible_list_height`, the window the
+renderer actually drew. An impression is the model's only evidence that
+something was *shown and passed over*, so a fixed 25 both invented negatives
+below the fold on a short terminal and missed real ones below row 25 on a tall
+one. Before the first frame nothing has been seen and nothing is logged -
+`visible_list_height` is 0 until the renderer reports it in `FrameLayout`.
+
+**Impressions record where they were shown, and what they were.**
+`events.rank` is the row's position in the list, counting from 1, and it is set
+only for impressions - a click has no position because a click is not a list.
+`events.is_dir` is what the row was at the moment it was shown.
+
+`is_dir` is recorded rather than looked up because training used to answer it by
+stat-ing the path during feature generation - today's filesystem answering a
+question about last March, wrong for anything since deleted or replaced, and a
+syscall per row across 80k rows. Rows written before the column exists keep
+`NULL` and still fall back to that `stat`, so the old answer ages out as history
+accumulates rather than needing a migration that cannot be written. It matters because a row
 nobody clicked at position 1 is a far stronger "no" than the same row at
 position 24, which may never have been looked at, and today the training data
 treats those two identically.
@@ -963,6 +980,14 @@ This is the one signal a directory row had nothing to say about before.
 a place I work" is the whole question, every existing feature was answering a
 different one. The data was already being collected and read by nothing: 2,312
 visits across 130 directories, against 1,165 clicks across 132 paths.
+
+**`is_under_cwd` is one prefix check, on both sides.** `FeatureInputs` used to
+carry an `is_from_walker` flag that the feature short-circuited on, because a
+walked file is always under the current directory. True, but it meant inference
+read a flag where training did a prefix check - two ways of computing one
+feature, which is the shape train/serve skew takes. Every path in the registry
+is canonical, so the check is exact and cheap. Verified by generating the
+training CSV before and after: byte for byte identical.
 
 **Query-specific features:** The `clicks_for_this_query` feature tracks clicks for specific (query, file) pairs. This distinguishes between files clicked for different search contexts - e.g., a file clicked 10 times for query "config" vs 0 times for query "test" is more relevant for "config" searches.
 Why: General click counts don't capture query-specific relevance. A frequently clicked file for one query may be irrelevant for another.

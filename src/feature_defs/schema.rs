@@ -46,7 +46,6 @@ pub struct FeatureInputs<'a> {
     /// The same, for engagements anywhere in an episode containing this query.
     pub engagements_for_query: Option<&'a FxHashMap<String, Vec<ClickEvent>>>,
     pub current_timestamp: i64,
-    pub is_from_walker: bool,
     pub is_dir: bool,
     /// How well the file matched the query, as the caller already computed it.
     /// Inference gets it from the filter, which has just done this match;

@@ -40,6 +40,9 @@ pub struct FileMetadata {
     pub mtime: Option<i64>,
     pub atime: Option<i64>,
     pub size: Option<i64>,
+    /// What the row was when it was shown. Recorded rather than looked up
+    /// later: by training time the path may be gone or may be something else.
+    pub is_dir: bool,
 }
 
 /// A snapshot of what the database holds, for the debug pane.
@@ -91,6 +94,9 @@ pub struct EventData<'a> {
     /// Where this row sat in the list, counting from 1, when it was shown.
     /// `None` for anything that is not an impression.
     pub rank: Option<usize>,
+    /// Whether the path was a directory when the user saw it. `None` only for
+    /// rows written before this column existed.
+    pub is_dir: Option<bool>,
 }
 
 /// Databases whose schema this process has already set up.
@@ -180,7 +186,8 @@ impl Database {
                 action TEXT NOT NULL,
                 session_id TEXT NOT NULL,
                 episode_queries TEXT,
-                rank INTEGER
+                rank INTEGER,
+                is_dir INTEGER
             )",
             [],
         )?;
@@ -252,6 +259,15 @@ impl Database {
         if !event_columns.iter().any(|name| name == "rank") {
             log::info!("Adding events.rank for impression positions");
             conn.execute("ALTER TABLE events ADD COLUMN rank INTEGER", [])?;
+        }
+
+        // Whether the row was a directory, as the UI knew it at the time.
+        // Training used to answer this by stat-ing the path during feature
+        // generation, which is today's filesystem answering a question about
+        // last March. Old rows keep NULL and fall back to the stat.
+        if !event_columns.iter().any(|name| name == "is_dir") {
+            log::info!("Adding events.is_dir");
+            conn.execute("ALTER TABLE events ADD COLUMN is_dir INTEGER", [])?;
         }
 
         // The old index covered every row, and 96% of them are impressions
@@ -334,8 +350,8 @@ impl Database {
         };
 
         self.conn.prepare_cached(
-            "INSERT INTO events (timestamp, query, file_path, full_path, mtime, atime, file_size, subsession_id, action, session_id, episode_queries, rank)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "INSERT INTO events (timestamp, query, file_path, full_path, mtime, atime, file_size, subsession_id, action, session_id, episode_queries, rank, is_dir)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         )?.execute(
             params![
                 timestamp,
@@ -349,7 +365,8 @@ impl Database {
                 action,
                 event.session_id,
                 event.episode_queries,
-                event.rank
+                event.rank,
+                event.is_dir
             ],
         )?;
 
@@ -384,6 +401,7 @@ impl Database {
                 mtime,
                 atime,
                 size,
+                is_dir,
             },
         ) in file_paths.iter().enumerate()
         {
@@ -399,6 +417,7 @@ impl Database {
                 session_id,
                 episode_queries: None,
                 rank: Some(position + 1), // as the user counts them
+                is_dir: Some(*is_dir),
             })?;
         }
 
@@ -754,6 +773,7 @@ mod rank_tests {
                 mtime: Some(1_700_000_000),
                 atime: None,
                 size: Some(100),
+                is_dir: false,
             })
             .collect()
     }
@@ -800,6 +820,7 @@ mod rank_tests {
             session_id: "s",
             episode_queries: None,
             rank: None,
+            is_dir: Some(false),
         })
         .unwrap();
 
@@ -810,6 +831,40 @@ mod rank_tests {
             })
             .unwrap();
         assert_eq!(rank, None);
+    }
+
+    #[test]
+    fn test_impressions_record_what_the_row_was_when_it_was_shown() {
+        // Not looked up later: by training time the path may be gone, or may be
+        // a file where a directory used to be.
+        let db = Database::new(Path::new(":memory:")).unwrap();
+        let mut rows = shown(&["notes.md"]);
+        rows.push(FileMetadata {
+            relative_path: "src".to_string(),
+            full_path: "/tmp/src".to_string(),
+            mtime: Some(1_700_000_000),
+            atime: None,
+            size: None,
+            is_dir: true,
+        });
+        db.log_impressions("q", &rows, 1, "s").unwrap();
+
+        let recorded: Vec<(String, Option<i64>)> = db
+            .conn
+            .prepare("SELECT file_path, is_dir FROM events ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+
+        assert_eq!(
+            recorded,
+            vec![
+                ("notes.md".to_string(), Some(0)),
+                ("src".to_string(), Some(1)),
+            ]
+        );
     }
 
     #[test]

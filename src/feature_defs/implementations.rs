@@ -162,13 +162,11 @@ impl Feature for IsUnderCwd {
     }
 
     fn compute(&self, inputs: &FeatureInputs) -> f64 {
-        // Files from walker are guaranteed to be under cwd
-        if inputs.is_from_walker {
-            return 1.0;
-        }
-
-        // Historical files have already been canonicalized at startup
-        // so we can do a simple prefix check
+        // One prefix check, both sides. There used to be an `is_from_walker`
+        // short-circuit here, on the grounds that a walked file is always under
+        // cwd - true, but it made inference read a flag where training did the
+        // prefix check, which is one more place the two could drift apart. Every
+        // path in the registry is canonical, so the check is cheap and exact.
         if inputs.full_path.starts_with(inputs.cwd) {
             1.0
         } else {
@@ -707,7 +705,6 @@ mod tests {
             clicks_for_query: None,
             engagements_for_query: None,
             current_timestamp: NOW,
-            is_from_walker: true,
             is_dir,
             fuzzy_score: 0,
         }

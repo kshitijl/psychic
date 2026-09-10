@@ -25,7 +25,6 @@ pub struct FileCandidate<'a> {
     pub full_path: &'a Path,
     pub mtime: Option<i64>,
     pub file_size: Option<i64>,
-    pub is_from_walker: bool,
     pub is_dir: bool,
     pub fuzzy_score: i64, // Score from fuzzy matcher (higher = better match)
 }
@@ -778,7 +777,6 @@ fn compute_features_into(
         clicks_for_query: clicks.clicks_for_query,
         engagements_for_query: clicks.engagements_for_query,
         current_timestamp,
-        is_from_walker: file.is_from_walker,
         is_dir: file.is_dir,
         fuzzy_score: file.fuzzy_score,
     };
@@ -1026,7 +1024,6 @@ mod tests {
             full_path: &test_path,
             mtime: Some(1234567890),
             file_size: Some(2048),
-            is_from_walker: true,
             is_dir: false,
             fuzzy_score: 100,
         }];
@@ -1074,7 +1071,6 @@ mod tests {
             full_path: &PathBuf::from("/tmp/foo/bar.txt"),
             mtime: Some(1700000000i64), // Nov 14, 2023
             file_size: Some(12_288),
-            is_from_walker: true,
             is_dir: false,
             // What the filter would have produced for this pair: "foo/bar.txt"
             // does not match "test", so the matcher returns None and the
@@ -1237,7 +1233,6 @@ mod tests {
                 full_path,
                 mtime: Some(1_700_500_000),
                 file_size: Some(size),
-                is_from_walker: true,
                 is_dir: false,
                 fuzzy_score: 50,
             })
@@ -1488,7 +1483,6 @@ mod tests {
             full_path: &PathBuf::from("/tmp/popular.txt"),
             mtime: Some(1700500000), // Recent (1.2 days ago)
             file_size: Some(1024),
-            is_from_walker: true,
             is_dir: false,
             fuzzy_score: 100,
         };
@@ -1513,7 +1507,6 @@ mod tests {
             full_path: &PathBuf::from("/tmp/recent.txt"),
             mtime: Some(1700500000), // Recent
             file_size: Some(2048),
-            is_from_walker: true,
             is_dir: false,
             fuzzy_score: 100,
         };
@@ -1538,7 +1531,6 @@ mod tests {
             full_path: &PathBuf::from("/tmp/old.txt"),
             mtime: Some(1600000000), // Very old
             file_size: Some(512),
-            is_from_walker: true,
             is_dir: false,
             fuzzy_score: 100,
         };
@@ -1601,7 +1593,6 @@ mod tests {
             full_path: &PathBuf::from("/tmp/foo.txt"),
             mtime: Some(1700500000), // Recent (1 day ago)
             file_size: Some(1024),
-            is_from_walker: true,
             is_dir: false,
             fuzzy_score: 100,
         };
@@ -1628,7 +1619,6 @@ mod tests {
             full_path: &PathBuf::from("/tmp/bar.txt"),
             mtime: Some(1600000000), // Very old
             file_size: Some(2048),
-            is_from_walker: true,
             is_dir: false,
             fuzzy_score: 100,
         };
@@ -1694,7 +1684,6 @@ mod tests {
                 full_path: &popular,
                 mtime: Some(1700000000),
                 file_size: Some(1024),
-                is_from_walker: true,
                 is_dir: false,
                 fuzzy_score: 100,
             },
@@ -1704,7 +1693,6 @@ mod tests {
                 full_path: &recent,
                 mtime: Some(1700600000), // Very recent
                 file_size: Some(2048),
-                is_from_walker: true,
                 is_dir: false,
                 fuzzy_score: 100,
             },

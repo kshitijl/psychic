@@ -356,7 +356,8 @@ fn main() -> Result<()> {
                     action: db::UserInteraction::StartupVisit,
                     session_id: &session_id,
                     episode_queries: None,
-                    rank: None, // not an impression
+                    rank: None,         // not an impression
+                    is_dir: Some(true), // a visit is always to a directory
                 })?;
 
                 return Ok(());
@@ -559,7 +560,8 @@ fn main() -> Result<()> {
                     action: db::UserInteraction::StartupVisit,
                     session_id: &session_id_clone,
                     episode_queries: None,
-                    rank: None, // not an impression
+                    rank: None,         // not an impression
+                    is_dir: Some(true), // a visit is always to a directory
                 }) {
                     Ok(_) => log::info!("Logged startup visit for {}", root_clone.display()),
                     Err(e) => log::error!("Failed to log startup visit: {:?}", e),
@@ -732,6 +734,7 @@ fn run_app(
         // Take what only the layout knew, now that the frame is drawn.
         if let Some(layout) = frame_layout {
             app.path_bar_width = layout.path_bar_width;
+            app.visible_list_height = layout.visible_list_height;
             app.update_scroll(layout.visible_list_height, layout.file_list_scroll);
         }
 

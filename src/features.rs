@@ -28,6 +28,9 @@ struct Event {
     file_size: Option<i64>,
     action: String,
     episode_queries: Option<String>, // JSON array of queries in this episode
+    /// What the row was when the user saw it, as the UI recorded it. `None` for
+    /// rows written before the column existed, which fall back to a `stat`.
+    is_dir: Option<bool>,
 }
 
 // Output format enum
@@ -311,7 +314,7 @@ pub fn generate_features(
 
 fn fetch_all_events(conn: &Connection) -> Result<Vec<Event>> {
     let mut stmt = conn.prepare(
-        "SELECT session_id, subsession_id, query, file_path, full_path, timestamp, mtime, file_size, action, episode_queries FROM events ORDER BY timestamp, id",
+        "SELECT session_id, subsession_id, query, file_path, full_path, timestamp, mtime, file_size, action, episode_queries, is_dir FROM events ORDER BY timestamp, id",
     )?;
     let event_iter = stmt.query_map([], |row| {
         Ok(Event {
@@ -325,6 +328,7 @@ fn fetch_all_events(conn: &Connection) -> Result<Vec<Event>> {
             file_size: row.get(7)?,
             action: row.get(8)?,
             episode_queries: row.get(9)?,
+            is_dir: row.get::<_, Option<i64>>(10)?.map(|flag| flag != 0),
         })
     })?;
 
@@ -381,10 +385,13 @@ fn compute_features_from_accumulator(
 
     // Check if file is under cwd - files under cwd at impression time would have come from walker
     let full_path = Path::new(&impression.full_path);
-    let is_from_walker = full_path.starts_with(cwd);
 
-    // Check if this is a directory (best effort - check if path exists and is dir)
-    let is_dir = full_path.is_dir();
+    // What the row was when the user saw it. Recorded on the event since
+    // 2026-09-10; before that there is nothing to read, and the best available
+    // answer is today's filesystem - which is wrong for anything since deleted
+    // or replaced, and costs a syscall per row. Rows keep arriving with the
+    // column set, so this fallback ages out on its own.
+    let is_dir = impression.is_dir.unwrap_or_else(|| full_path.is_dir());
 
     let inputs = FeatureInputs {
         query: &impression.query,
@@ -403,7 +410,6 @@ fn compute_features_from_accumulator(
             .engagements_by_episode_query_and_file
             .get(&impression.query),
         current_timestamp: impression.timestamp,
-        is_from_walker,
         is_dir,
         // Inference reuses the score the filter already computed; training has
         // no filter, so it does the same match here - against the same string,
@@ -480,6 +486,7 @@ mod tests {
                 file_size: Some(100),
                 action: "impression".to_string(),
                 episode_queries: None,
+                is_dir: None,
             },
             Event {
                 session_id: "s1".to_string(),
@@ -492,6 +499,7 @@ mod tests {
                 file_size: Some(100),
                 action: "click".to_string(),
                 episode_queries: None,
+                is_dir: None,
             },
             Event {
                 session_id: "s1".to_string(),
@@ -504,6 +512,7 @@ mod tests {
                 file_size: Some(100),
                 action: "impression".to_string(),
                 episode_queries: None,
+                is_dir: None,
             },
         ];
 

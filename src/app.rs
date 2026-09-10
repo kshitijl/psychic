@@ -77,8 +77,6 @@ pub struct App {
     pub history: history::History,
     pub history_selected: usize, // Selected item in history mode UI
 
-    pub num_results_to_log_as_impressions: usize,
-
     // For marquee path bar
     pub path_bar_scroll: u16,
     pub path_bar_scroll_direction: i8,
@@ -86,6 +84,10 @@ pub struct App {
     /// Width of the path bar as the last frame laid it out. Only the renderer
     /// knows it, and the marquee cannot advance without it.
     pub path_bar_width: u16,
+    /// Rows of file list the last frame drew. Like `path_bar_width`, only the
+    /// renderer knows it - and impressions are the rows that were on screen,
+    /// which cannot be known without it.
+    pub visible_list_height: u16,
 
     // For debug pane
     pub model_stats_cache: Option<ranker::ModelStats>, // Cached from worker, refreshed periodically
@@ -197,10 +199,10 @@ impl App {
             cwd: root.clone(),
             history: history::History::new(root),
             history_selected: 0,
-            num_results_to_log_as_impressions: 25,
             path_bar_scroll: 0,
             path_bar_scroll_direction: 1,
             path_bar_width: 0,
+            visible_list_height: 0,
             last_path_bar_update: Instant::now(),
             model_stats_cache: None,
             currently_retraining: false,
@@ -348,13 +350,23 @@ impl App {
         page.files.get(offset_in_page)
     }
 
+    /// Log the rows that were on screen as impressions.
+    ///
+    /// The rows on screen, not the top 25: an impression is the model's only
+    /// evidence that something was *shown and passed over*, and a row the user
+    /// never saw is not that. It used to log a fixed 25 from the top, which both
+    /// invented negatives below the fold on a short terminal and missed real
+    /// ones below row 25 on a tall one.
+    ///
+    /// Before the first frame is drawn nothing has been seen, so nothing is
+    /// logged - `visible_list_height` is 0 until the renderer reports it.
     pub fn check_and_log_impressions(&mut self, force: bool) -> Result<()> {
-        // Collect top N visible files with metadata from page cache
+        let first_visible = self.file_list_scroll;
+        let last_visible =
+            (first_visible + self.visible_list_height as usize).min(self.total_results);
+
         let mut top_n = Vec::new();
-        for i in 0..self
-            .num_results_to_log_as_impressions
-            .min(self.total_results)
-        {
+        for i in first_visible..last_visible {
             if let Some(display_info) = self.get_file_at_index(i) {
                 top_n.push(FileMetadata {
                     relative_path: display_info.display_name.clone(),
@@ -362,6 +374,7 @@ impl App {
                     mtime: display_info.mtime,
                     atime: display_info.atime,
                     size: display_info.file_size,
+                    is_dir: display_info.is_dir,
                 });
             }
         }
@@ -498,6 +511,7 @@ impl App {
             let mtime = display_info.mtime;
             let atime = display_info.atime;
             let file_size = display_info.file_size;
+            let is_dir = display_info.is_dir;
             let query = self.query.clone();
 
             // Now we can safely borrow analytics
@@ -518,6 +532,7 @@ impl App {
                     session_id: &session_id,
                     episode_queries: None,
                     rank: None, // not an impression
+                    is_dir: Some(is_dir),
                 },
             )?;
         }
@@ -551,10 +566,10 @@ impl App {
             cwd: root.clone(),
             history: history::History::new(root),
             history_selected: 0,
-            num_results_to_log_as_impressions: 25,
             path_bar_scroll: 0,
             path_bar_scroll_direction: 1,
             path_bar_width: 0,
+            visible_list_height: 0,
             last_path_bar_update: Instant::now(),
             model_stats_cache: None,
             currently_retraining: false,
@@ -712,6 +727,116 @@ impl App {
                 });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod impression_tests {
+    //! Impressions are the rows that were on screen.
+    //!
+    //! They are the model's only evidence that something was shown and passed
+    //! over, so logging a row nobody saw invents a negative, and missing one
+    //! they did see loses a real one.
+
+    use super::*;
+
+    fn app_showing(total: usize) -> App {
+        let mut app = App::for_test();
+        app.total_results = total;
+        app.page_cache.insert(
+            0,
+            Page {
+                start_index: 0,
+                end_index: total,
+                files: (0..total)
+                    .map(|i| crate::search_worker::DisplayFileInfo {
+                        display_name: format!("file{}.rs", i),
+                        full_path: PathBuf::from(format!("/tmp/file{}.rs", i)),
+                        score: 0.0,
+                        features: Vec::new(),
+                        mtime: None,
+                        atime: None,
+                        file_size: None,
+                        is_dir: false,
+                        is_cwd: false,
+                        is_historical: false,
+                        is_under_cwd: true,
+                        simple_score: None,
+                        ml_score: None,
+                        simple_weight: None,
+                        ml_weight: None,
+                        fuzzy_score: 0,
+                    })
+                    .collect(),
+            },
+        );
+        app
+    }
+
+    /// The rows `check_and_log_impressions` would log, by name.
+    fn would_log(app: &App) -> Vec<String> {
+        let first = app.file_list_scroll;
+        let last = (first + app.visible_list_height as usize).min(app.total_results);
+        (first..last)
+            .filter_map(|i| app.get_file_at_index(i))
+            .map(|f| f.display_name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn test_nothing_is_logged_before_a_frame_has_been_drawn() {
+        // visible_list_height is 0 until the renderer reports it, and a row
+        // that has not been drawn has not been seen.
+        let app = app_showing(50);
+        assert!(would_log(&app).is_empty());
+    }
+
+    #[test]
+    fn test_a_short_terminal_logs_only_what_fits() {
+        let mut app = app_showing(50);
+        app.visible_list_height = 8;
+
+        assert_eq!(
+            would_log(&app).len(),
+            8,
+            "eight rows on screen, eight logged"
+        );
+        assert_eq!(would_log(&app)[0], "file0.rs");
+    }
+
+    #[test]
+    fn test_a_tall_terminal_logs_past_the_old_limit_of_25() {
+        let mut app = app_showing(50);
+        app.visible_list_height = 40;
+
+        assert_eq!(
+            would_log(&app).len(),
+            40,
+            "forty rows were on screen; the old code logged 25 of them"
+        );
+    }
+
+    #[test]
+    fn test_scrolling_moves_the_window_rather_than_the_top() {
+        let mut app = app_showing(50);
+        app.visible_list_height = 10;
+        app.file_list_scroll = 20;
+
+        let logged = would_log(&app);
+        assert_eq!(logged.first().unwrap(), "file20.rs");
+        assert_eq!(logged.last().unwrap(), "file29.rs");
+    }
+
+    #[test]
+    fn test_the_window_stops_at_the_last_result() {
+        let mut app = app_showing(3);
+        app.visible_list_height = 40;
+
+        assert_eq!(
+            would_log(&app).len(),
+            3,
+            "no rows invented below the results"
+        );
     }
 }
 
