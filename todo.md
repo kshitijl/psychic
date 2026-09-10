@@ -117,6 +117,30 @@ data, runs the real thing, and takes seven seconds.
   for developers, but needs a background `git status --porcelain` per repo at
   walk time. Belongs with the gitignore machinery, which now exists.
 
+### 6. Check how fragile the September tuning is, and redo it in a year
+
+Every choice made in September - objective, tree size, learning rate, half-life,
+which features are in - was measured against one history at one moment: about a
+year of one person's clicks, 1,200 of them. how-it-works.md has the table of
+what was chosen and what it beat, under "Where these choices came from".
+
+**The experiment that has not been run.** Take windows of the history - last
+week, last month, last six months - and slide each along the timeline, redoing
+the key comparisons inside each. A choice that wins in every window is a
+property of the problem; one that only wins in the windows with a few hundred
+clicks is a property of *this much* data. `bench/model.py` already takes a CSV
+and a set of folds, and restricting to a window is a filter on `episode_id`, so
+this is the same shape as the rolling-origin folds it already runs.
+
+Most likely to be window-dependent, in order: `num_leaves` and `learning_rate`
+(more data supports a bigger model), the 180-day half-life (this history is
+back-loaded - 54% of rows are 240+ days old - so "old" means something unusual
+here), and click-through rate, rejected partly for having too thin a base.
+
+**And redo the tuning after another year of use.** By late 2027 the database
+should hold several times the clicks it does now, which is the axis these
+choices are most sensitive to.
+
 ## measurement discipline
 
 Three things this repo learned the hard way in September. All three are in

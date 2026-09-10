@@ -1182,6 +1182,60 @@ remains is all in `tty_input.rs`, where `libc::poll`, `isatty` and `close` are
 called on raw descriptors.
 Why: LightGBM Booster contains raw pointers (not Send by default). Safe because model is read-only.
 
+### Where these choices came from, and when to stop trusting them
+
+Everything in this section - the objective, the tree size, the learning rate,
+the half-life, which features are in and which were tried and dropped - was
+chosen by measuring against **one person's click history, about a year of it,
+as it stood in September 2026**: roughly 1,200 clicks, 85,000 impressions,
+2,300 directory visits, 1,800 episodes. They are findings about that data. They
+are not laws.
+
+What was tuned, and what the answer was:
+
+| choice | settled on | what it beat |
+|---|---|---|
+| objective | `lambdarank`, grouped by episode | `binary`, by 7 points of top-1 |
+| `num_leaves` | 15 | 31, the default, by 2 points |
+| `learning_rate` | 0.1 | 0.05, the default |
+| split | by time, 80/10/10 on episode id | a random split, which leaked |
+| shipped model | refit on every row | the validated fit, by 3 points of top-1 |
+| recency weighting | 180-day half-life | uniform, by choice: it *costs* 2 points |
+| blend gate | `num_positive_examples` | clicks in the last 30 days |
+| file size | `log2(1 + bytes)` | raw bytes, though the model cannot tell |
+
+Features kept: `visits_last_7_days`, `visits_last_30_days`,
+`seconds_since_last_click`, `seconds_since_last_click_parent_dir`,
+`extension_click_share`. Features built, measured and dropped: `query_length`,
+clicks under a directory, visits inherited by the files inside a directory,
+per-query clicks by directory, depth below cwd, click-through rate. The
+reasoning for each is in `todo.md`, and the measurements are in the commits.
+
+**Why this is worth doubting.** Every one of those comparisons is a single
+history at a single moment. A smaller history would favour a smaller model; a
+much larger one might justify 31-leaf trees again. Someone who navigates mostly
+by `cd` would get more from the visit features than this data shows; someone who
+never uses the shell hook would get nothing from them. The 180-day half-life is
+tuned against a history that happens to be back-loaded - 54% of rows are 240+
+days old - and would mean something different on an evenly used year.
+
+**The experiment that would tell us how fragile these are**, and which has not
+been run: take windows of the history - the last week, the last month, the last
+six months - and slide each of them along the timeline, redoing the key
+comparisons inside each window. If `lambdarank` wins in every window, that is a
+property of the problem. If 15 leaves only wins in the windows with a few
+hundred clicks, it is a property of *this much* data and should be revisited as
+the history grows. The harness can already do this: `bench/model.py` takes a
+feature CSV and a set of folds, and restricting to a window is a filter on
+`episode_id`. It is the same shape as the rolling-origin folds already there.
+
+**Redo this work after another year of use.** By late 2027 this database should
+hold several times the clicks it does now, which is exactly the axis most of
+these choices are sensitive to. The ones most likely to flip, in order: tree
+size and learning rate (more data supports a bigger model), the recency
+half-life (a longer history changes what "old" means), and click-through rate,
+which was rejected partly for having too thin a base.
+
 ### Training: `train.py`
 
 Trains LightGBM LambdaRank model from features CSV.
