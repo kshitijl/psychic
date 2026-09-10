@@ -695,8 +695,7 @@ Worker thread owns all file data and processes queries asynchronously.
 **WorkerState owns:**
 - `file_registry: Vec<FileInfo>` - All files with metadata
 - `path_to_id: HashMap<PathBuf, FileId>` - Deduplication
-- `filtered_files: Vec<FileId>` - Ranked result IDs
-- `file_scores: Vec<FileScore>` - Scores and features
+- `file_scores: Vec<FileScore>` - The ranked results: ids, scores and features
 - `current_filter: FilterType` - Active filter (None, OnlyCwd, OnlyDirs, OnlyFiles)
 - `ranker: Ranker` - ML model
 
@@ -733,12 +732,69 @@ second list to keep in step.
 **Eviction:** `WorkerRequest::Evict { path, query_id }` drops a path the UI found
 missing from disk, then re-runs the current query so the row disappears at once. The
 `FileInfo` is *marked* `evicted`, not removed: `FileId` is an index into
-`file_registry`, and those indices are held by `filtered_files` and by pages already
+`file_registry`, and those indices are held by `file_scores` and by pages already
 sent to the UI, so removing an element would invalidate them. `filter_and_rank` tests
 the flag before doing any matching work, making an evicted entry cost a bool test.
 
 `add_file` clears the flag if the walker later rediscovers the path - the walker
 seeing it on disk is proof it exists, so the eviction should not outlive that.
+
+**Catching up on the world: `catch_up`.** The registry is a cache of the
+filesystem, and the moment it is guaranteed to be wrong is the moment psychic
+gets the terminal back. The user opened a file in `$EDITOR` and saved it; or
+dropped into a shell and did anything at all. Every row on screen was rendered
+from a `stat` taken before that.
+
+This is not only a display problem. `modified_age` and `modified_last_24h` are
+ranking features, so a registry that keeps its first mtime forever ranks a file
+edited thirty seconds ago as though it had not been touched since the walk. The
+file the user is most likely to want next is precisely the one they just came
+back from editing.
+
+**Re-stat'ing is paired with reloading the model, in one method, on purpose.**
+The model is reloaded at exactly two moments - coming back from a suspended
+child (`WorkerRequest::Reload`) and entering a directory (`ChangeCwd`) - and
+those moments were chosen because the whole list is about to be rebuilt and
+reordering is therefore expected (see `main.rs`, *the list on screen must never
+reorder without user input*). That is
+the same argument, word for word, for when re-stat'ing is free and safe. So
+`catch_up` does both, and the two handlers call it rather than calling two
+things in the right order and hoping the next one does too.
+
+The directory-change case is not redundant with the walk that follows it. The
+walk covers the new directory; the registry also holds historical paths from
+everywhere else, which nothing is going to walk, and those are precisely what
+the list shows in the window before the walk's results arrive.
+
+`refresh_metadata` re-stats every entry in the registry:
+
+- **mtime, atime and size are replaced** with what disk says now.
+- **A path that no longer stats is evicted**, using the same flag the UI's
+  eviction sets. `rm` in the dropped-into shell takes the row off the screen.
+- **A path that stats again is un-evicted.** Editors that write by
+  rename-over-original make a file vanish and come back; if the UI evicted it in
+  the gap there may be no walk coming to rediscover it.
+- **`is_dir` is left alone.** Discovery settles it - the walker from its own
+  stat, the cwd root by construction - and refreshing it here would read a
+  symlink differently from the way the walker read it.
+- `symlink_metadata`, not `metadata`, for that same reason: the walker does not
+  follow links, so following them here would give a symlink entry a different
+  mtime depending on which code path last touched it.
+
+Measured on this machine over real paths: **0.37ms for a 244-entry registry**
+(1.5us a stat, the size `$HOME` reaches) and **23ms for 8,000 entries** (2.9us a
+stat - a bigger, colder set spread over more of the tree). It is
+paid on a frame that was going to be redrawn from scratch anyway - never on a
+keystroke. The count of entries that actually moved goes in the log as
+`TIMING {"op":"refresh_metadata", ...}`, which is the number to read if the list
+ever looks stale again.
+
+The same bug had a second instance in `add_file`: on an already-registered path
+it only cleared `evicted`, leaving `mtime`, `atime` and `file_size` at whatever
+was recorded the first time the path was seen. A walk after `cd`, or the walk
+that follows a rediscovery, therefore re-visited files without ever refreshing
+them. It now takes the walker's fresh stat, which is by definition newer than
+what the entry holds.
 
 ### Hiding directories
 
@@ -1636,6 +1692,21 @@ Why here and not at render time: `App::get_file_at_index` is called for every vi
 row on every frame and must stay IO-free. This is one `stat`, on one path, per
 keypress. Display-time revalidation was considered and deliberately not done.
 
+**One way back in.** There are three ways out of the TUI and back: opening a
+file in `$EDITOR`, `Ctrl-J` into a shell in the current directory, and Enter on
+a directory when `--on-dir-click=shell`. All three now end in
+`refresh_after_suspend`, which sends the one `WorkerRequest::Reload` that
+re-stats the registry, reloads the model and the click history, and reranks -
+see `catch_up` under `search_worker.rs` for what goes stale and why.
+
+Only the editor path used to do any of this, and it did the model half only. The
+two shell paths did nothing at all: a user who dropped into a shell, edited three
+files and came back saw all three still listed with the times they had before.
+
+The request is fire-and-forget and a failure to send is logged, not propagated.
+The refresh improves on what is already drawn; taking the app down because it
+could not be asked for would be worse than a stale time string.
+
 **What it does not decide:** which key does what. `handle_input` resolves the
 event to a `keymap::Action` and then dispatches on that action, so this module
 says what each action *does*, never which key triggers it. The dispatch `match`
@@ -1880,10 +1951,11 @@ Now an event loop and application glue of about 900 lines, down from 2000+.
   screen must never reorder without user input; a reorder several seconds after
   launch, unprompted, is jarring (Spotlight does this and people hate it).
   Reordering during the initial fill-in is acceptable, later it is not. So the
-  new model is picked up at the next moment the screen changes anyway: opening a
-  file (on return from the editor) or entering a directory. Both go through
-  `WorkerRequest::Reload` / `reload_model` in `search_worker.rs`, which reloads
-  the click history along with the model in a single rerank.
+  new model is picked up at the next moment the screen changes anyway: coming
+  back from a suspended child (the editor, or a shell) or entering a directory.
+  Both go through `WorkerState::catch_up` in `search_worker.rs`, which in one
+  rerank re-stats the file registry, reloads the model, and reloads the click
+  history.
 
 **Why:** Fresh model on every launch ensures ranking improves as you use the tool. Background execution means no startup delay.
 

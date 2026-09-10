@@ -237,7 +237,7 @@ fn handle_help_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Inp
 
 /// Execute on-cwd-visit action for a given directory
 fn execute_cwd_visit_action(
-    app: &App,
+    app: &mut App,
     dir_path: &std::path::Path,
     terminal: &mut Terminal<CrosstermBackend<std::fs::File>>,
 ) -> Result<InputAction> {
@@ -248,6 +248,7 @@ fn execute_cwd_visit_action(
         }
         OnCwdVisitAction::DropIntoShell => {
             suspend_tui_and_run_shell(app, dir_path, terminal)?;
+            refresh_after_suspend(app);
             Ok(InputAction::Continue)
         }
     }
@@ -255,10 +256,13 @@ fn execute_cwd_visit_action(
 
 /// Handle Ctrl-J (execute on-cwd-visit action for current directory)
 fn handle_ctrl_j(
-    app: &App,
+    app: &mut App,
     terminal: &mut Terminal<CrosstermBackend<std::fs::File>>,
 ) -> Result<InputAction> {
-    execute_cwd_visit_action(app, &app.cwd, terminal)
+    // Cloned because the action needs `app` mutably, to ask for a refresh on
+    // the way back from the shell.
+    let cwd = app.cwd.clone();
+    execute_cwd_visit_action(app, &cwd, terminal)
 }
 
 /// The selected row, confirmed to still exist on disk.
@@ -600,6 +604,7 @@ fn handle_directory_click(
         }
         OnDirClickAction::DropIntoShell => {
             suspend_tui_and_run_shell(app, &dir_path, terminal)?;
+            refresh_after_suspend(app);
             Ok(InputAction::Continue)
         }
     }
@@ -612,15 +617,29 @@ fn handle_file_click(
     terminal: &mut Terminal<CrosstermBackend<std::fs::File>>,
 ) -> Result<()> {
     suspend_tui_for_editor(app, &file_path, terminal)?;
-
-    // Returning from the editor redraws everything anyway, so this is a safe
-    // moment to pick up the retrained model and the click just recorded.
-    let query_id = app.next_query_id();
-    if let Err(e) = app.reload_ranker(query_id) {
-        log::error!("Failed to reload ranker: {}", e);
-    }
+    refresh_after_suspend(app);
 
     Ok(())
+}
+
+/// Ask the worker to re-stat the files on screen and rerank them, after the
+/// terminal has been handed to a child process and given back.
+///
+/// Every path out of the TUI and back in goes through here. The editor writes
+/// the file the user just opened; a shell does anything at all. Either way the
+/// list on screen was rendered from metadata read before that happened, and
+/// `modified_age` and `modified_last_24h` are ranking features - so without
+/// this the user comes back to a file they edited thirty seconds ago still
+/// displayed as modified an hour ago, and still ranked as one.
+///
+/// Failure is logged rather than propagated: the refresh is an improvement on
+/// what is already on screen, and taking the app down because it could not be
+/// requested would be a worse outcome than a stale time string.
+fn refresh_after_suspend(app: &mut App) {
+    let query_id = app.next_query_id();
+    if let Err(e) = app.refresh_after_suspend(query_id) {
+        log::error!("Failed to request post-suspend refresh: {}", e);
+    }
 }
 
 /// Set the current filter and trigger query update

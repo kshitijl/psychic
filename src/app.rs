@@ -307,10 +307,21 @@ impl App {
         });
     }
 
-    /// Ask the worker to pick up the retrained model and the latest clicks,
-    /// then rerank under `query_id`. One request does both.
-    pub fn reload_ranker(&mut self, query_id: u64) -> Result<()> {
-        log::info!("Requesting ranker reload from worker");
+    /// Come back from a suspended child - an editor, or a shell - and make the
+    /// list true again.
+    ///
+    /// Three things went stale while the terminal belonged to someone else, and
+    /// one request covers all of them: the files on screen were edited, so
+    /// their metadata is re-stat'd; a click was recorded on the way out and the
+    /// model may have been retrained since, so both are reloaded; and the
+    /// ranking rests on all of that, so it is recomputed under `query_id`.
+    ///
+    /// Called on the way back rather than on a timer. The user has been gone
+    /// for seconds at least and the screen is about to be redrawn from scratch
+    /// anyway, so there is no flicker to pay for and no risk of results moving
+    /// under a hand that was mid-keystroke.
+    pub fn refresh_after_suspend(&mut self, query_id: u64) -> Result<()> {
+        log::info!("Requesting post-suspend refresh from worker");
         self.worker_tx
             .send(WorkerRequest::Reload { query_id })
             .context("Failed to send Reload request to worker")?;

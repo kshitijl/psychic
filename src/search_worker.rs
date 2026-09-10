@@ -105,7 +105,9 @@ pub enum WorkerRequest {
         query_id: u64,
         page_num: usize,
     },
-    /// Pick up the newly retrained model and the latest click history.
+    /// Catch up on everything that moved while the TUI was suspended: re-stat
+    /// the registry, pick up the newly retrained model and the latest click
+    /// history, then rerank. Sent on the way back from an editor or a shell.
     Reload {
         query_id: u64,
     },
@@ -630,9 +632,17 @@ impl WorkerState {
         let canonical_path = path.canonicalize().unwrap_or_else(|_| path.clone());
 
         if let Some(&file_id) = self.path_to_id.get(&canonical_path) {
-            // Already registered. If it had been evicted as missing, the walker
-            // has just seen it on disk again, so it is real: put it back.
+            // Already registered. The walker has just stat'd it, so what it
+            // carries is newer than whatever the entry holds - from the last
+            // walk, or from the database at startup. Taking it matters because
+            // `modified_age` and `modified_last_24h` are ranking features: an
+            // entry that keeps its first mtime forever ranks as though the file
+            // had never been touched again.
             let file_info = &mut self.file_registry[file_id.0];
+            file_info.mtime = mtime;
+            file_info.atime = atime;
+            file_info.file_size = file_size;
+            file_info.is_dir = is_dir;
             if file_info.evicted {
                 log::info!("Worker: un-evicting rediscovered path {:?}", canonical_path);
                 file_info.evicted = false;
@@ -931,6 +941,97 @@ impl WorkerState {
         Ok(())
     }
 
+    /// Catch up on everything the world did while we were not looking: re-stat
+    /// the registry, then pick up the retrained model and the latest clicks.
+    ///
+    /// The two belong together, and calling them together is the point of this
+    /// method existing. A model is only ever reloaded at a moment when the
+    /// whole list is about to be rebuilt and reordering is expected - coming
+    /// back from an editor or a shell, entering a directory. Those are exactly
+    /// the moments when the metadata behind the list has had a chance to go
+    /// stale, and the only moments when re-stat'ing is both free and safe. Two
+    /// separate calls at the same two sites would be one refactor away from
+    /// being one call at one site.
+    fn catch_up(&mut self) -> Result<()> {
+        let refresh_start = std::time::Instant::now();
+        let changed = self.refresh_metadata();
+        log::info!(
+            "TIMING {{\"op\":\"refresh_metadata\",\"ms\":{},\"count\":{},\"changed\":{}}}",
+            refresh_start.elapsed().as_secs_f64() * 1000.0,
+            self.file_registry.len(),
+            changed
+        );
+
+        self.reload_model()
+    }
+
+    /// Re-stat every path in the registry, and reconcile what has appeared or
+    /// gone since.
+    ///
+    /// The user has been away - in an editor, in a shell, or just long enough
+    /// to walk somewhere else - and the files they were working on are exactly
+    /// the ones whose mtime decides where they rank: `modified_age` and
+    /// `modified_last_24h` are features. Without this the list comes back
+    /// showing times from before the edit and ranking as though nothing had
+    /// happened.
+    ///
+    /// A `stat` is one to three microseconds warm, so this is 0.37ms over a
+    /// 244-entry registry and 23ms over 8,000 - paid at a moment the whole list
+    /// is being rebuilt anyway, never on a keystroke.
+    ///
+    /// Returns how many entries changed, for the log.
+    fn refresh_metadata(&mut self) -> usize {
+        let mut changed = 0;
+
+        for file_info in &mut self.file_registry {
+            // `symlink_metadata`, not `metadata`: the walker does not follow
+            // links, so following them here would give a symlink entry a
+            // different mtime depending on which code path last touched it.
+            match std::fs::symlink_metadata(&file_info.full_path) {
+                Ok(metadata) => {
+                    let mtime = metadata.mtime_as_secs();
+                    let atime = metadata.atime_as_secs();
+                    let file_size = Some(metadata.len() as i64);
+
+                    if file_info.mtime != mtime || file_info.file_size != file_size {
+                        changed += 1;
+                    }
+
+                    file_info.mtime = mtime;
+                    file_info.atime = atime;
+                    file_info.file_size = file_size;
+                    // `is_dir` is left alone. Discovery settles it - the walker
+                    // from its own stat, the cwd root by construction - and a
+                    // path does not change kind without becoming a different
+                    // thing, which the next walk registers anyway.
+
+                    if file_info.evicted {
+                        // Gone when the UI last looked, back now. An editor
+                        // that writes by rename-over-original looks exactly
+                        // like this.
+                        log::info!(
+                            "Worker: un-evicting {:?}, back on disk",
+                            file_info.full_path
+                        );
+                        file_info.evicted = false;
+                        changed += 1;
+                    }
+                }
+                Err(_) => {
+                    // Deleted while the user was away. Same treatment as a path
+                    // the UI found missing when it was acted on: the entry stays
+                    // so `FileId` indices remain valid, and filtering skips it.
+                    if !file_info.evicted {
+                        file_info.evicted = true;
+                        changed += 1;
+                    }
+                }
+            }
+        }
+
+        changed
+    }
+
     /// Stop showing `path`, which the UI found missing from disk.
     ///
     /// The registry entry is marked rather than removed: `FileId` is an index
@@ -1188,10 +1289,13 @@ fn worker_thread_loop<T>(
                 }
                 WorkerRequest::Reload { query_id } => {
                     state.current_query_id = query_id;
-                    // `reload_model` reloads the clicks too: it goes through
-                    // `load_ranker`, and both `Ranker::new` and
-                    // `Ranker::new_empty` call `Ranker::load_clicks`.
-                    if let Err(e) = state.reload_model() {
+                    // The user has been away in an editor or a shell. Re-stat
+                    // before re-ranking, or the rank is computed from mtimes
+                    // taken before they made their changes. `catch_up` reloads
+                    // the clicks too: it goes through `load_ranker`, and both
+                    // `Ranker::new` and `Ranker::new_empty` call
+                    // `Ranker::load_clicks`.
+                    if let Err(e) = state.catch_up() {
                         log::error!("Failed to reload model: {}", e);
                     } else {
                         // Re-filter and rank with new model
@@ -1208,7 +1312,12 @@ fn worker_thread_loop<T>(
                     // Entering a directory refilters from scratch and redraws
                     // the whole list, so it is a safe moment to pick up a
                     // newly retrained model: nothing reorders unprompted.
-                    if let Err(e) = state.reload_model() {
+                    //
+                    // And to re-stat. The walk about to start covers the new
+                    // directory, but the registry also holds historical paths
+                    // from everywhere else, which nothing will walk - and those
+                    // are what the list shows until the walk arrives.
+                    if let Err(e) = state.catch_up() {
                         log::error!("Failed to reload model on cwd change: {}", e);
                     }
                     if let Err(e) = state.change_cwd(new_cwd) {
@@ -2505,6 +2614,222 @@ mod eviction_tests {
             after,
             vec!["alpha.txt", "beta.txt", "gamma.txt"],
             "Rediscovered file is back, and was not registered a second time"
+        );
+    }
+}
+
+#[cfg(test)]
+mod metadata_refresh_tests {
+    //! Coming back from an editor or a shell, the files on screen have moved on
+    //! without us. These cover the re-stat that catches up.
+
+    use super::eviction_tests::TempDataDir;
+    use super::*;
+
+    /// A worker rooted at a real directory holding one real file, `notes.txt`,
+    /// registered exactly as the walker would register it.
+    ///
+    /// Real paths, unlike the `/test` ones the eviction tests use, because the
+    /// whole point here is what `stat` says about them.
+    struct RealTree {
+        state: WorkerState,
+        root: PathBuf,
+        _data: TempDataDir,
+        _walker_rx: mpsc::Receiver<WalkerCommand>,
+    }
+
+    impl RealTree {
+        fn new(name: &str) -> Self {
+            let data = TempDataDir::new(name);
+            let root = data.path.join("tree");
+            std::fs::create_dir_all(&root).expect("tree dir");
+            // Canonical, because `add_file` stores canonical paths and `evict`
+            // looks them up by exact match. On macOS the temp dir is a symlink,
+            // so an uncanonicalized root would never match what was registered.
+            let root = root.canonicalize().expect("canonical tree dir");
+            std::fs::write(root.join("notes.txt"), b"first").expect("write notes");
+
+            let (walker_tx, walker_rx) = mpsc::channel::<WalkerCommand>();
+            let mut state = WorkerState::new(
+                root.clone(),
+                &data.path,
+                walker_tx,
+                true, // no_click_loading
+                true, // no_model
+                Vec::new(),
+            )
+            .expect("Worker state should build against an empty data dir");
+
+            state.file_registry.clear();
+            state.path_to_id.clear();
+
+            let file = root.join("notes.txt");
+            let metadata = std::fs::metadata(&file).expect("stat notes");
+            state.add_file(
+                file,
+                metadata.mtime_as_secs(),
+                metadata.atime_as_secs(),
+                Some(metadata.len() as i64),
+                false,
+            );
+
+            Self {
+                state,
+                root,
+                _data: data,
+                _walker_rx: walker_rx,
+            }
+        }
+
+        fn notes(&self) -> PathBuf {
+            self.root.join("notes.txt")
+        }
+
+        fn registered_mtime(&self) -> Option<i64> {
+            self.state.file_registry[0].mtime
+        }
+    }
+
+    /// Give a path an mtime an hour in the past, so a test can tell "before the
+    /// edit" from "after" without waiting a second for the clock to move.
+    fn backdate(path: &Path, seconds_ago: u64) {
+        let when = std::time::SystemTime::now() - std::time::Duration::from_secs(seconds_ago);
+        let file = std::fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("open to set times");
+        file.set_times(
+            std::fs::FileTimes::new()
+                .set_modified(when)
+                .set_accessed(when),
+        )
+        .expect("set times");
+    }
+
+    #[test]
+    fn test_editing_a_file_while_suspended_updates_its_modified_time() {
+        // The bug this fixes: open a file, edit it, come back, and the row
+        // still says it was modified an hour ago.
+        let mut tree = RealTree::new("refresh-edited");
+        backdate(&tree.notes(), 3600);
+        let stale = std::fs::metadata(tree.notes()).unwrap().mtime_as_secs();
+        tree.state.file_registry[0].mtime = stale;
+
+        // The editor writes.
+        std::fs::write(tree.notes(), b"second and longer").expect("rewrite notes");
+
+        let changed = tree.state.refresh_metadata();
+
+        assert_eq!(
+            changed, 1,
+            "the one file that moved is the one that counted"
+        );
+        assert_ne!(
+            tree.registered_mtime(),
+            stale,
+            "the registry no longer holds the pre-edit time"
+        );
+        assert_eq!(
+            tree.state.file_registry[0].file_size,
+            Some(17),
+            "and the size is the new one, not the old"
+        );
+    }
+
+    #[test]
+    fn test_a_file_nothing_touched_is_not_reported_as_changed() {
+        // The count goes in the log. It is only worth reading if it means
+        // something, so an untouched tree must report zero.
+        let mut tree = RealTree::new("refresh-untouched");
+
+        assert_eq!(tree.state.refresh_metadata(), 0, "nothing moved");
+    }
+
+    #[test]
+    fn test_a_file_deleted_while_suspended_drops_out_of_the_results() {
+        // `rm` in the dropped-into shell. The row must not survive it: acting
+        // on it would hand a missing path to the editor.
+        let mut tree = RealTree::new("refresh-deleted");
+        tree.state.filter_and_rank("").expect("filter");
+        assert_eq!(super::eviction_tests::results(&tree.state).len(), 1);
+
+        std::fs::remove_file(tree.notes()).expect("remove notes");
+
+        assert_eq!(tree.state.refresh_metadata(), 1, "the deletion counted");
+        assert!(
+            tree.state.file_registry[0].evicted,
+            "the entry is marked gone rather than removed, so FileId stays valid"
+        );
+
+        tree.state.filter_and_rank("").expect("filter");
+        assert!(
+            super::eviction_tests::results(&tree.state).is_empty(),
+            "and it is off the screen"
+        );
+    }
+
+    #[test]
+    fn test_a_file_written_back_by_rename_comes_out_of_eviction() {
+        // Editors that write by rename-over-original make a path vanish and
+        // reappear. If the UI evicted it in the gap, the re-stat is what brings
+        // it back - there may be no walk coming.
+        let mut tree = RealTree::new("refresh-rewritten");
+        tree.state.evict(&tree.notes());
+        tree.state.filter_and_rank("").expect("filter");
+        assert!(super::eviction_tests::results(&tree.state).is_empty());
+
+        assert_eq!(tree.state.refresh_metadata(), 1, "coming back counted");
+
+        tree.state.filter_and_rank("").expect("filter");
+        assert_eq!(
+            super::eviction_tests::results(&tree.state),
+            vec!["notes.txt"],
+            "the file is on screen again"
+        );
+    }
+
+    #[test]
+    fn test_catch_up_re_stats_as_well_as_reloading_the_model() {
+        // The two handlers that reload the model - coming back from a suspend,
+        // and entering a directory - both go through `catch_up`, so this is
+        // where the pairing is worth pinning down. Reloading the model without
+        // re-stat'ing was the bug; one method doing both is the fix.
+        let mut tree = RealTree::new("refresh-catch-up");
+        backdate(&tree.notes(), 3600);
+        let stale = std::fs::metadata(tree.notes()).unwrap().mtime_as_secs();
+        tree.state.file_registry[0].mtime = stale;
+
+        std::fs::write(tree.notes(), b"edited while away").expect("rewrite notes");
+        tree.state.catch_up().expect("catch up");
+
+        assert_ne!(
+            tree.registered_mtime(),
+            stale,
+            "reloading the model re-stats too, or the rerank it triggers uses \
+             mtimes from before the user went away"
+        );
+    }
+
+    #[test]
+    fn test_the_walker_seeing_a_file_again_refreshes_what_we_hold() {
+        // The other half of the same bug. A walk after `cd` re-visits paths
+        // already in the registry; it used to keep whatever mtime was recorded
+        // the first time, forever.
+        let mut tree = RealTree::new("refresh-walked");
+        tree.state.file_registry[0].mtime = Some(1000);
+
+        tree.state
+            .add_file(tree.notes(), Some(2000), Some(2000), Some(99), false);
+
+        assert_eq!(
+            tree.registered_mtime(),
+            Some(2000),
+            "the walker's fresh stat wins over what was there"
+        );
+        assert_eq!(
+            tree.state.file_registry.len(),
+            1,
+            "and it was not registered a second time"
         );
     }
 }
