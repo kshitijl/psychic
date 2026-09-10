@@ -2313,20 +2313,120 @@ And synthetic feature values understate predict badly, because they take short
 paths through the trees; the same benchmark on made-up numbers reported 0.96ms
 against a true 1.89ms.
 
-### The benchmark harness: `bench/`
+### The two benchmark harnesses: `bench/`
+
+There are two, because psychic has two things that can regress independently.
+**Speed** is `bench/run.py`: how long until the list appears, how long from a
+keystroke to a redraw. **Ranking quality** is `bench/model.py`: whether the file
+you wanted comes out on top. A change can improve one and ruin the other -
+switching to `lambdarank` cost 2.8x on predict and bought seven points of top-1 -
+so a commit that touches ranking reports both.
 
 ```bash
-./bench/run.py setup 1d4d767   # build that commit, stage a data dir per version
+./bench/run.py setup HEAD      # build the parent commit as the baseline
 ./bench/run.py startup 10      # startup timings, alternating, medians
 ./bench/run.py keystroke 50    # keystroke -> redraw
 ./bench/run.py walk 12         # walk time, with and without gitignore
+
+./bench/model.py compare --seeds 5   # ranking quality, baseline vs current
+./bench/model.py compare 120         # ...with the round count pinned
+./bench/model.py objectives          # two training objectives, one feature set
+./bench/model.py seeds 8             # the noise floor of the metric itself
 ```
 
-`setup` builds the baseline in a git worktree under `/tmp/psychic-bench` and
-gives each version its own copy of the real `events.db`, so the two runs cannot
-interfere. Nothing reads or writes the real data directory except to copy out of
-it. `harness.py` holds the pty plumbing and the log parsing; `run.py` is the four
-commands on top.
+#### How `setup` builds a second psychic
+
+Comparing two commits means having two binaries at once, and a repository can
+only be at one commit. `setup` uses a **git worktree**: a second checkout of the
+same repository, sharing its object store, living at
+`/tmp/psychic-bench/old-src`. `git worktree add` creates it on the first run;
+afterwards it is `git reset --hard`, `git clean -fd` and `git checkout --detach`
+onto whatever ref was asked for, so moving the baseline forward one commit is an
+incremental rebuild of a few seconds rather than a clean one of forty.
+
+Two mistakes are already built out of it. The reset and clean are there because
+experiments edit that tree directly - stripping features out of the registry to
+measure them, for instance - and a dirty tree makes every later checkout fail.
+And the ref is resolved with `git rev-parse` **in the main repository, not in the
+worktree**: `HEAD` inside the worktree means whatever the last benchmark left
+checked out, so without that the baseline silently stops moving forward while
+appearing to work.
+
+#### One database each, and one model each
+
+Each version gets its own directory under `/tmp/psychic-bench`, staged fresh on
+every `setup` from a `sqlite3 .backup` of the real `events.db`. `.backup` rather
+than `cp` because it folds the write-ahead log into one clean file: left to
+accumulate, one copy once had a 20MB WAL against the other's 4.4MB, and the same
+binary measured against itself came out 1.6x apart on first paint purely from the
+cost of opening it. **The real data directory is only ever read from.**
+
+Each version also gets **its own trained model**, built by running its own binary's
+`retrain` at setup and restored before every trial. Not one shared model: a
+change that adds a feature makes the two builds expect different numbers of
+columns, the mismatched model is refused at load, and the run would quietly
+measure the simple-model fallback instead of the thing being benchmarked. That
+refusal is itself a September addition, and it earns its keep - it has caught a
+stale pinned model twice, once reporting `predict` at 0.00ms, which is obviously
+wrong in a way that a silently worse model would not have been. **Re-run `setup`
+after any feature-set change.**
+
+#### Driving a TUI
+
+`harness.py` opens a pty itself rather than using `script(1)`, for three reasons
+that each produced a wrong answer first:
+
+- **Geometry.** `script` gives no control over window size and hands out 80x24,
+  which nobody runs and which made the old synchronous `bat` spawn look four
+  times cheaper than it was. The harness sets 40x120 with `TIOCSWINSZ`.
+- **stdin.** An immediate EOF on the pty reads as a keypress and psychic quits
+  before it has finished starting up - silently measuring nothing.
+- **Teardown.** The pty is closed before the child is killed, and `waitpid` is
+  polled with `WNOHANG` rather than blocking, because a child stuck exiting once
+  hung the whole run.
+
+Numbers come back out of psychic's own `TIMING` log lines rather than from
+wall-clock guesses outside the process, so they measure the same thing the debug
+pane and `internal analyze-perf` do. The exception is keystroke latency, which is
+measured from outside: write one byte, wait for the first byte of the redraw.
+Both versions still redraw on a tick, so each measurement first waits for a quiet
+moment - that starts the clock just after a tick redraw, which makes the next
+write the one the keystroke caused.
+
+#### Two more traps in reading the output
+
+- **Compare queries in the steady state.** At its first query the pre-September
+  binary ranks 126 files and the current one ranks all 244, because the
+  two-phase walk has already delivered the root's children. Comparing those two
+  makes a 1.5x improvement read as a 2x regression. `run.py` reports both the
+  first query and the last one of the run, and the last one has both at 244.
+- **Interleave, do not block.** Trials alternate between versions, and `walk`
+  interleaves its three configurations. Running all trials of one configuration
+  before the next lets a slow patch on the machine land entirely on one of them,
+  which inverted the gitignore result once already.
+
+#### What `model.py` does differently
+
+It generates the feature CSV with each binary from one copy of the database, then
+trains both the way `train.py` does - importing `make_params`, `recency_weights`
+and `group_sizes` from `train.py` itself rather than restating them, because a
+benchmark that has drifted from what ships is worse than no benchmark. Scoring is
+rolling-origin: train on a growing prefix of episodes, early-stop on the next
+tenth, score the tenth after that, three times.
+
+Unlike the timing harness it is deterministic - the same code twice reports
+`+0.0000` on every metric - but it has a noise source of its own, the seed.
+Bagging and feature sampling are random, and adding a column perturbs which
+subsets each tree sees. `seeds 8` measures that directly: one feature set, eight
+seeds, top-1 spanning 0.027. Most single features are worth less than that, which
+is why `compare` takes `--seeds`.
+
+Two modes exist because two questions kept coming up. `compare 120` pins the
+round count, so a feature that shifts the validation curve cannot change the tree
+count and be compared as two differently sized models. `objectives` trains one
+feature set two ways, because `compare` takes `train.py` from the working tree
+for *both* arms - a training-parameter change reads `+0.0000` there, and the tool
+now says so rather than letting the next person believe it.
 
 Psychic is a TUI, so both halves of a measurement are awkward: it has to be
 driven on a real terminal, and the numbers have to come back out of its own
