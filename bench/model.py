@@ -14,8 +14,9 @@
 # ///
 """What a ranking change did to ranking quality.
 
-    ./bench/model.py compare      # baseline binary vs current, same database
+    ./bench/model.py compare [rounds] [--seeds N]   # baseline vs current
     ./bench/model.py objectives   # two training objectives, one feature set
+    ./bench/model.py seeds 8      # one feature set, N seeds: the noise floor
 
 Speed benchmarks cannot see a feature: it changes what the model predicts, not
 how fast it predicts it. This trains both versions the way train.py does and
@@ -161,7 +162,24 @@ def score(model, X, y, episodes):
     }
 
 
-def compare(fixed_rounds=None):
+def seed_overrides(seed):
+    return {
+        "seed": seed,
+        "bagging_seed": seed,
+        "feature_fraction_seed": seed,
+        "data_random_seed": seed,
+    }
+
+
+def compare(fixed_rounds=None, seed_count=1):
+    """Baseline binary against the current one, on one copy of the database.
+
+    With `seed_count` above 1 each side is trained under that many seeds and the
+    means are compared. Do that for anything smaller than a few points: bagging
+    and feature sampling are random, adding a column perturbs which subsets each
+    tree sees, and on this data one seed moves top-1 by up to 0.027 on its own -
+    wider than most single features are worth.
+    """
     train_py = load_train_py()
     baseline_binary = WORK / "old-src/target/release/psychic"
     current_binary = REPO / "target/release/psychic"
@@ -174,11 +192,30 @@ def compare(fixed_rounds=None):
             out_dir = Path(tmp) / name
             csv_path = generate_features(binary, out_dir)
             print(f"--- {name}: {binary} ---", flush=True)
-            results[name] = evaluate(train_py, csv_path, out_dir, fixed_rounds)
+            if seed_count > 1:
+                runs = []
+                for seed in range(1, seed_count + 1):
+                    print(f"    seed {seed}", flush=True)
+                    metrics, gains = evaluate(train_py, csv_path, out_dir, fixed_rounds,
+                                              seed_overrides(seed))
+                    runs.append(metrics)
+                averaged = {key: float(np.mean([run[key] for run in runs]))
+                            for key in ("auc", "top1", "mrr", "rmse", "rounds")}
+                averaged["episodes"] = runs[0]["episodes"]
+                averaged["folds"] = runs[0]["folds"]
+                averaged["spread"] = {key: max(run[key] for run in runs)
+                                      - min(run[key] for run in runs)
+                                      for key in ("top1", "mrr")}
+                averaged["runs"] = runs
+                results[name] = (averaged, gains)
+            else:
+                results[name] = evaluate(train_py, csv_path, out_dir, fixed_rounds)
 
     (before, before_gains), (after, after_gains) = results["before"], results["after"]
 
     how = f", {fixed_rounds} rounds fixed" if fixed_rounds else ""
+    if seed_count > 1:
+        how += f", mean of {seed_count} seeds"
     print(f"\nrolling-origin folds at {FOLD_STARTS}{how}, "
           f"{before['episodes']} scored episodes\n")
     print(f"{'':<10}{'before':>10}{'after':>10}{'change':>10}")
@@ -186,6 +223,16 @@ def compare(fixed_rounds=None):
         delta = after[key] - before[key]
         print(f"{label:<10}{before[key]:>10.4f}{after[key]:>10.4f}{delta:>+10.4f}")
     print(f"{'rounds':<10}{before['rounds']:>10.0f}{after['rounds']:>10.0f}")
+
+    if seed_count > 1:
+        # A change smaller than the seed spread is not evidence of anything.
+        for key, label in (("top1", "top-1"), ("mrr", "MRR")):
+            values_before = [run[key] for run in before["runs"]]
+            values_after = [run[key] for run in after["runs"]]
+            print(f"  {label} across seeds: before {min(values_before):.4f}-"
+                  f"{max(values_before):.4f}, after {min(values_after):.4f}-"
+                  f"{max(values_after):.4f}, "
+                  f"sd of the mean {np.std(values_after) / np.sqrt(seed_count):.4f}")
 
     # Per fold as well as averaged. A mean that moves while the folds disagree
     # is one fold's luck, not a feature that works.
@@ -205,6 +252,46 @@ def compare(fixed_rounds=None):
               f"({after_gains[name] / total * 100:.1f}% of total, rank {rank} of {len(after_gains)})")
     for name in gone:
         print(f"removed feature {name!r}")
+
+
+def seeds(count):
+    """The same feature set, trained under several seeds.
+
+    This is the honest floor under every other number here. Bagging and feature
+    sampling are random, and adding a column changes which subsets each tree
+    sees - so part of any measured difference between two feature sets is the
+    same perturbation a different seed would cause. If the spread here is as
+    wide as the differences being acted on, those differences are not evidence.
+    """
+    train_py = load_train_py()
+
+    with tempfile.TemporaryDirectory(prefix="psychic-seeds-") as tmp:
+        out_dir = Path(tmp) / "current"
+        csv_path = generate_features(REPO / "target/release/psychic", out_dir)
+        runs = []
+        for seed in range(1, count + 1):
+            print(f"--- seed {seed} ---", flush=True)
+            metrics, _ = evaluate(
+                train_py, csv_path, out_dir,
+                params_override={
+                    "seed": seed,
+                    "bagging_seed": seed,
+                    "feature_fraction_seed": seed,
+                    "data_random_seed": seed,
+                },
+            )
+            runs.append(metrics)
+
+    print(f"\n{count} seeds, one feature set, {runs[0]['episodes']} scored episodes\n")
+    print(f"{'seed':<6}{'top-1':>10}{'MRR':>10}{'rounds':>9}")
+    for seed, run in enumerate(runs, start=1):
+        print(f"{seed:<6}{run['top1']:>10.4f}{run['mrr']:>10.4f}{run['rounds']:>9.0f}")
+
+    for key, label in (("top1", "top-1"), ("mrr", "MRR")):
+        values = [run[key] for run in runs]
+        spread = max(values) - min(values)
+        print(f"\n{label}: min {min(values):.4f}  max {max(values):.4f}  "
+              f"spread {spread:.4f}  sd {np.std(values):.4f}")
 
 
 def objectives():
@@ -245,9 +332,16 @@ def objectives():
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "compare":
         # ./bench/model.py compare [rounds]
-        rounds = int(sys.argv[2]) if len(sys.argv) > 2 else None
-        compare(rounds)
+        args = sys.argv[2:]
+        seed_count = 1
+        if "--seeds" in args:
+            index = args.index("--seeds")
+            seed_count = int(args[index + 1])
+            args = args[:index] + args[index + 2:]
+        compare(int(args[0]) if args else None, seed_count)
     elif len(sys.argv) > 1 and sys.argv[1] == "objectives":
         objectives()
+    elif len(sys.argv) > 1 and sys.argv[1] == "seeds":
+        seeds(int(sys.argv[2]) if len(sys.argv) > 2 else 8)
     else:
         print(__doc__)

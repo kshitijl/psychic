@@ -932,8 +932,8 @@ the range: the click index only ever holds 30 days, whose log is 14.77, so
 what lets one monotone split tell "no history" from "old history".
 
 On this developer's data `seconds_since_last_click` came out as the largest
-feature by gain, at 22.7% of the total - ahead of `clicks_for_this_query` and
-`fuzzy_score`.
+feature by gain - 28.5% of the total, ahead of `fuzzy_score` and
+`filename_starts_with_query`.
 
 **Directory visits are not clicks.** `visits_last_7_days` and
 `visits_last_30_days` count `startup_visit` events - the zsh `chpwd` hook, via

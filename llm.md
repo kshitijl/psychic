@@ -81,6 +81,23 @@ timeline, so the model is always predicting the future from the past. One
 feature per commit - two at once and neither number means anything, because a
 gain and a loss cancel and both look like noise.
 
+**Average over seeds, and know the floor.** Bagging and feature sampling are
+random, and adding a column changes which subsets each tree sees - the same
+perturbation a different seed causes. Measured on this data with
+`./bench/model.py seeds 8`: one feature set, eight seeds, top-1 ranges 0.7827 to
+0.8094. **A spread of 0.027, sd 0.010.** Most single features are worth less
+than that, so a one-seed comparison cannot see them.
+
+    ./bench/model.py compare --seeds 5     # means of 5 seeds, both sides
+
+Five seeds put the standard error of the mean near 0.004, which is enough to
+resolve a one-point change. Anything measured at one seed and smaller than about
+0.03 top-1 is not evidence, whichever way it points.
+
+Gain is the steadier number at this data size: it aggregates thousands of
+splits, where top-1 rests on ~110 episodes a fold. A feature that reads 20%+ of
+total gain is being used heavily whatever the held-out delta says that day.
+
 Report the feature's own importance too (gain, from `model_stats.json`), and say
 where the data came from: a feature computed from rows the collection has never
 written is a feature that will read zero until enough time passes.

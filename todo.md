@@ -402,6 +402,37 @@ Optimizations".
   breakpoint, `get_eza_flags` in ui_state (does not exist), LambdaRank,
   `Analytics`/`App` method lists, and "Streams results" for the walker.
 
+### Correction: tonight's feature measurements were under-powered
+
+Everything measured on 2026-09-10 below used **one seed**. Measured afterwards
+with `./bench/model.py seeds 8`: the same feature set under eight seeds spans
+top-1 0.7827 to 0.8094 - a spread of 0.027, sd 0.010. Most of the deltas quoted
+below are smaller than that.
+
+Re-measured over 5 seeds a side, the three features shipped tonight (directory
+visits, seconds since last click, extension click share) are worth **+0.0098
+top-1 and +0.0088 MRR together**, sd of the mean 0.0040. Real, about 2.5 sigma,
+and roughly a third of what the individual single-seed numbers claimed.
+
+What survives unchanged:
+
+- **lambdarank, +0.0707 top-1.** Seven times the seed sd; not in doubt.
+- **`seconds_since_last_click` at 28.5% of total gain, rank 1 of 20.** Gain
+  aggregates thousands of splits and is far steadier than a held-out delta over
+  ~110 episodes a fold.
+- **`query_length` rejected.** -0.039 is about 4 sd, and it has independent
+  evidence: trained on the first 70%, top-1 rose on data it had seen and fell
+  0.041 on the future.
+- **Clicks under a directory rejected.** Two of three folds came out
+  bit-identical with and without it, which no amount of seed variance explains.
+
+What does *not* survive: the rejections at -0.010 to -0.016 (visits inherited by
+files, per-query clicks by directory, depth below cwd). Those were inside the
+noise. They were not shown to hurt; they were shown not to help enough to see.
+They stay out on parsimony - each costs compute on every keystroke and none read
+more than 1.4% of gain - but anyone revisiting them should start from
+`compare --seeds` rather than from those numbers.
+
 ### 2026-09-08 feature ideas, ranked
 
 What the 15 current features cover: match quality (fuzzy_score,
