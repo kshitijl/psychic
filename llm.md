@@ -96,7 +96,9 @@ than that, so a one-seed comparison cannot see them.
     ./bench/model.py compare --seeds 5     # means of 5 seeds, both sides
 
 Five seeds put the standard error of the mean near 0.004, which is enough to
-resolve a one-point change. Anything measured at one seed and smaller than about
+resolve a one-point change. **Where the decision is close, run eight.** A
+feature measured at four seeds once read top-1 +0.0056, MRR +0.0031 and AUC
++0.0010 - positive on every metric, and wrong: at eight seeds it was -0.0008. Anything measured at one seed and smaller than about
 0.03 top-1 is not evidence, whichever way it points.
 
 Gain is the steadier number at this data size: it aggregates thousands of
