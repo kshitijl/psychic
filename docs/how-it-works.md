@@ -185,12 +185,12 @@ had drifted into describing an animation the code could not produce - they read
 500ms and 80ms against a 200ms tick, so the 80ms was inert and the "0.5s pause"
 actually lasted 600ms.
 
-**Five that live for the session:**
+**Six that live for the session:**
 - **Main (UI)**: Renders UI, blocks on unified event channel, owns visible file slice only
 - **Worker**: Owns all file data, does filtering/ranking, sends results to unified channel
 - **Walker**: Discovers files via walkdir, sends to worker
 - **Input**: Sleeps in the kernel until the terminal has bytes, decodes them with crossterm, sends to unified channel. Stoppable, so a child process can own the terminal (see "The input thread" below)
-- **Tick timer**: Sends tick events every 200ms for UI animations (marquee)
+- **Tick timer**: Wakes the main loop so the screen can refresh itself with nobody touching it - every 200ms while the marquee runs, once a second otherwise (see "The tick redraws at two rates")
 - **Preview**: Reads and highlights the selected file off the UI thread (see `preview.rs`)
 
 **And four that do one job and exit**, all detached: the retrainer (`ranker.rs`,
@@ -274,11 +274,12 @@ when the kernel wakes us. The signal cannot do the waking either: `signal-hook`
 registers with `SA_RESTART`, so the kernel restarts the interrupted `poll`
 rather than returning `EINTR`.
 
-Without that pipe a resize is not lost, only late. The 200ms tick redraws, and
-ratatui re-reads the terminal size on every `draw`, so the UI reflows on the next
-tick: measured at 134-151ms, against about 1ms with the pipe. That fallback stops
-existing the moment ticks are made conditional on something actually animating,
-which is the remaining half of this cleanup.
+Without that pipe a resize used to be late rather than lost: the tick redrew
+five times a second and ratatui re-reads the terminal size on every `draw`, so
+the UI reflowed on the next tick - measured at 134-151ms, against about 1ms with
+the pipe. That safety net is gone now that an idle psychic redraws only once a
+second, which makes the pipe the only thing standing between a resize and a
+second of stale layout.
 
 `signal-hook` keeps a registry of handlers per signal, so ours is added alongside
 crossterm's rather than replacing it: crossterm still turns the signal into the
@@ -363,28 +364,34 @@ Database at `~/.local/share/psychic/events.db` with two tables:
 
 ```sql
 CREATE TABLE events (
-    timestamp INTEGER,
-    query TEXT,
-    file_path TEXT,      -- relative path
-    full_path TEXT,      -- absolute path
+    id INTEGER PRIMARY KEY,
+    timestamp INTEGER NOT NULL,
+    query TEXT NOT NULL,
+    file_path TEXT NOT NULL,   -- relative path
+    full_path TEXT NOT NULL,   -- absolute, canonical
     mtime INTEGER,
     atime INTEGER,
     file_size INTEGER,
     subsession_id INTEGER,
-    action TEXT,         -- 'impression', 'scroll', or 'click'
-    session_id TEXT
+    action TEXT NOT NULL,      -- 'impression', 'scroll', 'click' or 'startup_visit'
+    session_id TEXT NOT NULL,
+    episode_queries TEXT,      -- JSON array, on clicks only
+    rank INTEGER,              -- 1-based row position, on impressions only
+    is_dir INTEGER             -- what the row was when it was shown
 );
 
 CREATE TABLE sessions (
     session_id TEXT PRIMARY KEY,
-    cwd TEXT,
-    gateway TEXT,
-    subnet TEXT,
-    dns TEXT,
-    timezone TEXT,
-    created_at INTEGER
+    cwd TEXT NOT NULL,
+    timezone TEXT NOT NULL,
+    created_at INTEGER NOT NULL
 );
 ```
+
+`episode_queries`, `rank` and `is_dir` are all `NULL` on rows written before the
+column existed, and none of them can be backfilled - nothing recorded the answer
+at the time. Anything reading them has to cope with a mixture until enough
+history accumulates.
 
 ```sql
 CREATE TABLE hidden_prefixes (
@@ -662,33 +669,29 @@ long walk meant the directory you navigated to was never walked at all.
 Why background thread: large directories take seconds to scan.
 Why send metadata: avoids re-fetching it later.
 
-### Module: `context.rs`### Module: `context.rs`
+### Module: `context.rs`
 
-Gathers system context at startup in background thread:
-- `cwd` - Current working directory
-- `gateway` - Default gateway from `netstat -nr`
-- `subnet` - First two octets of local IP
-- `dns` - First DNS nameserver from `scutil --dns`
-- `timezone` - Multi-tier fallback: $TZ env var → /etc/localtime symlink → "UTC"
+Twenty-eight lines, and that is the whole point of it. `gather_context` returns
+two strings for the session row:
 
-Why gather this: network context (home, office, cafe) may become an ML feature.
+- `cwd` - where psychic was launched, which `is_under_cwd` and the visit
+  features are computed against
+- `timezone` - `$TZ`, or `"unknown"`
 
-`running_processes` (the output of `ps`) and `shell_history` (the last ten
-commands typed) used to be collected here too. Nothing ever read either. They
-were 40MB of a 67MB database, and the second was a plain-text copy of what the
-user had been doing, sitting in `~/.local/share`. Both are gone, and the columns
-with them.
+It used to shell out three times per launch - `netstat -nr` for the default
+gateway, `ifconfig` for the subnet, and a DNS lookup - on the theory that a
+laptop's network stands in for "home or work". Nothing was ever built on it: no
+query, feature or view read those columns in the life of the program. The same
+was true of `running_processes` (the output of `ps`) and `shell_history` (the
+last ten commands typed), which together were 40MB of a 67MB database and, in
+the second case, a plain-text copy of what the user had been doing sitting in
+`~/.local/share`. All five are gone, and `Database::migrate` drops the columns.
 
-**Note on `timezone`:** still recorded per session, but no feature reads it - all
-time windows are rolling (see "Time windows are rolling, not calendar days"). It is
-session context for later analysis, not a model input.
-
-**Error handling:** All fields fallback to "unknown" on error. Never crash due to missing tools.
-
-**Timezone detection:** Uses sophisticated fallback chain:
-1. Check $TZ environment variable
-2. Read /etc/localtime symlink and extract timezone from path (handles both /usr/share/zoneinfo and /var/db/timezone paths)
-3. Default to "UTC" if all methods fail
+What is left needs no subprocess at all, which is why there is no fallback chain
+and no error handling to describe: reading an environment variable does not fail.
+`timezone` is recorded but read by nothing - every time window in feature
+computation is rolling (see "Time windows are rolling, not calendar days"), so
+it is session context for later analysis, not a model input.
 
 ### Module: `search_worker.rs`
 
@@ -701,13 +704,19 @@ Worker thread owns all file data and processes queries asynchronously.
 - `current_filter: FilterType` - Active filter (None, OnlyCwd, OnlyDirs, OnlyFiles)
 - `ranker: Ranker` - ML model
 
-**Worker loop:**
-1. Process walker updates (non-blocking `try_recv`)
-   - `FileMetadata`: Add file to registry, mark files_changed
-   - `AllDone`: Mark walker_done, force immediate FilesChanged notification
-2. Send FilesChanged if files changed AND (walker_done OR >200ms since last notification)
-3. Process work requests with 5ms timeout
-4. Debounce queries (drain channel, keep latest)
+**Worker loop:** one blocking `recv()`, then `drain_requests` takes everything
+else already queued behind it. The walker sends into the same channel, wrapped in
+`WorkerRequest::Walker` - see "The worker and the walker share one channel" above,
+which is where the 5ms `recv_timeout` over two channels went.
+
+1. Block on `recv()`. Drain whatever else is queued, dropping queries that a
+   later query supersedes and keeping everything else in order
+2. Handle the walker's messages in the batch first: `FileMetadata` adds to the
+   registry and marks `files_changed`; `ChildrenDone` and `AllDone` also set
+   `publish_now`
+3. Send `FilesChanged` if files changed AND (`publish_now` OR >200ms since the
+   last notification)
+4. Handle the remaining requests in order
 
 **One result list, not two.** `file_scores` is the result set: ranked order,
 with each row's score and features at that row's position. There used to be a
@@ -827,7 +836,7 @@ containing `root`, and both consumers take its output:
   the bool, so hiding costs nothing per keystroke.
 
 **Impressions:** hidden rows are dropped in `filter_and_rank`, so they never enter
-`filtered_files`, never reach a page, and never reach the UI's page cache - which is
+`file_scores`, never reach a page, and never reach the UI's page cache - which is
 what `check_and_log_impressions` reads. A hidden file therefore cannot be logged as
 seen when it was not. `test_hidden_files_never_reach_a_page` pins this down, because it
 is the property that keeps hiding from quietly corrupting the training data.
@@ -845,11 +854,21 @@ Why: Avoids wasted computation and improves responsiveness.
 
 **Auto-refresh:** When new files arrive from the walker, the worker sends a `FilesChanged` notification to the UI thread (debounced to 200ms intervals). When walker sends `AllDone`, the debounce is bypassed to ensure immediate UI update. The UI is then responsible for triggering a new query with a new `query_id` to get fresh results. This preserves the "UI generates IDs" architecture and ensures the page cache is handled correctly.
 
-**Filtering:** The worker applies filters in `filter_and_rank()`. Text queries use **case-insensitive substring matching** (`.contains()`), not fuzzy matching. Filters are additive - both the text query and the filter type must match. Filter logic:
-- `FilterType::None`: No additional filtering beyond text query
-- `FilterType::OnlyCwd`: Only files with `origin == FileOrigin::CwdWalker` (excludes historical files)
-- `FilterType::OnlyDirs`: Only files where `is_dir == true`
-- `FilterType::OnlyFiles`: Only files where `is_dir == false`
+**Filtering:** The worker applies filters in `filter_and_rank()`. Text queries
+are matched with `fuzzy_matcher`'s `SkimMatcherV2` against the display name, so
+"srw" finds `src/search_worker.rs`. The match returns a score as well as a
+yes/no, and that score is carried through to the ranker as the `fuzzy_score`
+feature rather than being computed a second time - see "The fuzzy score is
+passed in, not recomputed" under `ranker.rs`. An empty query matches everything
+with `i64::MAX`.
+
+Filters are additive - both the text query and the filter type must match:
+
+- `FilterType::None`: no additional filtering beyond the text query
+- `FilterType::OnlyCwd`: `is_under_cwd`, whatever the origin - a historical file
+  that happens to live under the current root counts
+- `FilterType::DirectCwd`: under cwd *and* whose parent is the root exactly
+- `FilterType::OnlyDirs` / `FilterType::OnlyFiles`: on `is_dir`
 
 The filter is part of `UpdateQueryRequest` and persists across query changes until the user selects a different filter.
 
@@ -859,10 +878,16 @@ The filter is part of `UpdateQueryRequest` and persists across query changes unt
 struct FileId(usize);  // Newtype for type safety
 
 struct FileInfo {
-    full_path: PathBuf,
+    full_path: PathBuf,    // Canonical
     display_name: String,  // Computed once (relative path or ".../filename" or directory name for cwd)
-    mtime: Option<i64>,    // From walker or historical load
+    mtime: Option<i64>,    // From the walker, the historical load, or a re-stat
+    atime: Option<i64>,
+    file_size: Option<i64>,
     origin: FileOrigin,    // CwdWalker or UserClickedInEventsDb
+    is_dir: bool,
+    is_under_cwd: bool,    // What OnlyCwd and DirectCwd filter on
+    evicted: bool,         // Gone from disk; kept so FileId indices stay valid
+    hidden: bool,          // Under an active hidden prefix
 }
 ```
 
@@ -955,7 +980,12 @@ Trait-based feature registry - single source of truth for all features.
 pub trait Feature: Send + Sync {
     fn name(&self) -> &'static str;
     fn feature_type(&self) -> FeatureType;
-    fn compute(&self, inputs: &FeatureInputs) -> Result<f64>;
+    fn monotonicity(&self) -> Option<Monotonicity> { None }
+    /// Infallible on purpose: every feature is arithmetic over a struct that
+    /// already holds what it needs. A `Result` here put an `.expect()` inside a
+    /// rayon loop, where the only thing it could do was take the worker down
+    /// without a word.
+    fn compute(&self, inputs: &FeatureInputs) -> f64;
 }
 
 // implementations.rs - all features implement trait
@@ -963,7 +993,7 @@ pub struct FilenameStartsWithQuery;
 impl Feature for FilenameStartsWithQuery {
     fn name(&self) -> &'static str { "filename_starts_with_query" }
     fn feature_type(&self) -> FeatureType { FeatureType::Binary }
-    fn compute(&self, inputs: &FeatureInputs) -> Result<f64> { /* ... */ }
+    fn compute(&self, inputs: &FeatureInputs) -> f64 { /* ... */ }
 }
 
 // registry.rs - THE SINGLE SOURCE OF TRUTH
@@ -971,9 +1001,8 @@ pub static FEATURE_REGISTRY: Lazy<Vec<Box<dyn Feature>>> = Lazy::new(|| {
     vec![
         Box::new(FilenameStartsWithQuery),
         Box::new(ClicksLast30Days),
-        Box::new(ModifiedLast24h),
-        Box::new(IsUnderCwd),
-        Box::new(IsHidden),
+        // ... twenty in all; see the grouped list under `features.rs`
+        Box::new(ExtensionClickShare),
     ]
 });
 ```
@@ -1057,8 +1086,10 @@ Measured effect, before -> after:
 
 Feature computation is no longer the expensive part of ranking - at 0.69ms it now
 costs less than the model inference it feeds (0.71ms), and the most expensive
-single feature is `log_file_size` at 0.25ms total, which is a `stat` syscall
-doing real work.
+single feature is `log_file_size` at 0.25ms total, which is one `log2` over a
+size the walk already had. Nothing in feature computation touches the
+filesystem: every syscall was paid once, during the walk, and carried on
+`FileInfo` from there.
 
 **What kind of file you open, without naming a file.**
 `extension_click_share` is the fraction of recent engagements that landed on
@@ -1144,11 +1175,23 @@ Generates training data from events database.
 
 ```rust
 struct Accumulator {
-    clicks_by_file: HashMap<String, Vec<ClickEvent>>,
-    scrolls_by_file: HashMap<String, Vec<ScrollEvent>>,
-    pending_impressions: HashMap<(String, u64, String), PendingImpression>,
+    // The same six indexes `Ranker::load_clicks` builds, in the same shapes.
+    // They have to agree: this is the train side of every click feature, and a
+    // difference here is train/serve skew that nothing would report.
+    clicks_by_file: FxHashMap<String, Vec<ClickEvent>>,
+    visits_by_dir: FxHashMap<String, Vec<ClickEvent>>,
+    clicks_by_extension: FxHashMap<String, usize>,
+    clicks_indexed: usize,
+    clicks_by_parent_dir: FxHashMap<PathBuf, Vec<ClickEvent>>,
+    clicks_by_query_and_file: FxHashMap<String, FxHashMap<String, Vec<ClickEvent>>>,
+    engagements_by_episode_query_and_file:
+        FxHashMap<String, FxHashMap<String, Vec<ClickEvent>>>,
+
+    // Key: (session_id, subsession_id, full_path)
+    pending_impressions: FxHashMap<(String, u64, String), PendingImpression>,
     output_rows: Vec<HashMap<String, String>>,
     current_episode_id: u64,
+    last_session_id: Option<String>,   // episode boundaries also fall on session ones
 }
 ```
 
@@ -1192,9 +1235,17 @@ pub struct Ranker {
 }
 
 pub struct ClickData {
-    clicks_by_file: HashMap<String, Vec<ClickEvent>>,
-    clicks_by_parent_dir: HashMap<PathBuf, Vec<ClickEvent>>,
-    clicks_by_query_and_file: HashMap<(String, String), Vec<ClickEvent>>,
+    clicks_by_file: FxHashMap<String, Vec<ClickEvent>>,
+    clicks_by_parent_dir: FxHashMap<PathBuf, Vec<ClickEvent>>,
+    /// `cd`s from the shell hook, kept apart from clicks on purpose
+    visits_by_dir: FxHashMap<String, Vec<ClickEvent>>,
+    /// Engagements per extension, and the total, so the feature is their ratio
+    clicks_by_extension: FxHashMap<String, usize>,
+    clicks_indexed: usize,
+    /// query -> path -> events, nested rather than keyed by (query, path)
+    clicks_by_query_and_file: FxHashMap<String, FxHashMap<String, Vec<ClickEvent>>>,
+    engagements_by_episode_query_and_file:
+        FxHashMap<String, FxHashMap<String, Vec<ClickEvent>>>,
 }
 ```
 
@@ -1229,12 +1280,15 @@ call it was made for. The ranker keeps its own candidate type rather than taking
 the worker's `FileInfo`: the worker knows about the ranker, and pointing that
 the other way as well would tie the two together for no gain.
 
-**Preloading clicks:** All click and scroll events from the last 30 days are loaded at startup into multiple HashMaps:
-- `clicks_by_file`: Indexed by full file path
-- `clicks_by_parent_dir`: Indexed by parent directory path
-- `clicks_by_query_and_file`: Indexed by (query, full_path) tuple for query-specific click tracking
+**Preloading clicks:** `Ranker::load_clicks` runs two queries at startup -
+`engagements_since` and `visits_since`, both over the last 30 days - and builds
+every index above in one pass over the rows. Each is `FxHashMap`, not the default
+hasher: these keys are short strings hashed hundreds of times per keystroke.
 
-Why: O(1) lookup per file vs O(n) query per file. Database query runs once with composite index. Multiple indices enable different features without re-querying the database.
+Why preload at all: O(1) per file against a database query per file. The 30-day
+window is also what keeps the ranker's memory flat as history grows, and is why
+`seconds_since_last_click` needs a `NEVER_CLICKED` constant that sits clear of
+the window's own maximum.
 
 **Hybrid Ranking Approach:**
 
@@ -1304,13 +1358,17 @@ trained on enough clicks to beat it.
 pub fn rank_files(
     &mut self,
     query: &str,
-    file_candidates: &[FileCandidate],
+    files: &[FileCandidate<'_>],
     current_timestamp: i64,
-    cwd: &PathBuf,
-) -> Result<Vec<FileScore>>
+    cwd: &Path,
+) -> Result<Ranking>
 ```
 
-Returns `Vec<FileScore>` sorted by predicted relevance (descending).
+Returns a `Ranking`: the `FileScore`s sorted by predicted relevance descending,
+plus a `RankTimings` breaking down where the pass spent its time. The timings
+ride back with the scores rather than being logged as they are computed, so the
+`TIMING` line can be written after the results have been sent - see "One TIMING
+line per query".
 
 **FileScore:**
 ```rust
@@ -1537,12 +1595,18 @@ Setting `HALF_LIFE_DAYS = 1000` restores uniform weighting.
 **Usage:**
 ```bash
 psychic generate-features  # Outputs features.csv + feature_schema.json
-python train.py features.csv output
-# Outputs:
-#   - output.txt (model file)
-#   - ~/.local/share/psychic/model.txt (copy for TUI)
-#   - output_viz.pdf (feature importance, SHAP, metrics)
+uv run train.py features.csv <output_prefix> [--data-dir DIR]
+# From the prefix:  <prefix>.txt (the model), <prefix>_viz.pdf
+# From --data-dir:  model_stats.json, and feature_schema.json is read from there
 ```
+
+psychic calls this with a prefix of `<data_dir>/model`, which is why the shipped
+model is `<data_dir>/model.txt`.
+
+`uv run`, not `python`: the script carries its own dependencies in a PEP 723
+block, as described above. And it writes only where it was told - the second,
+hardcoded write to `~/.local/share/psychic/model.txt` is gone, which is what used
+to make `--data-dir` silently train into the real data directory.
 
 **Schema integration:** Reads `feature_schema.json` to get feature names and types. Errors if missing.
 Why: Ensures Rust and Python agree on feature order.
@@ -1641,9 +1705,11 @@ Why tested: 11 unit tests verify invariants, edge cases, and the bug fix for his
 pub struct Analytics { /* ... */ }
 
 impl Analytics {
-    pub fn check_and_log_impressions(&mut self, force: bool, top_n: Vec<FileMetadata>) -> Result<()>
+    pub fn new(session_id: String, db: Database, no_logging: bool) -> Self
+    pub fn wants_impressions(&mut self, force: bool) -> bool
+    pub fn log_impressions(&mut self, top_n_files: Vec<FileMetadata>) -> Result<()>
     pub fn log_scroll(&mut self, query: &str, event_data: EventData) -> Result<()>
-    pub fn log_click(&self, event_data: EventData) -> Result<()>
+    pub fn log_click(&mut self, event_data: EventData) -> Result<()>
     pub fn new_subsession(&mut self, query_id: u64, query: String)
     pub fn next_subsession_id(&mut self) -> u64
     pub fn current_subsession_id(&self) -> u64
@@ -1965,7 +2031,7 @@ halfway through is caught by sanitising, not by sniffing.
 
 ### Module: `main.rs`
 
-Now an event loop and application glue of about 900 lines, down from 2000+.
+Now an event loop and application glue of about 1,100 lines, down from ~2,900.
 
 **Startup behavior:**
 - Spawns a background thread to retrain the model using collected events
@@ -2071,53 +2137,51 @@ Why: Progressive disclosure - hide when not needed, expand for detailed debuggin
 
 **App structure:**
 ```rust
-struct App {
+pub struct App {
     // Search state
     query: String,
     page_cache: HashMap<usize, Page>,
     total_results: usize,
     total_files: usize,
     selected_index: usize,
+    file_list_scroll: usize,
+    current_filter: search_worker::FilterType,
 
     // UI state
     ui_state: ui_state::UiState,
     history: history::History,
     history_selected: usize,
+    preview: PreviewState,
+    status_message: Option<String>,     // e.g. "Gone: <name>", until the next key
 
-    // Analytics
-    current_subsession: Option<Subsession>,
-    next_subsession_id: u64,
-    scrolled_files: HashSet<(String, String)>,
-    session_id: String,
+    // What the last frame worked out, which only the renderer knows
+    path_bar_width: u16,
+    visible_list_height: u16,           // impressions are the rows that fit in it
 
-    // Configuration
-    on_dir_click: OnDirClickAction,    // Navigate, PrintToStdout, or DropIntoShell
-    on_cwd_visit: OnCwdVisitAction,    // PrintToStdout or DropIntoShell
-    current_filter: search_worker::FilterType,
-
-    // Worker communication
+    // Owned subsystems
+    analytics: Analytics,               // subsessions, impressions, scrolls, episodes
+    options: AppOptions,                // on_dir_click, on_cwd_visit, editor, the --no-* flags
+    input: tty_input::TtyInput,
     worker_tx: mpsc::Sender<WorkerRequest>,
+    worker_handle: Option<JoinHandle<()>>,
+
+    // Thread control
+    tick_paused: Arc<AtomicBool>,
+    something_animates: Arc<AtomicBool>, // the marquee, today
 
     // Debug pane
-    timings: Timings,                  // Latencies shown in the pane
-    db_stats: Option<db::DbStats>,     // Loaded on first open, in the background
-    query_sent_at: Option<(u64, Instant)>,  // Times the round trip of the live query
+    timings: Timings,                   // latencies shown in the pane
+    db_stats: Option<db::DbStats>,      // loaded on first open, in the background
+    recent_logs: VecDeque<String>,      // filled by the loop from a receiver main owns
+    query_sent_at: Option<(u64, Instant)>,
 
     // ... (other fields)
 }
 ```
 
-**Subsession tracking:**
-```rust
-struct Subsession {
-    id: u64,
-    query: String,
-    created_at: Instant,
-    events_have_been_logged: bool,
-}
-```
-
-New subsession metadata is created when the UI receives a valid `QueryUpdated` response from the worker. The `id` is generated from a counter in the UI thread (`App.next_subsession_id`) and serves a dual purpose:
+Subsessions live on `Analytics`, not here. A subsession is created when the UI
+receives a valid `QueryUpdated` from the worker. Its `id` comes from a counter on
+the UI thread (`Analytics::next_subsession_id`) and serves a dual purpose:
 1.  It links analytics events (`impression`, `click`) together for a given search.
 2.  It acts as the `query_id` for the robust communication protocol with the search worker.
 
@@ -2141,8 +2205,9 @@ loop {
     // Draw UI
     terminal.draw(|f| { render_ui(f, &mut app, ...) })?;
 
-    // Drain logging channel (non-blocking, for logs sent before unified channel migration)
-    while let Ok(log_msg) = app.log_receiver.try_recv() { ... }
+    // Drain the logging channel into the debug pane's ring buffer. `main` owns
+    // the receiver, not `App` - see the shutdown rule below.
+    while let Ok(log_msg) = log_rx.try_recv() { ... }
 
     // Block until ANY event arrives (instant wake!)
     let app_event = event_rx.recv()?;
@@ -2214,9 +2279,10 @@ the terminal is actually attached to, which is the `/dev/tty` psychic opened,
 and emphatically not stdin.
 
 **Filters:**
-Filter picker appears as a popup overlay in the bottom-right when Ctrl-F is pressed. Four filter options:
+Filter picker appears as a popup overlay in the bottom-right when Ctrl-F is pressed. Five filter options:
 - 0: No filter (show all matching files)
-- c: Only CWD (show only files from current working directory, excludes historical files)
+- c: Only CWD - anything under the current root, recursively, historical files included
+- i: Direct CWD - only the root's immediate children
 - d: Only directories
 - f: Only files (non-directories)
 
@@ -2229,18 +2295,11 @@ You can also set the initial filter via CLI: `psychic --filter=dirs` or `--filte
 **History Navigation Mode:**
 Pressing Ctrl-H enters history navigation mode, which provides a browser-style back/forward navigation through directories visited during the current session.
 
-**State Management:**
-- `dir_history: Vec<PathBuf>` - chronologically ordered list of visited directories
-- `history_index: usize` - current position in history (where we are in the timeline)
-- `history_selected: usize` - UI selection within filtered history list
-- `history_mode: bool` - whether history mode is active
-
-**Navigation behavior:**
-When you navigate to a directory via Enter:
-1. If selecting the directory at `history_index` (next in chronological order), increment `history_index` to preserve history
-2. Otherwise, this is a branch point: truncate history at `history_index`, append current `cwd`, then set `history_index` to the new end
-
-This creates a branch-point model similar to browser history - you can go back, then navigate to a different directory, which creates a new branch and discards the "future" history.
+**State:** the timeline itself is `history::History` (`dirs` and `current_index`,
+with the invariant `cwd == dirs[current_index]`); `App` holds only
+`history_selected`, the cursor within the filtered list, and `ui_state.history_mode`.
+Branch-point behaviour is described under "Module: `history.rs`" and not repeated
+here.
 
 **UI in history mode:**
 - Left pane: List of directories in reverse chronological order (most recent at top, with line numbers)
@@ -2255,7 +2314,9 @@ This creates a branch-point model similar to browser history - you can go back, 
 
 Why reverse chronological: Most recent directories are most relevant, so they should be at the top for quick access.
 Why include current dir: Allows seeing where you are in context of history, and provides consistent behavior even when history is empty.
-Why substring filtering: Consistent with normal search behavior (both use `.contains()`).
+Why substring filtering here rather than the fuzzy match the file list uses: the
+history list is short and the user is usually recalling a directory name they
+know, where a literal match is more predictable than a scored one.
 Why auto-exit on Enter: Most common use case is "go back to X" - staying in history mode would require extra keypress.
 
 **Preview:**
@@ -2265,18 +2326,28 @@ Why auto-exit on Enter: Most common use case is "go back to X" - staying in hist
 
 Why generate once: scrolling then costs nothing, since the offset is applied when slicing.
 
-**Editor launch:**
+**Handing the terminal to a child.** Every one of them - `$EDITOR`, a shell -
+goes through `input::suspend_tui_and_run`, which does five things in order and
+undoes them however the child exits:
+
 ```rust
-disable_raw_mode()?;
-terminal.backend_mut().execute(LeaveAlternateScreen)?;
-Command::new("hx").arg(&full_path).status()?;
-enable_raw_mode()?;
-terminal.backend_mut().execute(EnterAlternateScreen)?;
-terminal.clear()?;  // CRITICAL
+let _paused = app.input.pause();        // guard: Drop resumes, so no early
+                                        // return can leave the terminal deaf
+app.tick_paused.store(true, Relaxed);   // or ticks pile up and arrive in a burst
+open_child_tty(command)?;               // our stdout may be a pipe; the child
+                                        // gets /dev/tty, not what we inherited
+leave_tui(terminal)?;                   // raw mode off, alt screen left
+command.status();                       // not `?`: the terminal must be restored
+enter_tui(terminal)?;                   // ...whatever the child did
 ```
 
-Why `terminal.backend_mut().execute()`: Must use same terminal instance (not stdout()).
-Why `terminal.clear()`: Wipes leftover state from editor. Without it, blank screen on resume.
+`pause()` returns only once the input thread has acknowledged that it has stopped
+reading, so the child provably has the terminal to itself - see `tty_input.rs`.
+`enter_tui` clears the screen, without which the editor's leftover state shows
+through. The editor itself is `$EDITOR`, then `$VISUAL`, then `vi`, resolved once
+at startup into `AppOptions::editor`.
+
+On the way back, `refresh_after_suspend` asks the worker to re-stat and rerank.
 
 **Logging:** Uses `fern` crate with dual dispatch:
 - File output: `<data dir>/app.log`, which follows `--data-dir`. The command
@@ -2330,7 +2401,8 @@ Why worker sends page 0: Avoids extra round-trip. Main thread has immediate resu
 
 ## Performance Optimizations
 
-1. **Batched file updates:** Don't call update_filtered_files() for every file from walker. Batch with flag.
+1. **Batched file updates:** the walker's messages are handled as a batch and
+   `filter_and_rank` runs once at the end, not once per file.
    Why: 800x speedup during startup (1 rank operation vs 800).
 
 2. **Zero-copy ranker API:** Takes `&[FileCandidate]` instead of `Vec<FileCandidate>`.
@@ -2495,7 +2567,13 @@ binary measured against itself came out 1.6x apart on first paint purely from th
 cost of opening it. **The real data directory is only ever read from.**
 
 Each version also gets **its own trained model**, built by running its own binary's
-`retrain` at setup and restored before every trial. Not one shared model: a
+`retrain` at setup and restored before every trial. Restored *before every trial*
+because every launch retrains in the background, and a retrain that finishes
+replaces `model.txt` mid-run: the baseline's `train.py` once wrote a 53-tree
+model where the current one wrote 84, and the resulting 1.8x gap in predict time
+looked exactly like a regression until both were pinned, when it closed to 1.10x.
+
+Not one shared model either: a
 change that adds a feature makes the two builds expect different numbers of
 columns, the mismatched model is refused at load, and the run would quietly
 measure the simple-model fallback instead of the thing being benchmarked. That
@@ -2561,38 +2639,6 @@ feature set two ways, because `compare` takes `train.py` from the working tree
 for *both* arms - a training-parameter change reads `+0.0000` there, and the tool
 now says so rather than letting the next person believe it.
 
-Psychic is a TUI, so both halves of a measurement are awkward: it has to be
-driven on a real terminal, and the numbers have to come back out of its own
-`TIMING` lines rather than from wall-clock guesses outside the process. Five
-things had to be got right, each of which produced a confident wrong answer
-first:
-
-- **Pin the model.** Every launch retrains in the background, and a retrain that
-  finishes replaces `model.txt`. The baseline's `train.py` wrote a 53-tree model
-  where the current one writes 84, and the resulting 1.8x difference in predict
-  time looked exactly like a regression. Pinning one model for both closed it to
-  1.10x.
-- **Size the pty.** `script(1)` gives no control over geometry and hands out
-  80x24, which nobody runs and which makes the baseline's synchronous `bat`
-  spawn look four times cheaper than it is. The harness opens the pty itself and
-  sets 40x120 with `TIOCSWINSZ`.
-- **Keep stdin open.** An immediate EOF on the pty reads as a keypress, and
-  psychic quits before it has finished starting up - so the first version of the
-  harness measured nothing at all, silently.
-- **Compare queries in the steady state.** At its first query the baseline ranks
-  126 files and the current binary ranks all 243, because the two-phase walk has
-  already delivered the root's children. Comparing those two numbers makes a 1.5x
-  improvement read as a 2x regression. The last query of a run, after the walk,
-  has both at 243.
-- **Interleave, do not block.** Running all trials of one configuration before
-  the next lets a slow patch on the machine land entirely on one of them. That
-  inverted the walk result once already.
-
-Both versions still redraw on a tick, about ten writes a second when idle, so
-the keystroke measurement waits for a quiet moment before starting its clock:
-that puts it just after a tick redraw, which makes the next write the one the
-keystroke caused.
-
 ## Shutdown Sequence
 
 **The rule: the log sink must outlive everything that logs.**
@@ -2611,8 +2657,17 @@ ever fixed the thread being joined, and had to be done again the next time a
 thread was added. The retraining and context threads are detached and can log at
 any moment, so they could not have been fixed that way at all.
 
+**The worker is told to stop, not starved of senders.** Step 1 used to be
+`drop(worker_tx)`, on the theory that the channel disconnecting is the signal.
+That stopped being true the moment the walker was given a clone of the same
+sender: with a second sender alive the channel never disconnected, the worker sat
+in `recv()` forever and `handle.join()` hung - Ctrl-C did nothing and the process
+had to be killed from another terminal. An explicit `WorkerRequest::Shutdown`
+does not care how many senders exist. `test_the_worker_stops_when_asked_even_though_the_walker_holds_a_sender`
+bounds the join at ten seconds so this cannot come back quietly.
+
 **Order:**
-1. Drop `worker_tx` (signals the worker to stop) and join the worker
+1. Send `WorkerRequest::Shutdown` and join the worker
 2. `input.shutdown()` - not for the logging, but so nothing is still reading the
    terminal while it is being put back
 3. Drop `app`
@@ -2635,6 +2690,15 @@ any moment, so they could not have been fixed that way at all.
 - `once_cell` - Lazy static for feature registry
 - `timeago` - Human-readable relative timestamps
 - `rand` - Random number generation (session IDs)
+- `fuzzy-matcher` - `SkimMatcherV2`, which decides what matches a query and how well
+- `rayon` - the parallel pass over candidates in `rank_files`
+- `rustc-hash` - `FxHashMap` for the click indexes, hashed hundreds of times a keystroke
+- `libc` - `poll(2)`, `isatty`, `close` in `tty_input.rs`; the only `unsafe` left
+- `signal-hook` - SIGWINCH, alongside crossterm's handler rather than replacing it
+- `unicode-width` - column widths for truncation and layout
+- `strum` - deriving the `FilterType` cycle
+- `csv`, `serde`, `serde_json` - training rows out, schema and episode queries both ways
+- `regex` - used by `analyze_perf.rs`
 
 ## CLI Commands
 
@@ -2674,6 +2738,11 @@ psychic zsh
 psychic track-visit /path/to/directory
 # Logs a startup_visit event for the directory
 
+# Manage directories hidden from results (nothing is deleted; see "Hiding directories")
+psychic hidden list
+psychic hidden add /path/to/directory
+psychic hidden remove /path/to/directory
+
 # Internal commands (development/debugging)
 psychic internal analyze-perf
 psychic internal print-log
@@ -2681,9 +2750,9 @@ psychic internal clear-log
 psychic internal summarize-events
 psychic internal preview <path> [--lines N] [--repeat N] [--show]
 
-# Train model (standalone Python script)
-python train.py features.csv output
-# Outputs: output.txt + ~/.local/share/psychic/model.txt + output_viz.pdf
+# Train model (standalone; `psychic retrain` does this for you)
+uv run train.py features.csv <output_prefix> [--data-dir DIR]
+# Outputs: <prefix>.txt, <prefix>_viz.pdf, and model_stats.json in --data-dir
 ```
 
 ## Data Files

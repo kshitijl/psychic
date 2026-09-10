@@ -1084,11 +1084,15 @@ mod tests {
         // Format as string for expect-test style comparison
         let actual = format!("{:?}", features);
 
-        // Expected output: [filename_starts_with_query, clicks_last_30_days, modified_last_24h, is_under_cwd, is_hidden, log_file_size, clicks_last_week_parent_dir, clicks_last_hour, clicks_last_24h, clicks_last_7_days, modified_age, clicks_for_this_query, engagements_in_episode_with_query, is_dir, fuzzy_score]
+        // Expected output is the feature vector in `FEATURE_REGISTRY` order.
+        // The notes below cover the first fifteen; the rest are the September
+        // additions, which go on the end (visits_last_7_days,
+        // visits_last_30_days, seconds_since_last_click,
+        // seconds_since_last_click_parent_dir, extension_click_share).
         // filename_starts_with_query=0 (bar.txt doesn't start with "test")
         // clicks_last_30_days=3 (3 clicks on bar.txt itself)
         // modified_last_24h=0 (mtime is exactly 24h before current_timestamp, so outside)
-        // is_under_cwd=1 (is_from_walker=true, so guaranteed to be under cwd)
+        // is_under_cwd=1 (full_path is under cwd; one prefix check, both sides)
         // is_hidden=0 (no dot-prefixed components)
         // log_file_size=13.585079902767108 (log2 of 1 + 12288, a 12 KB file)
         // clicks_last_week_parent_dir=4 (3 clicks on bar.txt + 1 click on other.txt in /tmp/foo/)
