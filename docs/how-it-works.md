@@ -47,13 +47,15 @@ The codebase follows John Ousterhout's "deep modules" philosophy: simple interfa
 **Utilities:**
 18. **`path_display.rs`** - Path formatting utilities (truncation, abbreviation)
 19. **`cli.rs`** - CLI argument parsing with clap
+20. **`metadata_ext.rs`** - One trait, so mtime and atime are read out of
+    `fs::Metadata` the same way everywhere
 
 **Main Entry Point:**
-20. **`main.rs`** - Event loop glue (~900 lines, down from ~2000+)
+21. **`main.rs`** - Event loop glue (~1,100 lines, down from ~2,900)
 
 **Development Tools:**
-21. **`analyze_perf.rs`** - Performance analysis for timing logs
-22. **`bench/`** - Not a module: the benchmark harness, in Python. `run.py`
+22. **`analyze_perf.rs`** - Performance analysis for timing logs
+23. **`bench/`** - Not a module: the benchmark harness, in Python. `run.py`
     measures speed against another commit, `model.py` measures ranking quality.
     See `llm.md`.
 
@@ -1117,8 +1119,22 @@ feature, which is the shape train/serve skew takes. Every path in the registry
 is canonical, so the check is exact and cheap. Verified by generating the
 training CSV before and after: byte for byte identical.
 
-**Query-specific features:** The `clicks_for_this_query` feature tracks clicks for specific (query, file) pairs. This distinguishes between files clicked for different search contexts - e.g., a file clicked 10 times for query "config" vs 0 times for query "test" is more relevant for "config" searches.
-Why: General click counts don't capture query-specific relevance. A frequently clicked file for one query may be irrelevant for another.
+**Query-specific features, and why there are two of them.**
+`clicks_for_this_query` counts clicks on a (query, file) pair: a file clicked 10
+times under "config" and never under "test" is evidence for "config" and not for
+"test", which a general click count cannot express.
+
+`engagements_in_episode_with_query` is the same idea widened along the episode.
+Type "tc", then "todo", then "todo-current", then click `todo-current.md`: the
+exact-match feature credits only "todo-current", while this one credits all
+three, because all three were on the way to the same click. The queries are
+recorded on the click row itself as `episode_queries` (see `analytics.rs`), so
+loading it is one scan of the clicks and a short JSON parse each - no join.
+
+This is what makes psychic feel like it is guessing: one letter, buried in the
+middle of a filename, is enough when that letter was on the path to that file
+before. The two features are kept separate rather than merged so the model can
+weigh an exact repeat against a near miss on its own.
 
 ### Module: `features.rs`
 
@@ -1149,12 +1165,20 @@ Why single-pass: O(n) instead of O(n²). No future data leakage (features only s
 **Episode-based ranking:** Each episode spans from one engagement event to the next.
 Why: LambdaRank needs episodes (groups of impressions). Each episode = impressions leading to an action. More meaningful than subsession-based grouping.
 
-**Features computed:** See `feature_defs/implementations.rs` for full list. Examples:
-- Query matching: filename_starts_with_query
-- Click history: clicks_last_30_days, clicks_last_7_days, clicks_last_24h, clicks_last_hour, clicks_for_this_query
-- File properties: is_hidden, is_under_cwd, log_file_size
-- Temporal: modified_last_24h, modified_age
-- Directory features: clicks_last_week_parent_dir
+**Features computed:** `feature_defs/registry.rs` is the source of truth - the
+list below is grouped for reading, and its order there is the model's feature
+vector, which is why new features go on the end. Twenty of them:
+
+- Query matching: `filename_starts_with_query`, `fuzzy_score`
+- Click history: `clicks_last_30_days`, `clicks_last_7_days`, `clicks_last_24h`,
+  `clicks_last_hour`
+- Query-specific: `clicks_for_this_query`, `engagements_in_episode_with_query`
+- File properties: `is_hidden`, `is_under_cwd`, `is_dir`, `log_file_size`
+- Temporal: `modified_last_24h`, `modified_age`, `seconds_since_last_click`,
+  `seconds_since_last_click_parent_dir`
+- Directory: `clicks_last_week_parent_dir`, `visits_last_7_days`,
+  `visits_last_30_days`
+- Extension: `extension_click_share`
 
 ### Module: `ranker.rs`
 
@@ -1337,7 +1361,7 @@ Features kept: `visits_last_7_days`, `visits_last_30_days`,
 `extension_click_share`. Features built, measured and dropped: `query_length`,
 clicks under a directory, visits inherited by the files inside a directory,
 per-query clicks by directory, depth below cwd, click-through rate. The
-reasoning for each is in `todo.md`, and the measurements are in the commits.
+reasoning for each is in `docs/todo.md`, and the measurements are in the commits.
 
 **Why this is worth doubting.** Every one of those comparisons is a single
 history at a single moment. A smaller history would favour a smaller model; a
@@ -2175,6 +2199,19 @@ Run `eval "$(psychic zsh)"` in your ~/.zshrc to enable the `p`, `pd`, and `pc` c
 
 **How automatic tracking works:**
 The shell integration installs a `__psychic_hook()` function that runs after every directory change. This hook calls `psychic track-visit <directory>` in the background, which logs a `startup_visit` event to the database. These visits appear in search results and help the ML model learn your directory preferences, but they don't count as positive click signals (unlike actual clicks), preventing bias in the ranking.
+
+**Why the TUI is drawn to `/dev/tty` and not to stdout.** A shell cannot change
+its own parent's directory, so `p` has to run psychic in a command substitution
+and `cd` to what comes back on stdout. That only works if stdout carries the
+answer and nothing else - but a TUI's whole job is to write to the terminal. So
+psychic opens `/dev/tty` itself and points ratatui at that (`main.rs`, and again
+in `input.rs` for a suspended child's three descriptors), leaving stdout free to
+carry exactly one line: the path, printed on the way out under
+`--on-cwd-visit=print-to-stdout` or `--on-dir-click=print-to-stdout`. This is
+how zoxide's interactive mode works too. It is also why `tty_input.rs` is
+careful about *which* descriptor it polls: the fd it waits on must be the one
+the terminal is actually attached to, which is the `/dev/tty` psychic opened,
+and emphatically not stdin.
 
 **Filters:**
 Filter picker appears as a popup overlay in the bottom-right when Ctrl-F is pressed. Four filter options:

@@ -57,7 +57,7 @@ that is an hour, and the measurement above is the thing worth keeping.
 
 Every choice made in September - objective, tree size, learning rate, half-life,
 which features are in - was measured against one history at one moment: about a
-year of one person's clicks, 1,200 of them. how-it-works.md has the table of
+year of one person's clicks, 1,200 of them. `docs/how-it-works.md` has the table of
 what was chosen and what it beat, under "Where these choices came from".
 
 **The experiment that has not been run.** Take windows of the history - last

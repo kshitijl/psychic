@@ -1,3 +1,18 @@
+> **Archived transcript, September 2026. Not a description of how the code
+> works.**
+>
+> This is the raw terminal log of the review session that produced the September
+> 2026 batch of work: the performance pass, the lambdarank switch, the feature
+> experiments, and the tuning that came with them. It is kept for provenance -
+> what was measured, what was argued, and what was rejected - and for nothing
+> else.
+>
+> Much of what it proposes was done differently, or measured again and dropped.
+> Anything from it that survived contact with the data lives in
+> `docs/how-it-works.md` (under *Where these choices came from, and when to stop
+> trusting them*), in `docs/todo.md`, and in the commit messages. **Where this
+> file and those disagree, those are right.**
+
  ▐▛███▛█   Claude Code v2.1.263
 ▝▜██████▀  Fable 5.1 · Claude Pro
   ▝▝ ▝▝    ~/local-src/32-psychic

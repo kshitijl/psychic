@@ -10,7 +10,7 @@ use std::path::Path;
 // Every window here is a plain rolling window counted backwards from the moment
 // being scored: "the last 24 hours", never "since midnight". Nothing in this
 // file is timezone aware, and that is deliberate - see "Time windows are
-// rolling, not calendar days" in how-it-works.md.
+// rolling, not calendar days" in docs/how-it-works.md.
 //
 // The short version: a calendar day needs a timezone, and resolving one cost
 // more than every other feature combined (~50ms on the first ranking pass,

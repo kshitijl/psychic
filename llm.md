@@ -1,4 +1,4 @@
-Read how-it-works.md to understand the code and decisions.
+Read `docs/how-it-works.md` to understand the code and decisions.
 
 Use asserts liberally throughout the code. For any function, consider documenting its preconditions in the form of asserts. Put these at the top of the function. They should be asserts, not debug_asserts, so they're run in prod and we can find bugs.
 
@@ -10,9 +10,13 @@ Follow John Ousterhout's "deep modules" philosophy:
 * **Small interface, deep implementation** - Each module should have a minimal public API that hides substantial complexity inside
 * **Separation of concerns** - Think hard about the API between different components. A minimal API should be exposed.
 * **Information hiding** - The work of each component should be defined, and functions for that should live in the code for that component. They should not be public.
-* **Example of a good deep module:** `preview.rs` (if extracted) would expose just `render()`, `scroll()`, `reset_scroll()` but hide all the bat/eza execution, caching, ANSI parsing, width adaptation logic inside.
+* **Example of a good deep module:** `preview.rs` exposes little more than "give
+  me the preview for this path" and hides the thread, the syntect highlighting,
+  the visible-window-plus-runway logic and the binary-file sniffing behind it.
 
-See `refactor.md` for planned module extractions following this philosophy.
+The extractions this repo once had planned - `preview.rs`, `render.rs`,
+`path_display.rs`, `cli.rs`, `app.rs`, `analytics.rs` - are all done. The module
+map in `docs/how-it-works.md` is the current list.
 
 Read src/main.rs to understand the entrypoint. Read train.py to understand how the model is made.
 
@@ -23,7 +27,7 @@ After adding implementing a feature or fixing a bug:
 * run `cargo test`
 * also `cargo clippy`.
 * add new tests for the feature just added, if possible
-* **update how-it-works.md so that it reflects current state, in the same
+* **update `docs/how-it-works.md` so that it reflects current state, in the same
   commit.** Not "later", not a follow-up: a commit that changes behaviour and
   leaves the document describing the old behaviour has made the document
   actively misleading, which is worse than a gap. If the change is genuinely

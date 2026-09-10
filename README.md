@@ -63,7 +63,7 @@ If you're using the shell integration (which you should), type
 Otherwise, type `psychic` to open the TUI. By default, it will explore both files and directories.
 
 * Start typing to filter the list of files.
-* Hit enter on a file to open it in my favorite editor, Helix (note to self: respect the user's `$EDITOR` environment variable).
+* Hit enter on a file to open it in `$EDITOR`, falling back to `$VISUAL` and then to `vi`.
 * Hit enter on a directory to navigate into it.
 * `Tab` and `Shift-Tab` to cycle through different filters: all files, just directories, just items under the current cwd, just direct descendants of the cwd.
 * `Left/Right` to go back and forward in history.
@@ -75,7 +75,7 @@ Otherwise, type `psychic` to open the TUI. By default, it will explore both file
 
 ## LLM use disclosure
 
-This was my first project where I used LLMs to generate a substantial portion of the code. That being said, I stand behind the quality of this code. The design and architecture are my own creation. I exercised substantial creative control in how the tests and types are set up, which constrain the rest of the code. You can read `llm.md` and `how-it-works.md` to see how the LLMs were instructed, but they are only a small part of the story. Every single commit is here because I decided that change was necessary, and many initial drafts were rejected before getting to the commits you see in this repository. 
+This was my first project where I used LLMs to generate a substantial portion of the code. That being said, I stand behind the quality of this code. The design and architecture are my own creation. I exercised substantial creative control in how the tests and types are set up, which constrain the rest of the code. You can read `llm.md` and `docs/how-it-works.md` to see how the LLMs were instructed, but they are only a small part of the story. Every single commit is here because I decided that change was necessary, and many initial drafts were rejected before getting to the commits you see in this repository. 
 
 At least as that term was defined in Karpathy's original tweet, this is not a vibe-coded project.
 
