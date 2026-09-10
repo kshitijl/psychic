@@ -1,638 +1,263 @@
 ## now
 
-### 2026-09-08 review: remaining findings and suggested order
+Ordered by what a user would feel, then by risk removed. Every item ends with
+its own check. Read `llm.md` first: every change gets benchmarked against its
+parent, and a ranking change gets `./bench/model.py compare --seeds 5` as well.
 
-**Working notes for whoever picks these up.**
+### 1. Predict is now most of the per-keystroke budget
 
-- *Design rule not written down anywhere else:* the visible result list must
-  never reorder without user input. Reranking during the initial fill-in is
-  fine; a reorder seconds later with no keypress is not (Spotlight does this
-  and it is hated). Anything that changes ranking must be tied to a user
-  action. This is why the retrained model is loaded on click/navigation, not
-  when training finishes.
-- *Workflow* (from llm.md): `just build` (release binary; the user's daily
-  symlink points at it, never plain `cargo build`), `cargo test`,
-  `cargo clippy`, then update how-it-works.md to describe the *current*
-  state, not the history. Asserts for preconditions, not debug_asserts.
-  Structs over tuples. Each todo item above ends with its own check.
-- *Never test against the real data dir.* Make an isolated copy:
-  ```sh
-  S=/tmp/psychic-sandbox; mkdir -p $S/.local/share/psychic
-  sqlite3 ~/.local/share/psychic/events.db ".backup $S/.local/share/psychic/events.db"
-  cp ~/.local/share/psychic/{model.txt,model_stats.json} $S/.local/share/psychic/
-  ```
-  `.backup` is a consistent copy that does not touch the live file. Then run
-  with `HOME=$S` so both the data dir and app.log land in the sandbox
-  (the logger currently ignores --data-dir, see B7). Note `uv run train.py`
-  under a fresh HOME builds a cold uv cache; fine, it is background.
-- *Headless TUI run for timing:* the TUI needs a tty; `script` provides one
-  and forwards piped stdin, and 0x03 is Ctrl-C = quit:
-  ```sh
-  ( sleep 2; printf '\x03' ) | HOME=$S EDITOR=true script -q /dev/null \
-      ./target/release/psychic --no-preview >/dev/null 2>&1
-  grep -o '"op":"[a-z_]*","ms":[0-9.]*' $S/.local/share/psychic/app.log
-  ```
-  Run from the directory you want walked. `psychic internal analyze-perf`
-  prints the last TUI session's startup breakdown. The debug pane (Ctrl-O)
-  shows the same numbers live.
-- *Baseline to beat* (real session from `~`, 2026-09-08): first paint 3.3ms,
-  first results 18.4ms, first full render 49.7ms (draw 31.3ms, bat 15.7ms),
-  walk complete 92.6ms. From this 44-file repo in the sandbox: walk complete
-  11ms, first results 13ms. Per keystroke filter+rank ~2ms for ~240 rows.
-- *Real data shape* (for judging whether something matters): 83k events =
-  80k impressions, 1.1k clicks, 2.1k startup_visits, 7 scrolls; 971
-  sessions; 208 distinct engaged paths; model.txt 180 trees x 31 leaves;
-  registry ~240 rows from `~` after shallow mode, ~170 historical.
-- *Two invariants to keep while refactoring the worker:* `FileId` is an
-  index into `file_registry`, held by `filtered_files`/`file_scores` and by
-  pages the UI has, so never remove registry entries except in `change_cwd`
-  where `filter_and_rank` is re-run immediately after; and every response
-  to the UI carries the `query_id` of the request it answers, and the UI
-  drops anything older than its current id.
-- *Tests that look like coverage but are not:* `test_basic_feature_generation`
-  and `test_ranker_basic` skip themselves when their fixture files are
-  absent (always, in CI and locally). Do not count on them.
+Ranking a 244-file query from `$HOME` costs 2.35ms, and **1.9-2.1ms of that is
+one `predict_with_params` call**. Feature computation, which used to be the
+expensive half, is 0.24ms. This is the cost of the ranking work in September:
+the lambdarank model settles at ~156 trees where the old classification one
+stopped at ~90, and predict is proportional to trees.
 
-From a full read of the code plus measurements against the real data dir
-(62MB events.db, 971 sessions, 80k impressions, 31MB app.log). The three
-sections above came out of the same review. Everything below is still open.
+Measured directly, on the real model and real feature rows,
+`num_threads` does nothing at all - 1.888, 1.896, 1.888, 1.889ms for 1, 2, 4 and
+8. The parameter is inert at this call site, so **P9 is answered: there is no
+threading win to take.** The only lever left is a smaller model.
 
-**Suggested order.** Each step is independent; this is by what the user
-feels, then by risk removed, then cleanup.
+What to try, in order, measuring ranking quality *and* latency for each:
 
-1. Two-phase walker (P1). Biggest startup win in the common `p` from `~` case.
-2. Preview thread (P2). Removes the largest chunk of the first full render
-   and the per-keystroke stalls.
-3. Dropped-request bug (B1) and cwd-row bugs (B2). Silent, user-visible.
-4. Model reload item (above), blend weight item (above), training item
-   (above). Behavior of the ranking; do after the walker/preview work so
-   perf numbers are stable to compare.
-5. Database diet (P8) and logging cut (P4). Disk and per-keystroke syscalls.
-6. Startup syscalls (P3), allocation-free lookups (P5), get_slice (P6),
-   idle wakeups (P7). Small, safe, mechanical.
-7. Bugs B3-B7, then simplifications S1-S8, then the docs pass (S9).
+- `learning_rate` 0.05 -> 0.1, which should roughly halve the tree count. If
+  top-1 holds within the seed noise, this is a straight 2x on predict.
+- `num_leaves` 31 -> 15. Smaller trees, shallower traversal.
+- A hard cap on `num_boost_round` for the refit, accepting whatever early
+  stopping asks for only up to that cap.
 
-**Measured startup, last real session launched from `~`:**
-first paint 3.3ms; first results 18.4ms; first full render 49.7ms, of which
-the draw took 31.3ms because it spawned `bat` (15.7ms) synchronously; walk
-complete 92.6ms. In an isolated data dir from this 44-file repo the walk
-completes at 11ms, so the ~90ms is specific to the shallow-mode restart.
-Filter+rank is ~2ms per keystroke and is not the problem.
+This is a quality-for-latency trade, so it needs the quality number beside the
+latency number: `./bench/model.py compare --seeds 5` and `./bench/run.py startup`.
+Do not take a 2x on predict for a point of top-1 without saying so in the commit.
 
-**Re-measured 2026-09-09 against `1d4d767`, the commit before any of this
-work.** Both binaries from `$HOME` on a 40x120 pty, same events.db copy, same
-pinned model. Keystroke to redraw 12.20ms -> 2.45ms; first full render
-29.92 -> 11.55ms, its draw 18.23 -> 3.08ms; first results 11.54 -> 8.28ms
-while ranking 243 files rather than 126; worker state 8.50 -> 3.96ms;
-steady-state filter+rank 1.57 -> 1.05ms. Walk complete went 64.7 -> 76.9ms,
-and gitignore support is all of it: `--no-ignore` walks in 61.9ms, faster
-than the baseline. The numbers above reproduce at about 0.6x scale - that
-session ran in a larger terminal - with the same shape. Full table and the
-harness (`bench/run.py`) in how-it-works.md under "Performance
-Optimizations".
+### 2. B5. Train/serve skew on `is_dir`, and impressions that were never seen
 
-#### Performance
+Two separate things, both making the training data describe something other
+than what happened.
 
-- **P1. Two-phase walk.** DONE (2026-09-09). The walker now sends the root's
-  own children first (one readdir, `min_depth(1).max_depth(1)`) followed by a
-  new `WalkerMessage::ChildrenDone`, then collects everything deeper
-  (`min_depth(2)`) and hands it over only if it comes in under the threshold.
-  Past the threshold the deep pass is abandoned and the children stand alone,
-  so a tree too big to index costs one walk instead of two and shows its
-  children immediately instead of after both walks. `ChildrenDone` bypasses
-  the worker's 200ms debounce the way `AllDone` does, without which publishing
-  early would have bought nothing.
-  Measured, launch to the file list appearing, median of 5: in `~` 80.9ms ->
-  13.3ms; in this repo 13.7ms -> 12.3ms (small tree, never hit the threshold,
-  so nothing to win). `walker_complete` itself barely moves (65-69ms either
-  way): the depth-1 re-walk that was removed was always the cheap half.
-  Two bugs fixed on the way, both found while rewriting:
-  * An interrupted walk `try_recv`d the `ChangeCwd` that interrupted it and
-    dropped it, then the outer loop blocked on `recv` for a command already
-    delivered - so navigating during a long walk never walked the new
-    directory. `walk_directory` now returns the command that stopped it.
-  * `filter_entry` was applied to the root, so launching inside a directory
-    called `target` (or `.git`, `node_modules`, `.venv`) showed an empty
-    screen. Depth 0 is now exempt.
-  Follow-up if a large-but-under-threshold project ever feels slow: stream the
-  deep pass too, in batches, and add a message telling the worker to drop
-  everything below depth 1 when the threshold is hit. Not done because it
-  would make results appear and then vanish in exactly the `~` case this was
-  about.
-- **P2. Previews: off the UI thread and in process.** DONE (2026-09-09).
-  New `preview.rs`: a thread that turns a path into styled text and keeps only
-  its newest request, plus a `PreviewState` holding what is shown, what was
-  asked for, and the scroll offset. The UI shows a preview only when the path
-  it was generated for is the path selected now, so no file's contents ever
-  sit under another's name. `render.rs` records the pane width; the main loop
-  asks for the preview after the frame is drawn.
-  `bat` and `eza` are gone: highlighting is `syntect` (the library bat is
-  built on), a listing is a `read_dir`, and `ansi-to-tui` is dropped because
-  nothing produces ANSI to parse any more. History mode uses the same thread,
-  where it used to spawn `eza` on every frame including every tick, uncached.
-  Measured, moving the selection one row: median 15.90ms -> 0.55ms, p90
-  20.84 -> 2.18, max 23.58 -> 2.33. First full draw 31.6ms -> 4.2ms. The
-  syntax set costs 3ms to load, once, on the preview thread. Binary grows
-  10.0MB -> 12.7MB for the syntax definitions.
-  Fixed along the way: **the binary-file display corruption** (todo: "display
-  is broken if we scroll past a binary file"). The real fix is not sniffing
-  but sanitising - `path_display::printable` turns tabs into spaces and every
-  other control character into a dot, and every string that reaches a cell
-  goes through it: file contents, directory entry names, file list rows, the
-  path bar. Ratatui passes cell contents straight through, so an ESC in a file
-  *or in a filename* was an instruction the terminal obeyed. The NUL sniff
-  still names an obvious binary, but it only looks at the first 8KB and is no
-  longer what keeps the display safe.
-  Also: previews are capped at 5,000 lines and 4MB (the old code read whole
-  files into memory as styled text), sliced to the visible window at draw time
-  so a long preview is not cloned every frame, and scroll is clamped so it
-  cannot walk off into the distance.
-  Generation has **two states**, as the `bat` version did: a screenful while
-  unscrolled, then the whole file in one pass on the first scroll, after which
-  scrolling is free. The first cut generated whole files up front and a large
-  markdown preview took 150ms; the second cut grew the budget as the user
-  scrolled, which is worse still - syntect state means every pass restarts at
-  line one, so a growing budget costs ~2x the work in a series of hiccups. Syntect is built with `oniguruma`, not `fancy-regex`: measured on
-  markdown it is ~5x faster (median 11.81ms -> 2.53ms, worst 102.57 -> 25.79)
-  and the binary is *smaller* (12.7MB -> 11.2MB). Syntaxes and theme come from
-  `two-face` (bat's set): syntect's own defaults have no TOML, TypeScript or
-  Dockerfile, and its themes render markdown headings as near-invisible grey.
-  `psychic internal preview` times the generator with nothing around it; against
-  bat we are 1.3-2.0x faster even discounting bat's entire start-up, and at a
-  screenful our whole operation costs less than bat's floor alone.
-- **P3. Startup syscalls and sequencing.** DONE (2026-09-09). One `stat` per
-  historical path instead of `exists()` + `canonicalize()` + `metadata()`, and
-  the history load now runs beside the ranker load rather than after it (the
-  ranker stays put: `Booster` is not `Send`). Verified against the real
-  database that no stored path differs from its canonical form by more than a
-  trailing slash, which `Path` ignores. Measured, median of 7, same 177
-  registry entries either way: `load_historical_files` 4.06ms -> 2.37ms,
-  `worker_state_new_total` 8.56ms -> 4.49ms, `first_query_complete` 12.27ms ->
-  8.63ms. About half from each change; with only the syscall fix the total was
-  6.79ms. `get_file_metadata`/`FileMetadata` fell out as dead weight.
-- **P4. Timing instrumentation: keep every number, cut the allocations and
-  the line count.** DONE (2026-09-09). Ranking returns a `Ranking` (scores plus
-  `RankTimings`) instead of logging as it goes, and the worker writes one
-  `TIMING {"op":"query",...}` line per query - filter/simple/features/predict/
-  blend/total, count, and a nested `per_feature` map - after `QueryUpdated` has
-  been sent, so the write syscall is behind the user's results. A three-query
-  session dropped from 66 per-query lines to 3. Per-file feature timing is now
-  a `&mut [Duration]` indexed by registry position, folded per rayon chunk
-  rather than a `FxHashMap` of 15 fresh `String` keys per file; feature
-  computation over 171 files went 0.329ms -> 0.225ms (median of 4, same
-  results). Every number is still collected, `Instant::now` included.
-  `analyze_perf.rs` learned the nested shape and prints it as an indented
-  block, slowest feature first; the line's shape is pinned by expect tests on
-  both sides. (d) was already done in an earlier commit: the session id is
-  captured in the fern closure and the `unsafe set_var` is gone. The five
-  duplicated `QueryUpdated` sends collapsed into `send_query_updated`, which is
-  what guarantees the log-after-send ordering everywhere. **Not done:** a size
-  cap or rotation for app.log - see P11.
-- **P5. Query-constant lookups allocate per file.** DONE (2026-09-09). The two
-  query maps are `query -> path -> events` now, resolved once per `rank_files`
-  into `QueryClicks`; `FuzzyScore` reads the score the filter already computed,
-  carried on `FileCandidate` through `FeatureInputs`, and training computes it
-  once per row with a shared matcher. `compute_simple_score` borrows the path
-  rather than owning it. Training data is byte-identical before and after,
-  checked by generating the CSV with both binaries from the same database.
-  Steady-state filter+rank 1.02 -> 0.96ms, features 0.32 -> 0.28ms, keystroke
-  to redraw 2.66 -> 2.28ms over 60 keystrokes.
-- **P6. `get_slice` is O(results) per row.** DONE (2026-09-10). `file_scores`
-  is the result list; the parallel `Vec<FileId>` is gone and a page is a slice
-  by position. Because the two lists held the same order, the old search found
-  row *k* after *k* comparisons, so the cost grew with scroll depth rather than
-  page size: over 8,000 results, page 0 cost 0.019ms and page 60 cost 0.761ms,
-  against a flat 0.012ms now. The one place the lists disagreed - ranking
-  failing, which left the ids populated and the scores empty - now builds
-  unscored rows in the filter's order instead.
-- **P7. Idle wakeups and input latency.** Three loops poll. The input one is
-  DONE (2026-09-09); the other two are independent of it and still open.
-  - *DONE: the input thread.* Rewritten as `src/tty_input.rs`: it waits with
-    `libc::poll` on three descriptors - the terminal, a self-pipe for "stop
-    reading", and a second self-pipe fed by a SIGWINCH handler - so it can
-    block with no timeout and still be interrupted. `crossbeam` was used for
-    nothing else and is gone. `pause()` now returns only once the thread has
-    acknowledged it stopped, so the two 50ms sleeps in `input.rs` are gone,
-    and it returns a guard whose Drop resumes the thread. The two
-    near-identical `suspend_tui_*` functions are now one
-    `suspend_tui_and_run`, which also pops the keyboard enhancement flags
-    before suspending (they were pushed on every resume and never popped).
-    The thread is shut down and joined explicitly in main before `drop(app)`,
-    like the worker: it logs as it exits, and App's `log_receiver` field is
-    declared before `input`, so leaving it to Drop closed the logging channel
-    first and printed "Error performing logging" over the restored terminal
-    (reproduced on 3 of 5 runs, 0 of 5 after).
-    The reasoning is written up in how-it-works.md under "The input thread".
-  - *Measured, old binary vs new, same pty, 30 trials:* keystroke to redraw
-    median 6.87ms -> 2.00ms, mean 7.50 -> 1.74, p90 12.90 -> 3.17, max
-    14.38 -> 3.64. Resize to redraw 4.8-13.1ms -> 1.0-2.2ms. The old numbers
-    are the ~2ms of real work plus a uniform 0-10ms wait for the next poll.
-  - *Correction to the original finding:* the idle CPU claim was wrong. Both
-    binaries use 0.02s of CPU over 20s idle (`ps -o time`), i.e. the 100
-    wakeups/second cost nothing measurable - each was a cheap `kevent` that
-    found nothing. The wins here were latency and correctness (a design in
-    which the eaten-keystroke bug cannot recur), not CPU. Do not expect the
-    two items below to show up in a CPU measurement either; do them for
-    simplicity, and because the tick one is a prerequisite for anything that
-    wants the UI to be genuinely idle when idle.
-  - *Still open - worker:* `recv_timeout(5ms)` in `worker_thread_loop` exists
-    only because the walker has its own channel. Give the walker a clone of
-    the worker request sender and add `WorkerRequest::Walker(WalkerMessage)`;
-    the worker then blocks on one `recv()` with no timeout. Keep the
-    FilesChanged debounce logic.
-  - *Still open - tick:* send ticks only while something animates, i.e. the
-    marquee path overflows the path bar. Note that the tick currently also
-    serves as the fallback that makes a resize take effect (ratatui
-    re-reads the terminal size on every `draw`); that fallback is no longer
-    load-bearing now that the input thread wakes on SIGWINCH itself.
-  - *Still open:* each redraw builds the debug pane text even when the pane
-    is hidden, and deep-clones `PreviewManager` twice (render.rs
-    `ctx.preview.clone()` then `text.clone()`); gate on visibility and pass
-    `&mut`.
-- **P8. Database diet.** DONE (2026-09-09). `running_processes` and
-  `shell_history` are no longer collected and their columns are dropped;
-  `Database::migrate` does it on any open and `VACUUM`s once (83ms) when it
-  actually dropped something. The full index is replaced by a partial one on
-  the engagement actions, plus a narrow index on `action` alone for the debug
-  pane's histogram, which a partial index cannot answer. `load_clicks` states
-  the index predicate redundantly, without which SQLite cannot prove the
-  implication and silently scans; `db::plan_tests` runs EXPLAIN QUERY PLAN over
-  every query psychic issues, including one pinning why that clause is needed.
-  Impressions are one transaction rather than two dozen. Measured on a copy of
-  the real database:
+`is_dir` is computed at training time by stat-ing today's filesystem
+(`features.rs`, `full_path.is_dir()`), which is 80k syscalls per retrain and
+gets the answer wrong for anything since deleted or replaced. Add an `is_dir`
+column to events, set from `DisplayFileInfo.is_dir` at log time - it is known
+there - and read it back. Cannot be backfilled, so the sooner the better; the
+`rank` column (done 2026-09-10) is the pattern to copy, migration and all.
 
-  | | before | after |
-  |---|---|---|
-  | file | 67.1 MB | 19.1 MB |
-  | sessions table | 40.2 MB | 0.1 MB |
-  | indexes on events | 9.9 MB | 2.0 MB |
-  | `load_clicks_total` | 0.48ms | 0.47ms |
-  | `load_historical_files` | 2.50ms | 1.93ms |
-  | `internal summarize-events` | 14.99ms | 12.47ms |
+Impressions log the top 25 rows by rank (`num_results_to_log_as_impressions`),
+not the rows actually on screen. `visible_list_height` is already known and
+already reported by the renderer in `FrameLayout`. Log exactly the visible rows,
+so a negative means "shown and not chosen" rather than "would have been shown".
 
-  Nothing got slower. Still open from the original item: `session_id` is a u64
-  stored as TEXT.
-- **P9. Measure `num_threads=8` vs 1 in `predict_with_params`.** 180 trees,
-  ~200 rows, 1.2-1.4ms; OpenMP fork/join likely exceeds the work.
-- **P10. Optional: cache query-independent features per registry entry.**
-  12 of 15 features do not depend on the query. Irrelevant at 200 files,
-  ~25ms/keystroke at the 8000 the shallow threshold allows.
-- **P11. app.log grows without bound.** 31MB when P4 was measured, and it is
-  read start-to-finish by `internal analyze-perf` and `print-log`. Cutting the
-  per-query lines by 22x slowed the growth but did not bound it. Wants a size
-  cap with one level of rotation (app.log -> app.log.1), which means deciding
-  what the readers do with the rotated file; `fern` has no built-in rotation,
-  so this is a custom `Dispatch` chain or a size check at startup.
+`is_from_walker` in `FeatureInputs` is redundant with `is_under_cwd` - walker
+files are always under cwd - and having training compute it one way and
+inference another is the same class of skew. Drop the field.
 
-#### Bugs
+### 3. Click-through rate per file
 
-- **B1-B4. DONE (2026-09-09).** One commit each.
-  * **B1** `stop the worker throwing away requests it did not expect`.
-    Draining kept the newest `UpdateQuery` and discarded anything else it
-    found, so typing then pressing Enter on a directory while the worker was
-    busy ate the `ChangeCwd`. Requests are queued and processed in order now,
-    collapsing only *consecutive* query updates.
-  * **B2** `give the current directory a row after navigating`. There is one
-    `display_name_for(path, root)` and one `ensure_root_row()`, called by both
-    `new` and `change_cwd`. A directory you had visited before is also
-    reclassified from history to where-you-are. `change_cwd` canonicalises its
-    root like `new` does.
-  * **B3** `measure text in columns`. The debug pane's log truncation was a
-    byte slice and panicked the UI on `end byte index 57 is not a char
-    boundary; it is inside 'é'`. Same mistake in the cursor position
-    (`query.len()`) and the file list's timestamp padding. `path_display` gained
-    `display_width` and `truncate_to_width`; the test reproduces the original
-    panic.
-  * **B4** `notice when the search worker dies`. The main loop checks
-    `worker_has_died()` after each event and exits with a message; the terminal
-    is restored first. `Feature::compute` returns `f64` rather than a `Result`
-    no implementation could fail, which removes the `.expect()` that sat inside
-    the rayon loop.
-- **B5. Train/serve skew.** Training computes `is_dir` by stat-ing today's
-  filesystem (`features.rs` `full_path.is_dir()`, 80k syscalls per retrain),
-  so a deleted directory trains as a file. Add an `is_dir` column to events,
-  set from `DisplayFileInfo.is_dir` at log time, and read it back. Also
-  impressions log the top 25 by rank, not the rows on screen
-  (`num_results_to_log_as_impressions`); log exactly the visible rows using
-  `visible_list_height`, so labels reflect what was seen. `is_from_walker`
-  in `FeatureInputs` is redundant with `is_under_cwd`; drop it.
-- **B6. Docs say LambdaRank; train.py is `objective: binary` + auc.**
-  Episodes only drive the split. Pick one and make README/how-it-works say
-  it. (Binary is fine; the episode machinery is then just grouping.)
-- **B7. Small ones.** ~~Logger path ignores `--data-dir`~~ DONE: the CLI is
-  parsed before logging is configured, so the log goes to the data directory
-  the rest of the program uses. The session id is captured in the formatter
-  rather than round-tripped through an environment variable, which removed the
-  program's only `unsafe` block. Two `get_eza_flags` (preview.rs: <100 cols,
-  three flags; render.rs: <80 cols, two flags). Layout breakpoint is 120 in
-  code, 100 in docs. Suspend-for-editor uses a 50ms sleep as a race guard;
-  have the input thread ack the pause on a channel. `test_basic_feature_generation`
-  asserts a stale header and is skipped when test/events.db is absent;
-  `test_ranker_basic` likewise; the `FileInfo` tests in search_worker.rs and
-  the field tests in ui_state.rs assert values they just set. Delete or fix.
+The one substantial feature idea left from the September review, and the only
+one that gives the model per-file memory of *negatives*. Impressions are the
+training labels, but no feature says how often this file has been shown and
+passed over, so two files with identical click counts score identically whether
+one has been ignored 200 times or never shown at all.
 
-#### Simplifications
+Two columns: `impressions_last_30_days` for confidence, and a **smoothed** rate,
+because raw clicks/impressions is 1.0 for one-shown-one-clicked and 0.5 for
+100-of-200, which is backwards:
 
-- **S1. Make render pure.** DONE (2026-09-09). `render_normal_mode(f, &App)
-  -> FrameLayout`, where the layout carries the four things only the renderer
-  knows: preview pane size, visible list height, the scroll it drew at, and the
-  path bar's width. `NormalRenderContext` (20 fields in) and `RenderUpdates`
-  (5 fields back) are gone, as are the duplicate `get_file_at_index` and the
-  unreachable auto-scroll branch of `App::update_scroll`. The marquee advances
-  in the Tick handler via `App::advance_marquee`, which made it testable: five
-  tests cover overflow, turning around at the ends, the two delays, and doing
-  nothing before the first frame. `App::for_test` and `TtyInput::detached` are
-  new, since a render test now needs an `App`.
-- **S2. One response path in the worker.** DONE (2026-09-09). The five arms
-  that each did "set id, mutate, filter_and_rank, get_page, send QueryUpdated"
-  went through `send_query_updated` with P4, which is also what guarantees the
-  log lands after the response rather than in front of it. `get_page` no longer
-  takes a page size: it uses `app::PAGE_SIZE`, because the UI keys its cache by
-  `index / PAGE_SIZE` and a worker paginating by anything else would hand back
-  pages that land in the wrong slot. Every caller passed the same literal 128.
-- **S3. Collapse parallel structs.** DONE (2026-09-09). `FeatureClickIndexes`
-  was `ClickData` field for field and is gone. `FileCandidate` now borrows
-  (`&'a str`, `&'a Path`) instead of cloning the display name and path for
-  every file on every keystroke - 243 files a query here, so 486 allocations
-  saved per keystroke; it kept the ranker's own vocabulary type rather than
-  taking `&FileInfo`, which would have pointed the ranker at the worker.
-  `Episode` was a `Vec<String>`, a `contains` check and a `to_json`, and is now
-  those three lines inside `Analytics` as `episode_queries`; its module is
-  deleted and its tests moved to `analytics::episode_tests`.
-  `Subsession.created_at` is an `Instant`, since it only ever answers "has this
-  been on screen 200ms" and a wall clock can go backwards under that.
-- **S4. One database open per thread.** DONE (2026-09-09), with the caveat
-  that it bought no measurable speed. `Ranker::load_clicks` no longer opens a
-  raw `Connection` with its own copy of the pragmas: the query moved to
-  `Database::engagements_since`, beside the index it needs and the plan test
-  that checks it. The worker holds one connection for its lifetime instead of
-  opening one per reload and per hide. `App::new` reads the hidden prefixes
-  from the connection it already has rather than `spawn` opening a second one
-  on the same thread, which removes one open per launch (5 -> 4). Schema
-  creation and migration now run once per database file per process rather
-  than down every connection (`PREPARED`; `:memory:` excluded, since each such
-  connection is its own database and caching it left the second one empty -
-  eight tests caught that).
-  Measured, median of 5, real database: `worker_state_new_total` 4.42ms ->
-  4.57ms, `first_query_complete` 8.87ms -> 8.55ms, RSS 291.7MB -> 292.4MB.
-  All noise: the schema work was ~0.2ms per open after the first, not the
-  ~0.7ms `App::new`'s old log line suggested. Do this for the tidiness, not
-  the speed.
-  `lsof` handles on events.db went 3 -> 4 while *live connections stayed at
-  2*. The extra one is a descriptor SQLite parks rather than closes when
-  another connection holds a lock (sqlite3.c: "that would clear those
-  locks"), because POSIX advisory locks are per-process. Verified it is not
-  the worker's held connection by building a variant without it: still 4.
-  Explained in how-it-works.md under "Why the same database is opened several
-  times".
-- **S5. Deduplicate terminal suspension.** DONE (2026-09-09). The two
-  `suspend_tui_*` functions became thin Command builders over one
-  `suspend_tui_and_run` with P7. What was left was the teardown: `leave_tui`,
-  a `cleanup_terminal` that only called it, and a third copy written out
-  longhand in main's shutdown. One `leave_tui` now, called by all four
-  hand-backs (editor, subshell, printing a path on the way out, and exit).
-- **S6. Walker cleanup.** DONE with P1: the buffer, the restart, the duplicated
-  command-check loop and the unreachable deep-mode `MAX_FILES` guard are gone.
-- **S7. `context.rs`** runs five `sh -c` pipelines per launch; nothing reads
-  any of it. Keep `cwd`, delete the rest (see P8).
-- **S8. `check_and_log_impressions`** builds the 25-row Vec on every event
-  before checking `already_logged`; check first.
-- **S9. Docs drift in how-it-works.md:** "5 threads" (there are 7+),
-  "~600-line main.rs" (830), `unsafe impl Send` ranker (no longer), 100-col
-  breakpoint, `get_eza_flags` in ui_state (does not exist), LambdaRank,
-  `Analytics`/`App` method lists, and "Streams results" for the walker.
+```
+ctr = (clicks_30d + k * global_ctr) / (impressions_30d + k)      k = 5..10
+```
 
-### Correction: tonight's feature measurements were under-powered
+`global_ctr` is total clicks over total impressions in the same window, about
+1.4% on today's data. An unseen file sits at the global rate; an often-shown,
+never-clicked file drifts toward zero. Training side: `impressions_by_file` and
+running totals in the `Accumulator`, counted before the current impression.
+Runtime: 30 days of impression counts per path at startup, either a `GROUP BY`
+with its own partial index or a counts table maintained at write time -
+**measure the startup cost before choosing**, since `worker_state_new_total` is
+5.9ms today and this could easily double it.
 
-Everything measured on 2026-09-10 below used **one seed**. Measured afterwards
-with `./bench/model.py seeds 8`: the same feature set under eight seeds spans
-top-1 0.7827 to 0.8094 - a spread of 0.027, sd 0.010. Most of the deltas quoted
-below are smaller than that.
+Once `rank` (done) has accumulated history, this becomes position-debiased: an
+unclicked row at position 1 is a far stronger negative than one at position 24.
 
-Re-measured over 5 seeds a side, the three features shipped tonight (directory
-visits, seconds since last click, extension click share) are worth **+0.0098
-top-1 and +0.0088 MRR together**, sd of the mean 0.0040. Real, about 2.5 sigma,
-and roughly a third of what the individual single-seed numbers claimed.
+### 4. P7 leftovers: the worker and tick loops
 
-What survives unchanged:
+The input thread is done - `tty_input.rs` blocks in `libc::poll` and is woken by
+a self-pipe. Two polling loops remain, and neither touches the terminal, so
+neither carries the risk that made the input one hard:
 
-- **lambdarank, +0.0707 top-1.** Seven times the seed sd; not in doubt.
-- **`seconds_since_last_click` at 28.5% of total gain, rank 1 of 20.** Gain
-  aggregates thousands of splits and is far steadier than a held-out delta over
-  ~110 episodes a fold.
-- **`query_length` rejected.** -0.039 is about 4 sd, and it has independent
-  evidence: trained on the first 70%, top-1 rose on data it had seen and fell
-  0.041 on the future.
-- **Clicks under a directory rejected.** Two of three folds came out
-  bit-identical with and without it, which no amount of seed variance explains.
+- **Worker.** `recv_timeout(5ms)` in `worker_thread_loop` exists only because
+  the walker has its own channel. Give the walker a clone of the worker's
+  request sender and add `WorkerRequest::Walker(WalkerMessage)`; the worker then
+  blocks on one `recv()` with no timeout. Keep the `FilesChanged` debounce.
+- **Tick.** Send ticks only while something animates, which today means only
+  when the path bar overflows. `App::advance_marquee` already knows - it returns
+  early when `path_bar_width` is not exceeded. Note the tick is no longer the
+  resize fallback: the input thread wakes on SIGWINCH itself.
 
-What does *not* survive: the rejections at -0.010 to -0.016 (visits inherited by
-files, per-query clicks by directory, depth below cwd). Those were inside the
-noise. They were not shown to hurt; they were shown not to help enough to see.
-They stay out on parsimony - each costs compute on every keystroke and none read
-more than 1.4% of gain - but anyone revisiting them should start from
-`compare --seeds` rather than from those numbers.
+Neither is a measurable CPU win - both binaries used 0.02s over 20s idle when
+this was checked - so do them for simplicity, and because the tick one is a
+prerequisite for the UI ever being genuinely idle.
 
-### 2026-09-08 feature ideas, ranked
+### 5. P11. app.log grows without bound
 
-What the 15 current features cover: match quality (fuzzy_score,
-filename_starts_with_query); positive engagement counts (clicks 1h/24h/7d/30d,
-clicks_for_this_query, engagements_in_episode_with_query,
-clicks_last_week_parent_dir); file properties (modified_age,
-modified_last_24h, log_file_size, is_dir, is_hidden, is_under_cwd). Top three
-by gain, since the time split stopped rewarding memorised file sizes:
-clicks_for_this_query, fuzzy_score, filename_starts_with_query.
+31MB when it was last measured, read start-to-finish by `internal analyze-perf`
+and `print-log`. Cutting the per-query lines 22x slowed the growth without
+bounding it. Wants a size cap and one level of rotation (`app.log` ->
+`app.log.1`), which means deciding what the readers do with the rotated file.
+`fern` has no rotation, so this is a custom `Dispatch` chain or a size check at
+startup.
 
-Every feature below must be computed identically in `ranker.rs` (inference,
-from the in-memory click maps) and `features.rs` (training, from the
-Accumulator's fold over time-sorted events), so add the index to both
-`ClickData` and `Accumulator`. Add to `feature_defs/implementations.rs` and
-`registry.rs`; update `test_feature_computation`'s expected vector.
+### 6. S7. `context.rs` still shells out three times per launch
 
-**Ranked.** Ordered by expected signal per unit of work.
+`gather_context` runs `netstat`, `ifconfig` and a DNS lookup through `sh -c` on
+every launch, and nothing reads gateway, subnet or dns - the columns survive in
+`sessions` only because dropping them was scoped to `running_processes` and
+`shell_history`. Keep `cwd` and `timezone`, delete the other three and their
+columns, and the context thread stops needing to exist.
 
-1. **Directory visits.** DONE (2026-09-10). `Database::visits_since` loads
-   `startup_visit` rows into `ClickData.visits_by_dir`, kept apart from clicks;
-   `visits_last_7_days` and `visits_last_30_days` count them for directory rows
-   and read 0 for files. Over three rolling-origin folds: top-1 0.6773 ->
-   0.6975, MRR 0.7878 -> 0.7997, RMSE 0.1192 -> 0.1169, AUC flat, and all three
-   folds moved the same way. The features rank 16th and 17th of 17 by gain,
-   which is what a feature that only fires on directory rows looks like: small
-   share of the total, decisive where it applies.
-2. **Seconds since last click.** DONE (2026-09-10).
-   `seconds_since_last_click` and `seconds_since_last_click_parent_dir`, both
-   `ln(1 + age)` with 19.57 (`ln(1 + ten years)`) when there is no history.
-   Largest feature by gain at 22.7% of the total, ahead of
-   `clicks_for_this_query`. top-1 0.6921 -> 0.7145 over three folds, but they
-   disagreed: +0.010, +0.066, -0.008, so the mean leans on one fold.
-3. **Query length.** TRIED AND REJECTED (2026-09-10). Implemented as
-   `query.chars().count()`, measured, reverted. Costs 3.9 points of top-1 with
-   early stopping removed and the round count fixed, in all three folds; AUC
-   moves +0.0007 the other way.
+### 7. S8, and the tests that only look like tests
 
-   Not what it looks like. The interactions do get learned - 75 splits on it,
-   none at the root, 143 splits on other features underneath them, which is
-   exactly "for short queries trust recency, for long queries trust the fuzzy
-   score". They just do not generalise: trained on the first 70% and scored
-   both ways, top-1 goes 0.7346 -> 0.7370 on data it trained on and
-   0.7377 -> 0.6967 on the future.
+`check_and_log_impressions` builds the 25-row Vec on every event before checking
+`already_logged`; check first.
 
-   **The general trap, worth remembering before adding any per-query feature:**
-   `query_length` is an episode-level attribute, and `min_data_in_leaf` counts
-   rows. Episodes here average ~48 rows, so a rule keyed to query length looks
-   supported by hundreds of rows while resting on a handful of independent
-   observations - the 3-4 character band is 102 episodes in the entire history.
-   The split-finder is confident for the wrong reason.
+`test_basic_feature_generation` returns early unless `test/events.db` exists and
+`test_ranker_basic` unless `output.txt` does. Neither file is in the repo, so
+both have always passed by doing nothing, and `test_basic_feature_generation`
+additionally asserts a stale CSV header. Delete them or give them fixtures - the
+trained-model test (`search_worker.rs`) is the model to copy: it builds its own
+data, runs the real thing, and takes seven seconds.
 
-   **Retried under lambdarank (2026-09-10), which was the suspected cause.** The
-   harm is gone: top-1 -0.0386 -> +0.0005, MRR +0.0071, so a ranking objective
-   does stop rewarding the uses of an episode-constant feature that cannot
-   reorder anything. But nothing is left over either - one fold still down
-   (-0.025), gain 1.1%, rank 12 of 20 - so it stays out. The finding was the
-   point: the objective was the problem, not the feature, and that is fixed
-   for every feature rather than this one.
-4. **Collection change: record rank position on impressions.** DONE
-   (2026-09-10). `events.rank`, set from the display index in
-   `log_impressions`, NULL for everything that is not an impression and for
-   every row written before this. Nothing reads it yet; it had to start being
-   collected before it could be used.
+### 8. Smaller, still open
 
-   Two things to do once there is history: weight unclicked rows by position
-   when training (unclicked at #1 is a much stronger negative than unclicked at
-   #24), and consider a feature for where the row sat last time it was shown.
-5. **Collection change: record `is_dir` on events** (see B5). Also cannot
-   be backfilled; closes the train/serve skew.
-6. **Click-through rate per file** (preferred over a raw impression count:
-   easier for the tree to use). Impressions are the training *labels* but
-   no *feature* says how often this file was shown without a click, so the
-   model has per-file memory of positives and none of negatives. Two
-   columns: `impressions_last_30_days` (confidence) and a *smoothed* CTR,
-   because raw clicks/impressions is 1.0 for one-shown-one-clicked and 0.5
-   for 100-of-200, which is backwards:
-   ```
-   ctr = (clicks_30d + k * global_ctr) / (impressions_30d + k)      k = 5..10
-   ```
-   `global_ctr` = total clicks / total impressions in the same window
-   (about 1.4% on today's data: 1,113 / 80k), computed once at load time
-   and once per fold position in training. An unseen file sits at the
-   global rate; an often-shown never-clicked file drifts to ~0. Optionally
-   the same per (query, file). Training side: `impressions_by_file` (and
-   running totals) in the Accumulator, counted before the current
-   impression. Runtime: 30 days of impressions per path at startup, either
-   `SELECT full_path, COUNT(*) ... WHERE action='impression' AND timestamp
-   >= ? GROUP BY full_path` (needs its own partial index on impressions,
-   or accept a scan of one month) or a small counts table maintained at
-   write time. Measure the startup cost first. Rank position (item 4) will
-   later let this become position-debiased.
-6b. **Visits credited to the files inside a directory.** TRIED AND REJECTED
-   (2026-09-10). `visits_to_parent_dir_7_days` / `_30_days`: a file gets the
-   visit count of the directory it lives in, 0 for directories (which have
-   `visits_last_*`). The idea being that a file in a directory you `cd` into
-   daily is more likely to be the one you want.
+- **P10.** Cache query-independent features per registry entry. 12 of 20 features
+  do not depend on the query. Irrelevant at 244 files and 0.24ms; it would
+  matter at the 8,000 the shallow-mode threshold allows. Revisit only if
+  someone launches in a big-but-under-threshold tree and it feels slow.
+- **Feature: modified since last click** (binary, `mtime > last_click_ts`).
+  "Something changed here since you last looked." Cheap: both numbers are in
+  memory already.
+- **Feature: mentioned in recent shell commands.** Speculative, and needs
+  `context.rs` to store extracted path-like tokens rather than raw commands -
+  which is a privacy improvement in its own right. Do after the CTR work.
+- **Feature: git status flags.** `is_git_modified`, `is_git_untracked`. Strong
+  for developers, but needs a background `git status --porcelain` per repo at
+  walk time. Belongs with the gitignore machinery, which now exists.
 
-   With the round count fixed at 120 so early stopping cannot move: top-1
-   0.7977 -> 0.7820, MRR 0.8656 -> 0.8589, two folds down and one unchanged.
-   Gain 0.5% and 0.1%, ranks 14 and 21 of 22 - the model does reach for it, and
-   the reaching is what costs.
+## measurement discipline
 
-   Not the "constant within an episode" failure that sank `query_length`: the
-   median episode spans 12 distinct parent directories, so this one genuinely
-   can reorder a list. It is just thin. Only ~130 directories have ever been
-   visited, so a rule keyed to a directory's visit count rests on very few
-   distinct values, and it does not transfer.
+Three things this repo learned the hard way in September. All three are in
+`llm.md`; they are repeated here because they are what makes the numbers above
+trustworthy.
 
-7. **Clicks under this directory.** TRIED AND REJECTED (2026-09-10). Built as
-   specified - every clicked path credited to its 8 nearest ancestors at index
-   time, 7d and 30d windows, 0 for files - and the model would not use it: gain
-   8 and 0, ranks 20 and 22 of 22. With the round count fixed so early stopping
-   cannot move, two of three folds come out bit-identical with and without it
-   and the third is 0.017 worse; MRR +0.0002.
+- **One seed cannot see one feature.** The same feature set under eight seeds
+  spans 0.027 of top-1. Anything smaller, measured once, is noise:
+  `./bench/model.py compare --seeds 5`.
+- **Early stopping moves underneath a comparison.** A feature that shifts the
+  validation curve changes the tree count, and then two differently sized models
+  are being compared. `./bench/model.py compare 120` pins it.
+- **The timing harness has five ways to lie**, all of them documented in
+  `bench/harness.py`: an unpinned model, an 80x24 pty, an immediate EOF on
+  stdin, comparing first queries that rank different numbers of files, and
+  running trials in blocks rather than interleaved. Read it before trusting a
+  surprising result.
 
-   It is not that the signal is wrong, it is that `visits_last_*` already
-   carries it. Both answer "do I work in this directory", and visits answer it
-   more directly - the user said so by `cd`-ing there - from twice as much data
-   (2,312 visits against 1,165 clicks). This was the collinearity risk noted
-   when the two were compared before either was built; worth knowing it
-   resolved this way rather than the other.
-8. **Clicks for this query in this directory.** TRIED AND REJECTED
-   (2026-09-10). Built as specified, keyed query -> parent dir -> events and
-   resolved once per query like its per-file sibling. Rounds fixed at 120:
-   top-1 0.7977 -> 0.7834, MRR 0.8656 -> 0.8578, folds -0.052, -0.008, +0.017.
-   Gain 0.9%, rank 12 of 21 - used, and the use costs.
+## done
 
-**Three directory generalisations in a row measured negative** (6b, 7, 8), and
-that is the useful finding rather than any of them individually. Taking a
-signal that works per file - clicks, visits, per-query clicks - and spreading it
-over a directory does not transfer on this data, whatever the signal.
-The directory features that *do* work are the ones about directories as rows in
-their own right: `visits_last_7_days` and `visits_last_30_days`, which describe
-a thing the user actually did to that directory rather than an average of what
-they did to its contents. Before building a fourth, have a reason why it is not
-the same idea again.
-9. **Modified since last click** (binary: mtime > last click ts). "Something
-   new here" for files you have opened before.
-10. **Extension click share.** DONE (2026-09-10). Fraction of recent
-    engagements on this file's extension, counted at load time.
-    top-1 0.7717 -> 0.7949, MRR 0.8422 -> 0.8644, 6th of 20 by gain.
-    Files with no extension deliberately get 0: the empty bucket holds every
-    directory as well as Makefile and LICENSE, and counting it made the feature
-    *negative* (-1.0 point of top-1). Cleaning the numerator instead needs
-    `is_dir` on events, which is item 5.
-11. **Depth below cwd.** TRIED AND REJECTED (2026-09-10). Component count
-    below cwd, 32 for anything outside it. Rounds fixed at 120: top-1
-    0.7977 -> 0.7876, MRR 0.8656 -> 0.8616, folds -0.031, -0.016, +0.017.
-    Gain 1.4%, rank 12 of 21.
+Detail lives in the commit messages; this is the index.
 
-    The likely reason it adds nothing: `is_under_cwd` already exists, and the
-    "outside the tree" constant is exactly that binary said again. What is left
-    is the depth *within* cwd, and the model would rather read that off
-    `fuzzy_score`, which already penalises long paths through the match.
-12. **Mentioned in recent shell commands** (binary): filename or its dir
-    appears as a token in the last 10 shell commands of this session. To
-    make it trainable and less of a privacy problem, change `context.rs` to
-    store only extracted path-like tokens per session (split on whitespace,
-    keep tokens containing '/' or '.', drop the rest), not the raw commands.
-    Read the session's tokens at startup into a HashSet. Speculative; try
-    after 1-6.
-13. **Git status flags** (`is_git_modified`, `is_git_untracked`): strong for
-    developers but needs a background `git status --porcelain` per repo at
-    walk time and belongs with the "respect .gitignore" item. Later.
+**September 2026 performance push** (`1d4d767` to `8c0f34e`). Measured end to
+end on 2026-09-10, current against the commit before any of it, from `$HOME` on
+a 40x120 pty:
 
-**Not worth it.** `ps` output: turning a process list into a per-file
-signal needs lsof-style work per process, and the plausible signal ("is my
-editor open on this project") is weak. Drop it (P8). Raw shell history as a
-blob: no; see 12 for the salvageable part. Time-of-day / day-of-week: needs
-a timezone and was removed for cost and skew reasons (see how-it-works).
+| | before | after | |
+|---|---|---|---|
+| keystroke -> redraw | 9.91ms | **3.16ms** | 3.1x |
+| first full render | 35.24ms | **13.71ms** | 2.6x |
+| - of it, the draw | 23.42ms | **2.46ms** | 9.5x |
+| worker state ready | 8.74ms | **5.91ms** | 1.5x |
+| - load history | 4.91ms | **2.41ms** | 2.0x |
+| first paint | 1.89ms | **1.35ms** | 1.4x |
+| steady: features | 0.61ms | **0.24ms** | 2.5x |
+| first results | 11.75ms | 11.27ms | 1.0x, on 244 files vs 127 |
+| steady: predict | 0.74ms | 2.06ms | **2.8x slower** |
+| steady: round trip | 1.73ms | 2.43ms | **1.4x slower** |
+| walk complete | 62.9ms | 75.7ms | **1.2x slower** |
 
-**Hygiene while in there.** `is_from_walker` in `FeatureInputs` is
-redundant with `is_under_cwd`; `modified_last_24h` is a threshold of
-`modified_age` the tree can learn itself (harmless, but drop it if you want
-a shorter vector). After adding features, rerun training with the time
-split (see training item) and compare validation AUC and per-feature gain;
-drop anything that does not move it.
+The two regressions are both understood and both bought something. Predict is
+the bigger, denser lambdarank model - item 1 above. The walk is gitignore
+support: the same binary with `--no-ignore` walks in 62.8ms, so the whole
+difference is reading and applying ignore rules, and it lands after the results
+are already on screen.
 
-distribution:
+- **P1** two-phase walk. **P2** previews on their own thread, in process, with
+  `bat`'s syntax set and no `eza`. **P3** one `stat` per historical path, and
+  history loaded beside the model. **P4** one TIMING line per query, written
+  after the results are sent. **P5** per-query work resolved once, not per file.
+  **P6** a page of results is a slice, not a search. **P8** database diet:
+  62MB -> 17MB, partial index, one transaction for impressions.
+- **B1** the worker no longer drops requests it did not expect. **B2** the
+  current directory keeps its row after navigating. **B3** text measured in
+  columns, so a non-ASCII path cannot panic the UI. **B4** the main loop
+  notices when the worker dies. **B6** void: the docs said LambdaRank, the code
+  had drifted to `binary`, and the code came back (`764ab2c`).
+- **S1** render reads `&App` and writes nothing back. **S2** one response path
+  in the worker. **S3** four parallel structs collapsed. **S4** one database
+  open per thread. **S5** one function hands the terminal back. **S6** walker
+  cleanup, with P1. **S9** docs drift, fixed 2026-09-10.
+- **Model reload** merged into one `Reload` request, and taken on directory
+  change as well as on file open.
 
-- full text search mode using rg.
+**Training and ranking** (`dd5af53` to `12eb383`):
 
-- do something about the size of the events db
-- if a historical file or dir no longer exists then filter it out
-- audit the whole codebase for modularity. can we refactor extract something into a module, which can then be expect tested? right now its a big ball of very IO heavy code that makes it difficult to test. maybe the overall state logic and keypress logic? maybe the page caching logic? maybe the logic that when walker is finished it sends an AllDone message? maybe the logic that historical files in cwd still need to shown in filter view?
-- when history is filtered, suppose number of items becomes less than selected index, then selected index should become 0 so the top item is automatically becomes selected.
-- display is broken if we scroll past a binary file and it gets previewed
-- if we hit up while file walker is still walking then it shows loading and we end up in some strange middle of the results. instead we should remember our scroll position as -1 and reevaluate that when results are updated.
-- pick some good keybindings for going to top, and paging up and down the results
-- watch the cwd + all historical files; if mtime changes then update. more generally, our internal file data structure must be kept up-to-date with the filesystem. Right now this works because the file list view polls the filesytem for file metadata every frame or something awful like that. But the fixes below will break that.
-- until filewalker is done, don't bother sorting and calculating features? idk. or really, make sure we don't recalculate features? hmm. maybe we want to divide features into query-dependent and query independent?
-- watch the cwd. if new files added then add them.
-- maybe add a slight linear term?
-- try fitting a linear or logistic regressor esp on modified time and num clicks and last time clicked
-- hit enter to open Preview or whatever default thing is configured
-- can we preview PDFs and images in the terminal?
-- make sure that subnet and gateway are being logged properly. generally, look at the db and see what's up, is it missing important data?
-- is_in_dotdir would need to be logged at query time i think. can't be done at feature gen time because what if FS changes
-- maybe try random forests?
+- Time-based split, refit on everything, recency weights at a 180-day half-life,
+  `log_file_size`, blend weight gated on training positives rather than
+  last-30-day activity.
+- **`lambdarank`, grouped by episode** (`764ab2c`) - the largest single ranking
+  change measured: top-1 0.7010 -> 0.7717, MRR 0.7993 -> 0.8422, all three folds
+  up. It had been `binary` since `ac1b74d`, "try using regression instead of
+  lambdarank", with no measurement recorded.
+- Features shipped: **directory visits**, **seconds since last click** (the
+  largest feature by gain, 28.5%), **extension click share**. Re-measured over
+  five seeds, the three together are worth +0.0098 top-1, sd of the mean 0.0040.
+- **Collection:** `events.rank` records where each impression sat in the list.
+- **A real bug found by benchmarking:** a model from a build with a different
+  feature set loaded happily and then failed inside every predict, dropping
+  ranking to unscored filter order. `Ranker::new` now checks the feature count.
 
+## tried, measured, rejected
+
+Kept because the measurements cost real time and the reasoning generalises.
+
+- **`query_length`.** Under the old pooled objective it cost 3.9 points of top-1
+  with rounds fixed, in all three folds. The interactions were learned - 75
+  splits, none at the root, 143 splits beneath them - they just did not
+  transfer: trained on the first 70%, top-1 rose on seen data and fell 0.041 on
+  the future. Retried under lambdarank: the harm is gone (+0.0005) and no gain
+  is left either.
+- **Three directory generalisations**, all negative: visits inherited by the
+  files inside a directory, clicks under a directory (the model would not use it
+  at all - two folds came out bit-identical), and per-query clicks by directory.
+  Taking a signal that works per file and spreading it over a directory does not
+  transfer here, whatever the signal. The directory features that *do* work
+  describe something the user did to that directory itself.
+- **Depth below cwd.** -0.010 top-1. `is_under_cwd` already carries the useful
+  half, and `fuzzy_score` already leans against long paths.
+
+Three of these five were rejected on deltas inside the seed noise (-0.010 to
+-0.016). They were not shown to hurt, only shown not to help enough to see, and
+they stay out on parsimony - each costs compute on every keystroke and none read
+more than 1.4% of gain. Anyone revisiting them should start from
+`compare --seeds`, not from those numbers.
+
+## not worth it
+
+- **`ps` output as a signal.** Turning a process list into a per-file signal
+  needs something like `lsof` per process; the plausible signal, "is my editor
+  open on this project", is weak. Collection was removed in `03ca743`.
+- **Raw shell history.** A plain-text copy of what the user has been typing,
+  living in `~/.local`. The valuable part - where they `cd` - is already
+  captured as `startup_visit` and is now the `visits_last_*` features.
+- **Time of day / day of week.** Plausible, but it is an episode-level
+  attribute, which is the shape that overfits here: see `query_length`.
 
 ## notes on performance
 

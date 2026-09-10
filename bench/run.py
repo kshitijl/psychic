@@ -50,6 +50,11 @@ def setup(ref):
     resolved = subprocess.run(["git", "rev-parse", "--short", ref], cwd=REPO,
                               capture_output=True, text=True, check=True).stdout.strip()
     if src.exists():
+        # Discard whatever the last run left behind. Experiments edit this tree
+        # directly - stripping features to measure them, say - and a dirty tree
+        # makes every later checkout fail.
+        subprocess.run(["git", "reset", "--hard", "--quiet"], cwd=src, check=True)
+        subprocess.run(["git", "clean", "-fdq"], cwd=src, check=True)
         subprocess.run(["git", "checkout", "--detach", resolved], cwd=src, check=True)
     else:
         subprocess.run(["git", "worktree", "add", str(src), resolved], cwd=REPO, check=True)

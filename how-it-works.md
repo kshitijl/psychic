@@ -35,20 +35,27 @@ The codebase follows John Ousterhout's "deep modules" philosophy: simple interfa
 12. **`input.rs`** - Dispatches keymap actions, terminal suspension
 13. **`render.rs`** - All UI rendering (normal mode, history mode, help screen, layouts)
 14. **`help.rs`** - Help screen layout, derived from the keymap, clap and the zsh script
-15. **`preview.rs`** - Preview generation with three-state caching (None/Light/Full)
+15. **`preview.rs`** - Previews on their own thread, highlighted in process
 
 **Application State:**
 16. **`app.rs`** - Application state (App struct, page cache management)
 
+**Terminal:**
+17. **`tty_input.rs`** - The input thread: waits in `libc::poll` on the terminal
+    and a self-pipe, decodes with crossterm, and can be stopped on demand
+
 **Utilities:**
-17. **`path_display.rs`** - Path formatting utilities (truncation, abbreviation)
-18. **`cli.rs`** - CLI argument parsing with clap
+18. **`path_display.rs`** - Path formatting utilities (truncation, abbreviation)
+19. **`cli.rs`** - CLI argument parsing with clap
 
 **Main Entry Point:**
-19. **`main.rs`** - Event loop glue (~600 lines, down from ~2000+)
+20. **`main.rs`** - Event loop glue (~900 lines, down from ~2000+)
 
 **Development Tools:**
-20. **`analyze_perf.rs`** - Performance analysis for timing logs
+21. **`analyze_perf.rs`** - Performance analysis for timing logs
+22. **`bench/`** - Not a module: the benchmark harness, in Python. `run.py`
+    measures speed against another commit, `model.py` measures ranking quality.
+    See `llm.md`.
 
 **One TIMING line per query.** Ranking used to write about 23 lines per query -
 eight op lines plus one per feature - and fern flushes per record, so each was a
@@ -104,12 +111,19 @@ beside it.
 
 ### Thread Architecture
 
-**5 threads:**
+**Five that live for the session:**
 - **Main (UI)**: Renders UI, blocks on unified event channel, owns visible file slice only
 - **Worker**: Owns all file data, does filtering/ranking, sends results to unified channel
 - **Walker**: Discovers files via walkdir, sends to worker
 - **Input**: Sleeps in the kernel until the terminal has bytes, decodes them with crossterm, sends to unified channel. Stoppable, so a child process can own the terminal (see "The input thread" below)
 - **Tick timer**: Sends tick events every 200ms for UI animations (marquee)
+- **Preview**: Reads and highlights the selected file off the UI thread (see `preview.rs`)
+
+**And four that do one job and exit**, all detached: the retrainer (`ranker.rs`,
+which itself spawns `uv` for `train.py`), the context gatherer and the database
+statistics query (both in `main.rs`/`app.rs`, feeding the debug pane), and the
+walker's own restart on a directory change. Nine `thread::spawn` sites in all,
+which is worth knowing when reading a stack trace.
 
 **Communication via Unified Event Channel:**
 ```
@@ -1134,7 +1148,13 @@ pub struct FileScore {
 
 Why file_id instead of path string: No string cloning in hot path. Direct O(1) mapping back to file registry.
 
-**Thread safety:** Ranker wrapped in `SendRanker` with `unsafe impl Send`.
+**Thread safety:** the ranker never leaves the worker thread, so nothing has to
+assert anything about it. A LightGBM `Booster` holds raw pointers and is not
+`Send`; what crosses a thread boundary is the `Vec<FileInfo>` the walker
+produces, which is. There used to be a `SendRanker` wrapper with an
+`unsafe impl Send` to move it between threads; it is gone. The `unsafe` that
+remains is all in `tty_input.rs`, where `libc::poll`, `isatty` and `close` are
+called on raw descriptors.
 Why: LightGBM Booster contains raw pointers (not Send by default). Safe because model is read-only.
 
 ### Training: `train.py`
@@ -1670,7 +1690,7 @@ halfway through is caught by sanitising, not by sniffing.
 
 ### Module: `main.rs`
 
-Now a clean ~600-line event loop and application glue (down from 2000+ lines before refactoring).
+Now an event loop and application glue of about 900 lines, down from 2000+.
 
 **Startup behavior:**
 - Spawns a background thread to retrain the model using collected events
@@ -1699,7 +1719,7 @@ Now a clean ~600-line event loop and application glue (down from 2000+ lines bef
 
 **Layout:**
 
-**Wide terminals (≥100 columns):** Horizontal layout
+**Wide terminals (≥120 columns):** Horizontal layout
 ```
 ┌─────────────┬─────────────┬──────────────┐
 │  File List  │   Preview   │ Debug/Stats  │
@@ -1714,7 +1734,7 @@ Now a clean ~600-line event loop and application glue (down from 2000+ lines bef
 └──────────────────────────────────────────┘
 ```
 
-**Narrow terminals (<100 columns):** Vertical stack layout
+**Narrow terminals (<120 columns):** Vertical stack layout
 ```
 ┌──────────────────────────────────────────┐
 │  File List (40%)                         │
@@ -1771,7 +1791,7 @@ Why adaptive layout: Narrow terminals benefit from vertical stacking (file list 
 - Hidden (default): No debug pane visible
 - Small: Debug pane at 20% width
 - Expanded: Debug pane at 75% width, file list at 25%, preview hidden
-Why: Progressive disclosure - hide when not needed, expand for detailed debugging. Not available in narrow mode (<100 columns) where space is limited.
+Why: Progressive disclosure - hide when not needed, expand for detailed debugging. Not available in narrow mode (<120 columns) where space is limited.
 
 **App structure:**
 ```rust
@@ -2104,6 +2124,39 @@ The baseline reproduces the profile recorded when this work was scoped, scaled
 by about 0.6 - that session ran in a larger terminal. The shape is what matters
 and it holds: the draw was 61% of the first full render here against 63% then,
 and first results landed at 18% of walk-complete against 20% then.
+
+**Re-measured after the ranking work**, 2026-09-10, same baseline, 8 trials:
+
+| | before | after | |
+|---|---|---|---|
+| keystroke -> redraw | 9.91ms | **3.16ms** | 3.1x |
+| first full render | 35.24ms | **13.71ms** | 2.6x |
+| - of it, the draw | 23.42ms | **2.46ms** | 9.5x |
+| worker state ready | 8.74ms | **5.91ms** | 1.5x |
+| steady: features | 0.61ms | **0.24ms** | 2.5x |
+| steady: predict | 0.74ms | 2.06ms | **2.8x slower** |
+| steady: round trip | 1.73ms | 2.43ms | **1.4x slower** |
+| walk complete | 62.9ms | 75.7ms | **1.2x slower** |
+
+**The per-keystroke path got slower, and it was worth it.** The ranking work in
+September traded latency for quality twice over. `lambdarank` settles at about
+156 trees where the classification objective stopped at 90, and predict is
+proportional to trees; five more features add rows to every vector. That is
+2.06ms of a 2.43ms round trip - **prediction is now 85% of the cost of ranking a
+query**, where feature computation used to be the expensive half.
+
+It bought seven points of top-1 from the objective alone. And the number the
+user actually feels, keystroke to redraw, is still three times better than
+before any of this, because the draw and the input thread gave back far more
+than the model took.
+
+Two things worth knowing before trying to win the 2ms back. `num_threads` on
+`predict_with_params` does nothing - measured on the real model and real feature
+rows at 1, 2, 4 and 8 threads: 1.888, 1.896, 1.888, 1.889ms. And synthetic
+feature values understate it badly, because they take short paths through the
+trees; the same benchmark on made-up numbers reported 0.96ms. The only lever
+left is a smaller model, which is a trade against ranking quality and belongs in
+`todo.md`, not in a quiet parameter change.
 
 ### The benchmark harness: `bench/`
 

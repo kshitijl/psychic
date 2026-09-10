@@ -199,7 +199,8 @@ fn main() -> Result<()> {
 
         // The session id is captured, not read from the environment on every
         // line. It also means nothing has to `set_var` before the threads
-        // start, which was the one `unsafe` block in the program.
+        // start, which was an `unsafe` block for no gain. (The `unsafe` that
+        // remains is `tty_input.rs` calling libc on raw descriptors.)
         let session = session_id.clone();
         fern::Dispatch::new()
             .format(move |out, message, record| {
