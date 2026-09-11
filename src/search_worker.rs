@@ -22,7 +22,6 @@ use strum::EnumCount;
 pub struct WalkerFileMetadata {
     pub path: PathBuf,
     pub mtime: Option<i64>,
-    pub atime: Option<i64>,
     pub file_size: Option<i64>,
     pub is_dir: bool,
 }
@@ -39,7 +38,6 @@ impl WalkerFileMetadata {
         Self {
             path: path.into(),
             mtime: Some(1000),
-            atime: Some(1000),
             file_size: Some(10),
             is_dir: false,
         }
@@ -99,7 +97,6 @@ pub struct DisplayFileInfo {
     pub score: f64,
     pub features: Vec<f64>,
     pub mtime: Option<i64>,
-    pub atime: Option<i64>,
     pub file_size: Option<i64>,
     pub is_dir: bool,
     pub is_cwd: bool,
@@ -214,7 +211,6 @@ struct FileInfo {
     full_path: PathBuf,
     display_name: String,
     mtime: Option<i64>,
-    atime: Option<i64>,
     file_size: Option<i64>,
     origin: FileOrigin,
     is_dir: bool,
@@ -269,7 +265,6 @@ fn load_historical_files(db_path: &Path, root: &Path) -> Vec<FileInfo> {
             Some(FileInfo::from_history(
                 path,
                 metadata.mtime_as_secs(),
-                metadata.atime_as_secs(),
                 Some(metadata.len() as i64),
                 metadata.is_dir(),
                 root,
@@ -315,7 +310,6 @@ impl FileInfo {
     fn from_history(
         full_path: PathBuf,
         mtime: Option<i64>,
-        atime: Option<i64>,
         file_size: Option<i64>,
         is_dir: bool,
         root: &Path,
@@ -327,7 +321,6 @@ impl FileInfo {
             full_path,
             display_name,
             mtime,
-            atime,
             file_size,
             origin: FileOrigin::UserClickedInEventsDb,
             is_dir,
@@ -593,7 +586,6 @@ impl WorkerState {
             full_path: root.clone(),
             display_name,
             mtime: metadata.as_ref().and_then(|m| m.mtime_as_secs()),
-            atime: metadata.as_ref().and_then(|m| m.atime_as_secs()),
             file_size: metadata.as_ref().map(|m| m.len() as i64),
             origin: FileOrigin::CwdWalker,
             is_dir: true,
@@ -661,7 +653,6 @@ impl WorkerState {
             // had never been touched again.
             let file_info = &mut self.file_registry[file_id.0];
             file_info.mtime = found.mtime;
-            file_info.atime = found.atime;
             file_info.file_size = found.file_size;
             file_info.is_dir = found.is_dir;
             if file_info.evicted {
@@ -677,7 +668,6 @@ impl WorkerState {
                 full_path: canonical_path.clone(), // Store the canonical path
                 display_name,
                 mtime: found.mtime,
-                atime: found.atime,
                 file_size: found.file_size,
                 origin: FileOrigin::CwdWalker,
                 is_dir: found.is_dir,
@@ -867,7 +857,6 @@ impl WorkerState {
                     score,
                     features,
                     mtime: file_info.mtime,
-                    atime: file_info.atime,
                     file_size: file_info.file_size,
                     is_dir: file_info.is_dir,
                     is_cwd,
@@ -1011,7 +1000,6 @@ impl WorkerState {
             match std::fs::symlink_metadata(&file_info.full_path) {
                 Ok(metadata) => {
                     let mtime = metadata.mtime_as_secs();
-                    let atime = metadata.atime_as_secs();
                     let file_size = Some(metadata.len() as i64);
 
                     if file_info.mtime != mtime || file_info.file_size != file_size {
@@ -1019,7 +1007,6 @@ impl WorkerState {
                     }
 
                     file_info.mtime = mtime;
-                    file_info.atime = atime;
                     file_info.file_size = file_size;
                     // `is_dir` is left alone. Discovery settles it - the walker
                     // from its own stat, the cwd root by construction - and a
@@ -1444,7 +1431,6 @@ mod tests {
         WorkerRequest::Walker(WalkerMessage::FileMetadata(WalkerFileMetadata {
             path: PathBuf::from(name),
             mtime: None,
-            atime: None,
             file_size: None,
             is_dir: false,
         }))
@@ -1541,7 +1527,6 @@ mod tests {
             full_path: walker_path.clone(),
             display_name: "src/main.rs".to_string(),
             mtime: Some(1000),
-            atime: None,
             file_size: Some(100),
             origin: FileOrigin::CwdWalker,
             is_dir: false,
@@ -1556,7 +1541,6 @@ mod tests {
             full_path: history_in_cwd_path.clone(),
             display_name: "/home/user/project/README.md".to_string(),
             mtime: Some(900),
-            atime: None,
             file_size: Some(50),
             origin: FileOrigin::UserClickedInEventsDb,
             is_dir: false,
@@ -1571,7 +1555,6 @@ mod tests {
             full_path: history_outside_path.clone(),
             display_name: "/home/user/other/file.txt".to_string(),
             mtime: Some(800),
-            atime: None,
             file_size: Some(25),
             origin: FileOrigin::UserClickedInEventsDb,
             is_dir: false,
@@ -1603,7 +1586,6 @@ mod tests {
             full_path: PathBuf::from("/test/dir"),
             display_name: "dir".to_string(),
             mtime: None,
-            atime: None,
             file_size: None,
             origin: FileOrigin::CwdWalker,
             is_dir: true,
@@ -1616,7 +1598,6 @@ mod tests {
             full_path: PathBuf::from("/test/file.txt"),
             display_name: "file.txt".to_string(),
             mtime: None,
-            atime: None,
             file_size: None,
             origin: FileOrigin::CwdWalker,
             is_dir: false,
@@ -1987,7 +1968,6 @@ mod reload_tests {
             file_path: "alpha.rs",
             full_path: "/test/alpha.rs",
             mtime: Some(1_700_000_000),
-            atime: None,
             file_size: Some(100),
             subsession_id: 1,
             action: crate::db::UserInteraction::Click,
@@ -2082,7 +2062,6 @@ mod fresh_install_tests {
         for name in ["alpha.rs", "beta.rs"] {
             state.add_file(WalkerFileMetadata {
                 mtime: Some(1_700_000_000),
-                atime: Some(1_700_000_000),
                 file_size: Some(100),
                 ..WalkerFileMetadata::walked(PathBuf::from("/test").join(name))
             });
@@ -2113,7 +2092,6 @@ mod fresh_install_tests {
                 relative_path: "alpha.rs".to_string(),
                 full_path: "/test/alpha.rs".to_string(),
                 mtime: Some(1_700_000_000),
-                atime: None,
                 size: Some(100),
                 is_dir: false,
             },
@@ -2121,7 +2099,6 @@ mod fresh_install_tests {
                 relative_path: "beta.rs".to_string(),
                 full_path: "/test/beta.rs".to_string(),
                 mtime: Some(1_700_000_000),
-                atime: None,
                 size: Some(100),
                 is_dir: false,
             },
@@ -2132,7 +2109,6 @@ mod fresh_install_tests {
             file_path: "alpha.rs",
             full_path: "/test/alpha.rs",
             mtime: Some(1_700_000_000),
-            atime: None,
             file_size: Some(100),
             subsession_id: 1,
             action: crate::db::UserInteraction::Click,
@@ -2179,7 +2155,6 @@ mod fresh_install_tests {
                 relative_path: "alpha.rs".to_string(),
                 full_path: "/test/alpha.rs".to_string(),
                 mtime: None,
-                atime: None,
                 size: None,
                 is_dir: false,
             }],
@@ -2247,7 +2222,6 @@ mod trained_model_tests {
                     relative_path: format!("file{}.rs", (i + n) % 7),
                     full_path: format!("/test/file{}.rs", (i + n) % 7),
                     mtime: Some(1_700_000_000),
-                    atime: None,
                     size: Some(100 + n as i64),
                     is_dir: false,
                 })
@@ -2259,7 +2233,6 @@ mod trained_model_tests {
                 file_path: &chosen,
                 full_path: &chosen,
                 mtime: Some(1_700_000_000),
-                atime: None,
                 file_size: Some(100),
                 subsession_id: i as u64,
                 action: crate::db::UserInteraction::Click,
@@ -2399,7 +2372,6 @@ mod cwd_row_tests {
         let file_id = FileId(state.file_registry.len());
         state.file_registry.push(FileInfo::from_history(
             visited.clone(),
-            None,
             None,
             None,
             true,
@@ -2682,7 +2654,6 @@ mod metadata_refresh_tests {
             state.add_file(WalkerFileMetadata {
                 path: file,
                 mtime: metadata.mtime_as_secs(),
-                atime: metadata.atime_as_secs(),
                 file_size: Some(metadata.len() as i64),
                 is_dir: false,
             });
@@ -2834,7 +2805,6 @@ mod metadata_refresh_tests {
 
         tree.state.add_file(WalkerFileMetadata {
             mtime: Some(2000),
-            atime: Some(2000),
             file_size: Some(99),
             ..WalkerFileMetadata::walked(tree.notes())
         });

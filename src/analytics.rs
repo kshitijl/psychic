@@ -216,7 +216,6 @@ mod episode_tests {
             relative_path: name.to_string(),
             full_path: format!("/tmp/{}", name),
             mtime: Some(1_700_000_000),
-            atime: None,
             size: Some(100),
             is_dir: false,
         }]
@@ -240,7 +239,6 @@ mod episode_tests {
                 file_path: "a.rs",
                 full_path: "/tmp/a.rs",
                 mtime: Some(1_700_000_000),
-                atime: None,
                 file_size: Some(100),
                 subsession_id: 1,
                 action: UserInteraction::Click,

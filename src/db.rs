@@ -38,7 +38,6 @@ pub struct FileMetadata {
     pub relative_path: String,
     pub full_path: String,
     pub mtime: Option<i64>,
-    pub atime: Option<i64>,
     pub size: Option<i64>,
     /// What the row was when it was shown. Recorded rather than looked up
     /// later: by training time the path may be gone or may be something else.
@@ -82,7 +81,6 @@ pub struct EventData<'a> {
     pub file_path: &'a str,
     pub full_path: &'a str,
     pub mtime: Option<i64>,
-    pub atime: Option<i64>,
     pub file_size: Option<i64>,
     pub subsession_id: u64,
     pub action: UserInteraction,
@@ -177,7 +175,6 @@ impl Database {
                 file_path TEXT NOT NULL,
                 full_path TEXT NOT NULL,
                 mtime INTEGER,
-                atime INTEGER,
                 file_size INTEGER,
                 subsession_id INTEGER,
                 action TEXT NOT NULL,
@@ -275,6 +272,23 @@ impl Database {
             conn.execute("ALTER TABLE events ADD COLUMN is_dir INTEGER", [])?;
         }
 
+        // `atime` was recorded on every row for a year and read by nothing. It
+        // was kept on the theory that "when did the user last *look* at this
+        // file" is exactly the question a file finder wants answered - which is
+        // true, and which atime does not answer on either machine this runs on.
+        // Reading a file does not update it on APFS (measured: `cat`, `grep`
+        // and a plain read all moved it by zero seconds), and Linux has
+        // defaulted to `relatime` since 2009, which updates it at most daily.
+        // What it actually held was a copy of `mtime`: on a sample of this
+        // tree, atime equalled mtime on eleven files of twelve, and of the
+        // rows where it was newer, 60% were newer by less than a day.
+        // See docs/todo.md, "tried, measured, rejected".
+        if event_columns.iter().any(|name| name == "atime") {
+            log::info!("Dropping unused events.atime column");
+            conn.execute("ALTER TABLE events DROP COLUMN atime", [])?;
+            dropped = true;
+        }
+
         // The old index covered every row, and 96% of them are impressions
         // that nothing looks up by action. Its entries carry `full_path`, so
         // covering them all cost 10MB.
@@ -347,8 +361,8 @@ impl Database {
         };
 
         self.conn.prepare_cached(
-            "INSERT INTO events (timestamp, query, file_path, full_path, mtime, atime, file_size, subsession_id, action, session_id, episode_queries, rank, is_dir)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            "INSERT INTO events (timestamp, query, file_path, full_path, mtime, file_size, subsession_id, action, session_id, episode_queries, rank, is_dir)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         )?.execute(
             params![
                 timestamp,
@@ -356,7 +370,6 @@ impl Database {
                 event.file_path,
                 event.full_path,
                 event.mtime,
-                event.atime,
                 event.file_size,
                 event.subsession_id,
                 action,
@@ -396,7 +409,6 @@ impl Database {
                 relative_path,
                 full_path,
                 mtime,
-                atime,
                 size,
                 is_dir,
             },
@@ -407,7 +419,6 @@ impl Database {
                 file_path: relative_path,
                 full_path,
                 mtime: *mtime,
-                atime: *atime,
                 file_size: *size,
                 subsession_id,
                 action: UserInteraction::Impression,
@@ -838,7 +849,6 @@ mod rank_tests {
                 relative_path: name.to_string(),
                 full_path: format!("/tmp/{}", name),
                 mtime: Some(1_700_000_000),
-                atime: None,
                 size: Some(100),
                 is_dir: false,
             })
@@ -880,7 +890,6 @@ mod rank_tests {
             file_path: "first.rs",
             full_path: "/tmp/first.rs",
             mtime: None,
-            atime: None,
             file_size: None,
             subsession_id: 1,
             action: UserInteraction::Click,
@@ -910,7 +919,6 @@ mod rank_tests {
             relative_path: "src".to_string(),
             full_path: "/tmp/src".to_string(),
             mtime: Some(1_700_000_000),
-            atime: None,
             size: None,
             is_dir: true,
         });
@@ -975,6 +983,69 @@ mod rank_tests {
             Some(1),
             "and new rows have one"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_the_unused_atime_column_is_dropped_on_open() {
+        // A year of atime was collected and read by nothing. Reading a file
+        // does not update atime on APFS at all, and Linux's relatime updates
+        // it at most once a day, so what the column actually held was a noisy
+        // copy of mtime. Dropping it is the same move the network columns got.
+        let dir = std::env::temp_dir().join(format!("psychic-atime-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("events.db");
+
+        {
+            let old = Connection::open(&path).unwrap();
+            old.execute(
+                "CREATE TABLE events (
+                     id INTEGER PRIMARY KEY, timestamp INTEGER NOT NULL, query TEXT NOT NULL,
+                     file_path TEXT NOT NULL, full_path TEXT NOT NULL, mtime INTEGER,
+                     atime INTEGER, file_size INTEGER, subsession_id INTEGER,
+                     action TEXT NOT NULL, session_id TEXT NOT NULL)",
+                [],
+            )
+            .unwrap();
+            old.execute(
+                "INSERT INTO events (timestamp, query, file_path, full_path, mtime, atime, action, session_id)
+                 VALUES (1, 'q', 'old.rs', '/tmp/old.rs', 111, 222, 'impression', 's')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let db = Database::new(&path).expect("an older database still opens");
+
+        let columns: Vec<String> = db
+            .conn
+            .prepare("SELECT name FROM pragma_table_info('events')")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            !columns.contains(&"atime".to_string()),
+            "the column is gone"
+        );
+
+        let (path_kept, mtime_kept): (String, Option<i64>) = db
+            .conn
+            .prepare("SELECT file_path, mtime FROM events")
+            .unwrap()
+            .query_row([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap();
+        assert_eq!(
+            (path_kept.as_str(), mtime_kept),
+            ("old.rs", Some(111)),
+            "and every other column on the row survived the rewrite"
+        );
+
+        // Opening again must not try to drop it a second time.
+        Database::new(&path).expect("a migrated database still opens");
 
         std::fs::remove_dir_all(&dir).ok();
     }

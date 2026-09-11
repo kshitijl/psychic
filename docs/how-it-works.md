@@ -47,8 +47,8 @@ The codebase follows John Ousterhout's "deep modules" philosophy: simple interfa
 **Utilities:**
 18. **`path_display.rs`** - Path formatting utilities (truncation, abbreviation)
 19. **`cli.rs`** - CLI argument parsing with clap
-20. **`metadata_ext.rs`** - One trait, so mtime and atime are read out of
-    `fs::Metadata` the same way everywhere
+20. **`metadata_ext.rs`** - One trait, so mtime is read out of `fs::Metadata`
+    the same way everywhere
 
 **Main Entry Point:**
 21. **`main.rs`** - Event loop glue (~1,100 lines, down from ~2,900)
@@ -372,7 +372,6 @@ CREATE TABLE events (
     file_path TEXT NOT NULL,   -- relative path
     full_path TEXT NOT NULL,   -- absolute, canonical
     mtime INTEGER,
-    atime INTEGER,
     file_size INTEGER,
     subsession_id INTEGER,
     action TEXT NOT NULL,      -- 'impression', 'scroll', 'click' or 'startup_visit'
@@ -394,6 +393,25 @@ CREATE TABLE sessions (
 column existed, and none of them can be backfilled - nothing recorded the answer
 at the time. Anything reading them has to cope with a mixture until enough
 history accumulates.
+
+**There was an `atime` column, and it is worth knowing why there is not.**
+"When did the user last *look* at this file" is exactly the question a file
+finder wants answered, which is why it was collected on every row for a year.
+It does not answer it. Maintaining `atime` turns every read into a metadata
+write, so operating systems stopped doing it: Linux has defaulted to `relatime`
+since 2009, which updates the timestamp only if it is already older than `mtime`
+or more than a day stale, and APFS does not update it on a read at all -
+measured here with `cat`, `grep` and a plain read on a backdated file, all of
+which moved it by zero seconds.
+
+What the column actually held was `mtime` with noise on it. On a sample of this
+repository, `atime` equalled `mtime` on eleven files of twelve; across the real
+database, of the 65,182 rows where it was newer, 60% were newer by less than a
+day. It correlated with clicks - 37% within the hour against 15% for impressions
+- for the same reason `mtime` does, and `mtime` is already two features.
+
+`Database::migrate` drops it, which on a 19MB database took it to 18MB and left
+every other column untouched.
 
 ```sql
 CREATE TABLE hidden_prefixes (
@@ -642,7 +660,7 @@ top-level listing is one where search is worth least.
 - Streams the root's children immediately; holds everything deeper until the walk
   is known to be small enough to keep
 - Sends both files and directories (with `is_dir` flag)
-- Extracts mtime, atime, and file_size from the metadata the walk already had
+- Extracts mtime and file_size from the metadata the walk already had
 - Sends `AllDone` when a walk runs to the end
 - Checks for commands every 100 entries (COMMAND_CHECK_INTERVAL)
 
@@ -788,7 +806,7 @@ the list shows in the window before the walk's results arrive.
 
 `refresh_metadata` re-stats every entry in the registry:
 
-- **mtime, atime and size are replaced** with what disk says now.
+- **mtime and size are replaced** with what disk says now.
 - **A path that no longer stats is evicted**, using the same flag the UI's
   eviction sets. `rm` in the dropped-into shell takes the row off the screen.
 - **A path that stats again is un-evicted.** Editors that write by
@@ -810,7 +828,7 @@ keystroke. The count of entries that actually moved goes in the log as
 ever looks stale again.
 
 The same bug had a second instance in `add_file`: on an already-registered path
-it only cleared `evicted`, leaving `mtime`, `atime` and `file_size` at whatever
+it only cleared `evicted`, leaving `mtime` and `file_size` at whatever
 was recorded the first time the path was seen. A walk after `cd`, or the walk
 that follows a rediscovery, therefore re-visited files without ever refreshing
 them. It now takes the walker's fresh stat, which is by definition newer than
@@ -890,7 +908,6 @@ struct FileInfo {
     full_path: PathBuf,    // Canonical
     display_name: String,  // Computed once (relative path or ".../filename" or directory name for cwd)
     mtime: Option<i64>,    // From the walker, the historical load, or a re-stat
-    atime: Option<i64>,
     file_size: Option<i64>,
     origin: FileOrigin,    // CwdWalker or UserClickedInEventsDb
     is_dir: bool,

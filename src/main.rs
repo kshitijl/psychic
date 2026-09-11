@@ -339,7 +339,6 @@ fn main() -> Result<()> {
                 // Get file metadata
                 let metadata = std::fs::metadata(&full_path)?;
                 let mtime = metadata.mtime_as_secs();
-                let atime = metadata.atime_as_secs();
 
                 // Log the directory visit
                 db.log_event(db::EventData {
@@ -351,7 +350,6 @@ fn main() -> Result<()> {
                         .as_ref(),
                     full_path: full_path.to_string_lossy().as_ref(),
                     mtime,
-                    atime,
                     file_size: None, // directories don't have meaningful sizes
                     subsession_id: 0,
                     action: db::UserInteraction::StartupVisit,
@@ -568,7 +566,6 @@ fn main() -> Result<()> {
                 // Get metadata for the directory
                 let metadata = std::fs::metadata(&root_clone).ok();
                 let mtime = metadata.as_ref().and_then(|m| m.mtime_as_secs());
-                let atime = metadata.as_ref().and_then(|m| m.atime_as_secs());
                 let file_size = metadata.as_ref().map(|m| m.len() as i64);
 
                 match db.log_event(EventData {
@@ -576,7 +573,6 @@ fn main() -> Result<()> {
                     file_path: dir_name,
                     full_path: &root_clone.to_string_lossy(),
                     mtime,
-                    atime,
                     file_size,
                     subsession_id: 0, // Initial event, before any query
                     action: db::UserInteraction::StartupVisit,

@@ -273,7 +273,6 @@ struct Selection {
     display_name: String,
     full_path: std::path::PathBuf,
     mtime: Option<i64>,
-    atime: Option<i64>,
     file_size: Option<i64>,
     is_dir: bool,
 }
@@ -303,7 +302,6 @@ fn resolve_selection(app: &mut App) -> Option<Selection> {
         display_name: display_info.display_name.clone(),
         full_path: display_info.full_path.clone(),
         mtime: display_info.mtime,
-        atime: display_info.atime,
         file_size: display_info.file_size,
         is_dir: display_info.is_dir,
     };
@@ -343,7 +341,6 @@ fn log_selection_click(app: &mut App, selection: &Selection) -> Result<()> {
         file_path: &selection.display_name,
         full_path: &selection.full_path.to_string_lossy(),
         mtime: selection.mtime,
-        atime: selection.atime,
         file_size: selection.file_size,
         subsession_id,
         action: UserInteraction::Click,

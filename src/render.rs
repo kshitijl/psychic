@@ -1056,7 +1056,6 @@ mod non_ascii_tests {
                     score: 0.0,
                     features: Vec::new(),
                     mtime: None,
-                    atime: None,
                     file_size: None,
                     is_dir: false,
                     is_cwd: false,

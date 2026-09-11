@@ -395,7 +395,6 @@ impl App {
                     relative_path: display_info.display_name.clone(),
                     full_path: display_info.full_path.to_string_lossy().to_string(),
                     mtime: display_info.mtime,
-                    atime: display_info.atime,
                     size: display_info.file_size,
                     is_dir: display_info.is_dir,
                 });
@@ -531,7 +530,6 @@ impl App {
             let display_name = display_info.display_name.clone();
             let full_path = display_info.full_path.to_string_lossy().to_string();
             let mtime = display_info.mtime;
-            let atime = display_info.atime;
             let file_size = display_info.file_size;
             let is_dir = display_info.is_dir;
             let query = self.query.clone();
@@ -547,7 +545,6 @@ impl App {
                     file_path: &display_name,
                     full_path: &full_path,
                     mtime,
-                    atime,
                     file_size,
                     subsession_id,
                     action: crate::db::UserInteraction::Scroll,
@@ -781,7 +778,6 @@ mod impression_tests {
                         score: 0.0,
                         features: Vec::new(),
                         mtime: None,
-                        atime: None,
                         file_size: None,
                         is_dir: false,
                         is_cwd: false,
@@ -891,7 +887,6 @@ mod marquee_tests {
                     score: 0.0,
                     features: Vec::new(),
                     mtime: None,
-                    atime: None,
                     file_size: None,
                     is_dir: false,
                     is_cwd: false,

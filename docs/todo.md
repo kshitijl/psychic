@@ -196,9 +196,34 @@ Kept because the measurements cost real time and the reasoning generalises.
   mode is not a wild number, it is a plausible one.
 - **Depth below cwd.** -0.010 top-1. `is_under_cwd` already carries the useful
   half, and `fuzzy_score` already leans against long paths.
+- **`atime` as "when did the user last read this file".** Rejected on the
+  filesystem, not on the metrics, and the only one of these where that was
+  possible. Collected on every row for a year and read by nothing; the plan was
+  to test it as `ln(1 + seconds since atime)`, since "has anyone *looked* at
+  this" is the question a file finder most wants answered and no other timestamp
+  carries it.
 
-Three of these five were rejected on deltas inside the seed noise (-0.010 to
--0.016). They were not shown to hurt, only shown not to help enough to see, and
+  It is not in that column. Maintaining `atime` turns every read into a metadata
+  write, so systems stopped doing it: Linux has defaulted to `relatime` since
+  2009 (update only if already older than `mtime`, or a day stale) and APFS does
+  not update it on a read at all - measured with `cat`, `grep` and a plain read
+  against a file with times backdated 30 days, all three moving it zero seconds.
+  Two machines, two different meanings, pooled into one training set.
+
+  What it held was `mtime` with noise: equal to `mtime` on 11 of 12 sampled
+  files here, and of the 65,182 database rows where it was newer, 60% newer by
+  less than a day. It did separate clicks from impressions - 37% within the hour
+  against 15% - but so does `mtime`, which is already two features. Column and
+  field deleted; `Database::migrate` drops it, 19MB to 18MB.
+
+  **The transferable part: check what a signal physically is before measuring
+  what it predicts.** A model run would have reported a small negative inside
+  the seed noise and taught nothing, and the three reads that settled it took a
+  minute. The same question is worth asking of any timestamp the OS is free to
+  stop maintaining.
+
+Three of the five that were measured as features were rejected on deltas inside
+the seed noise (-0.010 to -0.016). They were not shown to hurt, only shown not to help enough to see, and
 they stay out on parsimony - each costs compute on every keystroke and none read
 more than 1.4% of gain. Anyone revisiting them should start from
 `compare --seeds`, not from those numbers.

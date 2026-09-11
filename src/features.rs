@@ -625,7 +625,6 @@ mod tests {
                     relative_path: name.to_string(),
                     full_path: format!("/test/{}", name),
                     mtime: Some(1_700_000_000),
-                    atime: None,
                     size: Some(100),
                     is_dir: false,
                 })
@@ -636,7 +635,6 @@ mod tests {
                 file_path: "alpha.rs",
                 full_path: "/test/alpha.rs",
                 mtime: Some(1_700_000_000),
-                atime: None,
                 file_size: Some(100),
                 subsession_id: 1,
                 action: UserInteraction::Click,

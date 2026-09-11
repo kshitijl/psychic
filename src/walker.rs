@@ -286,7 +286,6 @@ fn describe(entry: &ignore::DirEntry) -> WalkerFileMetadata {
     WalkerFileMetadata {
         path: entry.path().to_path_buf(),
         mtime: metadata.as_ref().and_then(|m| m.mtime_as_secs()),
-        atime: metadata.as_ref().and_then(|m| m.atime_as_secs()),
         file_size: metadata.as_ref().map(|m| m.len() as i64),
         is_dir: entry.file_type().is_some_and(|t| t.is_dir()),
     }
