@@ -193,11 +193,13 @@ actually lasted 600ms.
 - **Tick timer**: Wakes the main loop so the screen can refresh itself with nobody touching it - every 200ms while the marquee runs, once a second otherwise (see "The tick redraws at two rates")
 - **Preview**: Reads and highlights the selected file off the UI thread (see `preview.rs`)
 
-**And four that do one job and exit**, all detached: the retrainer (`ranker.rs`,
-which itself spawns `uv` for `train.py`), the context gatherer and the database
-statistics query (both in `main.rs`/`app.rs`, feeding the debug pane), and the
-walker's own restart on a directory change. Nine `thread::spawn` sites in all,
-which is worth knowing when reading a stack trace.
+**And three that do one job and exit**, all detached: the retrainer (spawned in
+`main.rs`, running `ranker::retrain_model`, which itself spawns `uv` for
+`train.py`), the context gatherer, and the database statistics query that fills
+the debug pane. Eight `thread::spawn` sites in all, which is worth knowing when
+reading a stack trace. `retrain_model` used to make it nine by spawning a thread
+and immediately joining it, so a background retrain held two threads to do one
+job.
 
 **Communication via Unified Event Channel:**
 ```
