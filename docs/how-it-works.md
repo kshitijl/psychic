@@ -713,12 +713,19 @@ which is where the 5ms `recv_timeout` over two channels went.
 
 1. Block on `recv()`. Drain whatever else is queued, dropping queries that a
    later query supersedes and keeping everything else in order
-2. Handle the walker's messages in the batch first: `FileMetadata` adds to the
-   registry and marks `files_changed`; `ChildrenDone` and `AllDone` also set
-   `publish_now`
-3. Send `FilesChanged` if files changed AND (`publish_now` OR >200ms since the
+2. `partition` the batch into walker messages and everything else
+3. Handle the walker's messages first: `FileMetadata` adds to the registry and
+   marks `files_changed`; `ChildrenDone` and `AllDone` also set `publish_now`
+4. Send `FilesChanged` if files changed AND (`publish_now` OR >200ms since the
    last notification)
-4. Handle the remaining requests in order
+5. Handle the remaining requests in order
+
+The partition is why `add_file` takes the walker's `WalkerFileMetadata` whole
+rather than its five fields spread out as arguments. The two loops each own what
+they hold, so the message - path included - moves into the registry instead of
+having its `PathBuf` cloned once per file discovered. It also removes a dead
+`WorkerRequest::Walker(_) => {}` arm from the second loop, which existed only
+because the first loop had borrowed rather than consumed.
 
 **One result list, not two.** `file_scores` is the result set: ranked order,
 with each row's score and features at that row's position. There used to be a

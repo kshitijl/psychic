@@ -27,6 +27,25 @@ pub struct WalkerFileMetadata {
     pub is_dir: bool,
 }
 
+#[cfg(test)]
+impl WalkerFileMetadata {
+    /// What the walker would have reported for `path`: a plausible time, a
+    /// small size, not a directory.
+    ///
+    /// Tests that care about one of those set it afterwards. Most do not, and
+    /// read better without four placeholder arguments in the way of the thing
+    /// they are actually testing.
+    fn walked(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            mtime: Some(1000),
+            atime: Some(1000),
+            file_size: Some(10),
+            is_dir: false,
+        }
+    }
+}
+
 // Commands sent from worker to walker
 #[derive(Debug, Clone)]
 pub enum WalkerCommand {
@@ -620,16 +639,18 @@ impl WorkerState {
         Ok(true)
     }
 
-    fn add_file(
-        &mut self,
-        path: PathBuf,
-        mtime: Option<i64>,
-        atime: Option<i64>,
-        file_size: Option<i64>,
-        is_dir: bool,
-    ) {
-        // `path` is the original path from the walker.
-        let canonical_path = path.canonicalize().unwrap_or_else(|_| path.clone());
+    /// Register what the walker found, or refresh it if we have seen it before.
+    ///
+    /// Takes the walker's own message rather than its five fields spread out:
+    /// they travel together from the `stat` that produced them all the way to
+    /// the registry entry, and four `Option<i64>`/bool positionals in a row is
+    /// a call nobody can read at the call site.
+    fn add_file(&mut self, found: WalkerFileMetadata) {
+        // `found.path` is the original path from the walker.
+        let canonical_path = found
+            .path
+            .canonicalize()
+            .unwrap_or_else(|_| found.path.clone());
 
         if let Some(&file_id) = self.path_to_id.get(&canonical_path) {
             // Already registered. The walker has just stat'd it, so what it
@@ -639,27 +660,27 @@ impl WorkerState {
             // entry that keeps its first mtime forever ranks as though the file
             // had never been touched again.
             let file_info = &mut self.file_registry[file_id.0];
-            file_info.mtime = mtime;
-            file_info.atime = atime;
-            file_info.file_size = file_size;
-            file_info.is_dir = is_dir;
+            file_info.mtime = found.mtime;
+            file_info.atime = found.atime;
+            file_info.file_size = found.file_size;
+            file_info.is_dir = found.is_dir;
             if file_info.evicted {
                 log::info!("Worker: un-evicting rediscovered path {:?}", canonical_path);
                 file_info.evicted = false;
             }
         } else {
             // We have a new file.
-            // The display path should be the original `path` relative to `self.root`.
-            let display_name = display_name_for(&path, &self.root);
+            // The display path should be the original path relative to `self.root`.
+            let display_name = display_name_for(&found.path, &self.root);
 
             let file_info = FileInfo {
                 full_path: canonical_path.clone(), // Store the canonical path
                 display_name,
-                mtime,
-                atime,
-                file_size,
+                mtime: found.mtime,
+                atime: found.atime,
+                file_size: found.file_size,
                 origin: FileOrigin::CwdWalker,
-                is_dir,
+                is_dir: found.is_dir,
                 is_under_cwd: true,
                 evicted: false,
                 hidden: is_hidden_by(&self.active_hidden, &canonical_path),
@@ -1205,19 +1226,21 @@ fn worker_thread_loop<T>(
         // Set by the milestones worth showing at once, rather than whenever the
         // debounce below next comes round.
         let mut publish_now = false;
-        for message in pending.iter().filter_map(|request| match request {
-            WorkerRequest::Walker(message) => Some(message),
-            _ => None,
+        // Split once rather than walking `pending` twice and leaving a dead arm
+        // in the second loop. Both halves then own what they hold, which is
+        // what lets the walker's message go into the registry without its path
+        // being cloned on the way.
+        let (walker_messages, requests): (Vec<_>, Vec<_>) = pending
+            .into_iter()
+            .partition(|request| matches!(request, WorkerRequest::Walker(_)));
+
+        for message in walker_messages.into_iter().map(|request| match request {
+            WorkerRequest::Walker(message) => message,
+            _ => unreachable!("partitioned on this"),
         }) {
             match message {
                 WalkerMessage::FileMetadata(metadata) => {
-                    state.add_file(
-                        metadata.path.clone(),
-                        metadata.mtime,
-                        metadata.atime,
-                        metadata.file_size,
-                        metadata.is_dir,
-                    );
+                    state.add_file(metadata);
                     files_changed = true;
                 }
                 WalkerMessage::ChildrenDone => {
@@ -1253,13 +1276,15 @@ fn worker_thread_loop<T>(
             last_files_changed_notification = Instant::now();
         }
 
-        for request in pending {
+        for request in requests {
             match request {
                 WorkerRequest::Shutdown => {
                     log::debug!("Worker thread shutting down");
                     return;
                 }
-                WorkerRequest::Walker(_) => {} // handled above, as a batch
+                WorkerRequest::Walker(_) => {
+                    unreachable!("partitioned into walker_messages above")
+                }
                 WorkerRequest::UpdateQuery(latest_req) => {
                     state.current_query = latest_req.query.clone();
                     state.current_query_id = latest_req.query_id;
@@ -2055,13 +2080,12 @@ mod fresh_install_tests {
         );
 
         for name in ["alpha.rs", "beta.rs"] {
-            state.add_file(
-                PathBuf::from("/test").join(name),
-                Some(1_700_000_000),
-                Some(1_700_000_000),
-                Some(100),
-                false,
-            );
+            state.add_file(WalkerFileMetadata {
+                mtime: Some(1_700_000_000),
+                atime: Some(1_700_000_000),
+                file_size: Some(100),
+                ..WalkerFileMetadata::walked(PathBuf::from("/test").join(name))
+            });
         }
 
         state.filter_and_rank("").expect("first query");
@@ -2470,13 +2494,9 @@ mod eviction_tests {
         state.path_to_id.clear();
 
         for name in ["alpha.txt", "beta.txt", "gamma.txt"] {
-            state.add_file(
+            state.add_file(WalkerFileMetadata::walked(
                 PathBuf::from("/test").join(name),
-                Some(1000),
-                Some(1000),
-                Some(10),
-                false,
-            );
+            ));
         }
 
         (state, dir, walker_command_rx)
@@ -2505,7 +2525,7 @@ mod eviction_tests {
         state.path_to_id.clear();
 
         for path in ["/test/old/notes.txt", "/test/current/notes.txt"] {
-            state.add_file(PathBuf::from(path), Some(1000), Some(1000), Some(10), false);
+            state.add_file(WalkerFileMetadata::walked(path));
         }
 
         (state, dir, walker_command_rx)
@@ -2599,13 +2619,7 @@ mod eviction_tests {
         state.filter_and_rank("").expect("Filter should succeed");
         assert_eq!(results(&state).len(), 2, "Evicted file is hidden");
 
-        state.add_file(
-            PathBuf::from("/test/beta.txt"),
-            Some(2000),
-            Some(2000),
-            Some(20),
-            false,
-        );
+        state.add_file(WalkerFileMetadata::walked("/test/beta.txt"));
 
         state.filter_and_rank("").expect("Filter should succeed");
         let mut after = results(&state);
@@ -2665,13 +2679,13 @@ mod metadata_refresh_tests {
 
             let file = root.join("notes.txt");
             let metadata = std::fs::metadata(&file).expect("stat notes");
-            state.add_file(
-                file,
-                metadata.mtime_as_secs(),
-                metadata.atime_as_secs(),
-                Some(metadata.len() as i64),
-                false,
-            );
+            state.add_file(WalkerFileMetadata {
+                path: file,
+                mtime: metadata.mtime_as_secs(),
+                atime: metadata.atime_as_secs(),
+                file_size: Some(metadata.len() as i64),
+                is_dir: false,
+            });
 
             Self {
                 state,
@@ -2818,8 +2832,12 @@ mod metadata_refresh_tests {
         let mut tree = RealTree::new("refresh-walked");
         tree.state.file_registry[0].mtime = Some(1000);
 
-        tree.state
-            .add_file(tree.notes(), Some(2000), Some(2000), Some(99), false);
+        tree.state.add_file(WalkerFileMetadata {
+            mtime: Some(2000),
+            atime: Some(2000),
+            file_size: Some(99),
+            ..WalkerFileMetadata::walked(tree.notes())
+        });
 
         assert_eq!(
             tree.registered_mtime(),
@@ -2922,13 +2940,7 @@ mod hiding_tests {
         assert_eq!(results(&state).len(), 3, "Everything shows to begin with");
 
         // Root is /test, so hide a subdirectory of it rather than an ancestor.
-        state.add_file(
-            PathBuf::from("/test/sub/buried.txt"),
-            Some(1000),
-            Some(1000),
-            Some(10),
-            false,
-        );
+        state.add_file(WalkerFileMetadata::walked("/test/sub/buried.txt"));
         state.filter_and_rank("").expect("Filter should succeed");
         assert_eq!(results(&state).len(), 4, "The new file shows before hiding");
 
@@ -2955,9 +2967,13 @@ mod hiding_tests {
         // just the row that was selected.
         let (mut state, _dir, _rx) = worker_with_three_files("hide-descendants");
 
-        state.add_file(PathBuf::from("/test/b"), Some(1000), Some(1000), None, true);
+        state.add_file(WalkerFileMetadata {
+            file_size: None,
+            is_dir: true,
+            ..WalkerFileMetadata::walked("/test/b")
+        });
         for path in ["/test/b/c", "/test/b/c/deep.txt"] {
-            state.add_file(PathBuf::from(path), Some(1000), Some(1000), Some(10), false);
+            state.add_file(WalkerFileMetadata::walked(path));
         }
 
         state.filter_and_rank("").expect("Filter should succeed");
