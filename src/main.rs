@@ -216,7 +216,14 @@ fn main() -> Result<()> {
             })
             .level(log::LevelFilter::Debug)
             .chain(fern::log_file(&log_file).expect("Failed to open log file"))
-            .chain(log_tx)
+            // Not `.chain(log_tx)`: fern's own channel sink reports a send to
+            // a closed channel by printing the whole record to stderr. Once
+            // `log_rx` is gone nobody wants these lines - the file has them -
+            // so a failed send is dropped. See "Shutdown Sequence" in
+            // docs/how-it-works.md.
+            .chain(fern::Output::call(move |record| {
+                let _ = log_tx.send(record.args().to_string());
+            }))
             .apply()
             .expect("Failed to initialize logger");
     }
@@ -631,16 +638,10 @@ fn main() -> Result<()> {
     // Run the app
     let result = run_app(&mut terminal, &mut app, event_rx, main_start, &log_rx);
 
-    // Shutdown. The one rule: **the log sink must outlive everything that logs.**
-    // Background threads log as they wind down, and several of them are only
-    // told to stop by `app` being dropped, so if `app` owned the receiving end
-    // of the logging channel it would take the sink with it - and fern reports
-    // a dead channel by printing the whole record to stderr, over the terminal
-    // we are in the middle of restoring.
-    //
-    // `log_rx` is owned by `main` for exactly this reason, and dropped last.
-    // Joining threads one at a time only ever fixed the thread being joined;
-    // the retraining and context threads are detached and can log at any moment.
+    // Shutdown. Logging needs no ordering here: the channel sink drops sends
+    // once `log_rx` is gone (see the logger setup), so a detached thread - the
+    // preview, retraining and context threads all are - can log at any moment,
+    // including after `main` has returned, without writing to stderr.
     let worker_tx = std::mem::replace(&mut app.worker_tx, mpsc::channel().0);
     // Ask the worker to stop, rather than relying on this being the last
     // sender: the walker holds a clone so it can send into the same channel,
@@ -653,18 +654,14 @@ fn main() -> Result<()> {
         let _ = handle.join();
     }
 
-    // Not for the logging - that is handled above - but so that nothing is
-    // still reading the terminal while we put it back the way we found it.
+    // So that nothing is still reading the terminal while we put it back the
+    // way we found it.
     app.input.shutdown();
 
     drop(app);
 
     // Terminal cleanup, through the same function every other hand-back uses.
     input::leave_tui(&mut terminal)?;
-
-    // Everything that could have logged has now been told to stop, and the
-    // terminal is back. Anything still arriving goes nowhere, quietly.
-    drop(log_rx);
 
     result
 }
@@ -842,8 +839,7 @@ fn run_app(
 
         // Collect new log messages (non-blocking)
         while let Ok(log_msg) = log_rx.try_recv() {
-            // fern adds a newline to each message sent via channel, so trim it
-            app.recent_logs.push_back(log_msg.trim_end().to_string());
+            app.recent_logs.push_back(log_msg);
             // Keep only last 50 messages
             if app.recent_logs.len() > 50 {
                 app.recent_logs.pop_front();

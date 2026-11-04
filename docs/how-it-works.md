@@ -2231,8 +2231,7 @@ loop {
     // Draw UI
     terminal.draw(|f| { render_ui(f, &mut app, ...) })?;
 
-    // Drain the logging channel into the debug pane's ring buffer. `main` owns
-    // the receiver, not `App` - see the shutdown rule below.
+    // Drain the logging channel into the debug pane's ring buffer.
     while let Ok(log_msg) = log_rx.try_recv() { ... }
 
     // Block until ANY event arrives (instant wake!)
@@ -2667,21 +2666,25 @@ now says so rather than letting the next person believe it.
 
 ## Shutdown Sequence
 
-**The rule: the log sink must outlive everything that logs.**
-
-Background threads log as they wind down, and several of them are only *told* to
-stop by `App` being dropped. If `App` also owned the receiving end of the logging
-channel, dropping it would take the sink with it - and fern reports a send to a
-dead channel by printing the entire record to stderr, over the terminal that is
-at that moment being restored. The user sees a wall of `Error performing logging`
+**Logging cannot fail loudly, whatever the order.** Background threads log as
+they wind down, and several are detached: the preview thread is told to stop by
+`App` being dropped and then logs "Preview thread exiting", and the retraining
+and context threads can log at any moment. fern's built-in channel sink
+(`.chain(sender)`) reports a send to a dead channel by printing the whole record
+to stderr, so any of them logging after the receiver was gone left an
+`Error performing logging ... sending on a closed channel` in the user's shell
 after quitting.
 
-So `log_rx` is owned by `main`, not by `App`, and dropped last. That is
-structural rather than a matter of ordering: `App` cannot close the sink because
-it does not hold it. The earlier fix - join each thread before `drop(app)` - only
-ever fixed the thread being joined, and had to be done again the next time a
-thread was added. The retraining and context threads are detached and can log at
-any moment, so they could not have been fixed that way at all.
+Two earlier fixes were about order, and neither held. Joining each thread before
+`drop(app)` only fixed the thread being joined. Owning `log_rx` in `main` and
+dropping it last still lost the race: `drop(app)` wakes the preview thread, and
+`main` restored the terminal and dropped `log_rx` before that thread got to its
+last line. No ordering can cover a detached thread, which can outlive `main`
+itself.
+
+So the channel sink is a `fern::Output::call` closure that drops a failed send.
+Nobody wants those lines once the TUI is gone, and the log file still gets
+every one of them.
 
 **The worker is told to stop, not starved of senders.** Step 1 used to be
 `drop(worker_tx)`, on the theory that the channel disconnecting is the signal.
@@ -2698,7 +2701,6 @@ bounds the join at ten seconds so this cannot come back quietly.
    terminal while it is being put back
 3. Drop `app`
 4. Restore the terminal: raw mode, enhancement flags, mouse capture, alt screen
-5. Drop `log_rx` last
 
 ## Dependencies
 

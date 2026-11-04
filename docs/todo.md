@@ -241,3 +241,15 @@ more than 1.4% of gain. Anyone revisiting them should start from
 
 ## not now, maybe never
 - use tracing subscriber crate so we can have nice spans of time and we can maybe visualize and optimize idk
+- **Have `main` join every thread before it returns.** Today only the search
+  worker and tty input are joined. Preview, retrain, tick, context, db-stats
+  and walker are spawned and their handles dropped, on the model that the OS
+  kills them at exit. That model is what let the preview thread log after
+  `log_rx` was gone (2026-11-04). It was fixed by making the channel sink drop
+  failed sends instead, which works for any thread in any order; see "Shutdown
+  Sequence" in `how-it-works.md`. In the user's words: "i don't think it's
+  necessary but it's a cleaner model to reason about". The cost is a stop
+  signal for every thread: tick loops forever, the walker can be mid-walk, and
+  retrain would have to cancel `uv` or make quitting wait for training. Worth
+  checking first, separately: whether killing retrain mid-run can leave a
+  half-written model file.
