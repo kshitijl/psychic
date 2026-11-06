@@ -4,7 +4,6 @@ use lightgbm3::Booster;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 // Import features module
@@ -40,7 +39,7 @@ pub struct FileScore {
     pub fuzzy_score: i64,           // For debugging: fuzzy match score from skim matcher
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct ModelStats {
     pub trained_at: String,
     pub training_duration_seconds: f64,
@@ -48,10 +47,14 @@ pub struct ModelStats {
     pub num_total_examples: usize,
     pub num_positive_examples: usize,
     pub num_negative_examples: usize,
+    /// Trees in the model. Optional so stats from before it was recorded
+    /// still load.
+    #[serde(default)]
+    pub best_iteration: Option<usize>,
     pub top_3_features: Vec<FeatureImportance>,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct FeatureImportance {
     pub feature: String,
     pub importance: f64,
@@ -96,8 +99,6 @@ const RECENCY_WEIGHT: f64 = 1.0; // Weight for recency in simple model
 //   raw_score=50 → sigmoid ≈ 0.98
 const SIGMOID_K: f64 = 0.1; // Steepness of sigmoid curve
 const SIGMOID_X0: f64 = 10.0; // Midpoint (where sigmoid = 0.5)
-
-const TRAIN_PY_SOURCE: &str = include_str!("../train.py");
 
 /// Convert fuzzy score for ML use
 /// Maps i64::MAX (empty query) to 0.0, otherwise returns as f64
@@ -215,7 +216,7 @@ impl Ranker {
                 }
             }
         } else {
-            // Only reached with a model already loaded, and train.py writes both
+            // Only reached with a model already loaded, and training writes both
             // files in the same run. Without stats the blend has no idea how
             // much the model was trained on and falls back to ~2% weight, so a
             // model that ranks fine is nearly ignored - say so rather than
@@ -794,56 +795,8 @@ fn compute_features_into(
     features
 }
 
-/// Ensure train.py is materialized in the data directory and return its path.
-fn ensure_train_py(data_dir: &Path) -> Result<PathBuf> {
-    std::fs::create_dir_all(data_dir)
-        .with_context(|| format!("Failed to create data directory {}", data_dir.display()))?;
-
-    let train_py_path = data_dir.join("train.py");
-    let needs_write = match std::fs::read_to_string(&train_py_path) {
-        Ok(existing) => existing != TRAIN_PY_SOURCE,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
-        Err(err) => {
-            return Err(err).with_context(|| {
-                format!(
-                    "Failed to read existing train.py at {}",
-                    train_py_path.display()
-                )
-            });
-        }
-    };
-
-    if needs_write {
-        std::fs::write(&train_py_path, TRAIN_PY_SOURCE).with_context(|| {
-            format!(
-                "Failed to write embedded train.py to {}",
-                train_py_path.display()
-            )
-        })?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&train_py_path)
-                .with_context(|| format!("Failed to stat {}", train_py_path.display()))?
-                .permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&train_py_path, perms).with_context(|| {
-                format!(
-                    "Failed to set executable permissions on {}",
-                    train_py_path.display()
-                )
-            })?;
-        }
-
-        log::info!("Wrote embedded train.py to {:?}", train_py_path);
-    }
-
-    Ok(train_py_path)
-}
-
-/// Retrain the model: generate features from the events database, then run
-/// `train.py` over them. Blocking, and long - seconds, mostly in LightGBM.
+/// Retrain the model: generate features from the events database, then train
+/// on them in-process (`training`). Blocking, and long - seconds, mostly in LightGBM.
 ///
 /// Blocking is the right shape even though the TUI cannot afford to wait: the
 /// caller that cannot block (`main`, at startup) is already on a thread of its
@@ -896,87 +849,37 @@ pub fn retrain_model(data_dir: &Path, training_log_path: Option<PathBuf>) -> Res
         feature_duration.as_secs_f64()
     );
 
-    // Step 2: Ensure train.py is available
-    let train_py = ensure_train_py(&data_dir)?;
-    log::info!("Using train.py at {:?}", train_py);
-
-    // Step 3: Run training
+    // Step 2: Train
     log::info!("Training model...");
-    let training_start = Instant::now();
-    let output_prefix = data_dir.join("model");
-    let output_prefix_str = output_prefix
-        .to_str()
-        .context("Failed to convert output prefix to string")?;
+    let report = crate::training::train(&features_csv, &data_dir)?;
 
-    let data_dir_str = data_dir
-        .to_str()
-        .context("Failed to convert data_dir to string")?;
-
-    let output = Command::new("uv")
-        .arg("run")
-        .arg(&train_py)
-        .arg(&features_csv)
-        .arg(output_prefix_str)
-        .arg("--data-dir")
-        .arg(data_dir_str)
-        .output()
-        .context("Failed to run train.py with uv")?;
-
-    // Handle training output - either to file or stdout
-    if let Some(log_path) = training_log_path {
-        // Append to log file
-        use std::fs::OpenOptions;
-        use std::io::Write;
-
-        let mut log_file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-            .context("Failed to open training log file")?;
-
-        // Write timestamp header
-        let now = Timestamp::now();
-        let tz = jiff::tz::TimeZone::system();
-        let zoned = now.to_zoned(tz);
-        let timestamp = zoned.strftime("%Y-%m-%d %H:%M:%S");
-        writeln!(log_file, "\n=== Training run at {} ===", timestamp)?;
-
-        if !output.stdout.is_empty() {
-            log_file.write_all(&output.stdout)?;
+    match training_log_path {
+        Some(log_path) => {
+            use std::io::Write;
+            let mut log_file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+                .context("Failed to open training log file")?;
+            let zoned = Timestamp::now().to_zoned(jiff::tz::TimeZone::system());
+            writeln!(
+                log_file,
+                "\n=== Training run at {} ===\n{}",
+                zoned.strftime("%Y-%m-%d %H:%M:%S"),
+                report
+            )?;
         }
-        if !output.stderr.is_empty() {
-            log_file.write_all(&output.stderr)?;
-        }
-
-        log::info!("Training output appended to {:?}", log_path);
-    } else {
-        // Print to stdout/stderr
-        if !output.stdout.is_empty() {
-            let stdout_str = String::from_utf8_lossy(&output.stdout);
-            print!("{}", stdout_str);
-        }
-
-        if !output.stderr.is_empty() {
-            let stderr_str = String::from_utf8_lossy(&output.stderr);
-            eprint!("{}", stderr_str);
-        }
+        None => println!("{report}"),
     }
 
-    if !output.status.success() {
-        anyhow::bail!("Training failed with exit code: {:?}", output.status.code());
-    }
-
-    let training_duration = training_start.elapsed();
     log::info!(
-        "Training complete! ({:.2}s)",
-        training_duration.as_secs_f64()
+        "Training complete! ({:.2}s), model saved at {:?}",
+        report.seconds,
+        data_dir.join("model.txt")
     );
-    log::info!("Model saved at {:?}", output_prefix.with_extension("txt"));
-
-    let total_duration = total_start.elapsed();
     log::info!(
         "Total retraining time: {:.2}s",
-        total_duration.as_secs_f64()
+        total_start.elapsed().as_secs_f64()
     );
 
     Ok(())

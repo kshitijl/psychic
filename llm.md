@@ -18,7 +18,7 @@ The extractions this repo once had planned - `preview.rs`, `render.rs`,
 `path_display.rs`, `cli.rs`, `app.rs`, `analytics.rs` - are all done. The module
 map in `docs/how-it-works.md` is the current list.
 
-Read src/main.rs to understand the entrypoint. Read train.py to understand how the model is made.
+Read src/main.rs to understand the entrypoint. Read src/training/ to understand how the model is made; train.py is the Python reference it is checked against (`bench/train_parity.py`), and the place to change training first if you want to experiment in Python.
 
 ## Development workflow
 
@@ -70,6 +70,19 @@ Why every commit and not just the performance ones:
 * **The numbers accumulate into a history.** `git log` becomes the record of how
   the tool got faster and where it got slower, which is the only way to answer
   "when did startup double" without re-deriving it.
+
+## Changing how the model is trained
+
+psychic trains in-process (`src/training/`), as an exact port of `train.py`.
+The LightGBM parameters and every data-preparation step live in both, so a
+change to one is a change to both, and then:
+
+```bash
+./bench/train_parity.py        # must print "identical: N trees, byte for byte"
+```
+
+The same goes for a LightGBM upgrade: bump the pin in `train_parity.py` to the
+version `lightgbm3-sys` bundles.
 
 ## Adding or changing a ranking feature
 

@@ -14,7 +14,7 @@ What if we put Spotlight in the terminal and made it fast?
 
 ## Okay seriously what is this, how does it work
 
-`psychic` shows you all files and directories that are under the current working directory where you opened it, plus every file or directory you've interacted with while using psychic. If you set up the shell integration it also includes directories you `cd` into. Whenever you do some searches or click on anything, that gets recorded in a sqlite database on your filesystem. Every time you open `psychic`, it computes a bunch of features from your click data and trains a LightGBM model.
+`psychic` shows you all files and directories that are under the current working directory where you opened it, plus every file or directory you've interacted with while using psychic. If you set up the shell integration it also includes directories you `cd` into. Whenever you do some searches or click on anything, that gets recorded in a sqlite database on your filesystem. Every time you open `psychic`, it computes a bunch of features from your click data and trains a LightGBM model, in the background, inside the `psychic` binary itself: no Python, nothing else to install.
 
 This LightGBM model tries to predict, for every file/directory, given the current query, how likely you are to click it. `psychic` sorts the files and directories by that score.
 
@@ -46,7 +46,7 @@ The shell integration works with zsh. It might work with bash with a little bit 
 
 I'm working on making this part better, but for now there are no pre-built packages in any manager.
 
-You'll need the rust toolchain, `uv` and a recent version of CMake installed. Then,
+You'll need the rust toolchain and a recent version of CMake installed. Then,
 
 `cargo install --path .`
 

@@ -1059,6 +1059,7 @@ dependencies = [
  "jiff",
  "libc",
  "lightgbm3",
+ "lightgbm3-sys",
  "log",
  "once_cell",
  "rand",

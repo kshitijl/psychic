@@ -2173,8 +2173,8 @@ mod fresh_install_tests {
 
         assert_eq!(summary.positives, 0);
 
-        // `retrain_model` returns Ok without running train.py at all. Handing
-        // it to Python instead produced a traceback and an ERROR in the log on
+        // `retrain_model` returns Ok without training at all. Training on an
+        // empty set instead produced a traceback and an ERROR in the log on
         // every first launch, for a state that is entirely normal.
         crate::ranker::retrain_model(&dir.path, Some(dir.path.join("training.log")))
             .expect("a fresh install must not report a failure");
@@ -2192,12 +2192,9 @@ mod trained_model_tests {
     //! something to learn from, and check the model that comes out is actually
     //! the one used.
     //!
-    //! This runs `train.py` through `uv`, so it takes about seven seconds and
-    //! wants a network the first time, when uv has to populate its cache. It
-    //! runs by default anyway. `uv` is already required to build and use
-    //! psychic at all (see the README), and a test that has to be asked for is
-    //! a test nobody runs: this suite already carries two of those, which look
-    //! like coverage and are not.
+    //! Training runs for real, in-process, the same code `psychic retrain`
+    //! runs. It used to shell out to `train.py` through `uv`, which took seven
+    //! seconds and wanted a network the first time.
 
     use super::fresh_install_tests_support::*;
     use super::*;

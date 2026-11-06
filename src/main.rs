@@ -16,6 +16,7 @@ mod preview;
 mod ranker;
 mod render;
 mod search_worker;
+mod training;
 mod tty_input;
 mod ui_state;
 mod walker;
@@ -391,6 +392,13 @@ fn main() -> Result<()> {
                     } else {
                         println!("No log file found at {}", log_path.display());
                     }
+                    return Ok(());
+                }
+                InternalCommands::Train {
+                    features_csv,
+                    out_dir,
+                } => {
+                    println!("{}", training::train(&features_csv, &out_dir)?);
                     return Ok(());
                 }
                 InternalCommands::Preview {

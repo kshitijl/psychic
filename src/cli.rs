@@ -70,6 +70,16 @@ pub enum InternalCommands {
     ClearLog,
     /// Summarize events in the database by action type
     SummarizeEvents,
+    /// Train on a features CSV and write model.txt and model_stats.json into
+    /// a directory, without touching the database
+    ///
+    /// `bench/train_parity.py` runs this beside `train.py` on the same CSV.
+    Train {
+        /// Features CSV, as `generate-features` writes it
+        features_csv: PathBuf,
+        /// Where to write model.txt and model_stats.json
+        out_dir: PathBuf,
+    },
     /// Time the preview generator on a path, with no UI in the way
     ///
     /// Comparable to `bat --color=always --style=numbers --line-range :N`,

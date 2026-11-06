@@ -23,7 +23,9 @@ The codebase follows John Ousterhout's "deep modules" philosophy: simple interfa
 4. **`context.rs`** - Where psychic was launched, and the timezone
 5. **`features.rs`** - ML feature generation for training
 6. **`feature_defs/`** - Trait-based feature registry
-7. **`ranker.rs`** - LightGBM model inference
+7. **`ranker.rs`** - LightGBM model inference, and `retrain_model`, which
+   trains through **`training/`**: an in-process port of `train.py` onto
+   LightGBM's C API (see "Training" below)
 
 **Worker Thread:**
 8. **`search_worker.rs`** - Async worker thread for filtering/ranking
@@ -56,8 +58,8 @@ The codebase follows John Ousterhout's "deep modules" philosophy: simple interfa
 **Development Tools:**
 22. **`analyze_perf.rs`** - Performance analysis for timing logs
 23. **`bench/`** - Not a module: the benchmark harness, in Python. `run.py`
-    measures speed against another commit, `model.py` measures ranking quality.
-    See `llm.md`.
+    measures speed against another commit, `model.py` measures ranking quality,
+    `train_parity.py` checks the Rust trainer against `train.py`. See `llm.md`.
 
 **One TIMING line per query.** Ranking used to write about 23 lines per query -
 eight op lines plus one per feature - and fern flushes per record, so each was a
@@ -194,8 +196,8 @@ actually lasted 600ms.
 - **Preview**: Reads and highlights the selected file off the UI thread (see `preview.rs`)
 
 **And three that do one job and exit**, all detached: the retrainer (spawned in
-`main.rs`, running `ranker::retrain_model`, which itself spawns `uv` for
-`train.py`), the context gatherer, and the database statistics query that fills
+`main.rs`, running `ranker::retrain_model`, which trains in-process on that
+thread), the context gatherer, and the database statistics query that fills
 the debug pane. Eight `thread::spawn` sites in all, which is worth knowing when
 reading a stack trace. `retrain_model` used to make it nine by spawning a thread
 and immediately joining it, so a background retrain held two threads to do one
@@ -477,15 +479,15 @@ anyone noticing.
 - **Training does not run.** A fresh install has impressions but nothing
   clicked, so there is nothing to learn from. `generate_features` reports how
   many rows it wrote and how many were clicked, and `retrain_model` returns
-  early when none were. Handing an empty set to `train.py` produced a Python
+  early when none were. Handing an empty set to the trainer produced a
   traceback and an `ERROR` in the log on every first launch, for a state that is
   entirely normal.
 - **Once the user has clicked, it trains and the model is used.** The blend
   hands over as engagement accumulates, crossing at 30. That whole loop -
   use it, train, load, rank with the trained model outweighing the simple one -
-  is `trained_model_tests`. It runs `train.py` for real, which costs about seven
-  seconds of the suite's eight; that is the price of the only test that covers
-  the loop end to end, and `uv` is required to use psychic regardless.
+  is `trained_model_tests`. It trains for real, in-process, in a few
+  milliseconds. It used to run `train.py` through `uv`, which was seven seconds
+  of the suite's eight and wanted a network the first time.
 
 **Two ordering bugs lived here**, both only reachable on a first launch, which
 is why nothing caught them:
@@ -1036,7 +1038,7 @@ pub static FEATURE_REGISTRY: Lazy<Vec<Box<dyn Feature>>> = Lazy::new(|| {
 Why: Adding a new feature only requires: (1) implement trait, (2) add to registry. No manual synchronization across files. Feature vector order comes from registry order automatically.
 
 **Schema export:** `generate-features` command outputs `feature_schema.json` with feature names, types, and monotonicity hints.
-Why: Python training script reads schema to know feature order, types, and can apply monotonic constraints during training. No manual duplication.
+Why: `train.py` and `bench/model.py` read the schema to know feature order, types and monotonic constraints. The Rust trainer reads `FEATURE_REGISTRY` directly.
 
 **Monotonicity hints:** Each feature can declare its monotonicity (increasing=1, decreasing=-1, or null for none). For example:
 - `clicks_last_hour`: increasing (more clicks → higher relevance)
@@ -1372,7 +1374,7 @@ no file identity, so nothing in the model itself expires.
 
 A model that loaded but whose stats did not gets 0, and so ~2% weight. That means
 a working model is nearly ignored, so `load_stats` logs a warning when it happens;
-`train.py` writes both files in the same run, so it should not.
+training writes both files in the same run, so it should not.
 
 Why blend at all: on a new installation the ML model either doesn't exist or has
 nothing meaningful to learn from, so the simple model provides reasonable ranking
@@ -1472,22 +1474,56 @@ size and learning rate (more data supports a bigger model), the recency
 half-life (a longer history changes what "old" means), and click-through rate,
 which was rejected partly for having too thin a base.
 
-### Training: `train.py`
+### Training: `src/training/`
 
-Trains LightGBM LambdaRank model from features CSV.
+Trains a LightGBM LambdaRank model from the features CSV, inside the psychic
+binary, on the retrain thread. `retrain_model` generates `features.csv` and
+calls `training::train`, which writes `model.txt` and `model_stats.json`.
 
-**PEP 723 inline metadata:** the script declares its own `requires-python` and
+**Why not Python any more.** Training used to be `train.py`, embedded in the
+binary, written into the data directory and run with `uv run`. That made uv a
+runtime dependency, and the first training on a new machine downloaded pandas,
+matplotlib, shap and scikit-learn (~10s from a cold uv cache, and only with a
+network). If uv was missing, training failed into the log and ranking stayed on
+the simple model forever. The binary already linked LightGBM to predict with,
+and LightGBM's C library trains as well, so psychic now needs nothing else
+installed to learn.
+
+**It is a port, exact to the bit.** `src/training/` reproduces each step of
+`train.py`: dropping episodes with no click, the stable sort by episode, the
+180-day recency weights, the 80/10/10 time split (with numpy's quantile
+interpolation, rounding and all, because the boundaries come from it), the
+lambdarank parameters, Python LightGBM's early-stopping callback (strict
+improvement, any metric running out of patience stops it, ties go to the first
+metric), and the refit on every row for the round count early stopping found.
+On the author's 80k-row history, the trees it writes are byte-identical to
+`train.py`'s under LightGBM 4.6.0 with `num_threads=1`.
+
+`lightgbm3` wraps prediction but cannot set query groups or attach a validation
+set, so `training/lgbm.rs` calls `lightgbm3-sys` directly, behind owned handles;
+every `unsafe` in training is in that file.
+
+**Single-threaded.** `lightgbm3-sys` builds LightGBM without OpenMP, which is
+what keeps the binary free of libomp. The Python wheel uses every core, and
+summing histograms in a different order changes the last bit of some leaf
+values: against default multithreaded `train.py`, scores differed by at most
+4e-14 and no test ranking changed. Training takes ~2.4s on one core for 80k rows,
+in the background.
+
+**`train.py` stays, as the reference and for the plots.** It is what
+`bench/train_parity.py` checks the port against, and running it by hand still
+writes `model_viz.pdf` (training curves, importances, SHAP), which psychic no
+longer produces on every retrain. The LightGBM parameters are written in both
+places; `bench/train_parity.py` is what notices if they drift, so run it after
+changing either, or after a LightGBM upgrade. It pins Python LightGBM to the
+version `lightgbm3-sys` bundles, because a different version is allowed to build
+a different model.
+
+**PEP 723 inline metadata:** `train.py` declares its own `requires-python` and
 dependencies in a `# /// script` block, so `uv run train.py` builds an isolated
-environment on any machine with uv - no virtualenv, and no dependence on this
-repository's `pyproject.toml`. That matters because psychic embeds this file,
-writes it into the data directory, and runs it from whatever directory the user
-launched from, which may be an unrelated project with its own `pyproject.toml`;
-inline metadata takes precedence over a surrounding project. Every directly
-imported module is listed, including ones that would otherwise arrive
-transitively (numpy), so an upstream resolver change cannot break it. Verified
-from a cold uv cache: ~10s to resolve, install and run.
-
-`cargo install --path .` users don't need to copy ancillary files manually—the `psychic` binary embeds `train.py` and writes it into the data directory on demand (default `~/.local/share/psychic/train.py`) whenever training runs, overwriting stale copies if the script changed.
+environment on any machine with uv. Every directly imported module is listed,
+including ones that would otherwise arrive transitively (numpy), so an upstream
+resolver change cannot break it.
 
 **Key parameters:**
 - Objective: `lambdarank`, grouped by `episode_id`
@@ -1620,25 +1656,24 @@ Setting `HALF_LIFE_DAYS = 1000` restores uniform weighting.
 
 **Usage:**
 ```bash
-psychic generate-features  # Outputs features.csv + feature_schema.json
+psychic retrain                                  # features + training, into the data dir
+psychic internal train features.csv <out_dir>    # training only: <out_dir>/model.txt, model_stats.json
+./bench/train_parity.py [features.csv]           # Rust trainer vs train.py, must be identical
+
+# By hand, for the plots:
 uv run train.py features.csv <output_prefix> [--data-dir DIR]
 # From the prefix:  <prefix>.txt (the model), <prefix>_viz.pdf
 # From --data-dir:  model_stats.json, and feature_schema.json is read from there
 ```
 
-psychic calls this with a prefix of `<data_dir>/model`, which is why the shipped
-model is `<data_dir>/model.txt`.
-
-`uv run`, not `python`: the script carries its own dependencies in a PEP 723
-block, as described above. And it writes only where it was told - the second,
-hardcoded write to `~/.local/share/psychic/model.txt` is gone, which is what used
-to make `--data-dir` silently train into the real data directory.
-
-**Schema integration:** Reads `feature_schema.json` to get feature names and types. Errors if missing.
-Why: Ensures Rust and Python agree on feature order.
+**Schema integration:** the Rust trainer takes its feature list and monotone
+constraints from `FEATURE_REGISTRY`, and finds each feature's column in the CSV
+by name. `train.py` reads `feature_schema.json` for the same, and errors if it
+is missing.
 
 **Atomic output:** `model.txt` and `model_stats.json` are written to a temp file in
-the same directory and then `os.replace`d over the target. Retraining runs in a
+the same directory and then renamed over the target (`atomic_write` in
+`training/`, `os.replace` in `train.py`). Retraining runs in a
 background thread while the TUI is live, and the worker reloads the model on its
 own schedule, so a plain write exposed a window where a reader saw a truncated or
 empty file. `os.replace` is atomic on POSIX within a filesystem, so a reader gets
@@ -2777,8 +2812,9 @@ psychic internal print-log
 psychic internal clear-log
 psychic internal summarize-events
 psychic internal preview <path> [--lines N] [--repeat N] [--show]
+psychic internal train <features.csv> <out_dir>
 
-# Train model (standalone; `psychic retrain` does this for you)
+# Python reference trainer, for its plots (`psychic retrain` does not need it)
 uv run train.py features.csv <output_prefix> [--data-dir DIR]
 # Outputs: <prefix>.txt, <prefix>_viz.pdf, and model_stats.json in --data-dir
 ```
@@ -2789,6 +2825,6 @@ uv run train.py features.csv <output_prefix> [--data-dir DIR]
 - `~/.local/share/psychic/model.txt` - LightGBM model (optional)
 - `~/.local/share/psychic/model_stats.json` - Model training statistics (feature importance, accuracy, etc.)
 - `~/.local/share/psychic/features.csv` - Generated training features
-- `~/.local/share/psychic/feature_schema.json` - Feature definitions for Python training script
+- `~/.local/share/psychic/feature_schema.json` - Feature definitions, for `train.py` and `bench/model.py`
 - `~/.local/share/psychic/app.log` - Application logs
 - `~/.local/share/psychic/training.log` - Background model retraining output
