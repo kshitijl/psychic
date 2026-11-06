@@ -2826,9 +2826,9 @@ workflow is never edited by hand.
   `aarch64-apple-darwin` (macos-15), `x86_64-apple-darwin` (macos-15-intel),
   `x86_64-unknown-linux-gnu` (ubuntu-22.04), `aarch64-unknown-linux-gnu`
   (ubuntu-22.04-arm). No cross-compiling.
-- each archive is `psychic-<target>.tar.xz` holding the binary, README and
+- each archive is `psychic-cli-<target>.tar.xz` holding the binary, README and
   LICENSE, with a sha256.
-- a GitHub Release gets the archives and `psychic-installer.sh`, the
+- a GitHub Release gets the archives and `psychic-cli-installer.sh`, the
   `curl | sh` installer, which puts the binary in `~/.local/bin`.
 - the formula `psychic.rb` is pushed to the tap repo `kshitijl/homebrew-tap`
   (`brew install kshitijl/tap/psychic`), using the `HOMEBREW_TAP_TOKEN` secret:
@@ -2845,7 +2845,7 @@ Everything a user sees is still `psychic`: the binary (`[[bin]]`), `--version`
 (clap's `name`, which otherwise defaults to the package name), the data
 directory, the Homebrew formula (dist's `formula`) and the release page
 (`display-name`). dist can't rename the archives or the shell installer, so from
-v0.1.1 on they are `psychic-cli-<target>.tar.xz` and
+v0.2.0 on they are `psychic-cli-<target>.tar.xz` and
 `psychic-cli-installer.sh`. v0.1.0's were `psychic-*`, from before the
 rename. `include` in `Cargo.toml` limits the crate to `src/`, the embedded zsh
 script, README and LICENSE.

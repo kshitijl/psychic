@@ -19,7 +19,7 @@ on Apple Silicon, Intel Macs, and for Linuxbrew users on x86_64 and Arm.
 ### curl installer on Mac or Linux
 
 ```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/kshitijl/psychic/releases/latest/download/psychic-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/kshitijl/psychic/releases/latest/download/psychic-cli-installer.sh | sh
 ```
 
 This installs the binary to `~/.local/bin` and adds it to your PATH. Run it again to upgrade.
