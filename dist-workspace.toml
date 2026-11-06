@@ -24,3 +24,7 @@ publish-jobs = ["homebrew"]
 # Build every artifact on pull requests too, so a Linux build can be downloaded
 # and tried before anything is released
 pr-run-mode = "upload"
+# The package is `psychic-cli` (crates.io); everything users see is `psychic`.
+# Archives and the shell installer can't be renamed, so they're `psychic-cli-*`.
+formula = "psychic"
+display-name = "psychic"

@@ -1,11 +1,16 @@
 [package]
-name = "psychic"
+# `psychic` on crates.io belongs to an unrelated crate. The binary, the
+# Homebrew formula and the data directory are all still `psychic`.
+name = "psychic-cli"
 version = "0.1.0"
 edition = "2024"
 description = "Smarter file explorer and cd replacement that learns from your actions and ranks files with a model trained on your machine"
 license = "MIT"
 repository = "https://github.com/kshitijl/psychic"
 homepage = "https://github.com/kshitijl/psychic"
+# What `cargo publish` uploads: the build needs src/ and the zsh script it
+# embeds. Not bench/, notebooks, train.py or the Python project.
+include = ["/src/**/*", "/shell/psychic.zsh", "/README.md", "/LICENSE"]
 
 [[bin]]
 name = "psychic"

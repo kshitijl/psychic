@@ -2798,6 +2798,17 @@ workflow is never edited by hand.
 Pull requests run the same builds without publishing (`pr-run-mode =
 "upload"`), so a build can be downloaded from the run and tried first.
 
+**Names.** The Cargo package is `psychic-cli`, because `psychic` on crates.io
+belongs to an unrelated crate, and `cargo install psychic-cli` installs it.
+Everything a user sees is still `psychic`: the binary (`[[bin]]`), `--version`
+(clap's `name`, which otherwise defaults to the package name), the data
+directory, the Homebrew formula (dist's `formula`) and the release page
+(`display-name`). dist can't rename the archives or the shell installer, so from
+v0.1.1 on they are `psychic-cli-<target>.tar.xz` and
+`psychic-cli-installer.sh`. v0.1.0's were `psychic-*`, from before the
+rename. `include` in `Cargo.toml` limits the crate to `src/`, the embedded zsh
+script, README and LICENSE.
+
 **Decisions.**
 
 - *`[profile.dist]` is `release` exactly.* dist's default adds thin LTO, which

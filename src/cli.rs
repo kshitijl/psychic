@@ -131,7 +131,9 @@ pub enum OnCwdVisitAction {
 
 /// A terminal-based file browser that learns which files you want to see.
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+// `name`, because clap defaults to the package name, which is `psychic-cli`
+// (crates.io had `psychic`); the command is `psychic`.
+#[command(name = "psychic", author, version, about, long_about = None)]
 pub struct Cli {
     /// Data directory for database and training files (default: ~/.local/share/psychic)
     #[arg(long, global = true, value_name = "DIR")]

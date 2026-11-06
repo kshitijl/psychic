@@ -170,7 +170,16 @@ releasing"). The procedure:
 git tag v0.2.0 && git push origin main v0.2.0
 # 3. watch it: plan, 4 builds, host, publish-homebrew-formula, announce
 gh run watch $(gh run list --workflow release.yml --limit 1 --json databaseId --jq '.[0].databaseId')
+# 4. publish the same version to crates.io (`cargo login` once per machine)
+cargo publish
 ```
+
+**At the next release (v0.1.1), the README's installer URL breaks.** The
+package was renamed to `psychic-cli` after v0.1.0, so dist names the installer
+`psychic-cli-installer.sh`. `releases/latest/download/psychic-installer.sh`
+stops resolving once v0.1.1 is the latest release. Change the README to
+`psychic-cli-installer.sh` in the same commit as the version bump, then delete
+this paragraph.
 
 `.github/workflows/release.yml` is generated: change `dist-workspace.toml` and
 run `dist generate` (`brew install cargo-dist`), never edit the YAML. After
