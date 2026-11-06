@@ -438,6 +438,71 @@ fn active_hidden_for(hidden: &[PathBuf], root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Where `psychic jump` should go.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JumpTarget {
+    pub full_path: PathBuf,
+    pub display_name: String,
+    pub mtime: Option<i64>,
+    pub file_size: Option<i64>,
+}
+
+/// The best directory for `query`, ranked the way the TUI ranks it, without
+/// the TUI or the walk.
+///
+/// The candidates are everything in the history plus the cwd's direct
+/// children; the matcher, the filter (`OnlyDirs`) and the model are the
+/// worker's own. The cwd itself is skipped, as zoxide skips it: a jump to
+/// where you already are is a `cd` that does nothing.
+///
+/// `None` when nothing matches.
+pub fn top_directory(
+    cwd: PathBuf,
+    data_dir: &Path,
+    query: &str,
+    hidden_prefixes: Vec<PathBuf>,
+    respect_gitignore: bool,
+) -> Result<Option<JumpTarget>> {
+    // No walker, so nothing will ever read this; `change_cwd`, the only thing
+    // that sends on it, is never called here.
+    let (walker_command_tx, _) = mpsc::channel();
+    let mut state = WorkerState::new(
+        cwd,
+        data_dir,
+        walker_command_tx,
+        false,
+        false,
+        hidden_prefixes,
+    )?;
+
+    let children_start = std::time::Instant::now();
+    let children = crate::walker::children(&state.root, &state.active_hidden, respect_gitignore);
+    log::info!(
+        "TIMING {{\"op\":\"jump_children\",\"ms\":{},\"count\":{}}}",
+        children_start.elapsed().as_secs_f64() * 1000.0,
+        children.len()
+    );
+    for child in children {
+        state.add_file(child);
+    }
+
+    state.current_filter = FilterType::OnlyDirs;
+    state.filter_and_rank(query)?;
+    state.log_query_timings();
+
+    Ok(state
+        .file_scores
+        .iter()
+        .map(|score| &state.file_registry[score.file_id])
+        .find(|file| file.full_path != state.root)
+        .map(|file| JumpTarget {
+            full_path: file.full_path.clone(),
+            display_name: file.display_name.clone(),
+            mtime: file.mtime,
+            file_size: file.file_size,
+        }))
+}
+
 // Worker thread state - owns all file data
 struct WorkerState {
     file_registry: Vec<FileInfo>,
@@ -3032,5 +3097,121 @@ mod hiding_tests {
             vec![PathBuf::from("/test/current/notes.txt")],
             "The hidden file is absent from the page the UI logs impressions from"
         );
+    }
+}
+
+#[cfg(test)]
+mod jump_tests {
+    use super::*;
+    use crate::db::{EventData, UserInteraction};
+
+    /// A real tree and data directory. The names are ones a query cannot
+    /// match by accident in the temp directory's own path, because a directory
+    /// outside the cwd is matched by its absolute path.
+    ///
+    /// ```text
+    /// <tmp>/elsewhere/xylophone/   clicked once, so in the history
+    /// <tmp>/xyz-here/              the cwd
+    /// <tmp>/xyz-here/kumquat/
+    /// <tmp>/xyz-here/notes.txt
+    /// <tmp>/data/                  events.db
+    /// ```
+    struct Fixture {
+        top: PathBuf,
+        cwd: PathBuf,
+        data: PathBuf,
+    }
+
+    impl Fixture {
+        fn new(name: &str) -> Self {
+            let top =
+                std::env::temp_dir().join(format!("psychic-jump-{}-{}", name, std::process::id()));
+            let _ = std::fs::remove_dir_all(&top);
+            for dir in ["elsewhere/xylophone", "xyz-here/kumquat", "data"] {
+                std::fs::create_dir_all(top.join(dir)).unwrap();
+            }
+            std::fs::write(top.join("xyz-here/notes.txt"), "hi").unwrap();
+            // Canonical, as every writer of the events table stores it (on
+            // macOS the temp dir is behind a symlink).
+            let top = top.canonicalize().unwrap();
+
+            let data = top.join("data");
+            let db = Database::new(&Database::get_db_path(&data)).unwrap();
+            db.log_event(EventData {
+                query: "",
+                file_path: "xylophone",
+                full_path: &top.join("elsewhere/xylophone").to_string_lossy(),
+                mtime: None,
+                file_size: None,
+                subsession_id: 1,
+                action: UserInteraction::Click,
+                session_id: "s",
+                episode_queries: None,
+                rank: None,
+                is_dir: Some(true),
+            })
+            .unwrap();
+
+            Fixture {
+                cwd: top.join("xyz-here"),
+                top,
+                data,
+            }
+        }
+
+        fn jump(&self, query: &str) -> Option<String> {
+            top_directory(self.cwd.clone(), &self.data, query, Vec::new(), true)
+                .unwrap()
+                .map(|target| {
+                    target
+                        .full_path
+                        .strip_prefix(&self.top)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.top);
+        }
+    }
+
+    #[test]
+    fn a_directory_from_the_history_is_found_from_anywhere() {
+        let fixture = Fixture::new("1");
+        assert_eq!(
+            fixture.jump("phone"),
+            Some("elsewhere/xylophone".to_string())
+        );
+    }
+
+    #[test]
+    fn a_child_of_the_cwd_is_found_without_being_in_the_history() {
+        let fixture = Fixture::new("2");
+        assert_eq!(
+            fixture.jump("kumquat"),
+            Some("xyz-here/kumquat".to_string())
+        );
+    }
+
+    #[test]
+    fn the_cwd_itself_is_never_the_answer() {
+        let fixture = Fixture::new("3");
+        assert_eq!(fixture.jump("xyz-here"), None);
+    }
+
+    #[test]
+    fn files_are_never_the_answer() {
+        let fixture = Fixture::new("4");
+        assert_eq!(fixture.jump("notes"), None);
+    }
+
+    #[test]
+    fn no_match_is_none() {
+        let fixture = Fixture::new("5");
+        assert_eq!(fixture.jump("qqqq"), None);
     }
 }

@@ -139,6 +139,22 @@ struct WalkLimits {
     respect_gitignore: bool,
 }
 
+/// The root's direct children, read on the calling thread.
+///
+/// What `psychic jump` adds to the history: one `readdir` of the cwd, not a
+/// walk. The same entries the walker's first pass reports, so a jump and the
+/// TUI see the cwd's children identically.
+pub fn children(
+    root: &Path,
+    hidden: &[PathBuf],
+    respect_gitignore: bool,
+) -> Vec<WalkerFileMetadata> {
+    entries(root, hidden, respect_gitignore, 1..=1)
+        .take(MAX_FILES)
+        .map(|entry| describe(&entry))
+        .collect()
+}
+
 fn walk_directory<T>(
     root: &Path,
     hidden: &[PathBuf],

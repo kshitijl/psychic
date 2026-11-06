@@ -286,6 +286,42 @@ fn main() -> Result<()> {
                 println!("Done.");
                 return Ok(());
             }
+            Commands::Jump { query } => {
+                let jump_start = Instant::now();
+                let root = env::current_dir()?.canonicalize()?;
+                let db = db::Database::new(&db::Database::get_db_path(&data_dir))?;
+                let hidden = db.get_hidden_prefixes()?;
+
+                let target =
+                    search_worker::top_directory(root, &data_dir, &query, hidden, !cli.no_ignore)?;
+                let Some(target) = target else {
+                    log::info!("Jump: nothing matches {:?}", query);
+                    // Quietly: the shell falls back to the TUI with the query
+                    // typed in, and a message here would flash up before it.
+                    std::process::exit(1);
+                };
+
+                db.log_event(EventData {
+                    query: &query,
+                    file_path: &target.display_name,
+                    full_path: &target.full_path.to_string_lossy(),
+                    mtime: target.mtime,
+                    file_size: target.file_size,
+                    subsession_id: 0,
+                    action: db::UserInteraction::Jump,
+                    session_id: &session_id,
+                    episode_queries: None,
+                    rank: None,         // nothing was shown
+                    is_dir: Some(true), // jump only picks directories
+                })?;
+                log::info!(
+                    "TIMING {{\"op\":\"jump\",\"ms\":{}}}",
+                    jump_start.elapsed().as_secs_f64() * 1000.0
+                );
+
+                println!("{}", target.full_path.display());
+                return Ok(());
+            }
             Commands::Zsh => {
                 // Output zsh integration script
                 print!("{}", include_str!("../shell/psychic.zsh"));
@@ -505,6 +541,7 @@ fn main() -> Result<()> {
         no_click_logging: cli.no_click_logging,
         respect_gitignore: !cli.no_ignore,
         editor,
+        initial_query: cli.query.clone(),
     };
 
     let mut app = App::new(root.clone(), &data_dir, bootstrap, options)?;

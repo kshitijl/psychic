@@ -33,6 +33,9 @@ After adding implementing a feature or fixing a bug:
   actively misleading, which is worse than a gap. If the change is genuinely
   invisible there - a test, a benchmark script, a comment - say so in the commit
   message rather than leaving the reader to wonder whether it was forgotten.
+* **never edit `README.md`.** It is human prose only, written by the user. If a
+  change makes something in it wrong or leaves something out, say so in your
+  reply instead of editing it.
 * **benchmark the change against the commit before it, and put the numbers in
   the commit message.**
 

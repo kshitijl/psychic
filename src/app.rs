@@ -56,6 +56,8 @@ pub struct AppOptions {
     /// False when `--no-ignore` was given: show what git would hide.
     pub respect_gitignore: bool,
     pub editor: String,
+    /// What the search box starts with: `--query`, empty by default.
+    pub initial_query: String,
 }
 
 pub struct AppBootstrap {
@@ -164,6 +166,7 @@ impl App {
             preview_tx,
         } = bootstrap;
         let initial_filter = options.initial_filter;
+        let initial_query = options.initial_query.clone();
 
         let db_path = crate::db::Database::get_db_path(data_dir);
         let db = crate::db::Database::new(&db_path)?;
@@ -194,7 +197,7 @@ impl App {
         log::debug!("App::new() total time: {:?}", start_time.elapsed());
 
         let app = App {
-            query: String::new(),
+            query: initial_query.clone(),
             page_cache: HashMap::new(),
             total_results: 0,
             total_files: 0,
@@ -235,7 +238,7 @@ impl App {
         // Send initial query to worker with ID 0
         let _ = worker_tx.send(WorkerRequest::UpdateQuery(
             search_worker::UpdateQueryRequest {
-                query: String::new(),
+                query: initial_query,
                 query_id: 0,
                 filter: initial_filter,
             },
@@ -606,6 +609,7 @@ impl App {
                 no_click_logging: true,
                 respect_gitignore: true,
                 editor: "true".to_string(),
+                initial_query: String::new(),
             },
             analytics: Analytics::new("test-session".to_string(), db, true),
             worker_tx,

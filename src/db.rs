@@ -74,6 +74,10 @@ pub enum UserInteraction {
     Scroll,
     Impression,
     StartupVisit,
+    /// `psychic jump` (`pd xy`) picked this directory without showing a list.
+    /// Kept out of training: nothing was on screen, so there are no
+    /// impressions for it to be a click among.
+    Jump,
 }
 
 pub struct EventData<'a> {
@@ -358,6 +362,7 @@ impl Database {
             UserInteraction::Scroll => "scroll",
             UserInteraction::Impression => "impression",
             UserInteraction::StartupVisit => "startup_visit",
+            UserInteraction::Jump => "jump",
         };
 
         self.conn.prepare_cached(

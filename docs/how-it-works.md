@@ -376,7 +376,7 @@ CREATE TABLE events (
     mtime INTEGER,
     file_size INTEGER,
     subsession_id INTEGER,
-    action TEXT NOT NULL,      -- 'impression', 'scroll', 'click' or 'startup_visit'
+    action TEXT NOT NULL,      -- 'impression', 'scroll', 'click', 'startup_visit' or 'jump'
     session_id TEXT NOT NULL,
     episode_queries TEXT,      -- JSON array, on clicks only
     rank INTEGER,              -- 1-based row position, on impressions only
@@ -2318,6 +2318,8 @@ Why mouse scrolls preview: Keyboard for navigation (fast), mouse for exploration
 Run `eval "$(psychic zsh)"` in your ~/.zshrc to enable the `p`, `pd`, and `pc` commands, plus automatic directory tracking:
 - `p` - launch psychic, press Ctrl-J to cd your shell to the selected directory
 - `pd` - launch psychic in directories-only mode (same as `psychic --filter=dirs --on-dir-click=print-to-stdout`)
+- `pd xy` - `cd` to `xy` if it is a directory; otherwise to `psychic jump xy`, with no TUI; if nothing matches, the TUI opens with `xy` typed in. See "Jumping without the TUI" below.
+- `pd -i xy` - the TUI with `xy` typed in (`--query=xy`)
 - `pc` - launch psychic in current-directory-only mode (same as `psychic --filter=cwd --on-cwd-visit=print-to-stdout`)
 - **Automatic directory tracking**: The shell integration adds a `chpwd` hook that automatically tracks every directory you visit via `cd`. This allows psychic to learn which directories you frequently visit without requiring explicit clicks.
 - Without shell integration, Ctrl-J spawns a new shell in the selected directory (old behavior)
@@ -2337,6 +2339,39 @@ how zoxide's interactive mode works too. It is also why `tty_input.rs` is
 careful about *which* descriptor it polls: the fd it waits on must be the one
 the terminal is actually attached to, which is the `/dev/tty` psychic opened,
 and emphatically not stdin.
+
+**Jumping without the TUI (`psychic jump QUERY`, `pd xy`).** `pd xy` should be
+instant, like zoxide's `z`. A first attempt was the TUI with the query typed in
+and Enter pressed once results were final; it was thrown away because the TUI
+still started, and "final" meant waiting for the walk (~150ms in `~`). In the
+user's words: "tui shouldn't start up. i kinda want this to be instant like
+zoxide."
+
+So `jump` is a subcommand with no terminal, no walk, no preview and no
+background retrain. `search_worker::top_directory` builds a `WorkerState` on
+the calling thread (no worker thread, and a walker channel nobody listens on),
+adds the cwd's direct children with `walker::children` - one `readdir`, the
+same entries the walker's first pass reports - and runs the ordinary
+`filter_and_rank` under `OnlyDirs`. So the candidates are the history plus the
+cwd's children, and the matcher and model are exactly the TUI's. It prints the
+top row, skipping the cwd itself (as zoxide does: a jump to where you are is a
+`cd` that does nothing), and exits 1 with nothing printed when nothing matches.
+Measured on a 51-event database with no trained model, from `~`: ~4ms inside the
+process (1.8ms of it reading the children), ~10ms wall clock.
+
+What the shell function does, in order: one argument naming an existing
+directory is `cd`'d to directly (zoxide does the same); otherwise `jump`; and if
+that fails, the TUI with the query typed in, because a miss is exactly when the
+user wants to look around. `pd -i xy` skips straight to the TUI.
+
+**A jump is logged as a `jump` event, and is not training data.** Nothing was on
+screen, so there are no impressions for it to be a click among; logging it as
+impressions-plus-click would claim the user saw rows they did not. It is kept
+(query, chosen path) so that it can be learned from later, but `features.rs`
+skips it explicitly, and the history and ranker queries only read `click`,
+`scroll` and `startup_visit`, so it changes no candidate set or feature either.
+The `cd` it leads to is recorded by the shell hook as a `startup_visit`, as any
+other `cd` is.
 
 **Filters:**
 Filter picker appears as a popup overlay in the bottom-right when Ctrl-F is pressed. Five filter options:
@@ -2861,6 +2896,13 @@ psychic retrain
 # Output shell integration script
 psychic zsh
 # Add to ~/.zshrc: eval "$(psychic zsh)"
+
+# Print the best directory for a query, without the TUI (what `pd xy` runs)
+psychic jump xy
+# Exits 1, printing nothing, when nothing matches
+
+# Open the TUI with a query already typed in (what `pd -i xy` runs)
+psychic --query=xy
 
 # Track a directory visit (used by shell integration hook)
 psychic track-visit /path/to/directory

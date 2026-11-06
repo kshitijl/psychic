@@ -32,9 +32,22 @@ p() {
 
 # Jump to a directory using psychic (directories only)
 # Enter on a directory will print it and exit (no navigation mode)
+# `pd xy`: cd to xy if it is a directory, else to the best match for xy without
+#   opening the TUI (`psychic jump`); if nothing matches, open it with xy typed in
+# `pd -i xy`: open the TUI with xy typed in
 pd() {
     \builtin local result
-    result="$(\command psychic --filter=dirs --on-dir-click=print-to-stdout)" && \builtin cd -- "${result}"
+    if [[ "$1" == -i ]]; then
+        \builtin shift
+        result="$(\command psychic --filter=dirs --on-dir-click=print-to-stdout --query="$*")"
+    elif (( $# == 0 )); then
+        result="$(\command psychic --filter=dirs --on-dir-click=print-to-stdout)"
+    elif [[ $# -eq 1 && -d "$1" ]]; then
+        result="$1"
+    else
+        result="$(\command psychic jump -- "$*")" ||
+            result="$(\command psychic --filter=dirs --on-dir-click=print-to-stdout --query="$*")"
+    fi && \builtin cd -- "${result}"
 }
 
 # Jump to a directory using psychic (current directory files only)

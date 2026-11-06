@@ -22,6 +22,16 @@ pub enum Commands {
     ///
     /// This does everything, including feature generation.
     Retrain,
+    /// Print the best directory matching QUERY, without opening the TUI
+    ///
+    /// Ranks the directories psychic has seen you visit or click, plus the
+    /// cwd's direct children, the same way the TUI would, and prints the top
+    /// one (never the cwd itself). Exits 1, printing nothing, when nothing
+    /// matches. This is what `pd xy` runs.
+    Jump {
+        /// What you would have typed into the search box
+        query: String,
+    },
     /// Output shell integration script for zsh
     Zsh,
     /// Track a directory visit (for shell integration hooks)
@@ -150,6 +160,10 @@ pub struct Cli {
     /// Set initial filter (none, cwd, dirs, files)
     #[arg(long, value_enum)]
     pub filter: Option<FilterArg>,
+
+    /// Start with QUERY already typed into the search box
+    #[arg(long, value_name = "QUERY", default_value = "")]
+    pub query: String,
 
     /// Disable preview pane (show blank preview to improve startup time)
     #[arg(long)]

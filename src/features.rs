@@ -277,6 +277,11 @@ pub fn generate_features(
                 // directory-visit features, and never counts as a click.
                 acc.record_visit(event);
             }
+            "jump" => {
+                // Deliberately not training data, for now: a jump shows no list,
+                // so there are no impressions to rank it among. The visit it
+                // leads to is recorded by the cd hook as a `startup_visit`.
+            }
             _ => {} // Ignore unknown actions
         }
     }
