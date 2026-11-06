@@ -14,7 +14,7 @@ What if we put Spotlight in the terminal and made it fast?
 
 ## Okay seriously what is this, how does it work
 
-`psychic` shows you all files and directories that are under the current working directory where you opened it, plus every file or directory you've ever clicked on (hit enter on or used your mouse to scroll) using psychic. Whenever you do some searches or click on anything, that gets recorded in a sqlite database on your filesystem. Every time you open `psychic`, it computes a bunch of features from your click data and trains a LightGBM model.
+`psychic` shows you all files and directories that are under the current working directory where you opened it, plus every file or directory you've interacted with while using psychic. If you set up the shell integration it also includes directories you `cd` into. Whenever you do some searches or click on anything, that gets recorded in a sqlite database on your filesystem. Every time you open `psychic`, it computes a bunch of features from your click data and trains a LightGBM model.
 
 This LightGBM model tries to predict, for every file/directory, given the current query, how likely you are to click it. `psychic` sorts the files and directories by that score.
 
@@ -30,9 +30,11 @@ The model is written to disk so that next time you open the app, it uses the mod
 
 The sqlite database has some indexes to support the most common queries. There is one particularly expensive but also important feature that we mostly pre-compute at the time of writing to the db: "which queries were tried before the user clicked on this file?" The actions a user does before clicking is called, in this code, an *episode*. The episode queries help make psychic feel magical: it can sometimes guess the file you want based on the very first letter you type, even if that letter is buried somewhere in the middle of the filename, because in previous episodes, when you typed that letter, you eventually clicked on that file. The episode queries are written in the same db event row as the click even though they can be derived from the other data we write, because doing this lets us avoid a linear scan through all that data at startup time.
 
-The preview pane is generated in-process, on its own thread. Syntax highlighting is `syntect`, the same library `bat` is built on, and a directory listing is a `read_dir`. It used to shell out to `bat` and `eza` and parse the ANSI they printed back, which cost a process spawn per preview: moving the selection took 16ms, and all of it was in the way of the redraw. Now it is half a millisecond, because the redraw never waits for the preview at all - it is generated on a thread and appears when it is ready. Only what the pane can show is highlighted, plus a screen of runway, extended if you scroll: doing a whole large markdown file at once took 150ms. Anything that isn't text is named rather than painted.
+The preview pane is generated in-process, on its own thread. Syntax highlighting is `syntect`, the same library `bat` is built on, and a directory listing is a `read_dir`. It used to shell out to `bat` and `eza` and parse the ANSI they printed back, which cost a process spawn per preview: moving the selection took 16ms, which needs to happen before redraw. Now it's half a millisecond, because the redraw never waits for the preview at all - it is generated on a thread and appears when it is ready. If you don't scroll a file, only what the pane shows is highlighted. On your first scroll it highlights the rest of the file in one pass.
 
 Syscalls are expensive but of course this whole program is syscalls. We try to minimize syscalls. No syscalls in the main render loop; we carefully make sure that we ask for file metadata at the time we walk the filesystem and then carry that around everywhere else.
+
+We keep only the last 1 year and up to 2000 paths of history. More doesn't seem to improve results, and unlimited growth of the history would slow down startup.
 
 ## Supported systems
 
@@ -58,14 +60,14 @@ If you're using the shell integration (which you should), type
 
 * `p` to explore both files and directories
 * `pd` to explore just directories. Hit enter to `cd` into the selected directory
-* `pc` to explore just children of the cwd
+* `pc` to explore just things under the cwd, at any depth
 
 Otherwise, type `psychic` to open the TUI. By default, it will explore both files and directories.
 
 * Start typing to filter the list of files.
 * Hit enter on a file to open it in `$EDITOR`, falling back to `$VISUAL` and then to `vi`.
 * Hit enter on a directory to navigate into it.
-* `Tab` and `Shift-Tab` to cycle through different filters: all files, just directories, just items under the current cwd, just direct descendants of the cwd.
+* `Tab` and `Shift-Tab` to cycle through different filters: all items, under the cwd (any depth), direct children of the cwd, directories only, files only.
 * `Left/Right` to go back and forward in history.
 * `Alt-Up` to navigate to the parent directory.
 * `Ctrl-J` to get dropped in a shell in the current directory.
