@@ -452,8 +452,12 @@ pub struct JumpTarget {
 ///
 /// The candidates are everything in the history plus the cwd's direct
 /// children; the matcher, the filter (`OnlyDirs`) and the model are the
-/// worker's own. The cwd itself is skipped, as zoxide skips it: a jump to
-/// where you already are is a `cd` that does nothing.
+/// worker's own.
+///
+/// The cwd is skipped when anything else matches, as zoxide skips it: from
+/// `a/foo`, `pd foo` should reach `b/foo`, not stay put. When the cwd is the
+/// *only* match it is the answer, and the `cd` does nothing - the TUI would
+/// show that one row and nothing else, so opening it would be no help.
 ///
 /// `None` when nothing matches.
 pub fn top_directory(
@@ -490,17 +494,22 @@ pub fn top_directory(
     state.filter_and_rank(query)?;
     state.log_query_timings();
 
-    Ok(state
+    let mut matches = state
         .file_scores
         .iter()
-        .map(|score| &state.file_registry[score.file_id])
-        .find(|file| file.full_path != state.root)
-        .map(|file| JumpTarget {
-            full_path: file.full_path.clone(),
-            display_name: file.display_name.clone(),
-            mtime: file.mtime,
-            file_size: file.file_size,
-        }))
+        .map(|score| &state.file_registry[score.file_id]);
+    let first = matches.next();
+    let top = match first {
+        Some(file) if file.full_path == state.root => matches.next().or(first),
+        Some(_) | None => first,
+    };
+
+    Ok(top.map(|file| JumpTarget {
+        full_path: file.full_path.clone(),
+        display_name: file.display_name.clone(),
+        mtime: file.mtime,
+        file_size: file.file_size,
+    }))
 }
 
 // Worker thread state - owns all file data
@@ -3113,6 +3122,7 @@ mod jump_tests {
     /// <tmp>/elsewhere/xylophone/   clicked once, so in the history
     /// <tmp>/xyz-here/              the cwd
     /// <tmp>/xyz-here/kumquat/
+    /// <tmp>/xyz-here/xyzzy/
     /// <tmp>/xyz-here/notes.txt
     /// <tmp>/data/                  events.db
     /// ```
@@ -3127,7 +3137,12 @@ mod jump_tests {
             let top =
                 std::env::temp_dir().join(format!("psychic-jump-{}-{}", name, std::process::id()));
             let _ = std::fs::remove_dir_all(&top);
-            for dir in ["elsewhere/xylophone", "xyz-here/kumquat", "data"] {
+            for dir in [
+                "elsewhere/xylophone",
+                "xyz-here/kumquat",
+                "xyz-here/xyzzy",
+                "data",
+            ] {
                 std::fs::create_dir_all(top.join(dir)).unwrap();
             }
             std::fs::write(top.join("xyz-here/notes.txt"), "hi").unwrap();
@@ -3198,9 +3213,16 @@ mod jump_tests {
     }
 
     #[test]
-    fn the_cwd_itself_is_never_the_answer() {
+    fn the_cwd_is_skipped_when_something_else_matches() {
+        // "xyz" matches both the cwd and its child.
         let fixture = Fixture::new("3");
-        assert_eq!(fixture.jump("xyz-here"), None);
+        assert_eq!(fixture.jump("xyz"), Some("xyz-here/xyzzy".to_string()));
+    }
+
+    #[test]
+    fn the_cwd_is_the_answer_when_it_is_the_only_match() {
+        let fixture = Fixture::new("6");
+        assert_eq!(fixture.jump("xyz-h"), Some("xyz-here".to_string()));
     }
 
     #[test]

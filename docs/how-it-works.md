@@ -2354,8 +2354,14 @@ adds the cwd's direct children with `walker::children` - one `readdir`, the
 same entries the walker's first pass reports - and runs the ordinary
 `filter_and_rank` under `OnlyDirs`. So the candidates are the history plus the
 cwd's children, and the matcher and model are exactly the TUI's. It prints the
-top row, skipping the cwd itself (as zoxide does: a jump to where you are is a
-`cd` that does nothing), and exits 1 with nothing printed when nothing matches.
+top row and exits 1 with nothing printed when nothing matches.
+
+The cwd is skipped when anything else matches, as zoxide skips it: from `a/foo`,
+`pd foo` should reach `b/foo`, not stay put. When the cwd is the *only* match it
+is the answer, and the `cd` is a no-op. It used to be skipped unconditionally,
+which turned that case into "no match" and opened the TUI - showing the one row
+the user was already standing in. Found with `pd ps` inside the psychic
+checkout on a near-empty history: `32-psychic` was the only directory matching.
 Measured on a 51-event database with no trained model, from `~`: ~4ms inside the
 process (1.8ms of it reading the children), ~10ms wall clock.
 

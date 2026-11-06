@@ -26,8 +26,8 @@ pub enum Commands {
     ///
     /// Ranks the directories psychic has seen you visit or click, plus the
     /// cwd's direct children, the same way the TUI would, and prints the top
-    /// one (never the cwd itself). Exits 1, printing nothing, when nothing
-    /// matches. This is what `pd xy` runs.
+    /// one, skipping the cwd unless it is the only match. Exits 1, printing
+    /// nothing, when nothing matches. This is what `pd xy` runs.
     Jump {
         /// What you would have typed into the search box
         query: String,
