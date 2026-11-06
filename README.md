@@ -4,6 +4,44 @@ What if we put Spotlight in the terminal and made it fast?
 
 `psychic` is a terminal-based file browser with ML-powered ranking, built in Rust using ratatui. The results it shows you update as you type. It learns from your behavior (clicks, scrolls) to improve search relevance over time. Inspired by `fzf` and `zoxide`, `psychic` helps you navigate the filesystem and open the files you need, *fast*.
 
+## Installation
+
+### With homebrew on Mac or Linux
+
+```sh
+brew install kshitijl/tap/psychic
+```
+
+on Apple Silicon, Intel Macs, and for Linuxbrew users on x86_64 and Arm.
+
+### curl installer on Mac or Linux
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/kshitijl/psychic/releases/latest/download/psychic-installer.sh | sh
+```
+
+This installs the binary to `~/.local/bin` and adds it to your PATH. Run it again to upgrade.
+
+### Shell integration
+
+For shell integration, put this in your `.zshrc`:
+
+```sh
+eval "$(psychic zsh)"
+```
+
+### Linux requirements
+
+glibc 2.34 or newer, which means Ubuntu 22.04+, Debian 12+, Fedora/RHEL 9+.
+
+### From source
+
+You'll need the rust toolchain and CMake 3.28+ installed. Then,
+
+```sh
+cargo install --git https://github.com/kshitijl/psychic
+```
+
 ## DEMO!
 
 [![asciicast](https://asciinema.org/a/752725.svg)](https://asciinema.org/a/752725)
@@ -38,21 +76,9 @@ We keep only the last 1 year and up to 2000 paths of history. More doesn't seem 
 
 ## Supported systems
 
-I run this on macOS and Ubuntu. It probably works on other Linux systems; the closer to Debian the more likely it is to work. I haven't tried running it on Windows.
+Prebuilt binaries: macOS 11+ (Apple Silicon and Intel), and Linux on x86_64 or ARM with glibc 2.34+: Ubuntu 22.04+, Debian 12+, Fedora 41+. Ubuntu 20.04 and Alpine don't currently work. Windows is not supported.
 
 The shell integration works with zsh. It might work with bash with a little bit of work.
-
-## Installation
-
-I'm working on making this part better, but for now there are no pre-built packages in any manager.
-
-You'll need the rust toolchain and a recent version of CMake installed. Then,
-
-`cargo install --path .`
-
-For shell integration, put this in your `.zshrc`:
-
-`eval "$(psychic zsh)"`
 
 ## How to use it
 
