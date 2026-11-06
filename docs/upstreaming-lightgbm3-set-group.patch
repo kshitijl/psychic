@@ -1,0 +1,123 @@
+diff --git a/src/dataset.rs b/src/dataset.rs
+index 9cbdacf..d607328 100644
+--- a/src/dataset.rs
++++ b/src/dataset.rs
+@@ -2,7 +2,7 @@
+ 
+ use lightgbm3_sys::{
+     DatasetHandle, LGBM_DatasetGetFeatureNames, LGBM_DatasetSetFeatureNames, C_API_DTYPE_FLOAT32,
+-    C_API_DTYPE_FLOAT64,
++    C_API_DTYPE_FLOAT64, C_API_DTYPE_INT32,
+ };
+ use std::os::raw::c_void;
+ use std::{self, ffi::CString};
+@@ -475,6 +475,42 @@ impl Dataset {
+         ))?;
+         Ok(())
+     }
++
++    /// Set query groups, for ranking objectives such as `lambdarank`.
++    ///
++    /// Each value is the number of consecutive rows in one group, so the rows
++    /// of a group must be next to each other. `[3, 2]` puts the first three
++    /// rows in one group and the next two in another. The sizes must add up
++    /// to the number of rows.
++    ///
++    /// Example
++    /// ```
++    /// use lightgbm3::Dataset;
++    ///
++    /// let xs = vec![vec![1.0, 0.1], vec![0.7, 0.4], vec![0.9, 0.8], vec![0.2, 0.2], vec![0.1, 0.7]];
++    /// let labels = vec![0.0, 1.0, 0.0, 1.0, 0.0];
++    /// let mut dataset = Dataset::from_vec_of_vec(xs, labels, true).unwrap();
++    /// dataset.set_group(&[3, 2]).unwrap();
++    /// ```
++    pub fn set_group(&mut self, group: &[i32]) -> Result<()> {
++        let dataset_len = self.size()?.0 as i64;
++        let group_total: i64 = group.iter().map(|&size| size as i64).sum();
++        if dataset_len != group_total {
++            return Err(Error::new(format!(
++                "group sizes add up to {}, but dataset has {} records",
++                group_total, dataset_len
++            )));
++        }
++        let field_name = CString::new("group").unwrap();
++        lgbm_call!(lightgbm3_sys::LGBM_DatasetSetField(
++            self.handle,
++            field_name.as_ptr(),
++            group.as_ptr() as *const c_void,
++            group.len() as i32,
++            C_API_DTYPE_INT32 as i32, // groups other than int32 are not supported by LightGBM
++        ))?;
++        Ok(())
++    }
+ }
+ 
+ impl Drop for Dataset {
+@@ -611,6 +647,66 @@ mod tests {
+         assert!(dataset.set_weights(&weights_long).is_err());
+     }
+ 
++    #[test]
++    fn set_group() {
++        let xs = vec![
++            vec![1.0, 0.1, 0.2, 0.1],
++            vec![0.7, 0.4, 0.5, 0.1],
++            vec![0.9, 0.8, 0.5, 0.1],
++            vec![0.2, 0.2, 0.8, 0.7],
++            vec![0.1, 0.7, 1.0, 0.9],
++        ];
++        let labels = vec![0.0, 1.0, 0.0, 1.0, 0.0];
++        let mut dataset = Dataset::from_vec_of_vec(xs, labels, true).unwrap();
++        assert!(dataset.set_group(&[3, 2]).is_ok());
++    }
++
++    #[test]
++    fn set_group_wrong_total() {
++        let xs = vec![
++            vec![1.0, 0.1, 0.2, 0.1],
++            vec![0.7, 0.4, 0.5, 0.1],
++            vec![0.9, 0.8, 0.5, 0.1],
++            vec![0.2, 0.2, 0.8, 0.7],
++            vec![0.1, 0.7, 1.0, 0.9],
++        ];
++        let labels = vec![0.0, 1.0, 0.0, 1.0, 0.0];
++        let mut dataset = Dataset::from_vec_of_vec(xs, labels, true).unwrap();
++        assert!(dataset.set_group(&[3, 1]).is_err());
++        assert!(dataset.set_group(&[3, 3]).is_err());
++    }
++
++    #[test]
++    fn lambdarank_needs_groups() {
++        let xs = vec![
++            vec![1.0, 0.1, 0.2, 0.1],
++            vec![0.7, 0.4, 0.5, 0.1],
++            vec![0.9, 0.8, 0.5, 0.1],
++            vec![0.2, 0.2, 0.8, 0.7],
++            vec![0.1, 0.7, 1.0, 0.9],
++        ];
++        let labels = vec![0.0, 1.0, 0.0, 1.0, 0.0];
++        let params = serde_json::json! {
++            {
++                "num_iterations": 1,
++                "objective": "lambdarank",
++                "verbose": -1,
++            }
++        };
++
++        let without_groups = Dataset::from_vec_of_vec(xs.clone(), labels.clone(), true).unwrap();
++        let err = crate::Booster::train(without_groups, &params)
++            .err()
++            .unwrap();
++        assert!(err
++            .to_string()
++            .contains("Ranking tasks require query information"));
++
++        let mut with_groups = Dataset::from_vec_of_vec(xs, labels, true).unwrap();
++        with_groups.set_group(&[3, 2]).unwrap();
++        assert!(crate::Booster::train(with_groups, &params).is_ok());
++    }
++
+     #[test]
+     fn test_feature_names() {
+         let xs = vec![vec![1.0, 0.1], vec![0.7, 0.4]];
