@@ -159,6 +159,25 @@ You MUST ensure that `just build`, `cargo test` and `cargo clippy` produce clean
 This is a single developer repository. Work on `main` and commit there directly.
 Do not create a branch or open a pull request unless I ask for one.
 
+## Releasing
+
+Releases are built by [dist](https://github.com/axodotdev/cargo-dist):
+`dist-workspace.toml` is its config, and `.github/workflows/release.yml` is
+generated from it. Don't edit the workflow by hand; change the config and run
+`dist generate`.
+
+```bash
+# bump `version` in Cargo.toml, commit, then:
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+GitHub Actions builds macOS (arm64, x86_64) and Linux (x86_64, arm64), each on
+a native runner. It publishes them to a GitHub Release with a `curl | sh`
+installer, and pushes a formula to `kshitijl/homebrew-tap`. Pull requests build
+the same artifacts without releasing them; download them from the run to try one.
+
+The Linux builds come from Ubuntu 22.04, so they need glibc 2.35 or newer.
+
 ## Running the binary
 
 Write tests instead of trying to run the binary. It is a TUI application. It doesn't make sense for you, as an LLM, to test the binary by running it. It only makes sense when testing things like feature generation.

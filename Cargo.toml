@@ -2,6 +2,9 @@
 name = "psychic"
 version = "0.1.0"
 edition = "2024"
+description = "Smarter file explorer and cd replacement that learns from your actions and ranks files with a model trained on your machine"
+repository = "https://github.com/kshitijl/psychic"
+homepage = "https://github.com/kshitijl/psychic"
 
 [[bin]]
 name = "psychic"
@@ -42,3 +45,8 @@ rand = "0.8"
 
 [dev-dependencies]
 serde_json = "1.0"
+
+# The profile that 'dist' will build with. Exactly `release`, so the binary
+# people download is the one `bench/` measures.
+[profile.dist]
+inherits = "release"
