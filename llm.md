@@ -161,24 +161,36 @@ Do not create a branch or open a pull request unless I ask for one.
 
 ## Releasing
 
-Releases are built by [dist](https://github.com/axodotdev/cargo-dist):
-`dist-workspace.toml` is its config, and `.github/workflows/release.yml` is
-generated from it. Don't edit the workflow by hand; change the config and run
-`dist generate`.
+How releases work, and why, is in `docs/how-it-works.md` ("Building and
+releasing"). The procedure:
 
 ```bash
-# bump `version` in Cargo.toml, commit, then:
-git tag v0.2.0 && git push origin v0.2.0
+# 1. bump `version` in Cargo.toml (and Cargo.lock via `just build`), commit on main
+# 2. tag and push; the tag must match the version
+git tag v0.2.0 && git push origin main v0.2.0
+# 3. watch it: plan, 4 builds, host, publish-homebrew-formula, announce
+gh run watch $(gh run list --workflow release.yml --limit 1 --json databaseId --jq '.[0].databaseId')
 ```
 
-GitHub Actions builds macOS (arm64, x86_64) and Linux (x86_64, arm64), each on
-a native runner. It publishes them to a GitHub Release with a `curl | sh`
-installer, and pushes a formula to `kshitijl/homebrew-tap`. Pull requests build
-the same artifacts without releasing them; download them from the run to try one.
+`.github/workflows/release.yml` is generated: change `dist-workspace.toml` and
+run `dist generate` (`brew install cargo-dist`), never edit the YAML. After
+upgrading dist, `dist init` updates both.
 
-The Linux builds come from Ubuntu 22.04 and need glibc 2.34 or newer (measured
-with `objdump -T`): Ubuntu 22.04+, Debian 12+, RHEL 9+. LightGBM 4.7 needs
-CMake 3.28, newer than Ubuntu 22.04's own; the GitHub runners have one.
+**Before a release that changes the build** (dependencies, LightGBM, dist,
+targets), open a PR: it builds every artifact without publishing. Then try the
+Linux binaries in containers, from a Mac:
+
+```bash
+brew install colima docker && colima start --vm-type vz --vz-rosetta
+gh run download <run-id>    # somewhere under $HOME: colima only mounts $HOME
+docker run --rm --platform linux/amd64 -v "$PWD/<x86_64 unpacked dir>:/app:ro" \
+    debian:12-slim /app/psychic --version
+```
+
+`--platform linux/arm64` runs natively and `linux/amd64` runs through Rosetta.
+Use `ubuntu:22.04`, `debian:12-slim` and `fedora:41` for both. To see that
+LightGBM works, run `psychic internal train <features.csv> <out-dir>` in the
+container, not just `--version`. `colima stop` when done.
 
 ## Running the binary
 

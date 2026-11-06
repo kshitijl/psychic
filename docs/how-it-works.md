@@ -2744,6 +2744,8 @@ bounds the join at ten seconds so this cannot come back quietly.
 - `ignore` - Directory traversal that respects .gitignore (ripgrep's)
 - `rusqlite` - SQLite (bundled feature for static linking)
 - `lightgbm3` - LightGBM inference
+- `lightgbm3-sys` - LightGBM's C API, for training (`src/training/lgbm.rs`); the
+  same statically linked LightGBM `lightgbm3` predicts with
 - `anyhow` - Error handling
 - `jiff` - Timestamps
 - `syntect` + `two-face` - syntax highlighting in process, with bat's syntax and theme set
@@ -2756,12 +2758,64 @@ bounds the join at ten seconds so this cannot come back quietly.
 - `fuzzy-matcher` - `SkimMatcherV2`, which decides what matches a query and how well
 - `rayon` - the parallel pass over candidates in `rank_files`
 - `rustc-hash` - `FxHashMap` for the click indexes, hashed hundreds of times a keystroke
-- `libc` - `poll(2)`, `isatty`, `close` in `tty_input.rs`; the only `unsafe` left
+- `libc` - `poll(2)`, `isatty`, `close` in `tty_input.rs`; with
+  `src/training/lgbm.rs`, one of the two places that hold `unsafe`
 - `signal-hook` - SIGWINCH, alongside crossterm's handler rather than replacing it
 - `unicode-width` - column widths for truncation and layout
 - `strum` - deriving the `FilterType` cycle
 - `csv`, `serde`, `serde_json` - training rows out, schema and episode queries both ways
 - `regex` - used by `analyze_perf.rs`
+
+## Building and releasing
+
+psychic ships as one binary per platform: LightGBM (C++) and SQLite are compiled
+in, and training runs inside it, so a user needs nothing installed beside it.
+Building from source needs the Rust toolchain, a C++ compiler, and CMake 3.28+
+(LightGBM 4.7's minimum).
+
+Releases are made by [dist](https://github.com/axodotdev/cargo-dist). Its config
+is `dist-workspace.toml` (plus `[profile.dist]` in `Cargo.toml`), and
+`.github/workflows/release.yml` is generated from it by `dist generate`; the
+workflow is never edited by hand.
+
+**What a release is.** Pushing a tag `vX.Y.Z` (matching `version` in
+`Cargo.toml`) runs the workflow:
+
+- one native GitHub runner per target builds `--profile dist`:
+  `aarch64-apple-darwin` (macos-15), `x86_64-apple-darwin` (macos-15-intel),
+  `x86_64-unknown-linux-gnu` (ubuntu-22.04), `aarch64-unknown-linux-gnu`
+  (ubuntu-22.04-arm). No cross-compiling.
+- each archive is `psychic-<target>.tar.xz` holding the binary, README and
+  LICENSE, with a sha256.
+- a GitHub Release gets the archives and `psychic-installer.sh`, the
+  `curl | sh` installer, which puts the binary in `~/.local/bin`.
+- the formula `psychic.rb` is pushed to the tap repo `kshitijl/homebrew-tap`
+  (`brew install kshitijl/tap/psychic`), using the `HOMEBREW_TAP_TOKEN` secret:
+  a fine-grained token with Contents read/write on that repo only. When it
+  expires, the publish-homebrew-formula job fails and the rest of the release
+  still goes out.
+
+Pull requests run the same builds without publishing (`pr-run-mode =
+"upload"`), so a build can be downloaded from the run and tried first.
+
+**Decisions.**
+
+- *`[profile.dist]` is `release` exactly.* dist's default adds thin LTO, which
+  would ship a different binary from the one `bench/` measures.
+- *No Windows.* psychic uses Unix-only APIs (`poll`, ttys, signals).
+- *glibc, not musl, on Linux.* Built on Ubuntu 22.04, the binary needs glibc
+  2.34+ (`objdump -T`) and links `libstdc++` dynamically. Checked on the CI
+  binaries in containers: runs and trains on Ubuntu 22.04/24.04, Debian 12
+  slim and Fedora 41, both architectures; Ubuntu 20.04 (glibc 2.31) and Alpine
+  (musl) cannot run it. A static musl build would cover those and is the next
+  step if anyone asks.
+- *Same model everywhere.* LightGBM is built without OpenMP, so training is
+  single-threaded and deterministic. The four v0.1.0 candidate binaries trained
+  byte-identical trees from the same `features.csv`.
+- *Not signed or notarized on macOS.* `brew` and `curl | sh` don't set the
+  quarantine flag, so Gatekeeper doesn't block them; a binary downloaded with a
+  browser is blocked until allowed in System Settings. Signing needs a paid
+  Apple Developer account.
 
 ## CLI Commands
 
