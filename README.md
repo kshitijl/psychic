@@ -1,5 +1,7 @@
 ## psychic
 
+Read my post about it on tech website: [klauria.tech/psychic](https://klauria.tech/psychic/).
+
 What if we put Spotlight in the terminal and made it fast? 
 
 `psychic` is a terminal-based file browser with ML-powered ranking, built in Rust using ratatui. The results it shows you update as you type. It learns from your behavior (clicks, scrolls) to improve search relevance over time. Inspired by `fzf` and `zoxide`, `psychic` helps you navigate the filesystem and open the files you need, *fast*.
