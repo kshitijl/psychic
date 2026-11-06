@@ -32,14 +32,26 @@ eval "$(psychic zsh)"
 
 ### Linux requirements
 
-glibc 2.34 or newer, which means Ubuntu 22.04+, Debian 12+, Fedora/RHEL 9+.
+glibc 2.34 or newer, which means Ubuntu 22.04+, Debian 12+, Fedora 41+, RHEL 9+.
+
+### Using cargo
+
+You'll need the rust toolchain, CMake 3.28+ a C++ compiler and libclang. On macOS that's Xcode's command line tools (`xcode-select --install`); on Debian/Ubuntu, `build-essential clang libclang-dev`.
+
+Then,
+
+```sh
+cargo install psychic-cli
+```
 
 ### From source
 
-You'll need the rust toolchain and CMake 3.28+ installed. Then,
+Same requirements as above.
+
+Clone this repo, then run
 
 ```sh
-cargo install --git https://github.com/kshitijl/psychic
+cargo install --path .
 ```
 
 ## DEMO!
