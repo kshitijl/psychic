@@ -3,6 +3,7 @@ name = "psychic"
 version = "0.1.0"
 edition = "2024"
 description = "Smarter file explorer and cd replacement that learns from your actions and ranks files with a model trained on your machine"
+license = "MIT"
 repository = "https://github.com/kshitijl/psychic"
 homepage = "https://github.com/kshitijl/psychic"
 

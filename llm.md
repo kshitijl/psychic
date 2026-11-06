@@ -176,7 +176,9 @@ a native runner. It publishes them to a GitHub Release with a `curl | sh`
 installer, and pushes a formula to `kshitijl/homebrew-tap`. Pull requests build
 the same artifacts without releasing them; download them from the run to try one.
 
-The Linux builds come from Ubuntu 22.04, so they need glibc 2.35 or newer.
+The Linux builds come from Ubuntu 22.04 and need glibc 2.34 or newer (measured
+with `objdump -T`): Ubuntu 22.04+, Debian 12+, RHEL 9+. LightGBM 4.7 needs
+CMake 3.28, newer than Ubuntu 22.04's own; the GitHub runners have one.
 
 ## Running the binary
 
