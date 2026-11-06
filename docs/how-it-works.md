@@ -1497,7 +1497,7 @@ lambdarank parameters, Python LightGBM's early-stopping callback (strict
 improvement, any metric running out of patience stops it, ties go to the first
 metric), and the refit on every row for the round count early stopping found.
 On the author's 80k-row history, the trees it writes are byte-identical to
-`train.py`'s under LightGBM 4.6.0 with `num_threads=1`.
+`train.py`'s under LightGBM 4.7.0 with `num_threads=1`.
 
 `lightgbm3` wraps prediction but cannot set query groups or attach a validation
 set, so `training/lgbm.rs` calls `lightgbm3-sys` directly, behind owned handles;

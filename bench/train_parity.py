@@ -5,7 +5,7 @@
 #   # Exactly the LightGBM that lightgbm3-sys bundles (its lightgbm/VERSION.txt).
 #   # A different version is allowed to train a different model, and then this
 #   # could not tell a version change from a bug in the port.
-#   "lightgbm==4.6.0",
+#   "lightgbm==4.7.0",
 #   "numpy>=1.26",
 #   "pandas>=2.3.3",
 #   # train.py is imported whole, so its imports have to resolve.
