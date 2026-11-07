@@ -6,6 +6,9 @@
   the change it describes; if it disagrees with the code, the doc is the bug.
 - **[todo.md](todo.md)** - open work, and a record of what was tried, measured
   and rejected. The rejected list is the more useful half.
+- **[ml-ideas.md](ml-ideas.md)** - small ML ideas beyond the ranking model
+  (best-first walk, learned aliases, position bias), none built yet, with the
+  ones the user liked marked.
 - **[archive/](archive/)** - dated material kept for provenance, not for
   reading as current state.
 
