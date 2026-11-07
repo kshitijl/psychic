@@ -19,6 +19,7 @@ mod search_worker;
 mod training;
 mod tty_input;
 mod ui_state;
+mod usage_stats;
 mod walker;
 
 use anyhow::{Context, Result};
@@ -320,6 +321,20 @@ fn main() -> Result<()> {
                 );
 
                 println!("{}", target.full_path.display());
+                return Ok(());
+            }
+            Commands::Stats => {
+                let db = db::Database::new(&db::Database::get_db_path(&data_dir))?;
+                let history = db.usage_history()?;
+                let report = usage_stats::compute(&history.events, &history.launches);
+                let tz = jiff::tz::TimeZone::system();
+                print!(
+                    "{}",
+                    usage_stats::render(&report, |t| match jiff::Timestamp::from_second(t) {
+                        Ok(at) => at.to_zoned(tz.clone()).strftime("%Y-%m-%d").to_string(),
+                        Err(_) => t.to_string(),
+                    })
+                );
                 return Ok(());
             }
             Commands::Zsh => {

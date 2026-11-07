@@ -34,6 +34,42 @@ pub struct Visit {
     pub timestamp: i64,
 }
 
+/// What `psychic stats` reads: see `Database::usage_history`.
+pub struct UsageHistory {
+    /// In the order they were logged.
+    pub events: Vec<UsageEvent>,
+    pub launches: Vec<Launch>,
+}
+
+pub struct UsageEvent {
+    /// The row id: orders events logged in the same second.
+    pub id: i64,
+    pub timestamp: i64,
+    pub query: String,
+    pub full_path: String,
+    pub subsession_id: i64,
+    pub session_id: String,
+    pub action: UsageAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageAction {
+    /// `rank` is `None` on rows logged before the column existed.
+    Impression {
+        rank: Option<u32>,
+    },
+    Click,
+    Jump,
+}
+
+/// A TUI launch: one row of `sessions`.
+pub struct Launch {
+    pub session_id: String,
+    /// Where psychic was launched.
+    pub cwd: String,
+    pub created_at: i64,
+}
+
 pub struct FileMetadata {
     pub relative_path: String,
     pub full_path: String,
@@ -631,6 +667,57 @@ impl Database {
         Ok(stats)
     }
 
+    /// Every impression, click and jump, in the order they were logged, and
+    /// every launch's start, for `psychic stats`.
+    ///
+    /// Reads the whole table, like training does. That is fine for a command
+    /// someone runs on purpose once in a while, and is why nothing on the
+    /// startup path calls it. The action strings are parsed into
+    /// `UsageAction` here, so nothing past this point matches on them.
+    pub fn usage_history(&self) -> Result<UsageHistory> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, timestamp, query, full_path, subsession_id, session_id, action, rank
+             FROM events
+             WHERE action IN ('impression', 'click', 'jump')
+             ORDER BY id",
+        )?;
+        let events = stmt
+            .query_map([], |row| {
+                let action: String = row.get(6)?;
+                let action = match action.as_str() {
+                    "impression" => UsageAction::Impression { rank: row.get(7)? },
+                    "click" => UsageAction::Click,
+                    "jump" => UsageAction::Jump,
+                    other => unreachable!("the WHERE clause admits no {other:?}"),
+                };
+                Ok(UsageEvent {
+                    id: row.get(0)?,
+                    timestamp: row.get(1)?,
+                    query: row.get(2)?,
+                    full_path: row.get(3)?,
+                    subsession_id: row.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                    session_id: row.get(5)?,
+                    action,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let mut stmt = self
+            .conn
+            .prepare("SELECT session_id, cwd, created_at FROM sessions")?;
+        let launches = stmt
+            .query_map([], |row| {
+                Ok(Launch {
+                    session_id: row.get(0)?,
+                    cwd: row.get(1)?,
+                    created_at: row.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(UsageHistory { events, launches })
+    }
+
     pub fn summarize_events(&self) -> Result<Vec<(String, i64)>> {
         let mut stmt = self.conn.prepare(
             "SELECT action, COUNT(*) as count
@@ -833,6 +920,84 @@ mod session_column_tests {
             .query_row("SELECT cwd FROM sessions", [], |row| row.get(0))
             .unwrap();
         assert!(!cwd.is_empty(), "the launch directory, whatever it is");
+    }
+}
+
+#[cfg(test)]
+mod usage_history_tests {
+    //! `psychic stats` reads impressions, clicks and jumps, and nothing else.
+
+    use super::*;
+
+    fn event<'a>(path: &'a str, action: UserInteraction, rank: Option<usize>) -> EventData<'a> {
+        EventData {
+            query: "q",
+            file_path: path,
+            full_path: path,
+            mtime: None,
+            file_size: None,
+            subsession_id: 3,
+            action,
+            session_id: "s",
+            episode_queries: None,
+            rank,
+            is_dir: None,
+        }
+    }
+
+    #[test]
+    fn test_usage_history_reads_what_stats_needs_in_log_order() {
+        let db = Database::new(Path::new(":memory:")).unwrap();
+        db.log_event(event("/shown", UserInteraction::Impression, Some(2)))
+            .unwrap();
+        db.log_event(event("/unranked", UserInteraction::Impression, None))
+            .unwrap();
+        db.log_event(event("/visited", UserInteraction::StartupVisit, None))
+            .unwrap();
+        db.log_event(event("/scrolled", UserInteraction::Scroll, None))
+            .unwrap();
+        db.log_event(event("/shown", UserInteraction::Click, None))
+            .unwrap();
+        db.log_event(event("/jumped", UserInteraction::Jump, None))
+            .unwrap();
+        db.log_session(
+            "s",
+            &ContextData {
+                cwd: "/home".to_string(),
+                timezone: "UTC".to_string(),
+            },
+        )
+        .unwrap();
+
+        let history = db.usage_history().unwrap();
+        let events: Vec<(&str, i64, &str, UsageAction)> = history
+            .events
+            .iter()
+            .map(|e| {
+                (
+                    e.full_path.as_str(),
+                    e.subsession_id,
+                    e.session_id.as_str(),
+                    e.action,
+                )
+            })
+            .collect();
+        assert_eq!(
+            events,
+            vec![
+                ("/shown", 3, "s", UsageAction::Impression { rank: Some(2) }),
+                ("/unranked", 3, "s", UsageAction::Impression { rank: None }),
+                ("/shown", 3, "s", UsageAction::Click),
+                ("/jumped", 3, "s", UsageAction::Jump),
+            ]
+        );
+        assert!(history.events.windows(2).all(|w| w[0].id < w[1].id));
+        let launches: Vec<(&str, &str)> = history
+            .launches
+            .iter()
+            .map(|l| (l.session_id.as_str(), l.cwd.as_str()))
+            .collect();
+        assert_eq!(launches, vec![("s", "/home")]);
     }
 }
 

@@ -17,6 +17,8 @@ The codebase follows John Ousterhout's "deep modules" philosophy: simple interfa
 **Data & Analytics:**
 1. **`db.rs`** - SQLite event logging (clicks, scrolls, impressions)
 2. **`analytics.rs`** - Subsession tracking, impression debouncing (200ms logic), scroll deduplication
+   (and **`usage_stats.rs`**, which reads that log back for `psychic stats`; see
+   "psychic stats" below)
 
 **File Discovery & Ranking:**
 3. **`walker.rs`** - Background file discovery via walkdir
@@ -1803,6 +1805,49 @@ clock can go backwards underneath that.
 
 **Why this module:** Encapsulates all analytics complexity behind simple log_* methods. Main code just calls the methods without worrying about debouncing, deduplication, or subsession management.
 
+### psychic stats: `usage_stats.rs`
+
+`psychic stats` prints how much typing and time psychic saves, from the events
+database alone. It was written to quantify a year of the author's own use for
+a blog post, and is in the binary so anyone can run the same measurement on
+their own history.
+
+Two pure functions: `compute(events, launches) -> UsageReport` and
+`render(report, date_format) -> String`. `Database::usage_history` reads every
+impression, click and jump in id order, plus the `sessions` table, and parses
+the action strings into `UsageAction` there. It reads the whole table, like
+training does, so nothing on the startup path calls it: about 0.3s on a year
+of history (120k events).
+
+What each figure means, and what it does not:
+
+- **A pick** is a `click` event: Enter on a row of the list. **A launch** is a
+  session with an impression or a click; a jump (`pd xy`) is counted separately,
+  since nothing was shown.
+- **Characters typed** is the length of the query at the pick. It does not
+  count arrow keys. **"Opened psychic and pressed Enter, nothing else"** is an
+  empty query *and* the top row, so Enter was the only key; "no characters
+  typed" is just the empty query, with arrows possibly pressed.
+- **A pick's position** comes from the impressions logged for the same query,
+  subsession and launch just before it. The TUI force-logs what is on screen
+  before acting on Enter (`check_and_log_impressions(true)`), so there always
+  are some. Rows from before the `rank` column have no position, and the order
+  they were logged in stands in for it; on the author's database, in all 834
+  lists that have both, the two agree.
+- **Speed** is from the launch, or from the previous pick in the same launch,
+  to the pick. Measured from the launch alone, the second pick in a session
+  would include the time spent on the first. Timestamps are whole seconds, so
+  a recorded gap of 1s means under 2s, and the report says "under 2s". Gaps
+  over 10 minutes are left out: psychic was sitting open, not being searched.
+  The cutoff was an hour at first, and on the author's history that let in 52
+  later picks from long sessions, median gap 11 minutes and only one under 4s,
+  which dragged "under 4s" from 69% to 67% while no pick got slower. The author
+  chose 10 minutes.
+- **Effort** compares characters typed with the picked path written relative
+  to where psychic was launched, what `cd` would have taken. It does not credit
+  `cd`'s tab completion, so it overstates the saving against a fluent `cd`
+  user; the report says what it measures and leaves that to the reader.
+
 ### Module: `input.rs`
 
 **Simple interface:**
@@ -2913,6 +2958,9 @@ psychic --query=xy
 # Track a directory visit (used by shell integration hook)
 psychic track-visit /path/to/directory
 # Logs a startup_visit event for the directory
+
+# How much typing and time psychic saves, from its history (see "psychic stats")
+psychic stats
 
 # Manage directories hidden from results (nothing is deleted; see "Hiding directories")
 psychic hidden list

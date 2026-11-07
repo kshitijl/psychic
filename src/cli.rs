@@ -32,6 +32,12 @@ pub enum Commands {
         /// What you would have typed into the search box
         query: String,
     },
+    /// Show how much typing and time psychic saves you, from its history
+    ///
+    /// How often what you picked was the top result, how many characters you
+    /// typed first, and how long each pick took. Reads only the events
+    /// database; nothing leaves your machine.
+    Stats,
     /// Output shell integration script for zsh
     Zsh,
     /// Track a directory visit (for shell integration hooks)
