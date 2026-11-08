@@ -79,6 +79,9 @@ pub struct ClickData {
     pub clicks_by_query_and_file: FxHashMap<String, FxHashMap<String, Vec<ClickEvent>>>,
     pub engagements_by_episode_query_and_file:
         FxHashMap<String, FxHashMap<String, Vec<ClickEvent>>>,
+    /// Uses `psychic import` found for a path, already capped. Read only by
+    /// the simple model: imports are not clicks, and no feature sees them.
+    pub imported_uses: FxHashMap<String, u32>,
 }
 
 pub struct Ranker {
@@ -90,6 +93,11 @@ pub struct Ranker {
 // Tunable constants for hybrid ranking
 const CLICKS_WEIGHT: f64 = 3.0; // Weight for clicks in simple model
 const RECENCY_WEIGHT: f64 = 1.0; // Weight for recency in simple model
+/// Weight per imported use in the simple model. Uses are capped at 5, so an
+/// import adds at most 2.5 - about one click in the last week, and a little
+/// more than the best possible fuzzy match (2.0). Chosen by that comparison,
+/// not measured: a new install has no clicks to measure against.
+const IMPORTED_WEIGHT: f64 = 0.5;
 
 // Sigmoid parameters for normalizing simple scores to [0, 1] range
 // With k=0.1, x0=10.0:
@@ -360,6 +368,13 @@ impl Ranker {
 
         log::debug!("Loaded visits to {} directories", visits_by_dir.len());
 
+        // A few hundred rows, so no TIMING line of its own.
+        let imported_uses: FxHashMap<String, u32> = db
+            .imported_paths()?
+            .into_iter()
+            .map(|row| (row.full_path, row.uses))
+            .collect();
+
         Ok(ClickData {
             clicks_by_file,
             visits_by_dir,
@@ -368,6 +383,7 @@ impl Ranker {
             clicks_by_parent_dir,
             clicks_by_query_and_file,
             engagements_by_episode_query_and_file,
+            imported_uses,
         })
     }
 
@@ -379,7 +395,7 @@ impl Ranker {
 
     /// Compute simple score for cold-start ranking
     /// Raw formula: CLICKS_WEIGHT * clicks_last_7_days + RECENCY_WEIGHT / (1 + modified_age_in_days)
-    ///               + 2.0 * fuzzy_score
+    ///               + 2.0 * fuzzy_score + IMPORTED_WEIGHT * imported_uses
     /// Then normalized to [0, 1] using sigmoid function
     fn compute_simple_score(&self, file: &FileCandidate<'_>, current_timestamp: i64) -> f64 {
         // Count clicks in last 7 days
@@ -411,11 +427,19 @@ impl Ranker {
         // Normalize fuzzy score to [0, 1] range using helper function
         let fuzzy_score_normalized = fuzzy_score_for_simple_model(file.fuzzy_score);
 
+        let imported_uses = self
+            .clicks
+            .imported_uses
+            .get(full_path_str.as_ref())
+            .copied()
+            .unwrap_or(0) as f64;
+
         // Combine: clicks weighted 3x, recency 1x, fuzzy match 2x
         // Fuzzy match gets weight of 2.0 to make it significant but not dominating
         let raw_score = CLICKS_WEIGHT * clicks_last_7_days
             + RECENCY_WEIGHT / (1.0 + modified_age_in_days)
-            + 2.0 * fuzzy_score_normalized;
+            + 2.0 * fuzzy_score_normalized
+            + IMPORTED_WEIGHT * imported_uses;
 
         // Normalize to [0, 1] using sigmoid
         Self::sigmoid(raw_score)
@@ -981,6 +1005,7 @@ mod tests {
                 clicks_by_parent_dir,
                 clicks_by_query_and_file,
                 engagements_by_episode_query_and_file,
+                imported_uses: FxHashMap::default(),
             },
         );
 
@@ -1044,6 +1069,7 @@ mod tests {
                 clicks_by_parent_dir: FxHashMap::default(),
                 clicks_by_query_and_file: FxHashMap::default(),
                 engagements_by_episode_query_and_file: FxHashMap::default(),
+                imported_uses: FxHashMap::default(),
             },
             stats: None,
         };
@@ -1304,6 +1330,7 @@ mod tests {
                 clicks_by_parent_dir: FxHashMap::default(),
                 clicks_by_query_and_file: FxHashMap::default(),
                 engagements_by_episode_query_and_file: FxHashMap::default(),
+                imported_uses: FxHashMap::default(),
             },
             stats: None,
         };
@@ -1393,6 +1420,47 @@ mod tests {
     }
 
     #[test]
+    fn test_imported_uses_raise_the_simple_score() {
+        let mut imported_uses = FxHashMap::default();
+        imported_uses.insert("/tmp/used.txt".to_string(), 4);
+        let ranker = Ranker {
+            model: None,
+            clicks: ClickData {
+                clicks_by_file: FxHashMap::default(),
+                visits_by_dir: FxHashMap::default(),
+                clicks_by_extension: FxHashMap::default(),
+                clicks_indexed: 0,
+                clicks_by_parent_dir: FxHashMap::default(),
+                clicks_by_query_and_file: FxHashMap::default(),
+                engagements_by_episode_query_and_file: FxHashMap::default(),
+                imported_uses,
+            },
+            stats: None,
+        };
+        fn candidate(path: &Path) -> FileCandidate<'_> {
+            FileCandidate {
+                file_id: 0,
+                relative_path: "x",
+                full_path: path,
+                mtime: Some(1600000000),
+                file_size: Some(1),
+                is_dir: false,
+                fuzzy_score: 100,
+            }
+        }
+        let (other, used_path) = (
+            PathBuf::from("/tmp/other.txt"),
+            PathBuf::from("/tmp/used.txt"),
+        );
+        let now = 1700604800;
+        // Raw 1.001 (recency ~0, fuzzy 2 * 0.5) without the import; 4 uses at
+        // 0.5 each add 2.0. sigmoid(1.001) = 0.289, sigmoid(3.001) = 0.332.
+        let plain = ranker.compute_simple_score(&candidate(&other), now);
+        let used = ranker.compute_simple_score(&candidate(&used_path), now);
+        assert_eq!(format!("{plain:.3} {used:.3}"), "0.289 0.332");
+    }
+
+    #[test]
     fn test_compute_simple_score() {
         // Create a ranker with some synthetic click data
         let mut clicks_by_file = FxHashMap::default();
@@ -1418,6 +1486,7 @@ mod tests {
                 clicks_by_parent_dir: FxHashMap::default(),
                 clicks_by_query_and_file: FxHashMap::default(),
                 engagements_by_episode_query_and_file: FxHashMap::default(),
+                imported_uses: FxHashMap::default(),
             },
             stats: None,
         };
@@ -1504,6 +1573,7 @@ mod tests {
                 clicks_by_parent_dir: FxHashMap::default(),
                 clicks_by_query_and_file: FxHashMap::default(),
                 engagements_by_episode_query_and_file: FxHashMap::default(),
+                imported_uses: FxHashMap::default(),
             },
             stats: None,
         };

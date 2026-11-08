@@ -90,6 +90,18 @@ choices are most sensitive to.
 - **Feature: git status flags.** `is_git_modified`, `is_git_untracked`. Strong
   for developers, but needs a background `git status --porcelain` per repo at
   walk time. Belongs with the gitignore machinery, which now exists.
+- **More import sources** (see "Importing what you already use"). Not built:
+  neovim's ShaDa (`~/.local/state/nvim/shada/main.shada`, msgpack - many vim
+  users are on neovim now, and `.viminfo` misses them), atuin (records the
+  working directory per command, so no replay guessing), `z`/`fasd`/autojump
+  (`~/.z` is `path|rank|time`), Linux's `recently-used.xbel`, and the file paths
+  in coding-agent transcripts' tool calls. The JetBrains parser has never seen
+  a real `recentProjects.xml`.
+- **Imports leave out `~/Documents`, `~/Downloads`, Dropbox and iCloud
+  entirely**, to avoid macOS permission prompts. Someone who works in Dropbox
+  gets little from the import. If they have already granted the terminal
+  access - zoxide or shell history going there is evidence - those paths could
+  be allowed; not done, because one wrong guess is a prompt on first launch.
 
 ## measurement discipline
 

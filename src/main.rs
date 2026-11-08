@@ -8,6 +8,7 @@ mod feature_defs;
 mod features;
 mod help;
 mod history;
+mod import;
 mod input;
 mod keymap;
 mod metadata_ext;
@@ -51,6 +52,8 @@ enum AppEvent {
     Tick,
     /// Model retraining status update
     Retrain(bool),
+    /// The first-run import finished; the one-line summary to show.
+    Imported(String),
     /// Database statistics for the debug pane, gathered off the UI thread.
     /// Boxed to keep the event enum small; this arrives at most once per run.
     DbStats(Box<db::DbStats>),
@@ -166,6 +169,35 @@ fn to_ansi(text: &ratatui::text::Text<'_>) -> String {
         out.push('\n');
     }
     out
+}
+
+fn home_dir() -> Result<std::path::PathBuf> {
+    Ok(std::path::PathBuf::from(
+        env::var_os("HOME").context("HOME is not set")?,
+    ))
+}
+
+/// A Unix time as a local date, for `psychic import --dry-run`.
+fn format_day(timestamp: i64) -> String {
+    match jiff::Timestamp::from_second(timestamp) {
+        Ok(at) => at
+            .to_zoned(jiff::tz::TimeZone::system())
+            .strftime("%Y-%m-%d")
+            .to_string(),
+        Err(_) => timestamp.to_string(),
+    }
+}
+
+/// Import once, on what looks like a new install, and tell the UI.
+fn first_run_import(data_dir: &std::path::Path, tx: &mpsc::Sender<AppEvent>) -> Result<()> {
+    let db = db::Database::new(&db::Database::get_db_path(data_dir))?;
+    if !import::should_auto_import(&db)? {
+        return Ok(());
+    }
+    let report = import::run(&db, &home_dir()?, jiff::Timestamp::now().as_second())?;
+    log::info!("First-run import: {}", report.summary());
+    let _ = tx.send(AppEvent::Imported(report.short_summary()));
+    Ok(())
 }
 
 /// Generate a unique session ID using a random u64.
@@ -343,6 +375,35 @@ fn main() -> Result<()> {
                 print!("{}", include_str!("../shell/psychic.zsh"));
                 return Ok(());
             }
+            Commands::Import { dry_run, undo } => {
+                let home = home_dir()?;
+                let now = jiff::Timestamp::now().as_second();
+                if dry_run {
+                    let report = import::gather(&home, now);
+                    for path in &report.paths {
+                        let sources: Vec<&str> =
+                            path.sources.iter().map(|source| source.name()).collect();
+                        println!(
+                            "{}  uses={}  last used {}  ({})",
+                            path.full_path.display(),
+                            path.uses,
+                            format_day(path.last_used),
+                            sources.join(", ")
+                        );
+                    }
+                    println!("\n{} (dry run: nothing stored)", report.summary());
+                    return Ok(());
+                }
+                let db = db::Database::new(&db::Database::get_db_path(&data_dir))?;
+                if undo {
+                    let removed = db.clear_imported_paths()?;
+                    println!("Forgot {removed} imported paths. Your own history is untouched.");
+                    return Ok(());
+                }
+                let report = import::run(&db, &home, now)?;
+                println!("{}", report.summary());
+                return Ok(());
+            }
             Commands::Init { reverse, yes } => {
                 return shell_init::run(reverse, yes, &data_dir);
             }
@@ -506,6 +567,19 @@ fn main() -> Result<()> {
     // preview takes depends on the file, and the pane must never be what the
     // rest of the frame is waiting for.
     let preview_tx = preview::spawn(event_tx.clone());
+
+    // On a new install, import what the user already uses, in the background:
+    // it reads shell history and asks Spotlight, which together take about
+    // half a second. See "Importing what you already use" in how-it-works.md.
+    if !cli.no_click_logging && !cli.no_click_loading {
+        let import_tx = event_tx.clone();
+        let data_dir = data_dir.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = first_run_import(&data_dir, &import_tx) {
+                log::error!("First-run import failed: {}", e);
+            }
+        });
+    }
 
     // Start background retraining in a new thread
     let retrain_start = Instant::now();
@@ -918,6 +992,10 @@ fn run_app(
         match app_event {
             AppEvent::Retrain(retraining_status) => {
                 app.currently_retraining = retraining_status;
+            }
+            AppEvent::Imported(summary) => {
+                let _ = app.worker_tx.send(WorkerRequest::AddImported);
+                app.status_message = Some(summary);
             }
             AppEvent::DbStats(stats) => {
                 app.db_stats = Some(*stats);

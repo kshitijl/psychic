@@ -53,6 +53,25 @@ pub enum Commands {
         #[arg(long, short)]
         yes: bool,
     },
+    /// Find files and directories you already use, so search has them from the start
+    ///
+    /// Reads shell history (zsh, bash, fish), zoxide, VS Code / Cursor /
+    /// Windsurf recents, vim's viminfo, Spotlight's recently used files (macOS),
+    /// Claude Code / Codex / pi sessions, JetBrains recent projects, and git
+    /// repositories under your home directory. Nothing leaves your machine, and
+    /// none of it counts as a click. Each run replaces the last. On macOS,
+    /// folders that would ask for permission (Desktop, Documents, Downloads,
+    /// ~/Library, iCloud, external drives) are skipped without being touched.
+    ///
+    /// Runs by itself once, the first time psychic starts on a new install.
+    Import {
+        /// Print what would be imported, without storing it
+        #[arg(long, conflicts_with = "undo")]
+        dry_run: bool,
+        /// Forget everything imported
+        #[arg(long)]
+        undo: bool,
+    },
     /// Track a directory visit (for shell integration hooks)
     TrackVisit {
         /// Directory path to track

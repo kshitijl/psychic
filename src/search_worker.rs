@@ -141,6 +141,10 @@ pub enum WorkerRequest {
         path: PathBuf,
         query_id: u64,
     },
+    /// `psychic import` just ran: register what it found and give the ranker
+    /// its use counts. Nothing is re-ranked and nothing is sent back - the
+    /// list on screen must not change under the user. The next query sees it.
+    AddImported,
     /// Stop the worker thread.
     ///
     /// Sent by main before it joins the worker. Dropping the sender is not
@@ -226,8 +230,8 @@ struct FileInfo {
     hidden: bool,
 }
 
-/// Every path the user has interacted with that is still on disk, as registry
-/// entries.
+/// Every path the user has interacted with, or that `psychic import` found,
+/// that is still on disk, as registry entries.
 ///
 /// One `stat` per path. It used to be three: `exists()`, then `canonicalize()`,
 /// then `metadata()`. The first and third ask the same question - a `stat` that
@@ -251,10 +255,32 @@ fn load_historical_files(db_path: &Path, root: &Path) -> Vec<FileInfo> {
         }
     };
 
-    let paths = db.get_previously_interacted_files().unwrap_or_default();
+    // History first: registry order breaks ties, and what the user did in
+    // psychic says more than what an import guessed. An imported path that is
+    // also in history is registered once, as history, by the caller's dedup.
+    let mut paths = db.get_previously_interacted_files().unwrap_or_default();
+    paths.extend(
+        db.imported_paths()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|row| row.full_path),
+    );
     let candidates = paths.len();
+    let files = stat_into_registry_entries(paths, root);
 
-    let files: Vec<FileInfo> = paths
+    log::info!(
+        "TIMING {{\"op\":\"load_historical_files\",\"ms\":{},\"count\":{},\"candidates\":{}}}",
+        start.elapsed().as_secs_f64() * 1000.0,
+        files.len(),
+        candidates
+    );
+
+    files
+}
+
+/// One registry entry per path still on disk, at one `stat` each.
+fn stat_into_registry_entries(paths: Vec<String>, root: &Path) -> Vec<FileInfo> {
+    paths
         .into_iter()
         .filter_map(|path| {
             let path = PathBuf::from(path);
@@ -270,16 +296,7 @@ fn load_historical_files(db_path: &Path, root: &Path) -> Vec<FileInfo> {
                 root,
             ))
         })
-        .collect();
-
-    log::info!(
-        "TIMING {{\"op\":\"load_historical_files\",\"ms\":{},\"count\":{},\"candidates\":{}}}",
-        start.elapsed().as_secs_f64() * 1000.0,
-        files.len(),
-        candidates
-    );
-
-    files
+        .collect()
 }
 
 /// How a path should read in the list, given where we are standing.
@@ -686,6 +703,33 @@ impl WorkerState {
     /// Hide `path` and everything under it, from now on and in future sessions.
     ///
     /// Returns whether anything changed.
+    /// See `WorkerRequest::AddImported`.
+    fn add_imported(&mut self) {
+        let rows = match self.db.imported_paths() {
+            Ok(rows) => rows,
+            Err(e) => {
+                log::error!("Failed to read imported paths: {}", e);
+                return;
+            }
+        };
+        self.ranker.clicks.imported_uses = rows
+            .iter()
+            .map(|row| (row.full_path.clone(), row.uses))
+            .collect();
+        let paths = rows.into_iter().map(|row| row.full_path).collect();
+        let mut added = 0;
+        for file in stat_into_registry_entries(paths, &self.root) {
+            if !self.path_to_id.contains_key(&file.full_path) {
+                self.path_to_id
+                    .insert(file.full_path.clone(), FileId(self.file_registry.len()));
+                self.file_registry.push(file);
+                added += 1;
+            }
+        }
+        self.recompute_hidden();
+        log::info!("Registered {} imported paths", added);
+    }
+
     fn hide(&mut self, path: PathBuf) -> Result<bool> {
         assert!(
             !self.root.starts_with(&path),
@@ -1431,6 +1475,7 @@ fn worker_thread_loop<T>(
                         }
                     }
                 }
+                WorkerRequest::AddImported => state.add_imported(),
                 WorkerRequest::Hide { path, query_id } => {
                     state.current_query_id = query_id;
                     match state.hide(path) {
@@ -2100,7 +2145,16 @@ mod fresh_install_tests {
 
         let mut tables = names(&db, "table");
         tables.sort();
-        assert_eq!(tables, vec!["events", "hidden_prefixes", "sessions"]);
+        assert_eq!(
+            tables,
+            vec![
+                "events",
+                "hidden_prefixes",
+                "import_runs",
+                "imported_paths",
+                "sessions"
+            ]
+        );
 
         let mut indexes = names(&db, "index");
         indexes.sort();
@@ -2109,6 +2163,103 @@ mod fresh_install_tests {
             vec!["idx_events_action", "idx_events_engagement"],
             "a new database is created with the indexes, not left to a migration"
         );
+    }
+
+    fn imported(full_path: &Path, uses: u32) -> crate::db::ImportedRow {
+        crate::db::ImportedRow {
+            full_path: full_path.to_string_lossy().into_owned(),
+            uses,
+            last_used: jiff::Timestamp::now().as_second(),
+            sources: "zoxide".to_string(),
+        }
+    }
+
+    fn registered(state: &WorkerState, path: &Path) -> bool {
+        state
+            .file_registry
+            .iter()
+            .any(|file| file.full_path == path)
+    }
+
+    #[test]
+    fn test_imported_paths_are_candidates_from_startup() {
+        let dir = FreshDataDir::new("imported-at-start");
+        let project = dir.path.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let db = Database::new(&dir.db_path()).unwrap();
+        db.replace_imported_paths(
+            &[imported(&project, 3), imported(&dir.path.join("gone"), 1)],
+            1,
+        )
+        .unwrap();
+
+        let (walker_tx, _walker_rx) = mpsc::channel::<WalkerCommand>();
+        let state = WorkerState::new(
+            PathBuf::from("/test"),
+            &dir.path,
+            walker_tx,
+            false,
+            false,
+            Vec::new(),
+        )
+        .unwrap();
+
+        assert!(registered(&state, &project));
+        assert!(
+            !registered(&state, &dir.path.join("gone")),
+            "a path that is no longer on disk is not offered"
+        );
+        assert_eq!(
+            state
+                .ranker
+                .clicks
+                .imported_uses
+                .get(project.to_str().unwrap()),
+            Some(&3)
+        );
+    }
+
+    #[test]
+    fn test_an_import_that_finishes_after_startup_is_registered_without_reranking() {
+        let dir = FreshDataDir::new("imported-later");
+        let project = dir.path.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let (walker_tx, _walker_rx) = mpsc::channel::<WalkerCommand>();
+        let mut state = WorkerState::new(
+            PathBuf::from("/test"),
+            &dir.path,
+            walker_tx,
+            false,
+            false,
+            Vec::new(),
+        )
+        .unwrap();
+        state.filter_and_rank("").unwrap();
+        let scores_before = state.file_scores.len();
+
+        Database::new(&dir.db_path())
+            .unwrap()
+            .replace_imported_paths(&[imported(&project, 2)], 1)
+            .unwrap();
+        state.add_imported();
+        state.add_imported();
+
+        assert_eq!(
+            state
+                .file_registry
+                .iter()
+                .filter(|file| file.full_path == project)
+                .count(),
+            1,
+            "registered once, however often the import is announced"
+        );
+        assert_eq!(
+            state.file_scores.len(),
+            scores_before,
+            "the ranked list on screen is left alone until the next query"
+        );
+        state.filter_and_rank("project").unwrap();
+        assert_eq!(state.file_scores.len(), 1);
     }
 
     #[test]

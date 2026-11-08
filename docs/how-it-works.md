@@ -16,6 +16,9 @@ The codebase follows John Ousterhout's "deep modules" philosophy: simple interfa
 
 **Data & Analytics:**
 1. **`db.rs`** - SQLite event logging (clicks, scrolls, impressions)
+   (and **`import/`**, `psychic import` and the first-run import: reads the
+   files and directories the user already works with out of shell history,
+   editors and the like; see "Importing what you already use")
 2. **`analytics.rs`** - Subsession tracking, impression debouncing (200ms logic), scroll deduplication
    (and **`usage_stats.rs`**, which reads that log back for `psychic stats`; see
    "psychic stats" below)
@@ -368,7 +371,7 @@ Nothing reads it yet, and that is the point of collecting it now: it cannot be
 backfilled. Rows written before this keep `NULL`, so any future use has to cope
 with a mixture until enough history accumulates.
 
-Database at `~/.local/share/psychic/events.db` with two tables:
+Database at `~/.local/share/psychic/events.db`. The two event tables:
 
 ```sql
 CREATE TABLE events (
@@ -426,6 +429,24 @@ CREATE TABLE hidden_prefixes (
 );
 ```
 
+```sql
+CREATE TABLE imported_paths (     -- psychic import's latest snapshot
+    full_path TEXT PRIMARY KEY,   -- absolute, canonical
+    uses INTEGER NOT NULL,        -- summed across sources, capped at 5
+    last_used INTEGER NOT NULL,   -- unix seconds
+    sources TEXT NOT NULL         -- "zoxide, zsh history", for people only
+);
+
+CREATE TABLE import_runs (        -- that an import ran, so it runs by itself once
+    ran_at INTEGER NOT NULL,
+    paths INTEGER NOT NULL
+);
+```
+
+Both are kept out of `events` for the reason hiding is: they are not things the
+user did in psychic, and nothing that trains reads them. See "Importing what
+you already use".
+
 **Why hiding is its own table:** it is mutable, undoable state, not a log. Hiding
 suppresses results and nothing else - the events under a hidden directory stay exactly
 as they are, so a directory you stop using still contributes everything it taught the
@@ -476,6 +497,10 @@ anyone noticing.
 
 - **The database is created on first open**, tables and both indexes together;
   the migration path only runs against an older one.
+- **It imports what the user already uses**, on a background thread, once:
+  see "Importing what you already use" below. The first screen is drawn
+  without the imports; they become candidates when the import finishes and
+  show up on the next keystroke.
 - **Ranking runs on the simple model.** `load_ranker` finds no `model.txt`,
   falls back, and every score comes back with `simple_weight` 1.0 and no ML
   score at all. The first query still returns results, including the row for the
@@ -569,6 +594,90 @@ transaction and an fsync each.
 
 **File metadata:** Captured at event time, not discovery time.
 Why: Files can be modified between discovery and impression. Event-time metadata reflects what user actually saw.
+
+### Importing what you already use: `import/`
+
+A new install knows nothing, so the only candidates are what is under the
+current directory, ranked by fuzzy match and mtime. But the user's shell,
+editors and tools already know where they work. `psychic import` reads that
+once, and a new install runs it by itself.
+
+**Sources** (`import/sources.rs`, `import/shell_history.rs`), each optional - a
+tool that is not installed contributes nothing:
+
+| Source | Where | What it gives |
+|---|---|---|
+| zsh, bash, fish history | `~/.zsh_history` (and `$ZDOTDIR`), `~/.bash_history`, `fish_history` | directories `cd`'d into, files passed to editors and pagers, with timestamps where the format has them |
+| zoxide | `zoxide query --list --score` | directories, uses from the log of the score, no timestamps |
+| VS Code, Cursor, Windsurf, VSCodium | `User/globalStorage/state.vscdb`, key `history.recentlyOpenedPathsList` | recent folders and files, no timestamps |
+| vim | `~/.viminfo`, "History of marks within files" | files, last left at the `*` mark's timestamp |
+| Spotlight (macOS) | `mdfind -attr kMDItemLastUsedDate -attr kMDItemUseCount` over a year | what the Finder and GUI apps opened, with real use counts |
+| Claude Code, Codex, pi | `~/.claude/projects/*/*.jsonl`, `~/.codex/sessions/**/*.jsonl`, `~/.pi/agent/sessions/*/*.jsonl` | each session's working directory, at the transcript's mtime |
+| JetBrains IDEs | `JetBrains/*/options/recentProjects.xml` (and Android Studio's) | recent projects. The parser was written from the format's shape and is not tested against a real file |
+| git repositories | `$HOME`, 4 levels deep, at most 20,000 directories listed | each repository, at its `.git/index` mtime |
+
+**Shell history has no working directory**, so `shell_history.rs` replays it:
+start at `$HOME`, follow each `cd`, and resolve relative paths against where
+the replay says the shell is. Anything it cannot follow - a `cd` into
+something that no longer exists, `z`, `pd`, `popd` - makes the directory
+unknown, and relative paths are skipped until an absolute `cd` or a bare `cd`
+pins it again. It is wrong when several terminals share one history file, and
+every path it produces must exist, which stops a wrong guess from inventing
+anything. On this developer's history, which mostly navigates with `pd`, it
+found 9 directories and files in 11,000 lines.
+
+**macOS permission prompts are avoided by never touching the folders that
+cause them.** Apple's list (Platform Security guide, "Controlling app access
+to files", https://support.apple.com/guide/security/secddd1d86a6/web) is
+Desktop, Documents, Downloads, iCloud Drive, removable and network volumes;
+cloud storage through File Provider (`~/Library/CloudStorage`) and other apps'
+containers prompt too. So `is_off_limits` rejects, by the path's text alone,
+`~/Desktop`, `~/Documents`, `~/Downloads`, all of `~/Library`, `~/.Trash`,
+`/Volumes`, `/Network`, other users' homes and Photos libraries. Paths are
+then canonicalised by `resolve_safely`, which walks one component at a time
+and checks each step *before* stat'ing it: `fs::canonicalize` would follow
+`~/Dropbox` into `~/Library/CloudStorage/Dropbox` and touch it. Spotlight
+results inside those folders cost nothing - the index answers, not the files -
+and are dropped before anything opens them. The price is that everything in
+those folders is left out, including a Dropbox the user works in daily.
+
+**Junk** is dropped: `/tmp`, `/var` and the like, the directories above
+`$HOME`, anything inside `.git` or `node_modules`, and anything git would
+ignore - every `.gitignore` from the repository root down, then the global
+excludes file.
+
+**One row per path, capped.** Sightings of the same canonical path are merged:
+uses summed and capped at 5, `last_used` the latest timestamp any source
+recorded (a source with none, like zoxide, counts as "now" only when no source
+had a date, or one undated sighting would make every path it shares look used
+today). Paths last used over a year ago are dropped, and the most recent 1,000
+kept, since each is a registry entry every keystroke filters over. Measured on
+the keystroke benchmark with this developer's 109 imported paths: 73 more files
+ranked per query, filter+rank 0.76ms to 0.80ms.
+
+**Stored apart from events.** `imported_paths` is a snapshot, replaced whole by
+each import; `import_runs` records that one ran. Nothing that trains and
+nothing `psychic stats` reads looks at either, so imports cannot become
+training labels or inflate the click counts the blend gate uses. They reach
+ranking twice: `load_historical_files` registers them after history (history
+wins ties in registry order), and `Ranker::load_clicks` reads their uses for
+the simple model's term.
+
+**When it runs.** `psychic import` runs it by hand (`--dry-run` prints what it
+would store, `--undo` forgets it). On its own it runs once, on a background
+thread started with the TUI, when no import has ever run and nothing has ever
+been clicked or scrolled - shell-hook visits do not count, because
+`psychic init` and a few `cd`s usually come before the first launch. Someone
+upgrading with history of their own is left alone. `--undo` keeps the
+`import_runs` row, so it does not come back by itself. All of it takes about
+half a second here, 240ms of it Spotlight, which is why it is not on the
+startup path.
+
+**What the user sees.** When it finishes, the UI sets the status line to
+"Imported 109 paths you use (Spotlight, git repos, +7 more); undo: psychic
+import --undo" and sends the worker `AddImported`, which registers the paths
+and hands the ranker their uses *without re-ranking or replying*: the list on
+screen does not change under the user. The next keystroke ranks with them.
 
 ### Module: `walker.rs`
 
@@ -1327,7 +1436,11 @@ the window's own maximum.
 The ranker uses a two-model hybrid system to handle cold-start scenarios (new installations or few clicks):
 
 1. **Simple Linear Model:**
-   - Raw score: `3.0 * clicks_last_7_days + 1.0 / (1 + modified_age_in_days) + 2.0 * fuzzy_score`
+   - Raw score: `3.0 * clicks_last_7_days + 1.0 / (1 + modified_age_in_days) + 2.0 * fuzzy_score + 0.5 * imported_uses`
+   - `imported_uses` is what `psychic import` found for the path, capped at 5,
+     so it adds at most 2.5: about one click from the last week, a little more
+     than a perfect fuzzy match. Chosen by that comparison, not measured - a
+     new install has no clicks to measure against. No ML feature sees it.
    - Normalized to [0, 1] with a sigmoid (`k = 0.1`, midpoint at raw score 10)
    - Prioritizes recently clicked files, recently modified files, and query matches
    - Fast to compute, works with zero training data
@@ -3003,6 +3116,12 @@ psychic stats
 psychic hidden list
 psychic hidden add /path/to/directory
 psychic hidden remove /path/to/directory
+
+# Find files and directories you already use (shell history, editors, zoxide,
+# Spotlight, coding agents, git repos; see "Importing what you already use")
+psychic import             # replaces the previous import
+psychic import --dry-run   # print what it would store
+psychic import --undo      # forget everything imported
 
 # Internal commands (development/debugging)
 psychic internal analyze-perf

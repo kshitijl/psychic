@@ -34,6 +34,17 @@ pub struct Visit {
     pub timestamp: i64,
 }
 
+/// One path from `psychic import`: see the `imported_paths` table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportedRow {
+    pub full_path: String,
+    pub uses: u32,
+    pub last_used: i64,
+    /// The sources that reported it, by name, comma-separated. For people
+    /// reading the table; nothing parses it.
+    pub sources: String,
+}
+
 /// What `psychic stats` reads: see `Database::usage_history`.
 pub struct UsageHistory {
     /// In the order they were logged.
@@ -247,6 +258,34 @@ impl Database {
             "CREATE TABLE IF NOT EXISTS hidden_prefixes (
                 path TEXT PRIMARY KEY,
                 created_at INTEGER NOT NULL
+            )",
+            [],
+        )?;
+
+        // Paths `psychic import` found in shell history, editors and the like.
+        //
+        // Its own table, not `events` rows, for the same reason as hiding:
+        // these are not things the user did in psychic. Nothing that trains,
+        // or that counts clicks for `psychic stats`, reads this table, so an
+        // import cannot leak into either. It is a snapshot, replaced whole by
+        // each import, one row per path.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS imported_paths (
+                full_path TEXT PRIMARY KEY,
+                uses INTEGER NOT NULL,
+                last_used INTEGER NOT NULL,
+                sources TEXT NOT NULL
+            )",
+            [],
+        )?;
+
+        // When imports ran. Its only reader asks whether there has been one,
+        // so that a new install imports once on its own and never again -
+        // including after `psychic import --undo`.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS import_runs (
+                ran_at INTEGER NOT NULL,
+                paths INTEGER NOT NULL
             )",
             [],
         )?;
@@ -718,6 +757,82 @@ impl Database {
         Ok(UsageHistory { events, launches })
     }
 
+    /// Replace every imported path with `rows`, and record the run.
+    pub fn replace_imported_paths(&self, rows: &[ImportedRow], ran_at: i64) -> Result<()> {
+        let transaction = self.conn.unchecked_transaction()?;
+        transaction.execute("DELETE FROM imported_paths", [])?;
+        {
+            let mut insert = transaction.prepare(
+                "INSERT INTO imported_paths (full_path, uses, last_used, sources)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for row in rows {
+                insert.execute(params![row.full_path, row.uses, row.last_used, row.sources])?;
+            }
+        }
+        transaction.execute(
+            "INSERT INTO import_runs (ran_at, paths) VALUES (?1, ?2)",
+            params![ran_at, rows.len()],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Forget every imported path. The run stays recorded, so a new install
+    /// does not import again by itself. Returns how many were removed.
+    pub fn clear_imported_paths(&self) -> Result<usize> {
+        Ok(self.conn.execute("DELETE FROM imported_paths", [])?)
+    }
+
+    /// Imported paths used within the history lookback, most recent first.
+    /// The table holds one import's worth - at most a thousand rows - so this
+    /// reads all of it without an index.
+    pub fn imported_paths(&self) -> Result<Vec<ImportedRow>> {
+        let cutoff = jiff::Timestamp::now().as_second() - HISTORY_LOOKBACK_DAYS * SECONDS_PER_DAY;
+        let mut stmt = self.conn.prepare(
+            "SELECT full_path, uses, last_used, sources
+             FROM imported_paths
+             WHERE last_used >= ?1
+             ORDER BY last_used DESC, full_path",
+        )?;
+        let rows = stmt
+            .query_map(params![cutoff], |row| {
+                Ok(ImportedRow {
+                    full_path: row.get(0)?,
+                    uses: row.get(1)?,
+                    last_used: row.get(2)?,
+                    sources: row.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Has `psychic import` ever run against this database?
+    pub fn has_import_run(&self) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row("SELECT EXISTS(SELECT 1 FROM import_runs)", [], |row| {
+                row.get(0)
+            })?)
+    }
+
+    /// Has the user ever clicked or scrolled in psychic?
+    ///
+    /// Visits from the shell hook do not count: `psychic init` and a few
+    /// `cd`s usually come before the first launch, and they should not stop a
+    /// new install from importing. It is an index seek, never a scan of the
+    /// impressions; `plan_tests` checks.
+    pub fn has_engagements(&self) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM events
+                           WHERE action IN ('click', 'scroll', 'startup_visit')
+                             AND action IN ('click', 'scroll'))",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
     pub fn summarize_events(&self) -> Result<Vec<(String, i64)>> {
         let mut stmt = self.conn.prepare(
             "SELECT action, COUNT(*) as count
@@ -761,6 +876,81 @@ mod tests {
                 params![timestamp, path],
             )
             .expect("Failed to insert test event");
+    }
+
+    fn imported_row(path: &str, uses: u32, days_ago: i64) -> ImportedRow {
+        ImportedRow {
+            full_path: path.to_string(),
+            uses,
+            last_used: jiff::Timestamp::now().as_second() - days_ago * SECONDS_PER_DAY,
+            sources: "vim".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_an_import_replaces_the_last_and_drops_what_is_too_old() {
+        let db = test_db();
+        assert!(!db.has_import_run().unwrap());
+        db.replace_imported_paths(&[imported_row("/first", 1, 0)], 1)
+            .unwrap();
+        db.replace_imported_paths(
+            &[
+                imported_row("/older", 2, 3),
+                imported_row("/newer", 5, 1),
+                imported_row("/ancient", 1, 400),
+            ],
+            2,
+        )
+        .unwrap();
+        let paths: Vec<(String, u32)> = db
+            .imported_paths()
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.full_path, row.uses))
+            .collect();
+        assert_eq!(
+            paths,
+            vec![("/newer".to_string(), 5), ("/older".to_string(), 2)]
+        );
+        assert!(db.has_import_run().unwrap());
+
+        assert_eq!(db.clear_imported_paths().unwrap(), 3);
+        assert!(db.imported_paths().unwrap().is_empty());
+        assert!(
+            db.has_import_run().unwrap(),
+            "undoing an import does not make psychic import again by itself"
+        );
+    }
+
+    #[test]
+    fn test_visits_alone_are_not_engagements() {
+        let db = test_db();
+        assert!(!db.has_engagements().unwrap());
+        for (action, expected) in [
+            (UserInteraction::StartupVisit, false),
+            (UserInteraction::Click, true),
+        ] {
+            db.log_event(EventData {
+                query: "",
+                file_path: "a",
+                full_path: "/a",
+                mtime: None,
+                file_size: None,
+                subsession_id: 1,
+                action,
+                session_id: "s",
+                episode_queries: None,
+                rank: None,
+                is_dir: None,
+            })
+            .unwrap();
+            assert_eq!(
+                db.has_engagements().unwrap(),
+                expected,
+                "after {:?}",
+                action
+            );
+        }
     }
 
     #[test]
@@ -1296,6 +1486,27 @@ mod plan_tests {
         assert!(
             plan.contains("idx_events_engagement"),
             "visits_since must not scan the table: {}",
+            plan
+        );
+    }
+
+    #[test]
+    fn test_the_first_run_check_uses_an_index() {
+        let db = Database::new(Path::new(":memory:")).unwrap();
+
+        // Exactly what `has_engagements` runs.
+        let plan = plan(
+            &db,
+            "SELECT EXISTS(SELECT 1 FROM events
+                           WHERE action IN ('click', 'scroll', 'startup_visit')
+                             AND action IN ('click', 'scroll'))",
+        );
+
+        // SQLite picks `idx_events_action` here (a seek per action, and EXISTS
+        // stops at the first row); either index will do, a scan will not.
+        assert!(
+            plan.contains("USING") && !plan.contains("SCAN events"),
+            "has_engagements must not scan the impressions: {}",
             plan
         );
     }
