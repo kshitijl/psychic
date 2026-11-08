@@ -9,6 +9,9 @@
 - **[ml-ideas.md](ml-ideas.md)** - small ML ideas beyond the ranking model
   (best-first walk, learned aliases, position bias), none built yet, with the
   ones the user liked marked.
+- **[positioning-notes.md](positioning-notes.md)** - who would switch from
+  zoxide + fzf and why, and open questions about dropping a path into a
+  command. Raw material, nothing decided.
 - **[archive/](archive/)** - dated material kept for provenance, not for
   reading as current state.
 

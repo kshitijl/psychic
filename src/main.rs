@@ -12,6 +12,7 @@ mod import;
 mod input;
 mod keymap;
 mod metadata_ext;
+mod opener;
 mod path_display;
 mod preview;
 mod ranker;
@@ -371,8 +372,15 @@ fn main() -> Result<()> {
                 return Ok(());
             }
             Commands::Zsh => {
-                // Output zsh integration script
-                print!("{}", include_str!("../shell/psychic.zsh"));
+                print!("{}", shell_init::Shell::Zsh.script());
+                return Ok(());
+            }
+            Commands::Bash => {
+                print!("{}", shell_init::Shell::Bash.script());
+                return Ok(());
+            }
+            Commands::Fish => {
+                print!("{}", shell_init::Shell::Fish.script());
                 return Ok(());
             }
             Commands::Import { dry_run, undo } => {
@@ -404,8 +412,12 @@ fn main() -> Result<()> {
                 println!("{}", report.summary());
                 return Ok(());
             }
-            Commands::Init { reverse, yes } => {
-                return shell_init::run(reverse, yes, &data_dir);
+            Commands::Init {
+                shell,
+                reverse,
+                yes,
+            } => {
+                return shell_init::run(shell, reverse, yes, &data_dir);
             }
             Commands::Hidden { command } => {
                 let db_path = db::Database::get_db_path(&data_dir);
@@ -561,6 +573,7 @@ fn main() -> Result<()> {
     // Thread 1: terminal input. It sleeps in the kernel until a key arrives, a
     // resize happens, or we ask it to stop so a child process can have the
     // terminal. See tty_input.rs for why that is harder than it sounds.
+    tty_input::attach_stdin_to_terminal();
     let input = tty_input::spawn(event_tx.clone()).context("Failed to start the input thread")?;
 
     // Thread 2: preview generation. Kept off the UI thread because how long a
@@ -626,6 +639,7 @@ fn main() -> Result<()> {
 
     let options = AppOptions {
         on_dir_click: cli.on_dir_click.clone(),
+        on_file_click: cli.on_file_click.clone(),
         on_cwd_visit: cli.on_cwd_visit.clone(),
         initial_filter,
         no_preview: cli.no_preview,

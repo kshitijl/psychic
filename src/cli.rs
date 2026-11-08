@@ -40,12 +40,21 @@ pub enum Commands {
     Stats,
     /// Output shell integration script for zsh
     Zsh,
-    /// Set up shell integration: add `eval "$(psychic zsh)"` to ~/.zshrc
+    /// Output shell integration script for bash
+    Bash,
+    /// Output shell integration script for fish
+    Fish,
+    /// Set up shell integration: add the line that loads it to your shell's startup file
     ///
-    /// Shows the lines it will add and asks first. Does nothing if ~/.zshrc
-    /// already loads the integration. `--reverse` takes the lines out again and
-    /// says how to remove the rest of psychic.
+    /// ~/.zshrc, ~/.bashrc or ~/.config/fish/config.fish. Shows the lines it
+    /// will add and asks first, and does nothing if the file already loads
+    /// the integration. `--reverse` takes the lines out again (from all three
+    /// files, unless a shell is named) and says how to remove the rest of
+    /// psychic.
     Init {
+        /// Which shell; defaults to the one $SHELL names
+        #[arg(value_enum)]
+        shell: Option<crate::shell_init::Shell>,
         /// Remove the lines `psychic init` added, instead of adding them
         #[arg(long)]
         reverse: bool,
@@ -168,6 +177,15 @@ pub enum OnDirClickAction {
     DropIntoShell,
 }
 
+/// Action to take when user presses Enter on a file
+#[derive(ValueEnum, Clone, Debug, PartialEq)]
+pub enum OnFileClickAction {
+    /// Open it: in $EDITOR, or in its app for PDFs, images and the like (default)
+    Open,
+    /// Print path to stdout and exit (for `$(...)` and the Ctrl-T binding)
+    PrintToStdout,
+}
+
 /// Action to take when user presses Ctrl-J on current directory
 #[derive(ValueEnum, Clone, Debug, PartialEq)]
 pub enum OnCwdVisitAction {
@@ -190,6 +208,10 @@ pub struct Cli {
     /// Action when pressing Enter on a directory
     #[arg(long, value_enum, default_value = "navigate")]
     pub on_dir_click: OnDirClickAction,
+
+    /// Action when pressing Enter on a file
+    #[arg(long, value_enum, default_value = "open")]
+    pub on_file_click: OnFileClickAction,
 
     /// Action when pressing Ctrl-J (current directory visit)
     #[arg(long, value_enum, default_value = "drop-into-shell")]

@@ -103,6 +103,14 @@ choices are most sensitive to.
   access - zoxide or shell history going there is evidence - those paths could
   be allowed; not done, because one wrong guess is a prompt on first launch.
 
+- **Two processes creating the database at once: one fails.** Found
+  2026-11-08 while testing the bash hook: two `psychic track-visit` started
+  milliseconds apart against a database that does not exist yet, and one
+  exits with "database is locked" despite `busy_timeout`. The in-process
+  first-open lock (`PREPARED` in `db.rs`) does not cover other processes.
+  Only reachable on the very first database creation, e.g. two quick `cd`s
+  before psychic has ever run. Not investigated further.
+
 ## measurement discipline
 
 Three things this repo learned the hard way in September. All three are in

@@ -277,7 +277,7 @@ pub static KEYMAP: &[Binding] = &[
         &[key(KeyCode::Enter)],
         Context::Global,
         Section::Moving,
-        "open file in your editor, or enter dir",
+        "open file (editor, or its app for PDFs, images...), or enter dir",
     ),
     Binding::new(
         Action::ParentDir,

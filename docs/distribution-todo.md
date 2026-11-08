@@ -13,10 +13,11 @@ Most useful first.
    run before any clicks is usable, and that shell integration works. A
    friend's laptop, a second macOS user, or a Linux box would do.
 
-2. **bash and fish shell integration.** Only zsh is supported
-   (`shell/psychic.zsh`). A large share of the people who'd want a `cd`
-   replacement use bash or fish; zoxide supports both. This probably matters
-   more to new users than anything below.
+2. **bash and fish shell integration.** Written 2026-11-08
+   (`shell/psychic.bash`, `shell/psychic.fish`, `psychic init bash|fish`).
+   What is left is running them: fish and bash 4+ are not installed on the
+   development machine, so the fish script and bash's Ctrl-T are untested.
+   Only bash 3.2's hook and functions were exercised.
 
 3. **A static musl Linux build** (`x86_64-unknown-linux-musl`,
    `aarch64-unknown-linux-musl`), for Alpine and for older distros: Ubuntu

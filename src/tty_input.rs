@@ -245,6 +245,55 @@ where
     })
 }
 
+/// Make stdin the terminal, when it is not one already.
+///
+/// When stdin is not a terminal (a zsh widget such as Ctrl-T, or
+/// `psychic </dev/null`), crossterm reads from `/dev/tty` instead, and so
+/// would [`open_tty`]. On
+/// macOS that fails: `/dev/tty` is an alias for the controlling terminal, and
+/// neither kqueue (crossterm's mio) nor `poll(2)` accept it, so the input
+/// thread died with "Failed to initialize input reader" and the TUI ignored
+/// every key. The terminal's real device (`/dev/ttys003`) works with both;
+/// it is what stdin is when psychic runs from a prompt, which is why `p` and
+/// `pd` never hit this.
+///
+/// So find that device's name from stderr or stdout, whichever is a terminal
+/// (in `$(psychic)` stdout is a pipe but stderr is not), open it, and put it
+/// on fd 0, where crossterm and [`open_tty`] both look first. psychic never
+/// reads stdin otherwise, so nothing is lost. If no descriptor is a terminal,
+/// nothing changes and `/dev/tty` is the fallback it always was.
+///
+/// Must run before the input thread starts and before raw mode is enabled.
+pub fn attach_stdin_to_terminal() {
+    // SAFETY: `isatty`, `ttyname`, `open`, `dup2` and `close` take descriptor
+    // numbers and a NUL-terminated path; `ttyname`'s result is copied out
+    // before anything else can call it.
+    unsafe {
+        if libc::isatty(libc::STDIN_FILENO) == 1 {
+            return;
+        }
+        for fd in [libc::STDERR_FILENO, libc::STDOUT_FILENO] {
+            if libc::isatty(fd) != 1 {
+                continue;
+            }
+            let name = libc::ttyname(fd);
+            if name.is_null() {
+                continue;
+            }
+            let path = std::ffi::CStr::from_ptr(name).to_owned();
+            let tty = libc::open(path.as_ptr(), libc::O_RDWR | libc::O_NOCTTY);
+            if tty < 0 {
+                continue;
+            }
+            if libc::dup2(tty, libc::STDIN_FILENO) >= 0 {
+                log::info!("stdin was not a terminal; reading from {:?}", path);
+            }
+            libc::close(tty);
+            return;
+        }
+    }
+}
+
 /// The descriptor crossterm will read from, so that we wait on the same device.
 ///
 /// Mirrors crossterm's own `tty_fd`, which is not public: stdin when it is a

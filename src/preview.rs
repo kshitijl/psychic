@@ -363,6 +363,12 @@ impl Generator {
 
     /// The first `max_lines` of a file, highlighted, with line numbers.
     fn file(&self, path: &Path, max_lines: usize) -> Generated {
+        if path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"))
+        {
+            return pdf(path, max_lines);
+        }
         let (lines, complete) = match read_text(path, max_lines) {
             Ok(Content::Text { lines, complete }) => (lines, complete),
             Ok(Content::Binary) => return Generated::note("[binary file]"),
@@ -503,6 +509,82 @@ fn read_text(path: &Path, max_lines: usize) -> Result<Content, std::io::Error> {
     }
 
     Ok(Content::Text { lines, complete })
+}
+
+/// How many pages of a PDF the preview reads.
+const PDF_PAGES: u32 = 3;
+
+/// The text of a PDF's first pages, from poppler's `pdftotext`, if installed.
+///
+/// A subprocess, which the text preview stopped using for speed - but this
+/// runs on the preview thread, so the redraw never waits for it, and it is
+/// 10-20ms on a typical paper and about 130ms on a 5MB book here (first run,
+/// cold; 60ms warm). Writing a PDF text extractor is not worth that saving.
+fn pdf(path: &Path, max_lines: usize) -> Generated {
+    let output = std::process::Command::new("pdftotext")
+        .args(["-l", &PDF_PAGES.to_string(), "-enc", "UTF-8"])
+        .arg(path)
+        .arg("-")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output();
+    let stdout = match output {
+        Ok(output) if output.status.success() => output.stdout,
+        Ok(_) => return Generated::note("[PDF: pdftotext could not read it]"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Generated::note("[PDF: install poppler (pdftotext) for a text preview]");
+        }
+        Err(e) => return Generated::note(&format!("[PDF: could not run pdftotext: {e}]")),
+    };
+    let text = String::from_utf8_lossy(&stdout);
+    if text.trim().is_empty() {
+        return Generated::note("[PDF with no text in its first pages - scanned?]");
+    }
+    pdf_text_lines(&text, max_lines)
+}
+
+/// `pdftotext` output as preview lines: a dim header, then the text, with each
+/// form feed (a page break) shown as a dim rule. Sanitised like any file.
+fn pdf_text_lines(text: &str, max_lines: usize) -> Generated {
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut lines = vec![Line::from(Span::styled(
+        format!("PDF: text of the first {PDF_PAGES} pages"),
+        dim,
+    ))];
+    let mut page = 1;
+    let mut truncated = false;
+    for raw in text.lines() {
+        if lines.len() >= max_lines {
+            truncated = true;
+            break;
+        }
+        let mut rest = raw;
+        while let Some((before, after)) = rest.split_once('\u{c}') {
+            if !before.is_empty() {
+                lines.push(Line::from(printable(before).into_owned()));
+            }
+            page += 1;
+            if page <= PDF_PAGES {
+                lines.push(Line::from(Span::styled(format!("── page {page} ──"), dim)));
+            }
+            rest = after;
+        }
+        if !rest.is_empty() || !raw.contains('\u{c}') {
+            lines.push(Line::from(printable(rest).into_owned()));
+        }
+    }
+    // Trailing blank lines after the last page break say nothing.
+    while lines
+        .last()
+        .is_some_and(|line| line.spans.iter().all(|span| span.content.trim().is_empty()))
+    {
+        lines.pop();
+    }
+    Generated {
+        text: Text::from(lines),
+        // Cut short: a longer request (the user scrolling) runs it again.
+        complete: !truncated,
+    }
 }
 
 /// A directory listing: permissions, size, date, name.
@@ -731,6 +813,25 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
         }
+    }
+
+    #[test]
+    fn test_pdf_text_shows_page_breaks_and_stays_sanitised() {
+        let generated = pdf_text_lines("Title\n\nintro \u{1b}[31mred\n\u{c}Second page\n\u{c}", 50);
+        assert_eq!(
+            rendered(&generated),
+            vec![
+                "PDF: text of the first 3 pages",
+                "Title",
+                "",
+                "intro ·[31mred",
+                "── page 2 ──",
+                "Second page",
+                "── page 3 ──",
+            ]
+        );
+        assert!(generated.complete);
+        assert!(!pdf_text_lines("a\nb\nc\nd\n", 3).complete);
     }
 
     #[test]

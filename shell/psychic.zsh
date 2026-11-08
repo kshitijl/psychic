@@ -3,7 +3,7 @@
 #   eval "$(psychic zsh)"
 # or run `psychic init`, which does that for you.
 
-# Tells psychic the integration is loaded, so the TUI doesn't suggest setting it up.
+# Tells psychic the integration is loaded, so the TUI does not suggest setting it up.
 export PSYCHIC_SHELL=zsh
 
 # =============================================================================
@@ -60,3 +60,35 @@ pc() {
     \builtin local result
     result="$(\command psychic --filter=cwd --on-cwd-visit=print-to-stdout)" && \builtin cd -- "${result}"
 }
+
+# =============================================================================
+# Ctrl-T: insert a path picked in psychic at the cursor
+# =============================================================================
+
+# Enter on a file or directory prints it instead of opening it. A pick under
+# the current directory is inserted relative to it, anything else absolute,
+# quoted for the shell.
+__psychic_insert_path() {
+    \builtin local result
+    result="$(\command psychic --on-file-click=print-to-stdout --on-dir-click=print-to-stdout)"
+    if [[ -n "${result}" ]]; then
+        [[ "${result}" == "${PWD}/"* ]] && result="${result#"${PWD}"/}"
+        LBUFFER+="${(q)result} "
+    fi
+    \builtin zle reset-prompt
+}
+\builtin zle -N __psychic_insert_path
+
+# Bound to Ctrl-T only where Ctrl-T still does what zsh does by default, so an
+# fzf (or anything else) binding is never taken over. Set PSYCHIC_NO_CTRL_T
+# before loading this to skip it; bind the widget yourself with, e.g.,
+#   bindkey '^X^F' __psychic_insert_path
+if [[ -z "${PSYCHIC_NO_CTRL_T-}" ]]; then
+    for __psychic_keymap in emacs viins; do
+        case "$(\builtin bindkey -M "${__psychic_keymap}" '^T' 2>/dev/null)" in
+            *transpose-chars|*undefined-key|*self-insert|'')
+                \builtin bindkey -M "${__psychic_keymap}" '^T' __psychic_insert_path ;;
+        esac
+    done
+    \builtin unset __psychic_keymap
+fi

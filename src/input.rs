@@ -27,7 +27,7 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend};
 
 use crate::app::App;
-use crate::cli::{OnCwdVisitAction, OnDirClickAction};
+use crate::cli::{OnCwdVisitAction, OnDirClickAction, OnFileClickAction};
 use crate::db::{EventData, UserInteraction};
 use crate::keymap::{self, Action, Context};
 use crate::search_worker::{FilterType, UpdateQueryRequest, WorkerRequest};
@@ -565,8 +565,7 @@ fn handle_enter(
     if selection.is_dir {
         handle_directory_click(app, selection.full_path, terminal)
     } else {
-        handle_file_click(app, selection.full_path, terminal)?;
-        Ok(InputAction::Continue)
+        handle_file_click(app, selection.full_path, terminal)
     }
 }
 
@@ -607,16 +606,40 @@ fn handle_directory_click(
     }
 }
 
-/// Handle clicking on a file (open in editor)
+/// Handle clicking on a file: open it (in the editor, or in its app), or
+/// print it and exit.
 fn handle_file_click(
     app: &mut App,
     file_path: std::path::PathBuf,
     terminal: &mut Terminal<CrosstermBackend<std::fs::File>>,
-) -> Result<()> {
-    suspend_tui_for_editor(app, &file_path, terminal)?;
-    refresh_after_suspend(app);
-
-    Ok(())
+) -> Result<InputAction> {
+    match app.options.on_file_click {
+        OnFileClickAction::PrintToStdout => {
+            leave_tui(terminal)?;
+            Ok(InputAction::PrintAndExit(file_path.display().to_string()))
+        }
+        OnFileClickAction::Open => {
+            match crate::opener::choose(&file_path, crate::opener::Environment::current()) {
+                crate::opener::Opener::Editor => {
+                    suspend_tui_for_editor(app, &file_path, terminal)?;
+                    refresh_after_suspend(app);
+                }
+                // The TUI stays up: the file opens in its own window.
+                crate::opener::Opener::App(command) => {
+                    let name = file_path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    app.status_message =
+                        Some(match crate::opener::open_in_app(command, &file_path) {
+                            Ok(()) => format!("Opened {name} with {command}"),
+                            Err(e) => format!("Could not open {name}: {e:#}"),
+                        });
+                }
+            }
+            Ok(InputAction::Continue)
+        }
+    }
 }
 
 /// Ask the worker to re-stat the files on screen and rerank them, after the

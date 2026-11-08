@@ -8,7 +8,7 @@ use std::{
 };
 
 use crate::analytics::Analytics;
-use crate::cli::{OnCwdVisitAction, OnDirClickAction};
+use crate::cli::{OnCwdVisitAction, OnDirClickAction, OnFileClickAction};
 use crate::db::{EventData, FileMetadata};
 use crate::preview::{PreviewRequest, PreviewState};
 use crate::search_worker::{self, DisplayFileInfo, WorkerRequest};
@@ -47,6 +47,7 @@ pub struct Timings {
 
 pub struct AppOptions {
     pub on_dir_click: OnDirClickAction,
+    pub on_file_click: OnFileClickAction,
     pub on_cwd_visit: OnCwdVisitAction,
     pub initial_filter: search_worker::FilterType,
     pub no_preview: bool,
@@ -601,6 +602,7 @@ impl App {
             ui_state: ui_state::UiState::new(),
             options: AppOptions {
                 on_dir_click: OnDirClickAction::Navigate,
+                on_file_click: OnFileClickAction::Open,
                 on_cwd_visit: OnCwdVisitAction::DropIntoShell,
                 initial_filter: search_worker::FilterType::None,
                 no_preview: false,

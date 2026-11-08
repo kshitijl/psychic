@@ -54,6 +54,8 @@ The codebase follows John Ousterhout's "deep modules" philosophy: simple interfa
 **Utilities:**
 18. **`path_display.rs`** - Path formatting utilities (truncation, abbreviation)
 19. **`cli.rs`** - CLI argument parsing with clap
+   (and **`opener.rs`**, what Enter on a file runs: `$EDITOR`, or `open` /
+   `xdg-open` for PDFs, images, media and office documents; see "Opening files")
    (and **`shell_init.rs`**, `psychic init`: adds or removes the `~/.zshrc`
    line, and the TUI's "no shell integration" hint; see "Shell Integration")
 20. **`metadata_ext.rs`** - One trait, so mtime is read out of `fs::Metadata`
@@ -2135,7 +2137,33 @@ from a frame.
 
 **Why this module:** Hides all UI rendering complexity. Main loop just calls render_*() functions without understanding layout logic, colors, or animations.
 
+### Opening files: `opener.rs`
+
+Enter on a file used to run `$EDITOR` whatever it was, so a PDF opened as bytes
+in vim. `opener::choose` decides from the extension: a closed list of formats
+an editor is the wrong tool for (PDF, EPUB, office documents, images, audio,
+video) goes to the system's opener, everything else to `$EDITOR`. Formats that
+an app could show but people edit as text - SVG, HTML, CSV, Markdown - stay
+with the editor on purpose.
+
+The opener is `open` on macOS and `xdg-open` elsewhere, but only where there is
+a screen to open on: not over SSH on macOS (`open` would show it on the remote
+machine), and on Linux only with `DISPLAY` or `WAYLAND_DISPLAY` set (which X
+forwarding over SSH does set). With nowhere to show it, the editor at least
+shows something. The opener runs detached from the terminal and is reaped on a
+thread; the TUI stays up, and the status line says "Opened paper.pdf with
+open". The click is logged like any other.
+
 ### Module: `preview.rs`
+
+**PDFs are previewed as text**, from poppler's `pdftotext` (first 3 pages, a
+dim rule at each page break), when it is installed; otherwise the pane says to
+install poppler. A subprocess - the thing the text preview got rid of - but it
+runs on the preview thread, so the redraw never waits: 24ms for a 2MB paper
+here, 60-130ms for a 5MB book. Its output goes through the same `printable`
+sanitiser as any file. A PDF with no text (a scan) says so. Images and other
+binary formats still show "[binary file]"; drawing them would need a terminal
+graphics protocol (kitty, iTerm2, sixel), which not every terminal has.
 
 **Simple interface:**
 ```rust
@@ -2475,7 +2503,12 @@ loop {
 Why mouse scrolls preview: Keyboard for navigation (fast), mouse for exploration (natural). Most users don't use mouse for results list.
 
 **Shell Integration:**
-Run `psychic init`, or put `eval "$(psychic zsh)"` in your ~/.zshrc yourself, to enable the `p`, `pd`, and `pc` commands, plus automatic directory tracking:
+zsh, bash and fish, one script each in `shell/` (`psychic zsh`, `psychic bash`,
+`psychic fish` print them). Run `psychic init`, or load it yourself -
+`eval "$(psychic zsh)"` in `~/.zshrc`, `eval "$(psychic bash)"` in `~/.bashrc`,
+`psychic fish | source` in `~/.config/fish/config.fish` - to get the `p`, `pd`
+and `pc` commands, Ctrl-T, and automatic directory tracking. The three scripts
+define the same commands; the help screen reads them out of the zsh one.
 - `p` - launch psychic, press Ctrl-J to cd your shell to the selected directory
 - `pd` - launch psychic in directories-only mode (same as `psychic --filter=dirs --on-dir-click=print-to-stdout`)
 - `pd xy` - `cd` to `xy` if it is a directory; otherwise to `psychic jump xy`, with no TUI; if nothing matches, the TUI opens with `xy` typed in. See "Jumping without the TUI" below.
@@ -2483,20 +2516,59 @@ Run `psychic init`, or put `eval "$(psychic zsh)"` in your ~/.zshrc yourself, to
 - `pc` - launch psychic in current-directory-only mode (same as `psychic --filter=cwd --on-cwd-visit=print-to-stdout`)
 - **Automatic directory tracking**: The shell integration adds a `chpwd` hook that automatically tracks every directory you visit via `cd`. This allows psychic to learn which directories you frequently visit without requiring explicit clicks.
 - Without shell integration, Ctrl-J spawns a new shell in the selected directory (old behavior)
+- **Ctrl-T** inserts a path picked in psychic at the cursor, as fzf's Ctrl-T does: it runs
+  `psychic --on-file-click=print-to-stdout --on-dir-click=print-to-stdout`, so Enter on
+  anything prints it and exits. A pick under `$PWD` is inserted relative to it, anything
+  else absolute, quoted for the shell (`${(q)}`, `printf %q`, `string escape`), with a
+  trailing space.
+
+**Ctrl-T never takes a key someone else has.** Each script binds it only where it
+still does the shell's default (`transpose-chars`), or nothing: an fzf binding,
+loaded earlier, is left alone, and so is anything else. `PSYCHIC_NO_CTRL_T`, set
+before loading, skips the binding; the function (`__psychic_insert_path`) is
+there either way for binding to another key. In bash it needs bash 4+ for
+`READLINE_LINE`, so on macOS's bash 3.2 it is not bound.
+
+**How each shell tracks directories.** zsh has a `chpwd` hook. fish runs a
+function `--on-variable PWD`, disowned so no "job has ended" line appears. bash
+has neither, so `__psychic_hook` runs from `PROMPT_COMMAND` (prepended once,
+however often the script is loaded) and acts only when `$PWD` differs from the
+last prompt's; it starts from the directory the shell opened in, so opening a
+shell is not a visit. Checked on bash 3.2 by `cd`ing and calling the hook: one
+visit per change. **fish and bash 4+ have not been run here** - neither is
+installed on the development machine - so the fish script and bash's Ctrl-T
+are written from the shells' documentation, untested.
+
+**Why a zsh widget needed a change in `tty_input.rs`.** Inside a ZLE widget,
+psychic's stdin is not the terminal. crossterm then reads from `/dev/tty`, and
+on macOS neither kqueue (crossterm's mio) nor `poll(2)` accepts `/dev/tty` - it
+is an alias for the controlling terminal, not the device - so the input thread
+died at startup with "Failed to initialize input reader" and the TUI ignored
+every key. `psychic </dev/null` failed the same way. `attach_stdin_to_terminal`
+now finds the terminal's real device name from stderr or stdout (`ttyname`) and
+puts it on fd 0 before the input thread starts; both crossterm and the input
+thread look at stdin first. crossterm's `use-dev-tty` feature was tried and is
+not enough: it gets crossterm past kqueue, but psychic's own `poll` on
+`/dev/tty` still fails.
 
 **How automatic tracking works:**
 The shell integration installs a `__psychic_hook()` function that runs after every directory change. This hook calls `psychic track-visit <directory>` in the background, which logs a `startup_visit` event to the database. These visits appear in search results and help the ML model learn your directory preferences, but they don't count as positive click signals (unlike actual clicks), preventing bias in the ranking.
 
 **Setting it up and taking it out: `psychic init` (`shell_init.rs`).**
-`psychic init` appends two lines to `~/.zshrc` (`$ZDOTDIR/.zshrc` if that is
-set): a marker comment naming the undo command, and `eval "$(psychic zsh)"`.
-It prints them and asks y/N first; `--yes` skips the question, and without it
-a stdin that is not a terminal is an error rather than a silent "no". It adds
-nothing if any uncommented line already mentions `psychic zsh`, in whatever
-form, so it never puts a second copy beside one the user wrote. It refuses when
-`$SHELL` is not zsh, since there is no bash or fish integration yet.
+`psychic init [zsh|bash|fish]` (default: the shell `$SHELL` names) appends two
+lines to that shell's startup file - `~/.zshrc` (`$ZDOTDIR/.zshrc` if set),
+`~/.bashrc`, or `~/.config/fish/config.fish` (`$XDG_CONFIG_HOME`) - a marker
+comment naming the undo command, and the shell's load line. It prints them and
+asks y/N first; `--yes` skips the question, and without it a stdin that is not
+a terminal is an error rather than a silent "no". It adds nothing if any
+uncommented line already mentions `psychic <shell>`, in whatever form, so it
+never puts a second copy beside one the user wrote. For bash on macOS it also
+warns when `~/.bash_profile` exists and does not load `~/.bashrc`: macOS
+terminals start bash as a login shell, which reads only the profile.
 
-`psychic init --reverse` removes exactly the marker and the eval line, plus the
+`psychic init --reverse` cleans all three files unless a shell is named,
+because someone uninstalling may have set up a shell they no longer use. It
+removes exactly the marker and the load line, plus the
 blank line `init` put before the marker, so adding then removing gives back the
 original file. Other forms (`source <(psychic zsh)`, a full path) are reported
 with their line numbers and left alone: psychic did not write them and should
@@ -2510,9 +2582,9 @@ an rc file that is a symlink into a dotfiles repo stays a symlink. The decisions
 over the file's text (`plan_add`, `plan_remove`) are pure and tested on literal
 strings; only `run` touches the disk.
 
-**The "not set up" hint.** `shell/psychic.zsh` exports `PSYCHIC_SHELL=zsh`.
-When the TUI starts without it, the search box title shows
-"No shell integration (p, pd, pc): run `psychic init`" as its status message,
+**The "not set up" hint.** Every script exports `PSYCHIC_SHELL` (`zsh`,
+`bash`, `fish`). When the TUI starts without it, the search box title shows
+"No shell integration (p, pd, pc, Ctrl-T): run `psychic init`" as its status message,
 which the first keypress clears like any other. It comes back next launch,
 because there is nowhere sensible to remember a dismissal that would not also
 hide it from someone who simply has not seen it yet; anyone who wants psychic
@@ -2525,7 +2597,8 @@ answer and nothing else - but a TUI's whole job is to write to the terminal. So
 psychic opens `/dev/tty` itself and points ratatui at that (`main.rs`, and again
 in `input.rs` for a suspended child's three descriptors), leaving stdout free to
 carry exactly one line: the path, printed on the way out under
-`--on-cwd-visit=print-to-stdout` or `--on-dir-click=print-to-stdout`. This is
+`--on-cwd-visit=print-to-stdout`, `--on-dir-click=print-to-stdout` or
+`--on-file-click=print-to-stdout`. This is
 how zoxide's interactive mode works too. It is also why `tty_input.rs` is
 careful about *which* descriptor it polls: the fd it waits on must be the one
 the terminal is actually attached to, which is the `/dev/tty` psychic opened,
@@ -3090,13 +3163,18 @@ psychic generate-features
 # Retrain model (runs feature generation + training)
 psychic retrain
 
-# Output shell integration script
-psychic zsh
-# Add to ~/.zshrc: eval "$(psychic zsh)"
+# Configure file click behavior
+psychic --on-file-click=open             # $EDITOR, or the file's app for PDFs, images... (default)
+psychic --on-file-click=print-to-stdout  # Print path and exit: vim "$(psychic --on-file-click=print-to-stdout)"
 
-# Add that line to ~/.zshrc for you (asks first), or take it out again
-psychic init [--yes]
-psychic init --reverse [--yes]   # also prints how to uninstall psychic
+# Output shell integration script
+psychic zsh     # ~/.zshrc: eval "$(psychic zsh)"
+psychic bash    # ~/.bashrc: eval "$(psychic bash)"
+psychic fish    # ~/.config/fish/config.fish: psychic fish | source
+
+# Add that line to your shell's startup file (asks first), or take it out again
+psychic init [zsh|bash|fish] [--yes]        # default: the shell $SHELL names
+psychic init --reverse [SHELL] [--yes]      # all three unless named; prints how to uninstall
 
 # Print the best directory for a query, without the TUI (what `pd xy` runs)
 psychic jump xy
