@@ -51,6 +51,8 @@ The codebase follows John Ousterhout's "deep modules" philosophy: simple interfa
 **Utilities:**
 18. **`path_display.rs`** - Path formatting utilities (truncation, abbreviation)
 19. **`cli.rs`** - CLI argument parsing with clap
+   (and **`shell_init.rs`**, `psychic init`: adds or removes the `~/.zshrc`
+   line, and the TUI's "no shell integration" hint; see "Shell Integration")
 20. **`metadata_ext.rs`** - One trait, so mtime is read out of `fs::Metadata`
     the same way everywhere
 
@@ -2360,7 +2362,7 @@ loop {
 Why mouse scrolls preview: Keyboard for navigation (fast), mouse for exploration (natural). Most users don't use mouse for results list.
 
 **Shell Integration:**
-Run `eval "$(psychic zsh)"` in your ~/.zshrc to enable the `p`, `pd`, and `pc` commands, plus automatic directory tracking:
+Run `psychic init`, or put `eval "$(psychic zsh)"` in your ~/.zshrc yourself, to enable the `p`, `pd`, and `pc` commands, plus automatic directory tracking:
 - `p` - launch psychic, press Ctrl-J to cd your shell to the selected directory
 - `pd` - launch psychic in directories-only mode (same as `psychic --filter=dirs --on-dir-click=print-to-stdout`)
 - `pd xy` - `cd` to `xy` if it is a directory; otherwise to `psychic jump xy`, with no TUI; if nothing matches, the TUI opens with `xy` typed in. See "Jumping without the TUI" below.
@@ -2371,6 +2373,37 @@ Run `eval "$(psychic zsh)"` in your ~/.zshrc to enable the `p`, `pd`, and `pc` c
 
 **How automatic tracking works:**
 The shell integration installs a `__psychic_hook()` function that runs after every directory change. This hook calls `psychic track-visit <directory>` in the background, which logs a `startup_visit` event to the database. These visits appear in search results and help the ML model learn your directory preferences, but they don't count as positive click signals (unlike actual clicks), preventing bias in the ranking.
+
+**Setting it up and taking it out: `psychic init` (`shell_init.rs`).**
+`psychic init` appends two lines to `~/.zshrc` (`$ZDOTDIR/.zshrc` if that is
+set): a marker comment naming the undo command, and `eval "$(psychic zsh)"`.
+It prints them and asks y/N first; `--yes` skips the question, and without it
+a stdin that is not a terminal is an error rather than a silent "no". It adds
+nothing if any uncommented line already mentions `psychic zsh`, in whatever
+form, so it never puts a second copy beside one the user wrote. It refuses when
+`$SHELL` is not zsh, since there is no bash or fish integration yet.
+
+`psychic init --reverse` removes exactly the marker and the eval line, plus the
+blank line `init` put before the marker, so adding then removing gives back the
+original file. Other forms (`source <(psychic zsh)`, a full path) are reported
+with their line numbers and left alone: psychic did not write them and should
+not guess. It then prints how to uninstall the rest - `brew uninstall psychic`,
+`cargo uninstall psychic-cli` or `rm <binary>`, judged from where the running
+binary lives, and `rm -r` of the data directory. This is the uninstall story;
+`conda init --reverse` is the precedent for the flag name.
+
+Appending goes through the path and the rewrite goes to its canonical path, so
+an rc file that is a symlink into a dotfiles repo stays a symlink. The decisions
+over the file's text (`plan_add`, `plan_remove`) are pure and tested on literal
+strings; only `run` touches the disk.
+
+**The "not set up" hint.** `shell/psychic.zsh` exports `PSYCHIC_SHELL=zsh`.
+When the TUI starts without it, the search box title shows
+"No shell integration (p, pd, pc): run `psychic init`" as its status message,
+which the first keypress clears like any other. It comes back next launch,
+because there is nowhere sensible to remember a dismissal that would not also
+hide it from someone who simply has not seen it yet; anyone who wants psychic
+without the integration can set `PSYCHIC_SHELL` to anything to silence it.
 
 **Why the TUI is drawn to `/dev/tty` and not to stdout.** A shell cannot change
 its own parent's directory, so `p` has to run psychic in a command substitution
@@ -2947,6 +2980,10 @@ psychic retrain
 # Output shell integration script
 psychic zsh
 # Add to ~/.zshrc: eval "$(psychic zsh)"
+
+# Add that line to ~/.zshrc for you (asks first), or take it out again
+psychic init [--yes]
+psychic init --reverse [--yes]   # also prints how to uninstall psychic
 
 # Print the best directory for a query, without the TUI (what `pd xy` runs)
 psychic jump xy

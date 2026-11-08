@@ -16,6 +16,7 @@ mod preview;
 mod ranker;
 mod render;
 mod search_worker;
+mod shell_init;
 mod training;
 mod tty_input;
 mod ui_state;
@@ -342,6 +343,9 @@ fn main() -> Result<()> {
                 print!("{}", include_str!("../shell/psychic.zsh"));
                 return Ok(());
             }
+            Commands::Init { reverse, yes } => {
+                return shell_init::run(reverse, yes, &data_dir);
+            }
             Commands::Hidden { command } => {
                 let db_path = db::Database::get_db_path(&data_dir);
                 let db = db::Database::new(&db_path)?;
@@ -560,6 +564,7 @@ fn main() -> Result<()> {
     };
 
     let mut app = App::new(root.clone(), &data_dir, bootstrap, options)?;
+    app.status_message = shell_init::missing_integration_hint().map(str::to_string);
     log::info!(
         "TIMING {{\"op\":\"app_new\",\"ms\":{}}}",
         app_new_start.elapsed().as_secs_f64() * 1000.0

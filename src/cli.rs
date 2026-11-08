@@ -40,6 +40,19 @@ pub enum Commands {
     Stats,
     /// Output shell integration script for zsh
     Zsh,
+    /// Set up shell integration: add `eval "$(psychic zsh)"` to ~/.zshrc
+    ///
+    /// Shows the lines it will add and asks first. Does nothing if ~/.zshrc
+    /// already loads the integration. `--reverse` takes the lines out again and
+    /// says how to remove the rest of psychic.
+    Init {
+        /// Remove the lines `psychic init` added, instead of adding them
+        #[arg(long)]
+        reverse: bool,
+        /// Don't ask before editing ~/.zshrc
+        #[arg(long, short)]
+        yes: bool,
+    },
     /// Track a directory visit (for shell integration hooks)
     TrackVisit {
         /// Directory path to track

@@ -1,6 +1,10 @@
 # Psychic shell integration for zsh
 # Add this to your ~/.zshrc:
 #   eval "$(psychic zsh)"
+# or run `psychic init`, which does that for you.
+
+# Tells psychic the integration is loaded, so the TUI doesn't suggest setting it up.
+export PSYCHIC_SHELL=zsh
 
 # =============================================================================
 # Hook to track directory changes

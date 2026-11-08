@@ -36,12 +36,22 @@ Most useful first.
 6. **Uninstall instructions and where data lives** in the README:
    `brew uninstall psychic`, or delete `~/.local/bin/psychic`, plus
    `~/.local/share/psychic` for the click database and model. A tool that
-   records clicks should say how to wipe them.
+   records clicks should say how to wipe them. `psychic init --reverse` now
+   prints exactly this, so the README can point at it; the README itself is
+   the user's to edit.
 
 7. **The Homebrew formula's style warnings.** dist's generated formula has no
    `test do` block and one line is too long; `brew style` prints both on
    every release. They don't break anything, but homebrew-core would require a
    test (e.g. `system bin/"psychic", "--version"`).
+
+8. **A `psychic uninstall` command**, maybe, instead of (or on top of) the
+   uninstall hints `psychic init --reverse` prints today. It would work out how
+   psychic was installed (brew, the curl installer's `~/.local/bin`, cargo)
+   and uninstall itself that way, take the shell integration out of
+   `~/.zshrc`, and then deal with the history in the data directory: on a TTY,
+   ask whether to delete it; without one, leave it alone and print that it was
+   not deleted and where it is. Noted 2026-11-08, after `psychic init` landed.
 
 Decided against, for now:
 
