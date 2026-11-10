@@ -2,7 +2,7 @@
 # `psychic` on crates.io belongs to an unrelated crate. The binary, the
 # Homebrew formula and the data directory are all still `psychic`.
 name = "psychic-cli"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "Smarter file explorer and cd replacement that learns from your actions and ranks files with a model trained on your machine"
 license = "MIT"
