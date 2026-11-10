@@ -20,10 +20,14 @@ end
 # Navigation commands
 # =============================================================================
 
+# Escape in psychic exits 0 with no output, and fish's `cd` with no argument
+# goes to $HOME, so each command checks for a result before it cds.
+
 # Jump to a directory using psychic
 # Ctrl-J in psychic will print the directory and exit
 function p
     set -l result (command psychic --on-cwd-visit=print-to-stdout)
+    and test -n "$result"
     and builtin cd -- $result
 end
 
@@ -44,6 +48,7 @@ function pd
         set result (command psychic jump -- "$argv")
         or set result (command psychic --filter=dirs --on-dir-click=print-to-stdout --query="$argv")
     end
+    and test -n "$result"
     and builtin cd -- $result
 end
 
@@ -51,6 +56,7 @@ end
 # Navigate within current dir, Ctrl-J to cd there
 function pc
     set -l result (command psychic --filter=cwd --on-cwd-visit=print-to-stdout)
+    and test -n "$result"
     and builtin cd -- $result
 end
 

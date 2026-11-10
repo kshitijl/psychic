@@ -15,9 +15,10 @@ Most useful first.
 
 2. **bash and fish shell integration.** Written 2026-11-08
    (`shell/psychic.bash`, `shell/psychic.fish`, `psychic init bash|fish`).
-   What is left is running them: fish and bash 4+ are not installed on the
-   development machine, so the fish script and bash's Ctrl-T are untested.
-   Only bash 3.2's hook and functions were exercised.
+   bash 5.2 and fish 4.0/3.7 were tested in Linux containers on 2026-11-09
+   (see "Tested" in `docs/how-it-works.md`), which found and fixed Escape in
+   fish's `p`/`pd`/`pc` going to `$HOME`. What is left: bash 3.2 and the
+   `.bash_profile` warning on a clean Mac (a Tart or UTM VM would do).
 
 3. **A static musl Linux build** (`x86_64-unknown-linux-musl`,
    `aarch64-unknown-linux-musl`), for Alpine and for older distros: Ubuntu

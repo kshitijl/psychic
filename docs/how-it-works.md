@@ -2535,9 +2535,20 @@ has neither, so `__psychic_hook` runs from `PROMPT_COMMAND` (prepended once,
 however often the script is loaded) and acts only when `$PWD` differs from the
 last prompt's; it starts from the directory the shell opened in, so opening a
 shell is not a visit. Checked on bash 3.2 by `cd`ing and calling the hook: one
-visit per change. **fish and bash 4+ have not been run here** - neither is
-installed on the development machine - so the fish script and bash's Ctrl-T
-are written from the shells' documentation, untested.
+visit per change. Because it compares only at prompts, several `cd`s on one
+command line count as one visit; fish records each.
+
+**Cancelling in fish.** Escape exits psychic with status 0 and no output.
+`cd -- ""` does nothing in bash and zsh, but fish's `cd` with no argument goes
+to `$HOME`, so fish's `p`, `pd` and `pc` cd only when psychic printed a path.
+
+**Tested** 2026-11-09 at a real prompt in Linux containers: Debian trixie (bash
+5.2, fish 4.0) and Ubuntu 24.04 (fish 3.7): `init` and its re-run and
+`--reverse`, a visit per `cd` (including a path with a space), `pd <dir>`,
+`pd <name>`, `pd -i`, cancelling, Ctrl-T (relative and quoted, vi mode, left
+alone when fzf loaded first, `PSYCHIC_NO_CTRL_T`). zsh and bash 3.2 were tested
+on macOS earlier. Not tested: bash 3.2 and the `.bash_profile` warning on a
+clean Mac.
 
 **Why a zsh widget needed a change in `tty_input.rs`.** Inside a ZLE widget,
 psychic's stdin is not the terminal. crossterm then reads from `/dev/tty`, and
