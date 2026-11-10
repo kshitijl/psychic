@@ -169,6 +169,10 @@ releasing"). The procedure:
 
 ```bash
 # 1. bump `version` in Cargo.toml (and Cargo.lock via `just build`), commit on main
+# 1b. check the crate builds from its packaged files alone. Cargo.toml's
+#     `include` list must name every file include_str! reads (v0.4.0 shipped
+#     without the bash and fish scripts and had to be fixed after tagging)
+cargo package
 # 2. tag and push; the tag must match the version
 git tag v0.2.0 && git push origin main v0.2.0
 # 3. watch it: plan, 4 builds, host, publish-homebrew-formula, announce
