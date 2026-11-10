@@ -10,7 +10,7 @@ repository = "https://github.com/kshitijl/psychic"
 homepage = "https://github.com/kshitijl/psychic"
 # What `cargo publish` uploads: the build needs src/ and the zsh script it
 # embeds. Not bench/, notebooks, train.py or the Python project.
-include = ["/src/**/*", "/shell/psychic.zsh", "/README.md", "/LICENSE"]
+include = ["/src/**/*", "/shell/psychic.zsh", "/shell/psychic.bash", "/shell/psychic.fish", "/README.md", "/LICENSE"]
 
 [[bin]]
 name = "psychic"
