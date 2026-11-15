@@ -12,6 +12,9 @@
 - **[positioning-notes.md](positioning-notes.md)** - who would switch from
   zoxide + fzf and why, and open questions about dropping a path into a
   command. Raw material, nothing decided.
+- **[ctrl-r-notes.md](ctrl-r-notes.md)** - whether psychic should rank shell
+  history for Ctrl-R: the case for it, the risks, prior art (atuin, mcfly) and
+  an experiment to run first. Nothing decided.
 - **[archive/](archive/)** - dated material kept for provenance, not for
   reading as current state.
 
