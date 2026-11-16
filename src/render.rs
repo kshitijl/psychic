@@ -484,7 +484,7 @@ pub fn render_normal_mode(f: &mut Frame, app: &crate::app::App) -> FrameLayout {
             }
 
             if let Some(display_info) = app.get_file_at_index(i) {
-                let time_ago = get_time_ago(display_info.mtime);
+                let time_ago = get_time_ago(display_info.mtime, app.list_clock);
                 let rank = i + 1;
 
                 // Calculate space: "N. " takes 4 chars, time_ago length, we need padding between

@@ -678,10 +678,11 @@ fn main() -> Result<()> {
             // A tick is a full redraw, so the rate is the rate the screen
             // redraws itself with nobody touching it. While the marquee is
             // running that has to be every tick or the scrolling stutters.
-            // Otherwise once a second, which is enough to keep the relative
-            // times in the list ("2m ago") honest as the clock moves - they
-            // used to update only when a key was pressed - and cheap enough not
-            // to matter.
+            // Otherwise once a second, so the list's relative times ("2 minutes
+            // ago") move on within a second of `App::list_clock` stepping -
+            // they used to update only when a key was pressed. The clock
+            // itself steps once a minute; the redraws in between draw the
+            // same times.
             elapsed_ticks += 1;
             let animating = something_animates.load(std::sync::atomic::Ordering::Relaxed);
             if !animating && elapsed_ticks < TICKS_PER_IDLE_REDRAW {
@@ -832,16 +833,18 @@ fn main() -> Result<()> {
 /// last time and psychic has since been restarted.
 /// How often the tick thread wakes.
 ///
-/// The tick is what advances the marquee and what refreshes the relative times
-/// in the list ("2m ago"), so it is the granularity of every animation. Nothing
+/// The tick is what advances the marquee and what steps the clock the list's
+/// relative times are measured from, so it is the granularity of every
+/// animation. Nothing
 /// else is keyed off it.
 const TICK_INTERVAL: Duration = Duration::from_millis(200);
 
 /// Ticks between redraws when nothing is animating.
 ///
 /// The screen still has to refresh slowly even at rest: the list shows relative
-/// times, and "2m ago" is wrong a minute later. Five ticks is one second, which
-/// keeps them honest at a fifth of the redraw rate the marquee needs.
+/// times, and "2 minutes ago" is wrong a minute later. They step once a minute
+/// (`App::list_clock`); five ticks is one second, so a step shows up within a
+/// second, at a fifth of the redraw rate the marquee needs.
 const TICKS_PER_IDLE_REDRAW: u32 = 5;
 
 /// How long the marquee pauses at each end of a path before turning round.
@@ -1022,6 +1025,7 @@ fn run_app(
                 // to do it, which made the animation a side effect of rendering
                 // and meant render could not take `&App`.
                 app.advance_marquee(marquee_delay, marquee_speed);
+                app.advance_list_clock(jiff::Timestamp::now().as_second());
             }
             AppEvent::Worker(response) => {
                 // Handle worker response

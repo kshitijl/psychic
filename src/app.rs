@@ -26,6 +26,9 @@ pub struct Page {
 pub const PAGE_SIZE: usize = 128;
 pub const PREFETCH_MARGIN: usize = 32;
 
+/// How often the clock the list's relative times are measured from moves on.
+const LIST_CLOCK_STEP_SECS: u64 = 60;
+
 /// The handful of latencies worth watching, in milliseconds.
 ///
 /// Startup numbers are measured once from process start; the search numbers are
@@ -134,6 +137,12 @@ pub struct App {
     /// there is nothing to drive, so an idle psychic stops redrawing itself
     /// five times a second.
     pub something_animates: Arc<AtomicBool>,
+    /// The moment, in Unix seconds, that the list's "2 minutes ago" times are
+    /// measured from. It steps forward once a minute on the tick rather than
+    /// following the clock, so the times stay put while the marquee animates
+    /// and the screen redraws: a user found them distracting when they
+    /// changed every second.
+    pub list_clock: i64,
 
     // Startup tracking
     pub walker_done: bool,
@@ -226,6 +235,7 @@ impl App {
             input,
             tick_paused: Arc::new(AtomicBool::new(false)),
             something_animates: Arc::new(AtomicBool::new(false)),
+            list_clock: jiff::Timestamp::now().as_second(),
             walker_done: false,
             startup_complete_logged: false,
             timings: Timings::default(),
@@ -619,6 +629,7 @@ impl App {
             input: crate::tty_input::TtyInput::detached(),
             tick_paused: Arc::new(AtomicBool::new(false)),
             something_animates: Arc::new(AtomicBool::new(false)),
+            list_clock: jiff::Timestamp::now().as_second(),
             walker_done: false,
             startup_complete_logged: false,
             timings: Timings::default(),
@@ -681,6 +692,17 @@ impl App {
         self.path_bar_scroll = scroll;
         self.path_bar_scroll_direction = direction;
         self.last_path_bar_update = Instant::now();
+    }
+
+    /// Move `list_clock` to `now` if it has fallen a minute behind.
+    ///
+    /// Called from the tick. A clock that jumped backwards also counts as a
+    /// minute's difference, so the list never measures from the future for
+    /// long.
+    pub fn advance_list_clock(&mut self, now: i64) {
+        if now.abs_diff(self.list_clock) >= LIST_CLOCK_STEP_SECS {
+            self.list_clock = now;
+        }
     }
 
     /// Take the scroll position the frame was drawn at, and prefetch around it.
@@ -865,6 +887,25 @@ mod impression_tests {
             3,
             "no rows invented below the results"
         );
+    }
+}
+
+#[cfg(test)]
+mod list_clock_tests {
+    use super::*;
+
+    #[test]
+    fn list_clock_steps_once_a_minute() {
+        let mut app = App::for_test();
+        app.list_clock = 1_000;
+        app.advance_list_clock(1_059);
+        assert_eq!(app.list_clock, 1_000);
+        app.advance_list_clock(1_060);
+        assert_eq!(app.list_clock, 1_060);
+        app.advance_list_clock(1_100);
+        assert_eq!(app.list_clock, 1_060);
+        app.advance_list_clock(900); // clock set backwards
+        assert_eq!(app.list_clock, 900);
     }
 }
 

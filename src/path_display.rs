@@ -252,24 +252,40 @@ pub fn truncate_absolute_path(path_str: &str, max_len: usize) -> String {
 }
 
 /// Convert Unix timestamp to human-readable "time ago" string
-pub fn get_time_ago(mtime: Option<i64>) -> String {
-    if let Some(mtime_secs) = mtime {
-        // Convert Unix timestamp to SystemTime
-        let mtime_systime = std::time::UNIX_EPOCH + Duration::from_secs(mtime_secs as u64);
-
-        let duration = std::time::SystemTime::now()
-            .duration_since(mtime_systime)
-            .unwrap_or(Duration::from_secs(0));
-
-        let formatter = timeago::Formatter::new();
-        return formatter.convert(duration);
-    }
-    String::from("unknown")
+/// How long before `now` the file was modified, for the results list.
+///
+/// `now` is passed in rather than read here: the list measures every row from
+/// one clock that steps once a minute (`App::list_clock`), so the times on
+/// screen sit still instead of ticking over each second. For the same reason
+/// nothing finer than a minute is shown; anything newer is "just now". A file
+/// modified after `now` - the clock is up to a minute behind - is "just now"
+/// too.
+pub fn get_time_ago(mtime: Option<i64>, now: i64) -> String {
+    let Some(mtime) = mtime else {
+        return String::from("unknown");
+    };
+    let age = u64::try_from(now.saturating_sub(mtime)).unwrap_or(0);
+    timeago::Formatter::new()
+        .min_unit(timeago::TimeUnit::Minutes)
+        .too_low("just now")
+        .convert(Duration::from_secs(age))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn time_ago_shows_nothing_finer_than_a_minute() {
+        let now = 1_000_000;
+        assert_eq!(get_time_ago(Some(now), now), "just now");
+        assert_eq!(get_time_ago(Some(now - 59), now), "just now");
+        assert_eq!(get_time_ago(Some(now - 60), now), "1 minute ago");
+        assert_eq!(get_time_ago(Some(now - 150), now), "2 minutes ago");
+        assert_eq!(get_time_ago(Some(now - 3 * 3600), now), "3 hours ago");
+        assert_eq!(get_time_ago(Some(now + 30), now), "just now");
+        assert_eq!(get_time_ago(None, now), "unknown");
+    }
 
     #[test]
     fn test_truncate_path_simple() {

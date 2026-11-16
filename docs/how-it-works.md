@@ -175,6 +175,15 @@ the rate the screen refreshes itself with nobody touching it.
   is wrong a minute later. Before this the screen only redrew on events, so those
   times sat frozen until the next keypress.
 
+**The list's times step once a minute, not every second.** Each row's "2 minutes
+ago" is measured from `App::list_clock`, which the tick moves to the current time
+only once it is a minute behind, and nothing finer than a minute is shown
+(anything newer reads "just now"). The marquee and the once-a-second redraw still
+run, but they redraw the same times. A user asked for this: "somehow i don't like
+if time 'x seconds ago' is updated live". Before, every row's time came from the
+real clock at each redraw, so the newest files counted up their seconds and
+older rows turned over at scattered moments through the minute.
+
 It used to redraw five times a second unconditionally. Measured over a 60-second
 idle window:
 
