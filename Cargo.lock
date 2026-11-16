@@ -1064,7 +1064,6 @@ dependencies = [
  "rand",
  "ratatui",
  "rayon",
- "regex",
  "rusqlite",
  "rustc-hash",
  "serde",
